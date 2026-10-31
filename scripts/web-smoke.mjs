@@ -545,10 +545,10 @@ function buildEnv(opts) {
     } else if (path === '/api/repo/blob') {
       const p = query.get('path');
       if (p === 'ok.png') {
-        headers = { 'content-type': 'image/png' };
+        headers = { 'content-type': 'image/png', 'x-image-width': '16', 'x-image-height': '9' };
         blob = new Uint8Array([137, 80, 78, 71]).buffer;
       } else if (p === 'big.png') {
-        headers = { 'content-type': 'image/png' };
+        headers = { 'content-type': 'image/png', 'x-image-width': '12abc' };
         blob = new ArrayBuffer(4194305);
       } else {
         err(415, { code: 'unsupported', message: 'not an image' });
@@ -1604,11 +1604,13 @@ async function wbBridge() {
   const ok = await host.apiBlob('/api/repo/blob?task=r1%2Fapi&commit=head&path=ok.png');
   const call = env.calls[n0];
   check(ok.ok && ok.status === 200 && ok.type === 'image/png' && ok.bytes.byteLength === 4 && ok.data === null, 'apiBlob returns the bytes and the content type');
+  check(ok.width === 16 && ok.height === 9, 'apiBlob returns the declared dimensions from the headers');
   check(call.method === 'GET' && call.credentials === 'omit' && call.cache === 'no-store' && call.headers['X-Fleet-Session'] === SESSION && call.body === null, 'apiBlob is a GET with the session header and no ambient credentials');
   const nope = await host.apiBlob('/api/repo/blob?task=r1%2Fapi&commit=head&path=a.txt');
   check(!nope.ok && nope.status === 415 && nope.bytes === null && nope.data.error.code === 'unsupported', 'apiBlob returns the error document');
   const big = await host.apiBlob('/api/repo/blob?task=r1%2Fapi&commit=head&path=big.png');
   check(!big.ok && big.status === 413 && big.bytes === null, 'apiBlob refuses more than 4 MiB');
+  check(big.width === null && big.height === null && nope.width === null, 'apiBlob gives null dimensions when absent or invalid');
   const n1 = env.calls.length;
   const out = [await host.apiBlob('//evil.example/x.png'), await host.apiBlob('x'), await host.apiBlob(null)];
   check(out.every((r) => !r.ok && r.status === 0 && r.bytes === null) && env.calls.length === n1, 'apiBlob only fetches /api/ paths');

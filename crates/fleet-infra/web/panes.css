@@ -1,4 +1,4 @@
-/* workbench panes: explorer, file, diff, markdown, image. Colors come from the app.css variables where they exist. */
+/* workbench panes: explorer, file, diff, markdown, image. Colors come from the app.css variables where they exist. Images are always size-capped. */
 
 :root {
   --d-add-bg: #e6ffec;
@@ -628,6 +628,8 @@
 
 .md-img {
   max-width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
 }
 
 .md-status {
@@ -676,10 +678,13 @@
 
 .pane-img {
   display: block;
-  max-width: none;
+  max-width: 100%;
+  max-height: 80vh;
+  object-fit: contain;
 }
 
 .img-stage.fit .pane-img {
-  max-width: 100%;
+  width: 100%;
   height: auto;
+  max-height: 80vh;
 }

@@ -2364,11 +2364,25 @@
   const NO_VERIFICATION = Object.freeze({ state: 'none', dirty: null, commit: null });
   let verifCache = { status: null, goals: null, docs: new Map(), refs: new Map() };
 
+  // header value -> positive integer or null
+  function headerDim(resp, name) {
+    if (!resp.headers || typeof resp.headers.get !== 'function') {
+      return null;
+    }
+    const v = resp.headers.get(name);
+    if (typeof v !== 'string' || !/^[0-9]{1,6}$/.test(v.trim())) {
+      return null;
+    }
+    const n = Number(v.trim());
+    return n > 0 ? n : null;
+  }
+
   // GET with the session header; the body is returned as bytes (images only, from the daemon's blob
-  // endpoint). A failure carries the parsed error document when there is one.
+  // endpoint) with the declared dimensions of the X-Image-Width/Height headers. A failure carries the
+  // parsed error document when there is one.
   async function apiBlob(path) {
     const miss = function (status, type, data) {
-      return { ok: false, status: status, type: type, bytes: null, data: data };
+      return { ok: false, status: status, type: type, bytes: null, width: null, height: null, data: data };
     };
     if (typeof path !== 'string' || path.slice(0, 5) !== '/api/') {
       return miss(0, '', null);
@@ -2401,7 +2415,7 @@
     if (!bytes || typeof bytes.byteLength !== 'number' || bytes.byteLength > MAX_BLOB) {
       return miss(413, type, null);
     }
-    return { ok: true, status: resp.status, type: type, bytes: bytes, data: null };
+    return { ok: true, status: resp.status, type: type, bytes: bytes, width: headerDim(resp, 'X-Image-Width'), height: headerDim(resp, 'X-Image-Height'), data: null };
   }
 
   function taskInfo(ref) {

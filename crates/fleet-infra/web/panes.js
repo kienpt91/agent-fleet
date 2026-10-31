@@ -35,7 +35,9 @@
   const KEEP_CONTEXT = 3;
   const MD_MAX_DEPTH = 40;
   const MD_MAX_NODES = 20000;
-  const MD_MAX_IMAGES = 20;
+  const MD_MAX_IMAGES = 8;
+  const MD_PIXEL_BUDGET = 48000000;
+  const MD_UNKNOWN_PIXELS = 32000000;
   const MD_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'pre', 'code', 'blockquote', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'hr', 'em', 'strong', 'del', 'br', 'a', 'img', 'span', 'input']);
   const HEADS = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
   const ALIGN_CLASS = { left: 'md-al-left', center: 'md-al-center', right: 'md-al-right' };
@@ -55,6 +57,20 @@
       return false;
     }
     return allowEmpty || p.length > 0;
+  }
+
+  // A bare CR (one not followed by LF) becomes a visible mark; clean() would fold it into a line break.
+  function crMark(s) {
+    return String(s).replace(/\r(?!\n)/g, '[U+000D]');
+  }
+
+  // An external link target must be plain ASCII and carry no user info before the host.
+  function plainHost(url) {
+    if (/[^\u0021-\u007e]/.test(url)) {
+      return false;
+    }
+    const rest = url.replace(/^https?:\/\//i, '');
+    return !rest.split(/[/?#]/).at(0).includes('@');
   }
 
   function lifecycle() {
@@ -359,7 +375,7 @@
         return { ok: false, reason: 'not found' };
       }
       if (res.status === 413) {
-        return { ok: false, reason: 'too large (limit 4 MiB)' };
+        return { ok: false, reason: /dimension/i.test(errorOf(res)) ? 'image dimensions too large' : 'too large (limit 4 MiB)' };
       }
       if (res.status === 415) {
         return { ok: false, reason: 'not an image' };
@@ -389,22 +405,33 @@
     } catch (e) {
       return { ok: false, reason: 'could not encode the image' };
     }
-    return { ok: true, url: 'data:' + type + ';base64,' + b64, type, size: view.length };
+    const dim = (n) => (typeof n === 'number' && Number.isInteger(n) && n > 0 && n <= 1000000 ? n : null);
+    return { ok: true, url: 'data:' + type + ';base64,' + b64, type, size: view.length, width: dim(res.width), height: dim(res.height) };
   }
 
   function imageEl(url, alt, cls) {
     const img = el('img', cls);
     img.setAttribute('src', url);
     img.setAttribute('alt', clean(alt, { max: 300 }));
+    img.setAttribute('decoding', 'async');
     return img;
   }
 
-  function imageView(v, life, g, altText) {
+  // the placeholder of an image the daemon refuses to serve because of its pixel dimensions
+  function tooLargeNotice(doc) {
+    const n = (x) => (typeof x === 'number' && Number.isFinite(x) ? String(x) : '?');
+    return notice('warn', 'Image too large to show: declared size ' + n(doc.width) + ' \u00d7 ' + n(doc.height) + ' px; limits: at most ' + n(doc.max_side) + ' px on a side and ' + n(doc.max_pixels) + ' pixels.');
+  }
+
+  function imageView(v, life, g, altText, declared) {
     const box = el('div', 'img-view');
     const bar = el('div', 'pane-tools');
     const info = el('span', 'muted', 'Loading image...');
     const dims = el('span', 'muted');
     const stage = el('div', 'img-stage');
+    if (declared && Number.isInteger(declared.width) && Number.isInteger(declared.height) && declared.width > 0 && declared.height > 0) {
+      dims.textContent = declared.width + ' \u00d7 ' + declared.height + ' px';
+    }
     const fit = button('Fit to width', '', () => {
       const on = !stage.classList.contains('fit');
       stage.classList.toggle('fit', on);
@@ -426,6 +453,9 @@
         return;
       }
       const img = imageEl(r.url, altText, 'pane-img');
+      if (r.width !== null && r.height !== null) {
+        dims.textContent = r.width + ' \u00d7 ' + r.height + ' px';
+      }
       img.addEventListener('load', () => {
         const w = img.naturalWidth;
         const h = img.naturalHeight;
@@ -838,7 +868,7 @@
   function codeRow(n, text, hl) {
     const r = el('div', 'code-row' + (hl ? ' hl' : ''));
     r.appendChild(el('span', 'code-no', String(n)));
-    r.appendChild(el('span', 'code-text', typeof text === 'string' ? text : '', true));
+    r.appendChild(el('span', 'code-text', typeof text === 'string' ? crMark(text) : '', true));
     if (hl) {
       r.setAttribute('aria-current', 'true');
     }
@@ -956,7 +986,7 @@
         body.appendChild(notice('warn', 'File too large to show: ' + fmtBytes(size) + ', limit ' + limit + '.'));
       } else if (view === 'symlink') {
         body.appendChild(el('div', 'file-link', 'Symbolic link to'));
-        body.appendChild(el('pre', 'file-target mono', typeof doc.target === 'string' ? doc.target : '?', true));
+        body.appendChild(el('pre', 'file-target mono', typeof doc.target === 'string' ? crMark(doc.target) : '?', true));
         if (validPath(doc.target_path, false)) {
           const tp = doc.target_path;
           body.appendChild(button('Open target', '', () => open(ctx, 'file', { task: v.task, commit: v.commit, path: tp }, { reuse: 'file' }), 'Open the link target (it is not opened automatically)'));
@@ -968,7 +998,9 @@
         body.appendChild(el('pre', 'file-target mono', typeof doc.submodule_commit === 'string' ? doc.submodule_commit : '?'));
         body.appendChild(el('div', 'muted', 'The submodule is not opened.'));
       } else if (view === 'image') {
-        body.appendChild(imageView(v, life, life.gen(), basename(v.path)));
+        body.appendChild(imageView(v, life, life.gen(), basename(v.path), doc));
+      } else if (view === 'image_too_large') {
+        body.appendChild(tooLargeNotice(doc));
       } else {
         body.appendChild(notice('warn', 'Unsupported view type.'));
       }
@@ -1102,7 +1134,7 @@
       cut = true;
     }
     const ranges = cleanRanges(L.w, rawText.length);
-    const piece = (str) => clean(str, { multi: true, max: MAX_LINE_CHARS });
+    const piece = (str) => clean(crMark(str), { multi: true, max: MAX_LINE_CHARS });
     if (ranges.length === 0) {
       s.textContent = piece(rawText);
     } else {
@@ -1659,7 +1691,7 @@
       case 'code': {
         const e = mdMake(st, 'code', 'md-code', 1);
         if (e && typeof n.s === 'string') {
-          e.textContent = clean(n.s, { multi: true, max: 20000 });
+          e.textContent = clean(crMark(n.s), { multi: true, max: 20000 });
         }
         return e;
       }
@@ -1679,7 +1711,7 @@
     let target = '';
     let url = null;
     let path = null;
-    if (!inLink && kind === 'external' && typeof n.url === 'string' && n.url.length <= MAX_URL && URL_RE.test(n.url)) {
+    if (!inLink && kind === 'external' && typeof n.url === 'string' && n.url.length <= MAX_URL && URL_RE.test(n.url) && plainHost(n.url)) {
       url = n.url;
       target = n.url;
     } else if (!inLink && kind === 'repo' && validPath(n.path, false)) {
@@ -1698,7 +1730,7 @@
       return null;
     }
     const shown = clean(target, { max: 600 });
-    const own = typeof n.title === 'string' && n.title !== '' ? clean(n.title, { max: 200 }) + ' (' + shown + ')' : shown;
+    const own = typeof n.title === 'string' && n.title !== '' ? shown + ' \u2014 ' + clean(n.title, { max: 200 }) : shown;
     a.setAttribute('title', own);
     if (url !== null) {
       a.setAttribute('href', url);
@@ -1891,7 +1923,7 @@
         if (typeof n.lang === 'string' && n.lang !== '') {
           pre.setAttribute('title', clean(n.lang, { max: 40 }));
         }
-        code.textContent = typeof n.text === 'string' ? clean(n.text, { multi: true, max: 100000 }) : '';
+        code.textContent = typeof n.text === 'string' ? clean(crMark(n.text), { multi: true, max: 100000 }) : '';
         pre.appendChild(code);
         return pre;
       }
@@ -1959,6 +1991,7 @@
     }
 
     async function loadImages(list, g) {
+      let pixels = 0;
       for (const it of list) {
         if (!life.ok(g)) {
           return;
@@ -1968,8 +2001,13 @@
           return;
         }
         if (r.ok) {
-          const img = imageEl(r.url, it.alt, 'md-img');
-          it.holder.replaceChildren(img);
+          const px = r.width !== null && r.height !== null ? r.width * r.height : MD_UNKNOWN_PIXELS;
+          if (pixels + px > MD_PIXEL_BUDGET) {
+            it.label.textContent = clean(it.alt, { max: 300 }) + ' [image not loaded: the pixel budget of this document is used up]';
+          } else {
+            pixels += px;
+            it.holder.replaceChildren(imageEl(r.url, it.alt, 'md-img'));
+          }
         } else {
           it.label.textContent = clean(it.alt, { max: 300 }) + ' [image not loaded: ' + clean(r.reason, { max: 120 }) + ']';
         }
@@ -2075,9 +2113,28 @@
       head.setCommit(p.v.commit);
       head.setShas([]);
       tools.appendChild(el('span', 'pane-path mono', p.v.path));
-      body.replaceChildren(imageView(p.v, life, g, basename(p.v.path)));
+      body.replaceChildren(notice('info', 'Loading...'));
       node.replaceChildren(head.node, tools, body);
       setTitle(ctx, basename(p.v.path));
+      // the file document first: an image the daemon declares too large is never requested
+      getDoc('/api/repo/file?' + targetQuery(p.v.task, p.v.commit, p.v.path), 'fleet.repo.file/1').then((r) => {
+        if (!life.ok(g)) {
+          return;
+        }
+        body.replaceChildren();
+        if (r.err) {
+          body.appendChild(errNotice(r.err, p.v.commit));
+          return;
+        }
+        head.setShas([r.doc.commit]);
+        if (r.doc.view === 'image') {
+          body.appendChild(imageView(p.v, life, g, basename(p.v.path), r.doc));
+        } else if (r.doc.view === 'image_too_large') {
+          body.appendChild(tooLargeNotice(r.doc));
+        } else {
+          body.appendChild(notice('warn', 'Not an image.'));
+        }
+      });
     }
 
     init(raw);

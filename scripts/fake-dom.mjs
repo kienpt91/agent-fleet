@@ -351,8 +351,12 @@ export function makeHost(dom, fetchFn, extra) {
     },
     async apiBlob(path) {
       const res = await fetchFn(path, { method: 'GET', credentials: 'omit' });
+      const dim = (name) => {
+        const v = res.headers.get(name);
+        return typeof v === 'string' && /^[0-9]{1,6}$/.test(v) && Number(v) > 0 ? Number(v) : null;
+      };
       if (res.ok) {
-        return { ok: true, status: res.status, type: res.headers.get('content-type') || '', bytes: await res.arrayBuffer(), data: null };
+        return { ok: true, status: res.status, type: res.headers.get('content-type') || '', bytes: await res.arrayBuffer(), width: dim('x-image-width'), height: dim('x-image-height'), data: null };
       }
       let data = null;
       try {
@@ -360,7 +364,7 @@ export function makeHost(dom, fetchFn, extra) {
       } catch (e) {
         data = null;
       }
-      return { ok: false, status: res.status, type: '', bytes: null, data };
+      return { ok: false, status: res.status, type: '', bytes: null, width: null, height: null, data };
     },
     errText(res) {
       const m = res && res.data && res.data.error && res.data.error.message;

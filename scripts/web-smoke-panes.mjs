@@ -115,10 +115,15 @@ function ent(name, kind, p, size) {
 const text = (n) => n.textContent;
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5]);
-function pngResponse(bytes, type) {
+function pngResponse(bytes, type, dims) {
   const ab = new ArrayBuffer(bytes.length);
   new Uint8Array(ab).set(bytes);
-  return { status: 200, headers: { 'content-type': type || 'image/png' }, bytes: ab };
+  const headers = { 'content-type': type || 'image/png' };
+  if (dims) {
+    headers['x-image-width'] = String(dims[0]);
+    headers['x-image-height'] = String(dims[1]);
+  }
+  return { status: 200, headers, bytes: ab };
 }
 
 // ------------------------------------------------------------ static checks
@@ -805,7 +810,7 @@ function diffDoc(files, extra) {
 // ----------------------------------------------------------------- markdown
 
 const MD_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'pre', 'code', 'blockquote', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'hr', 'em', 'strong', 'del', 'br', 'a', 'img', 'span', 'input']);
-const MD_ATTRS = new Set(['class', 'href', 'rel', 'title', 'alt', 'src', 'start', 'type', 'disabled', 'checked', 'tabindex']);
+const MD_ATTRS = new Set(['class', 'href', 'rel', 'title', 'alt', 'src', 'decoding', 'start', 'type', 'disabled', 'checked', 'tabindex']);
 const MD_CLASSES = new Set(['md-h', 'md-code', 'md-pre', 'md-table', 'md-al-left', 'md-al-center', 'md-al-right', 'md-task', 'md-check', 'md-link', 'md-external', 'md-repo', 'md-dead', 'md-image', 'md-alt', 'md-img']);
 const DATA_URL = /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/]*={0,2}$/;
 const HTTP_URL = /^https?:\/\/[^\s]+$/i;
@@ -843,7 +848,8 @@ function auditMd(root, label) {
 const HOSTILE_URLS = [
   'javascript:alert(1)', 'JaVaScRiPt:alert(1)', ' javascript:alert(1)', 'data:text/html,<script>alert(1)</script>', 'data:image/png;base64,AAAA', '//evil.example/x', '\\\\evil\\x',
   'vbscript:msgbox(1)', 'file:///etc/passwd', 'http:evil', 'https:\\evil', 'http://ok.example/\u202e', 'http://ok.example/a b', 'http://ok.example/\u0000', 'blob:x', 'ftp://x/y',
-  'http://' + 'a'.repeat(3000), '', null, 5, { a: 1 }, ['http://x'], 'http://good.example/path?q=1#h', 'https://good.example/'
+  'http://user@evil.example/', 'https://good.example@evil.example/x', 'http://ex\u00e4mple.com/', 'http://\u0430pple.com/', 'http://good.example/\u00e9',
+  'http://' + 'a'.repeat(3000), '', null, 5, { a: 1 }, ['http://x'], 'http://good.example/path?q=1#h', 'https://good.example/', 'https://good.example/a@b'
 ];
 
 {
@@ -912,7 +918,7 @@ const HOSTILE_URLS = [
   eq('external href', ext.getAttribute('href'), 'https://good.example/a?b=1');
   eq('external rel', ext.getAttribute('rel'), 'noopener noreferrer');
   check('no target attribute', !ext.attrs.has('target'));
-  check('title carries the target', ext.getAttribute('title') === 'T (https://good.example/a?b=1)', ext.getAttribute('title'));
+  check('title carries the target, url first', ext.getAttribute('title') === 'https://good.example/a?b=1 \u2014 T', ext.getAttribute('title'));
   check('unsafe link has no anchor', !doc.byTag('a').some((a) => /alert/.test(a.getAttribute('href') || '')) && text(doc.byClass('md-dead')[0]) === 'evil');
   const status = m.node.byClass('md-status')[0];
   ext.dispatch('mouseover');
@@ -981,15 +987,15 @@ const HOSTILE_URLS = [
         maxInflight = Math.max(maxInflight, inflight);
         await new Promise((r) => setImmediate(r));
         inflight -= 1;
-        return pngResponse(PNG);
+        return pngResponse(PNG, 'image/png', [100, 100]);
       }
     })
   );
   const m = await b.mount('markdown', { task: REF, commit: 'head', path: 'README.md' });
   await settle(200);
-  eq('at most 20 images loaded', m.node.byTag('img').length, 20);
+  eq('at most 8 images loaded', m.node.byTag('img').length, 8);
   eq('never two image loads at once', maxInflight, 1);
-  check('images past the cap show alt and note', m.node.byClass('md-alt').filter((x) => /at most 20 images/.test(text(x))).length === 10);
+  check('images past the cap show alt and note', m.node.byClass('md-alt').filter((x) => /at most 8 images/.test(text(x))).length === 22);
   // reloading mid-way stops the old loader
   m.inst.setParams({ task: REF, commit: 'head', path: 'README.md' });
   m.inst.stop();
@@ -1176,7 +1182,7 @@ const HOSTILE_URLS = [
   eq('fuzz: no allowlist violation', problems.slice(0, 10), []);
   check('fuzz: node bound respected', worst.nodes <= 20002, worst.nodes);
   check('fuzz: depth bound respected', worst.depth <= 70, worst.depth);
-  check('fuzz: image cap respected', totalImgs <= 20, totalImgs);
+  check('fuzz: image cap respected', totalImgs <= 8, totalImgs);
   check('fuzz: ran many trees', idx >= 250, idx);
   check('fuzz: exercised anchors, images and many elements', anchorsSeen > 20 && imgsSeen > 5 && elementsSeen > 50000, anchorsSeen + '/' + imgsSeen + '/' + elementsSeen);
 }
@@ -1189,8 +1195,8 @@ const HOSTILE_URLS = [
   const m = await b.mount('markdown', { task: REF, commit: 'head', path: 'README.md' });
   const doc = m.node.byClass('md-doc')[0];
   const as = doc.byTag('a').map((a) => a.getAttribute('href'));
-  eq('only the two good urls became anchors', as, ['http://good.example/path?q=1#h', 'https://good.example/']);
-  eq('every other link is a dead span', doc.byClass('md-dead').length, HOSTILE_URLS.length - 2);
+  eq('only the three plain good urls became anchors', as, ['http://good.example/path?q=1#h', 'https://good.example/', 'https://good.example/a@b']);
+  eq('every other link is a dead span', doc.byClass('md-dead').length, HOSTILE_URLS.length - 3);
   eq('and the audit is clean', auditMd(doc, 'hrefs').problems, []);
 }
 
@@ -1199,12 +1205,22 @@ const HOSTILE_URLS = [
 {
   const b = boot(
     routesOf({
+      '/api/repo/file': (q) => {
+        const p = q.get('path');
+        if (p === 'nothing.png') return errDoc(404, 'not_found', 'missing');
+        if (p === 'toolarge.png') return json(fileDoc(p, { view: 'image_too_large', class: 'image', image: 'png', lines: [], width: 20000, height: 30000, max_side: 16384, max_pixels: 100000000 }));
+        if (p === 'notimg.txt') return json(fileDoc(p));
+        if (p === 'declared.png') return json(fileDoc(p, { view: 'image', class: 'image', image: 'png', lines: [], width: 7, height: 5 }));
+        return json(fileDoc(p, { view: 'image', class: 'image', image: 'png', lines: [] }));
+      },
       '/api/repo/blob': (q) => {
         const p = q.get('path');
         if (p === 'a.png') return pngResponse(PNG);
         if (p === 'jpg.jpg') return pngResponse(PNG, 'image/jpeg; charset=binary');
         if (p === 'txt') return { status: 415, body: { schema: 'fleet.error/1', error: { code: 'unsupported', message: 'nope' } } };
         if (p === 'big.png') return { status: 413, body: { schema: 'fleet.error/1', error: { code: 'limit', message: 'big' } } };
+        if (p === 'dim.png') return { status: 413, body: { schema: 'fleet.error/1', error: { code: 'limit', message: 'image dimensions exceed the limits' } } };
+        if (p === 'dims.png') return pngResponse(PNG, 'image/png', [32, 24]);
         if (p === 'svg.png') return pngResponse(PNG, 'image/svg+xml');
         if (p === 'big2.png') return pngResponse(new Uint8Array(4 * 1024 * 1024 + 1));
         if (p === 'empty.png') return pngResponse(new Uint8Array(0));
@@ -1238,10 +1254,22 @@ const HOSTILE_URLS = [
   const src = m.node.byTag('img')[0].getAttribute('src');
   const expect = Buffer.from(new Uint8Array(3 * 1024 * 1024).map((_, i) => i & 255)).toString('base64');
   check('large images are encoded correctly in chunks', src === 'data:image/png;base64,' + expect);
-  for (const [p, re] of [['txt', /not an image/], ['big.png', /too large/], ['svg.png', /not an image/], ['big2.png', /too large/], ['empty.png', /no image data/], ['nothing.png', /not found/]]) {
+  for (const [p, re] of [['txt', /not an image/], ['big.png', /too large/], ['dim.png', /dimensions too large/], ['svg.png', /not an image/], ['big2.png', /too large/], ['empty.png', /no image data/], ['nothing.png', /missing/]]) {
     m = await open(p);
     check('image error ' + p, m.node.byTag('img').length === 0 && re.test(text(m.node)), text(m.node));
   }
+  // the daemon refuses an image by its pixel dimensions: placeholder, no blob request
+  const blobsBefore = b.calls(/blob/).length;
+  m = await open('toolarge.png');
+  check('image_too_large: placeholder with declared size and limits', m.node.byTag('img').length === 0 && /Image too large to show: declared size 20000 \u00d7 30000 px; limits: at most 16384 px on a side and 100000000 pixels/.test(text(m.node)), text(m.node));
+  eq('image_too_large: no blob request', b.calls(/blob/).length, blobsBefore);
+  m = await open('notimg.txt');
+  check('image pane on a non-image file', m.node.byTag('img').length === 0 && /Not an image/.test(text(m.node)) && b.calls(/blob/).length === blobsBefore);
+  m = await open('dims.png');
+  check('dimensions from the blob headers shown before load', /32 \u00d7 24 px/.test(text(m.node)), text(m.node));
+  check('img has decoding async', m.node.byTag('img')[0].getAttribute('decoding') === 'async');
+  m = await open('declared.png');
+  check('declared dimensions of the file document are shown', /7 \u00d7 5 px/.test(text(m.node)), text(m.node));
   m = await open('odd<name>.png');
   check('hostile file name only as alt text', m.node.byTag('img')[0].getAttribute('alt') === 'odd<name>.png' && b.dom.created.every((t) => t !== 'name'));
   m = await b.mount('image', { task: REF, commit: SHA, path: 'a.png' });
@@ -1275,11 +1303,117 @@ const HOSTILE_URLS = [
   eq('401 calls host.unauthorized', un.host.unauthorizedCalls, 1);
 }
 
+// ---------------------------------------------------- security review fixes
+
+{
+  // 2. a lone CR is a visible mark and never a line break
+  const sym = fileDoc('lnk', { view: 'symlink', kind: 'symlink', lines: [], target: 'a\rb', target_path: null });
+  const b = boot(
+    routesOf({
+      '/api/repo/file': (q) => {
+        const p = q.get('path');
+        if (p === 'lnk') return json(sym);
+        if (p === 'cr.txt') return json(fileDoc(p, { lines: ['a\rb', 'c\r', '\rd', 'x\r\ny'], line_count: 4 }));
+        if (p === 'huge.png') return json(fileDoc(p, { view: 'image_too_large', class: 'image', image: 'png', lines: [], width: 9000, height: 9000, max_side: 8192, max_pixels: 50000000 }));
+        if (p === 'img.png') return json(fileDoc(p, { view: 'image', class: 'image', image: 'png', lines: [], width: 3, height: 2 }));
+        return errDoc(404, 'not_found', 'none');
+      },
+      '/api/repo/diff': () => json(diffDoc([mkFile('cr.txt', { hunks: [{ old_start: 1, old_count: 1, new_start: 1, new_count: 1, section: '', lines: [dline('del', 1, null, 'p\rq'), dline('add', null, 1, 'a\rb', { w: [[1, 2]] }), dline('ctx', 2, 2, '\r')] }] })])),
+      '/api/repo/markdown': () => json(mdDoc([{ t: 'code', lang: null, text: 'x\ry\r\nz' }, { t: 'p', c: [{ t: 'code', s: 'i\rj' }] }])),
+      '/api/repo/blob': () => pngResponse(PNG)
+    })
+  );
+  let m = await b.mount('file', { task: REF, commit: 'head', path: 'cr.txt' });
+  const rows = m.node.byClass('code-row');
+  eq('lone CR: one row per line', rows.length, 4);
+  eq('lone CR: a\\rb is one row with the mark', text(rows[0].byClass('code-text')[0]), 'a[U+000D]b');
+  eq('lone CR: trailing and leading', [text(rows[1].byClass('code-text')[0]), text(rows[2].byClass('code-text')[0])], ['c[U+000D]', '[U+000D]d']);
+  eq('lone CR: a CRLF pair stays a line end, not a mark', text(rows[3].byClass('code-text')[0]), 'x\ny');
+  m = await b.mount('file', { task: REF, commit: 'head', path: 'lnk' });
+  eq('lone CR: symlink target', text(m.node.byClass('file-target')[0]), 'a[U+000D]b');
+  m = await b.mount('diff', { task: REF });
+  const drows = m.node.byClass('diff-row');
+  eq('lone CR: diff rows', drows.length, 3);
+  eq('lone CR: diff del text', text(drows[0].byClass('dtext')[0]), 'p[U+000D]q');
+  eq('lone CR: diff add text with a range', text(drows[1].byClass('dtext')[0]), 'a[U+000D]b');
+  check('lone CR: the range still covers the same UTF-16 unit', drows[1].byClass('dw').length === 1 && text(drows[1].byClass('dw')[0]) === '[U+000D]');
+  eq('lone CR: diff ctx text', text(drows[2].byClass('dtext')[0]), '[U+000D]');
+  m.node.byText('Side by side', 'button')[0].dispatch('click');
+  check('lone CR: split view', text(m.node.byClass('diff-srow')[0].byClass('diff-cell')[1]).includes('a[U+000D]b'));
+  m = await b.mount('markdown', { task: REF, commit: 'head', path: 'README.md' });
+  const codes = m.node.byTag('code').map(text);
+  eq('lone CR: markdown code block and inline code', codes, ['x[U+000D]y\nz', 'i[U+000D]j']);
+
+  // 1. image placeholders
+  const before = b.calls(/blob/).length;
+  m = await b.mount('file', { task: REF, commit: 'head', path: 'huge.png' });
+  check('file pane image_too_large: placeholder with declared size and limits', m.node.byTag('img').length === 0 && /declared size 9000 \u00d7 9000 px/.test(text(m.node)) && /8192 px on a side/.test(text(m.node)) && /50000000 pixels/.test(text(m.node)), text(m.node));
+  eq('file pane image_too_large: no blob request', b.calls(/blob/).length, before);
+  m = await b.mount('file', { task: REF, commit: 'head', path: 'img.png' });
+  check('file pane image: declared dimensions and decoding attribute', /3 \u00d7 2 px/.test(text(m.node)) && m.node.byTag('img')[0].getAttribute('decoding') === 'async');
+
+  // 3. link title starts with the real url
+  const links = boot(
+    routesOf({
+      '/api/repo/markdown': () => json(mdDoc([{ t: 'p', c: [
+        { t: 'link', kind: 'external', url: 'https://good.example/a', title: 'Click me <b>', c: [{ t: 'text', s: 'one' }] },
+        { t: 'link', kind: 'external', url: 'https://good.example/b', title: 'x'.repeat(900), c: [{ t: 'text', s: 'two' }] },
+        { t: 'link', kind: 'external', url: 'https://good.example/c', title: null, c: [{ t: 'text', s: 'three' }] },
+        { t: 'link', kind: 'external', url: 'https://good.example@evil.example/', title: 'x', c: [{ t: 'text', s: 'four' }] },
+        { t: 'link', kind: 'external', url: 'https://ex\u00e4mple.com/', title: 'x', c: [{ t: 'text', s: 'five' }] },
+        { t: 'link', kind: 'external', url: 'https://good.example/p?q=@x#@y', title: null, c: [{ t: 'text', s: 'six' }] }
+      ] }]))
+    })
+  );
+  m = await links.mount('markdown', { task: REF, commit: 'head', path: 'README.md' });
+  const as = m.node.byTag('a');
+  eq('link title: the url comes first', as[0].getAttribute('title'), 'https://good.example/a \u2014 Click me <b>');
+  check('link title: author title truncated after the url', as[1].getAttribute('title').startsWith('https://good.example/b \u2014 xxx') && as[1].getAttribute('title').length < 260, as[1].getAttribute('title').length);
+  eq('link title: no author title is just the url', as[2].getAttribute('title'), 'https://good.example/c');
+  eq('only plain-host links are anchors', as.map((a) => text(a)), ['one', 'two', 'three', 'six']);
+  eq('user-info and non-ASCII links are text only', m.node.byClass('md-dead').map(text), ['four', 'five']);
+
+  // 1. markdown: pixel budget and image count
+  const dimsOf = { 'a.png': [4000, 5000], 'b.png': [4000, 5000], 'c.png': [4000, 5000], 'd.png': [10, 10], 'e.png': null, 'f.png': null };
+  const px = boot(
+    routesOf({
+      '/api/repo/markdown': () => json(mdDoc(Object.keys(dimsOf).map((k) => ({ t: 'p', c: [{ t: 'image', alt: 'alt-' + k, path: 'img/' + k, src: k, note: null }] })))),
+      '/api/repo/blob': (q) => pngResponse(PNG, 'image/png', dimsOf[q.get('path').slice(4)] || undefined)
+    })
+  );
+  m = await px.mount('markdown', { task: REF, commit: 'head', path: 'README.md' });
+  await settle(40);
+  const alts = m.node.byTag('img').map((i) => i.getAttribute('alt'));
+  eq('pixel budget: two 20MP images and the small one load, the third 20MP does not', alts.slice(0, 3), ['alt-a.png', 'alt-b.png', 'alt-d.png']);
+  check('pixel budget: an image without dimensions counts as 32MP', !alts.includes('alt-e.png') && !alts.includes('alt-f.png') && alts.length === 3, alts.join(','));
+  check('pixel budget: refused images show their alt text and a note', m.node.byClass('md-alt').filter((x) => /^alt-c\.png \[image not loaded: the pixel budget/.test(text(x))).length === 1 && m.node.byClass('md-alt').filter((x) => /^alt-e\.png \[image not loaded: the pixel budget/.test(text(x))).length === 1);
+  const solo = boot(
+    routesOf({
+      '/api/repo/markdown': () => json(mdDoc([{ t: 'p', c: [{ t: 'image', alt: 'x', path: 'img/x.png', src: 'x', note: null }] }])),
+      '/api/repo/blob': () => pngResponse(PNG)
+    })
+  );
+  m = await solo.mount('markdown', { task: REF, commit: 'head', path: 'README.md' });
+  check('pixel budget: one image without dimensions still loads (32MP < 48MP)', m.node.byTag('img').length === 1 && m.node.byTag('img')[0].getAttribute('decoding') === 'async');
+
+  // css rules
+  check('css: no max-width none anywhere', !/max-width:\s*none/.test(CSS));
+  const ruleOf = (sel) => {
+    const i = CSS.indexOf(sel + ' {');
+    return i < 0 ? '' : CSS.slice(i, CSS.indexOf('}', i));
+  };
+  for (const sel of ['.pane-img', '.md-img', '.img-stage.fit .pane-img']) {
+    check('css: ' + sel + ' keeps a height cap', /max-height:\s*\d+vh/.test(ruleOf(sel)), ruleOf(sel));
+  }
+  check('css: .pane-img is bounded and contained', /max-width:\s*100%/.test(ruleOf('.pane-img')) && /object-fit:\s*contain/.test(ruleOf('.pane-img')));
+  check('css: no max-height none', !/max-height:\s*none/.test(CSS));
+
+}
 // ---------------------------------------------------------- global audit
 
 {
   const TAGS = new Set(['div', 'span', 'p', 'pre', 'code', 'button', 'a', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'hr', 'em', 'strong', 'del', 'br', 'input', 'blockquote', 'nav']);
-  const ATTRS = new Set(['class', 'type', 'title', 'role', 'tabindex', 'disabled', 'href', 'rel', 'alt', 'src', 'start', 'checked']);
+  const ATTRS = new Set(['class', 'type', 'title', 'role', 'tabindex', 'disabled', 'href', 'rel', 'alt', 'src', 'decoding', 'start', 'checked']);
   let tags = 0;
   let attrs = 0;
   for (const dom of allDoms) {
