@@ -54,6 +54,25 @@ pub fn validate_worker_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Host names (`[hosts.<name>]` in the configuration) follow the worker name rules: they appear in
+/// file names (the pinned key file) and in messages, never as a network address.
+pub fn validate_host_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > MAX_ID_LEN {
+        return Err(FleetError::invalid("host name has a bad length"));
+    }
+    let first_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if !first_ok || !name.chars().all(is_id_char) {
+        return Err(FleetError::invalid(format!(
+            "host name {} must match [a-z0-9][a-z0-9_-]*",
+            show(name)
+        )));
+    }
+    Ok(())
+}
+
 /// A git ref name or branch name coming from outside (for example `--base`): rejects what git
 /// itself rejects plus anything that could be read as an option or smuggle control characters.
 pub fn validate_ref_name(name: &str) -> Result<()> {
@@ -230,6 +249,11 @@ string_id!(
     /// Name of a worker definition in the daemon configuration.
     WorkerName,
     validate_worker_name
+);
+string_id!(
+    /// Name of a remote host in the daemon configuration (`[hosts.<name>]`).
+    HostName,
+    validate_host_name
 );
 string_id!(
     /// Identifies a decision gate: `g` followed by a number.

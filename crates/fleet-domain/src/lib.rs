@@ -25,6 +25,7 @@ pub mod limits;
 pub mod output;
 pub mod quality;
 pub mod redact;
+pub mod remote;
 pub mod run;
 pub mod sanitize;
 pub mod status;
