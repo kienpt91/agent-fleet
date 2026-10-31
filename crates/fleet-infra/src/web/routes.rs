@@ -155,6 +155,9 @@ enum Route {
     Goal,
     Remaining,
     VerifyStatus,
+    Groups,
+    Group,
+    GroupCompare,
     Stream,
     GateResolve,
     ApprovalDecide,
@@ -176,6 +179,9 @@ fn route_for(path: &str) -> Option<(Route, Method)> {
         "/api/goal" => (Route::Goal, Method::Get),
         "/api/remaining" => (Route::Remaining, Method::Get),
         "/api/verify" => (Route::VerifyStatus, Method::Get),
+        "/api/groups" => (Route::Groups, Method::Get),
+        "/api/group" => (Route::Group, Method::Get),
+        "/api/group/compare" => (Route::GroupCompare, Method::Get),
         "/api/stream" => (Route::Stream, Method::Get),
         "/api/gate/resolve" => (Route::GateResolve, Method::Post),
         "/api/approval/decide" => (Route::ApprovalDecide, Method::Post),
@@ -649,6 +655,25 @@ fn run_route(
                 args.push(("ticket", Value::int(n)));
             }
             respond(call(shared, "verify.status", pass(args))?)
+        }
+        // Fan-out groups, read only. Creating one and picking its winner stay on the control
+        // socket.
+        Route::Groups => {
+            parse_query(&req.query, &[])?;
+            respond(call(shared, "group.list", Value::Null)?)
+        }
+        Route::Group | Route::GroupCompare => {
+            let q = parse_query(&req.query, &["id"])?;
+            let id = q
+                .get("id")
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| error_response(400, ErrorCode::Invalid, "`id` is required"))?;
+            let cmd = if route == Route::Group {
+                "group.show"
+            } else {
+                "group.compare"
+            };
+            respond(call(shared, cmd, pass(vec![("group", Value::str(id))]))?)
         }
         Route::Stream => open_stream(shared, req, verdict).map(Reply::Stream),
         Route::GateResolve => {

@@ -503,7 +503,10 @@
     if (parts[0] === 'goal' && parts[1]) {
       return { name: 'goal', id: parts[1] };
     }
-    if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health' || parts[0] === 'goals') {
+    if (parts[0] === 'group' && parts[1]) {
+      return { name: 'group', id: parts[1] };
+    }
+    if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health' || parts[0] === 'goals' || parts[0] === 'groups') {
       return { name: parts[0] };
     }
     return { name: 'runs' };
@@ -522,8 +525,8 @@
   }
 
   function setNav(name) {
-    const section = name === 'run' || name === 'task' ? 'runs' : name === 'goal' ? 'goals' : name;
-    ['runs', 'goals', 'decisions', 'events', 'health'].forEach(function (id) {
+    const section = name === 'run' || name === 'task' ? 'runs' : name === 'goal' ? 'goals' : name === 'group' ? 'groups' : name;
+    ['runs', 'goals', 'groups', 'decisions', 'events', 'health'].forEach(function (id) {
       const a = document.getElementById('nav-' + id);
       if (a) {
         a.classList.toggle('active', id === section);
@@ -553,6 +556,10 @@
       v = goalsView();
     } else if (r.name === 'goal') {
       v = goalView(r.id);
+    } else if (r.name === 'groups') {
+      v = groupsView();
+    } else if (r.name === 'group') {
+      v = groupView(r.id);
     } else {
       v = runsView();
     }
@@ -2262,6 +2269,309 @@
         if (!res.ok || !res.data) {
           sig = null;
           holder.replaceChildren(el('p', 'notice', 'Could not load the goal: ' + errText(res)));
+          return;
+        }
+        const s = JSON.stringify(res.data);
+        if (s !== sig) {
+          sig = s;
+          paint(res.data);
+        }
+      } finally {
+        busy = false;
+      }
+    }
+
+    return {
+      node: root,
+      start: load,
+      update: load,
+      stop: function () {
+        active = false;
+      }
+    };
+  }
+
+  // ------------------------------------------------------------ fan-out groups
+  // Read only: a fan-out is created and its winner picked with the command line (a pick is a merge
+  // and goes through the approval). These pages show the groups and the comparison the daemon
+  // computed from facts it knows; every text in them (titles, summaries, file names) is untrusted
+  // and goes through el() and cell() like everything else.
+
+  const FX = new Set(['running', 'finished', 'decided', 'closed', 'completed', 'failed', 'winner', 'superseded', 'verified', 'unverified']);
+  const MAX_FX_FILES = 100;
+
+  function fxBadge(value) {
+    const known = typeof value === 'string' && FX.has(value);
+    return el('span', 'badge fx-' + (known ? value : 'unknown'), value === null || value === undefined ? 'n/a' : value);
+  }
+
+  function fxDuration(ms) {
+    if (typeof ms !== 'number' || !Number.isFinite(ms)) {
+      return 'n/a';
+    }
+    if (ms < 1000) {
+      return ms + ' ms';
+    }
+    const s = ms / 1000;
+    return s < 120 ? s.toFixed(1) + ' s' : (s / 60).toFixed(1) + ' min';
+  }
+
+  function groupLink(id, label) {
+    const text = label === undefined || label === null || label === '' ? id : label;
+    if (typeof id === 'string' && ID_OK.test(id)) {
+      return routeLink('#/group/' + id, text);
+    }
+    return el('span', 'mono-text', text);
+  }
+
+  function groupsView() {
+    const root = el('section', 'page');
+    root.appendChild(el('h2', '', 'Fan-out groups'));
+    root.appendChild(el('p', 'muted small', 'One prompt given to several agents. Groups are created and picked with the command line (fleet fanout, fleet compare, fleet pick).'));
+    const box = el('div', 'fxlist');
+    root.appendChild(box);
+    let sig = null;
+    let busy = false;
+    let active = true;
+    box.appendChild(el('p', 'muted', 'Loading the groups.'));
+
+    function paint(d) {
+      const groups = Array.isArray(d.groups) ? d.groups.filter(Boolean) : [];
+      if (!groups.length) {
+        box.replaceChildren(el('p', 'muted', 'There are no fan-out groups.'));
+        return;
+      }
+      const table = makeTable(['Group', 'Title', 'Status', 'Run', 'Members', 'Completed', 'Failed', 'Winner', 'Evidence of the winner'], 'auto');
+      groups.slice(0, MAX_LIST_SHOWN).forEach(function (g) {
+        const c = g.counts || {};
+        const tr = el('tr');
+        [cell(groupLink(g.id)), cell(g.title), cell(fxBadge(g.status)), cell(g.run), cell(num(c.members)),
+          cell(num(c.completed)), cell(num(c.failed)), cell(g.winner || ''), cell(g.winner_verification ? fxBadge(g.winner_verification) : '')].forEach(function (x) {
+          tr.appendChild(x);
+        });
+        table.appendChild(tr);
+      });
+      box.replaceChildren(scrollBox(table));
+      if (groups.length > MAX_LIST_SHOWN) {
+        box.appendChild(el('p', 'muted small', (groups.length - MAX_LIST_SHOWN) + ' more are not shown.'));
+      }
+    }
+
+    async function load() {
+      if (busy || !active) {
+        return;
+      }
+      busy = true;
+      try {
+        const res = await api('GET', '/api/groups');
+        if (!active) {
+          return;
+        }
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        if (!res.ok || !res.data) {
+          sig = null;
+          box.replaceChildren(el('p', 'muted', 'Groups are not available: ' + errText(res)));
+          return;
+        }
+        const s = JSON.stringify(res.data);
+        if (s !== sig) {
+          sig = s;
+          paint(res.data);
+        }
+      } finally {
+        busy = false;
+      }
+    }
+
+    return {
+      node: root,
+      start: load,
+      update: load,
+      stop: function () {
+        active = false;
+      }
+    };
+  }
+
+  function groupView(id) {
+    const root = el('section', 'page');
+    root.appendChild(routeLink('#/groups', 'All groups'));
+    const holder = el('div', 'fxpage');
+    root.appendChild(holder);
+    let sig = null;
+    let busy = false;
+    let active = ID_OK.test(id);
+    if (!active) {
+      holder.appendChild(el('p', 'notice', 'Not a valid group id: ' + id));
+    } else {
+      holder.appendChild(el('p', 'muted', 'Loading the comparison.'));
+    }
+
+    function line(label, value) {
+      const p = el('p', 'fxline');
+      p.appendChild(el('span', 'label', label + ' '));
+      if (value && value.nodeType) {
+        p.appendChild(value);
+      } else {
+        p.appendChild(document.createTextNode(clean(value, { max: 600 })));
+      }
+      return p;
+    }
+
+    function memberDetail(run, m) {
+      const d = el('details', 'fxdetail');
+      d.appendChild(el('summary', '', m.task + ' in detail'));
+      const v = m.verification || {};
+      d.appendChild(el('div', 'label', 'Verification: ' + clean(v.status, { max: 20 })));
+      d.appendChild(el('p', 'small', v.reason));
+      const checks = Array.isArray(v.checks) ? v.checks.filter(Boolean) : [];
+      if (checks.length) {
+        const t = makeTable(['Goal', 'Check', 'Kind', 'Mandatory', 'Evidence', 'Summary'], 'auto');
+        checks.slice(0, MAX_LIST_SHOWN).forEach(function (c) {
+          const tr = el('tr');
+          [cell(c.goal), cell(c.check), cell(c.kind), cell(c.mandatory ? 'yes' : 'no'), cell(fxBadge(c.status)), cell(c.summary)].forEach(function (x) {
+            tr.appendChild(x);
+          });
+          t.appendChild(tr);
+        });
+        d.appendChild(scrollBox(t));
+      }
+      const sc = (m.scope && Array.isArray(m.scope.checks)) ? m.scope.checks.filter(Boolean) : [];
+      sc.forEach(function (r) {
+        d.appendChild(el('div', 'label', 'Scope check ' + clean(r.check, { max: 60 }) + (r.mandatory ? '' : ' (optional)')));
+        const outside = Array.isArray(r.outside) ? r.outside : [];
+        const allowed = Array.isArray(r.allowed_touched) ? r.allowed_touched : [];
+        d.appendChild(el('p', 'small', 'allowed paths touched: ' + (allowed.length ? allowed.join(', ') : 'none')));
+        d.appendChild(el('p', 'small ' + (outside.length ? 'fxbad' : ''), 'paths outside the scope: ' + num(r.outside_count) + (outside.length ? ' - ' + outside.join(', ') : '')));
+      });
+      const diff = m.diff || {};
+      if (diff.available) {
+        d.appendChild(el('div', 'label', 'Files changed (' + num(diff.files) + (diff.truncated ? ', list cut' : '') + ')'));
+        const changes = Array.isArray(diff.changes) ? diff.changes.filter(Boolean) : [];
+        const t = makeTable(['Path', 'Change', '+', '-'], 'auto');
+        changes.slice(0, MAX_FX_FILES).forEach(function (c) {
+          const tr = el('tr');
+          const where = c.old_path ? c.old_path + ' -> ' + c.path : c.path;
+          [cell(where), cell(c.binary ? c.kind + ' (binary)' : c.kind), cell(num(c.insertions)), cell(num(c.deletions))].forEach(function (x) {
+            tr.appendChild(x);
+          });
+          t.appendChild(tr);
+        });
+        d.appendChild(scrollBox(t));
+      } else {
+        d.appendChild(el('p', 'muted small', 'The diff is not available: ' + clean(diff.error, { max: 400 })));
+      }
+      d.appendChild(el('div', 'label', 'Commit and tree the evidence is bound to'));
+      d.appendChild(el('code', 'mono block', m.head || 'none'));
+      d.appendChild(el('code', 'mono block', m.tree || 'none'));
+      if (m.branch_moved) {
+        d.appendChild(el('p', 'notice small', 'The branch moved after review (now at ' + shortHash(m.branch_head) + '): this member cannot be picked.'));
+      }
+      d.appendChild(el('div', 'label', 'What the worker reported (not used for anything above)'));
+      d.appendChild(el('p', 'small', m.summary === null || m.summary === undefined ? 'nothing' : m.summary));
+      if (m.failure) {
+        d.appendChild(el('p', 'small fxbad', 'Why it failed: ' + clean(m.failure, { max: 600 })));
+      }
+      return d;
+    }
+
+    function paint(d) {
+      const g = d.group || {};
+      const run = g.run;
+      const parts = [];
+      parts.push(el('h2', '', g.title));
+      parts.push(line('Group', g.id));
+      parts.push(line('Status', fxBadge(g.status)));
+      parts.push(line('Run', g.run));
+      parts.push(line('Winner', g.winner ? g.winner + ' (merged as ' + shortHash(g.merge_sha) + ', evidence ' + clean(g.winner_verification, { max: 20 }) + ')' : 'not picked'));
+      const rk = d.ranking || {};
+      parts.push(el('h3', '', 'Ranking rule (advisory)'));
+      parts.push(el('p', 'mono-text', rk.formula));
+      const crit = Array.isArray(rk.described) ? rk.described.filter(Boolean) : [];
+      if (crit.length) {
+        const ol = el('ol', 'fxrule');
+        crit.forEach(function (c) {
+          ol.appendChild(el('li', 'small', c.criterion + ': ' + clean(c.rule, { max: 300 })));
+        });
+        parts.push(ol);
+      }
+      parts.push(el('h3', '', 'Members'));
+      const members = Array.isArray(d.members) ? d.members.filter(Boolean) : [];
+      const table = makeTable(['Rank', 'Task', 'Worker', 'State', 'Evidence', 'In scope', 'Files', '+/-', 'Gates', 'Attempts', 'Time', 'Why here'], 'auto');
+      members.forEach(function (m) {
+        const df = m.diff || {};
+        const tr = el('tr');
+        const ref = run && m.task ? run + '/' + m.task : '';
+        [cell(num(m.rank)), cell(ref ? taskLink(ref, m.task) : m.task), cell(m.worker || ''), cell(fxBadge(m.state)),
+          cell(fxBadge(m.verification && m.verification.status)),
+          cell(m.scope && m.scope.unknown ? 'unknown' : (m.scope && m.scope.in_scope ? 'yes' : 'no')),
+          cell(df.available ? num(df.files) : 'n/a'),
+          cell(df.available ? '+' + num(df.insertions) + ' -' + num(df.deletions) : 'n/a'),
+          cell(m.gates_passed ? 'passed' : 'failed'), cell(num(m.attempts)), cell(fxDuration(m.duration_ms)),
+          cell(m.decided_by)].forEach(function (x) {
+          tr.appendChild(x);
+        });
+        table.appendChild(tr);
+      });
+      parts.push(scrollBox(table));
+      members.forEach(function (m) {
+        parts.push(memberDetail(run, m));
+      });
+      const ov = d.overlap || {};
+      parts.push(el('h3', '', 'Files changed by several members'));
+      const shared = Array.isArray(ov.shared) ? ov.shared.filter(Boolean) : [];
+      if (!shared.length) {
+        parts.push(el('p', 'muted', 'none' + (ov.incomplete ? ' (some diffs could not be read in full)' : '')));
+      } else {
+        const t = makeTable(['Path', 'Members'], 'auto');
+        shared.slice(0, MAX_LIST_SHOWN).forEach(function (s) {
+          const tr = el('tr');
+          [cell(s.path), cell(Array.isArray(s.members) ? s.members.join(', ') : '')].forEach(function (x) {
+            tr.appendChild(x);
+          });
+          t.appendChild(tr);
+        });
+        parts.push(scrollBox(t));
+        parts.push(el('p', 'muted small', num(ov.shared_count) + ' shared files' + (ov.incomplete ? '; the picture may be incomplete' : '')));
+      }
+      const tasks = Array.isArray(ov.tasks) ? ov.tasks : [];
+      const matrix = Array.isArray(ov.matrix) ? ov.matrix : [];
+      if (tasks.length > 1) {
+        const t = makeTable([''].concat(tasks.map(String)), 'auto');
+        matrix.slice(0, tasks.length).forEach(function (row, i) {
+          const tr = el('tr');
+          tr.appendChild(cell(tasks[i]));
+          (Array.isArray(row) ? row : []).slice(0, tasks.length).forEach(function (n) {
+            tr.appendChild(cell(num(n)));
+          });
+          t.appendChild(tr);
+        });
+        parts.push(scrollBox(t));
+      }
+      parts.push(el('p', 'notice small', 'Picking a winner is a merge: run fleet pick ' + clean(g.id, { max: 40 }) + ' <task> on the command line. It asks for the normal merge approval.'));
+      holder.replaceChildren.apply(holder, parts);
+    }
+
+    async function load() {
+      if (busy || !active) {
+        return;
+      }
+      busy = true;
+      try {
+        const res = await api('GET', '/api/group/compare?id=' + enc(id));
+        if (!active) {
+          return;
+        }
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        if (!res.ok || !res.data) {
+          sig = null;
+          holder.replaceChildren(el('p', 'notice', 'Could not load the group: ' + errText(res)));
           return;
         }
         const s = JSON.stringify(res.data);
