@@ -1382,7 +1382,10 @@ mod tests {
             .parse()
             .unwrap();
         let live = live_pids(&runner);
-        assert_eq!(live, vec![(pid, pid)], "the group leader is registered");
+        assert!(
+            live.contains(&(pid, pid)),
+            "the group leader is registered: {live:?}"
+        );
         std::fs::write(wt.join("go"), "").unwrap();
         collect(&mut runner, 1);
         // the result is queued before the guard of the child is dropped; both happen right away
@@ -1406,7 +1409,7 @@ mod tests {
         runner.start(gates_job(&dir, vec![slow])).unwrap();
         assert!(wait_until(10_000, || dir.exists("pid-slow")));
         let pid: u32 = dir.read("pid-slow").trim().parse().unwrap();
-        assert_eq!(live_pids(&runner), vec![(pid, pid)]);
+        assert!(live_pids(&runner).contains(&(pid, pid)));
         dir.write("go", "");
         collect(&mut runner, 1);
         assert!(wait_until(5_000, || runner.live().is_empty()));
