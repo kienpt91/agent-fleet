@@ -1037,10 +1037,16 @@ impl MessageBoard {
             let channel = ChannelName::parse(&m.channel)
                 .ok()
                 .and_then(|n| self.channels.get(&(m.run.clone(), n)));
-            let silenced = channel.is_some_and(|c| c.muted.is_some())
-                || m.from
-                    .task()
-                    .is_some_and(|t| self.muted_tasks.contains_key(&(m.run.clone(), t.clone())));
+            // a channel muted because nobody is left still delivers what it already accepted (a
+            // worker's last message before it exits); every other mute holds everything
+            let silenced = channel.is_some_and(|c| {
+                c.muted
+                    .as_ref()
+                    .is_some_and(|n| n.reason != MuteReason::EndpointEnded)
+            }) || m
+                .from
+                .task()
+                .is_some_and(|t| self.muted_tasks.contains_key(&(m.run.clone(), t.clone())));
             for r in m
                 .recipients
                 .iter()

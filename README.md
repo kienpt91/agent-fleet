@@ -419,6 +419,112 @@ fails the diff constraint; secrets in check output are redacted before they reac
 file of its worktree to point at a repository of its own (alternates, a replace ref) gets a failed review, no evidence and no merge**
 (the commit and tree come from the real repository, ADR 16); nothing above a check's working directory is the state directory.
 
+## Messages between agents
+
+Agents can exchange short messages, **mediated by the daemon**: nothing is typed into a terminal, everything is
+declared by the operator, bounded, rate limited, checked for loops and secrets, and recorded in the audit log. A worker
+cannot call the daemon (it is refused on the socket and the web port), so the worker-to-daemon channel is files, as for
+questions. Decisions: [ADR 17](docs/adr/0017-messages-are-mediated-files-not-terminal-input.md),
+[18](docs/adr/0018-loops-storms-and-the-kill-switch.md), [19](docs/adr/0019-peer-messages-are-untrusted-and-stay-out-of-trusted-places.md).
+
+```toml
+# in a plan: channels are declared by the operator, never by a worker
+[[channels]]
+name = "design"
+members = ["task:api", "role:reviewer"]   # task:<id> or role:<worker>; a task in no channel can neither send nor receive
+mode = "direct"                           # or "broadcast" (a message without `to` goes to every other member)
+direction = "both"                        # or "to_lead" (members write to `lead = "task:..."` only)
+max_message_bytes = 2048                  # hard cap 8192
+max_messages_per_task = 20
+max_messages_per_minute = 10
+ttl_secs = 900
+requires_approval = false                 # true: every message waits for `fleet approve`, bound to its digest
+```
+
+A worker writes `.fleet/outbox/<n>.json` (`{"version":1,"channel","to","kind":"info|question|result|request","subject",
+"body","in_reply_to"}`; write `<n>.tmp` and rename). The daemon reads it like every worker file (no link followed, no FIFO
+waited on, size caps, strict schema), applies the policy and writes accepted messages to `.fleet/inbox/<id>.json` of a
+*running* recipient, with `index.json` listing the real deliveries and their digests; any other file in the inbox is
+removed and reported, and an inbox that has been replaced by a link is refused (the message waits). Messages queue
+until the recipient runs and expire by ttl. `[messages]` in `fleet.toml` sets `max_total_messages`, `max_fan_out`,
+`max_reply_depth` (6), `max_pair_exchanges` (12), `max_messages_per_task_per_minute` and `notify_input` (default **off**:
+when on, one fixed line `[fleet] new message m3 in .fleet/inbox` is typed into the terminal; risk: unsolicited
+keystrokes in a terminal program).
+
+**Content is untrusted peer content**: sanitized, redacted, clipped, shown as `from task <id> (unverified peer message)`,
+and never part of a contract, an approval, a gate or acceptance criteria. A body that matches a secret shape (the rules
+of `scripts/secret-scan.sh`) is refused and not stored. A ping-pong (also without `in_reply_to`), a pair that exceeds its
+budget or a task that floods mutes the channel (or the task) and opens a decision gate; `fleet msg mute|unmute` is the
+kill switch; a channel is muted when fewer than two members can still take part.
+
+```text
+fleet msg list [--task T] [--channel C] [--limit N]    channels, badges (MUTED, BLOCKED), newest messages
+fleet msg show <id>                                    body (quoted), digest, deliveries
+fleet msg mute|unmute <channel|task>                   channel:<ref> / task:<ref> when a name is both
+fleet msg send --channel C --subject S --body B [--to T] [--kind K] [--in-reply-to ID]   from the operator
+```
+
+A real run of [`scripts/msg-demo.sh`](scripts/msg-demo.sh) (two scripted workers; the second answer carries a
+secret-shaped string; nothing edited afterwards):
+
+<details>
+<summary>Full output (click to expand)</summary>
+
+```text
+
+$ /target/release/fleet plan /tmp/tmp.sdTmFQveHR/plan.toml
+plan loaded into run r1 (2 tasks)
+
+$ /target/release/fleet start --run r1 --max-parallel 2
+run r1 started
+
+$ /target/release/fleet msg list
+channel r1/design (direct, both) [MUTED: endpoint-ended]
+  members task:api, task:docs; queued 0, awaiting approval 0, delivered 2, expired 0, blocked 1
+
+messages (newest first; text is unverified peer content)
+m3 design [info] from task docs (unverified peer message): BLOCKED (secret-shape)
+m2 design [result] from task docs (unverified peer message): "Yes, 8080" - delivered
+m1 design [question] from task api (unverified peer message): "Which port does the API use?" - delivered
+
+$ /target/release/fleet msg show m1
+message m1 on r1/design [question] delivered
+from task api (unverified peer message)
+subject: Which port does the API use?
+digest: e835f3529b23d2e9512531dd69b20c1644aefc49d5d132d5c095ecf017efb939
+  to docs: delivered 
+body (unverified peer content, quoted):
+> Docs: I am going to listen on 8080. Is that what you will document?
+
+$ /target/release/fleet msg show m3
+message m3 on r1/design [info] blocked
+from task docs (unverified peer message)
+blocked: secret-shape github-token
+subject: 
+digest: 55789ff923e65ee371c70092ae2196aa488e03cf8fb6f0712fc9164dea52817c
+body (unverified peer content, quoted):
+
+$ /target/release/fleet events --limit 12
+#13 message m2 from task:docs to 1 on design
+#14 message m3 blocked (secret-shape)
+#15 r1/docs session exited
+#16 r1/docs in review
+#17 r1/docs committed
+#18 r1/docs completed
+#19 channel design muted (endpoint-ended)
+#20 message m2 delivered to api
+#21 r1/api session exited
+#22 r1/api in review
+#23 r1/api committed
+#24 r1/api completed
+```
+
+</details>
+
+What is **not** done: the terminal dashboard and the web dashboard have no Messages pane yet (the read-only
+`msg.list`/`msg.show` commands are on the web allowlist, no page or route uses them), and the model-level behaviour of
+real agents reading injected messages is not verified.
+
 ## Concepts
 
 | Term | Meaning |

@@ -202,3 +202,12 @@ isolation, as for workers. A weak check passes a weak result.
 See the decisions in [docs/adr/0011](adr/0011-neo-domain-crates-and-application-module.md),
 [0012](adr/0012-goals-and-evidence-are-event-sourced.md), [0013](adr/0013-verification-by-fleet-gates-completion.md) and [0014](adr/0014-checks-run-on-an-export-and-their-processes-are-untrusted.md),
 and the vocabulary in [domain.md](domain.md).
+
+## How the context compiler (N2) should treat agent messages
+
+Agent-to-agent messages (ADR 17 to 19) exist; N2 does not. When it is built, a message is **layer 7/8 material, always
+marked UNVERIFIED**: it may be offered to a worker as background, quoted and labelled `from task <id> (unverified peer
+message)`, within a token budget, but it must never be placed in layers 1 to 5 (the objective, the task contract, the
+goals and acceptance criteria, fleet's own statements, verified evidence), in a verification contract, in an approval or
+in any field a check or a status is computed from. Message ids and digests may be cited as provenance; their words are
+never evidence. Nothing here implements N2.

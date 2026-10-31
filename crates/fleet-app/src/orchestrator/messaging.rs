@@ -97,30 +97,39 @@ impl Orchestrator {
                 continue;
             };
             let (worktree, attempt) = (live.worktree.clone(), live.attempt);
-            let worker = self.roster(&key.0).into_iter().find(|e| e.task == key.1);
-            // a task that belongs to no channel cannot send anything: its outbox is never opened
-            let member = self
-                .board
-                .channels_of(
-                    &key.0,
-                    &key.1,
-                    worker.as_ref().and_then(|w| w.worker.as_ref()),
-                )
-                .is_empty();
-            if member || self.board.task_muted(&key.0, &key.1).is_some() {
-                continue;
-            }
-            let scan = self.ports.outbox.scan(&worktree, MAX_OUTBOX_PER_SCAN);
-            if let Some(why) = scan.refused {
-                self.warn(format!(
-                    "{}/{}: the outbox was not read: {why}",
-                    key.0, key.1
-                ));
-                continue;
-            }
-            for item in scan.items {
-                self.take_outbox_file(&key, attempt, &worktree, item);
-            }
+            self.read_outbox_of(&key, &worktree, attempt);
+        }
+    }
+
+    /// Reads the outbox of one task. Also called once when its session ends, so a message
+    /// written just before the worker exited (a final `result`) is not lost.
+    pub(crate) fn read_outbox_of(&mut self, key: &Key, worktree: &str, attempt: u32) {
+        if !self.board.has_channels() {
+            return;
+        }
+        let worker = self.roster(&key.0).into_iter().find(|e| e.task == key.1);
+        // a task that belongs to no channel cannot send anything: its outbox is never opened
+        let no_channel = self
+            .board
+            .channels_of(
+                &key.0,
+                &key.1,
+                worker.as_ref().and_then(|w| w.worker.as_ref()),
+            )
+            .is_empty();
+        if no_channel || self.board.task_muted(&key.0, &key.1).is_some() {
+            return;
+        }
+        let scan = self.ports.outbox.scan(worktree, MAX_OUTBOX_PER_SCAN);
+        if let Some(why) = scan.refused {
+            self.warn(format!(
+                "{}/{}: the outbox was not read: {why}",
+                key.0, key.1
+            ));
+            return;
+        }
+        for item in scan.items {
+            self.take_outbox_file(key, attempt, worktree, item);
         }
     }
 

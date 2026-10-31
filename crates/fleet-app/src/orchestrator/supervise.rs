@@ -119,6 +119,8 @@ impl Orchestrator {
                 key.0, key.1, e.message
             ));
         }
+        // a message written just before the worker exited is still a message
+        self.read_outbox_of(key, &live.worktree, live.attempt);
         let end = self.worker_end(
             &live.worktree,
             live.attempt,
