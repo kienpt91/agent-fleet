@@ -1,0 +1,29 @@
+[package]
+name = "fleet-infra"
+description = "Infrastructure adapters of agent-fleet: git, ptys, files, sockets. Implements the ports of fleet-app."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "fleet_infra"
+path = "src/lib.rs"
+
+[dependencies]
+fleet-domain = { path = "../fleet-domain" }
+fleet-app = { path = "../fleet-app" }
+serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+sha2 = { version = "=0.11.1", default-features = false }
+toml = { version = "=1.1.8", default-features = false, features = ["parse", "serde"] }
+portable-pty = "=0.9.0"
+nix = { version = "=0.31.3", default-features = false, features = ["signal", "socket", "fs", "user", "process"] }
+
+[dev-dependencies]
+fleet-app = { path = "../fleet-app", features = ["testing"] }
+
+[lints]
+workspace = true

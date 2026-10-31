@@ -1,0 +1,17 @@
+//! Infrastructure layer: adapters that implement the ports of `fleet-app` with real files, git,
+//! processes, ptys and sockets. Depends inward on `fleet-app` and `fleet-domain`.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
+
+pub mod json;
+pub mod digest;
+pub mod clock;
+pub mod fsx;
+pub mod statedir;
+
+#[doc(hidden)]
+pub mod testutil;
