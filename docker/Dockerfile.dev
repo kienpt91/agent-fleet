@@ -1,0 +1,9 @@
+# Development image used to build, test, lint and measure coverage without installing a toolchain on
+# the host: the official Rust 1.95 image (pinned by digest) plus git (tests create repositories),
+# procps, clippy, rustfmt, llvm-tools (coverage) and the macOS target (type-checks the macOS code).
+# Build: docker build -f docker/Dockerfile.dev -t fleet-dev docker/
+FROM rust@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup component add clippy rustfmt llvm-tools-preview --toolchain 1.95.0 \
+ && rustup target add aarch64-apple-darwin --toolchain 1.95.0

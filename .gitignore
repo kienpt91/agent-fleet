@@ -3,3 +3,5 @@ target
 *.pem
 *.key
 .fleet-worktrees
+*.profraw
+*.profdata
