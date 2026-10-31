@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod contracts;
+pub mod mail_contracts;
 
 use crate::config::{AppConfig, WorkerDef};
 use crate::orchestrator::Orchestrator;
@@ -1061,6 +1062,9 @@ impl OutboxReader for FakeOutbox {
     }
 
     fn settle(&self, worktree: &str, name: &str, accepted: bool) -> Result<()> {
+        if outbox_order(name).0 == u64::MAX {
+            return Err(FleetError::invalid("not an outbox file name"));
+        }
         let mut g = self.0.lock();
         if g.fail_settle {
             return Err(FleetError::internal("the outbox is not writable"));

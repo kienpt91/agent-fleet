@@ -1103,3 +1103,159 @@ fn the_lock_file_holds_no_http_async_or_tls_crate() {
         }
     }
 }
+
+// ---- messaging between agents ---------------------------------------------------------------------
+
+fn msg_files() -> Vec<PathBuf> {
+    let dir = crate_dir("fleet-domain").join("src/msg");
+    let mut files: Vec<PathBuf> = rust_files_in(&dir)
+        .into_iter()
+        .filter(|f| f.file_name().is_some_and(|n| n != "mod.rs"))
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn the_messaging_domain_is_pure_declared_and_tested() {
+    let files = msg_files();
+    assert!(files.len() >= 8, "only {} messaging files", files.len());
+    let module = read(&crate_dir("fleet-domain").join("src/msg/mod.rs"));
+    for file in &files {
+        let stem = file.file_stem().unwrap().to_string_lossy().into_owned();
+        assert!(
+            module.contains(&format!("pub mod {stem};")),
+            "{stem} is not declared in msg/mod.rs"
+        );
+        let text = read(file);
+        assert!(
+            text.contains("#[cfg(test)]"),
+            "{} has no unit tests",
+            file.display()
+        );
+        let production = match text.find("#[cfg(test)]") {
+            Some(i) => &text[..i],
+            None => &text,
+        };
+        let code = code_only(production);
+        // pure: no clock, no randomness, no files, no processes, no threads
+        for needle in [
+            "std::time",
+            "SystemTime",
+            "Instant",
+            "std::fs",
+            "std::process",
+            "std::thread",
+            "std::env::",
+            "std::net",
+            "rand::",
+            ".unwrap()",
+            ".expect(",
+        ] {
+            assert!(!code.contains(needle), "{} uses {needle}", file.display());
+        }
+    }
+    let declared = module.matches("pub mod ").count();
+    assert_eq!(
+        declared,
+        files.len(),
+        "msg/mod.rs declares a module without a file"
+    );
+}
+
+#[test]
+fn only_the_message_file_adapter_and_its_tests_write_inboxes() {
+    // the inbox belongs to the daemon: no inner layer touches the directory, and in the
+    // infrastructure crate only msgfs.rs (and the pty's fixed notice) knows its layout
+    for krate in PURE {
+        for file in rust_sources(krate) {
+            let rel = relative(&file);
+            if rel.contains("/testing") {
+                continue;
+            }
+            let text = read(&file);
+            let production = match text.find("#[cfg(test)]") {
+                Some(i) => &text[..i],
+                None => &text,
+            };
+            for needle in ["openat(", "renameat(", "unlinkat(", "\".fleet/inbox"] {
+                assert!(
+                    !code_only(production).contains(needle),
+                    "{rel} touches the message directories directly"
+                );
+            }
+        }
+    }
+    for file in rust_sources("fleet-infra") {
+        let rel = relative(&file);
+        if rel.ends_with("/msgfs.rs") || rel.contains("/web/") {
+            continue;
+        }
+        let text = read(&file);
+        let production = match text.find("#[cfg(test)]") {
+            Some(i) => &text[..i],
+            None => &text,
+        };
+        let code = code_only(production);
+        assert!(
+            !code.contains("INBOX_DIR")
+                && !code.contains("OUTBOX_DIR")
+                && !code.contains("\"inbox\""),
+            "{rel} knows the layout of the message directories"
+        );
+    }
+}
+
+#[test]
+fn the_web_adapter_never_names_the_operators_message_commands() {
+    let mut scanned = 0;
+    let mut files = rust_files_in(&crate_dir("fleet-infra").join("src/web"));
+    for asset in ["app.js", "index.html", "app.css"] {
+        files.push(crate_dir("fleet-infra").join("web").join(asset));
+    }
+    for file in files {
+        let full = read(&file);
+        // the tests of the web module name the commands to prove they are refused
+        let text = match full.find("#[cfg(test)]") {
+            Some(i) if file.extension().is_some_and(|e| e == "rs") => full[..i].to_string(),
+            _ => full,
+        };
+        for needle in ["msg.send", "msg.mute", "msg.unmute"] {
+            assert!(
+                !code_only(&text).contains(needle),
+                "{} reaches for {needle}",
+                file.display()
+            );
+        }
+        scanned += 1;
+    }
+    assert!(scanned >= 8, "only {scanned} web files were scanned");
+}
+
+#[test]
+fn message_text_has_no_path_into_an_approval_a_contract_or_a_goal() {
+    // peer text may not become part of anything the daemon treats as true: the approval
+    // action for a message is built from ids and a digest, and the verification crates do not
+    // know the message types at all
+    for krate in ["neo-verify", "neo-goals"] {
+        for file in rust_sources(krate) {
+            let code = code_only(&read(&file));
+            assert!(
+                !code.contains("msg::") && !code.contains("OutboxMessage"),
+                "{} knows messages",
+                file.display()
+            );
+        }
+    }
+    let approval = read(&crate_dir("fleet-domain").join("src/approval.rs"));
+    let action = approval
+        .split("pub fn message(")
+        .nth(1)
+        .and_then(|rest| rest.split("pub fn validate").next())
+        .unwrap_or("");
+    assert!(!action.is_empty(), "Action::message was not found");
+    assert!(
+        !action.contains("subject") && !action.contains("body"),
+        "the approval action must name the message, never its words"
+    );
+}

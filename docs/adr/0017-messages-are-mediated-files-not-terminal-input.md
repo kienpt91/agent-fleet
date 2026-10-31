@@ -41,3 +41,14 @@ inbox unwritable (the message then waits and expires); it cannot reach another w
 Workers are not sandboxed (see SECURITY.md): a worker can still write into another worktree directly as the same user;
 the design limits what *the daemon* does on its behalf and what the daemon records and shows, not what a same-user
 process can do to files.
+
+## Decisions that were open when this was written
+- **A `lead` key.** `direction = "to_lead"` has to say who receives, and the plan format had no way to. A channel
+  therefore takes an optional `lead` (one of its members), required for `to_lead` and refused for `both`. Naming the
+  first member instead would have made a security-relevant fact implicit.
+- **Members are `task:<id>` or `role:<worker>`, never a bare word.** A bare `api` could be a task or a worker, and
+  guessing widens who may talk (a role stands for every task that runs that worker). The prefix costs four characters
+  and removes the ambiguity. Roles must name a worker of `fleet.toml`; tasks must exist in the run when the plan is
+  loaded (checked before anything is recorded).
+- **A worker's outbox is read once more when its session ends**, before the task's end is recorded: the natural
+  pattern "send the final `result` message, then exit" would otherwise lose the message.

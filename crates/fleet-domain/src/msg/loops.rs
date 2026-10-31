@@ -295,4 +295,33 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn every_trip_describes_itself_with_ids_and_numbers_only() {
+        let flood = Trip::Flood {
+            task: t("a"),
+            refused: 20,
+            limit: 20,
+        };
+        assert_eq!(
+            flood.describe(),
+            "task a sent 20 refused messages in a minute (the limit is 20)"
+        );
+        assert_eq!(flood.pair(), None, "a flood is about one task");
+        let depth = Trip::ReplyDepth {
+            depth: 7,
+            limit: 6,
+            pair: pair_key(&t("b"), &t("a")),
+        };
+        assert_eq!(depth.pair(), Some(&(t("a"), t("b"))));
+        let budget = Trip::PairBudget {
+            exchanges: 13,
+            limit: 12,
+            pair: pair_key(&t("a"), &t("b")),
+        };
+        assert!(budget.describe().contains("13") && budget.describe().contains("12"));
+        for trip in [flood, depth, budget] {
+            assert!(trip.describe().chars().all(|c| !c.is_control()));
+        }
+    }
 }

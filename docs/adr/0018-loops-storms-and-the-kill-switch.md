@@ -38,3 +38,17 @@ A legitimate long exchange needs an operator to unmute or higher limits. A deter
 before it is noticed; the budget bounds the cost. Limits are per daemon lifetime of the log (counters are rebuilt by
 replay). Not covered: collusion through a channel that is allowed (the limits and the audit trail make it visible and
 bounded, they do not make it impossible), and anything two agents do outside the daemon.
+
+## Decisions that were open when this was written
+- **Endpoint-ended mute and messages already accepted.** The brief says a channel is muted when either endpoint's task
+  ends or fails. For channels of more than two members that would silence the survivors, so the rule is "fewer than two
+  members can still take part, or the lead is gone" (identical for two members). A mute for that reason stops *new*
+  submissions but still delivers what was accepted before it, to recipients that are still running: otherwise a worker's
+  last message before it exits (the commonest use) could never arrive. Every other mute (operator, loop, flood) holds
+  everything in both directions until it is lifted. Messages to a recipient that ended expire at once.
+- **Operator exemptions.** `fleet msg send` is subject to size, secret shapes, the sanitizer, fan-out, the global cap and
+  mutes, but not to per-task rates, totals, duplicate suppression, loop limits or approvals: a person is not a storm
+  source and a person's message needs no second person's approval. It is labelled `from operator`, allowed on `to_lead`
+  channels, and refused on a muted channel (unmute first).
+- **Message ids are consumed by refusals** (`m3` can be a `message_blocked`), so an id the sender or the operator sees is
+  always in the log.
