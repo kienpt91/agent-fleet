@@ -2,6 +2,7 @@
 
 use crate::error::{FleetError, Result};
 use crate::limits::MAX_ID_LEN;
+use crate::value::{Field, Value};
 
 /// Ids that would collide with names fleet creates itself.
 const RESERVED: [&str; 3] = ["integration", "head", "fleet"];
@@ -173,6 +174,130 @@ pub fn show(s: &str) -> String {
     out
 }
 
+macro_rules! string_id {
+    ($(#[$meta:meta])* $name:ident, $check:expr) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn parse(s: &str) -> Result<Self> {
+                let check: fn(&str) -> Result<()> = $check;
+                check(s)?;
+                Ok($name(s.to_string()))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Field for $name {
+            fn to_value(&self) -> Value {
+                Value::Str(self.0.clone())
+            }
+            fn from_value(v: &Value) -> Option<Self> {
+                v.as_str().and_then(|s| $name::parse(s).ok())
+            }
+        }
+    };
+}
+
+string_id!(
+    /// Identifies a run. Appears in branch names and paths.
+    RunId,
+    |s| validate_id("run", s)
+);
+string_id!(
+    /// Identifies a task inside a run. Appears in branch names and paths.
+    TaskId,
+    |s| validate_id("task", s)
+);
+string_id!(
+    /// Name of a worker definition in the daemon configuration.
+    WorkerName,
+    validate_worker_name
+);
+string_id!(
+    /// Identifies a decision gate: `g` followed by a number.
+    DecisionId,
+    |s| validate_counter_id("decision gate", 'g', s)
+);
+string_id!(
+    /// Identifies an approval: `a` followed by a number.
+    ApprovalId,
+    |s| validate_counter_id("approval", 'a', s)
+);
+string_id!(
+    /// A git object id in lowercase hex (SHA-1 or SHA-256 repositories).
+    Sha,
+    validate_sha
+);
+
+impl DecisionId {
+    pub fn from_seq(n: u64) -> Self {
+        DecisionId(format!("g{n}"))
+    }
+}
+
+impl ApprovalId {
+    pub fn from_seq(n: u64) -> Self {
+        ApprovalId(format!("a{n}"))
+    }
+}
+
+impl RunId {
+    pub fn from_seq(n: u64) -> Self {
+        RunId(format!("r{n}"))
+    }
+}
+
+impl TaskId {
+    pub fn from_seq(n: u64) -> Self {
+        TaskId(format!("t{n}"))
+    }
+}
+
+fn validate_counter_id(kind: &str, prefix: char, s: &str) -> Result<()> {
+    let ok = s.len() <= 20
+        && s.strip_prefix(prefix)
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+    if ok {
+        Ok(())
+    } else {
+        Err(FleetError::invalid(format!(
+            "{kind} id {} must look like {prefix}1",
+            show(s)
+        )))
+    }
+}
+
+fn validate_sha(s: &str) -> Result<()> {
+    let ok = (s.len() == 40 || s.len() == 64)
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(FleetError::invalid(format!(
+            "object id {} is not 40 or 64 lowercase hex digits",
+            show(s)
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +380,46 @@ mod tests {
         assert!(validate_text("spec", "a\u{1b}b", 10).is_err());
         assert!(validate_text("spec", "a\u{202e}b", 10).is_err());
         assert!(validate_text("spec", "abcdef", 3).is_err());
+    }
+
+    #[test]
+    fn typed_ids_validate_on_parse() {
+        assert!(RunId::parse("r1").is_ok());
+        assert!(RunId::parse("../x").is_err());
+        assert!(TaskId::parse("build-api").is_ok());
+        assert!(TaskId::parse("Build").is_err());
+        assert!(WorkerName::parse("default").is_ok());
+        assert!(WorkerName::parse("a b").is_err());
+        assert_eq!(DecisionId::from_seq(3).as_str(), "g3");
+        assert_eq!(ApprovalId::from_seq(12).to_string(), "a12");
+        assert_eq!(RunId::from_seq(2).as_str(), "r2");
+        assert_eq!(TaskId::from_seq(9).as_str(), "t9");
+        assert!(DecisionId::parse("g").is_err());
+        assert!(DecisionId::parse("a1").is_err());
+        assert!(ApprovalId::parse("a1x").is_err());
+        assert!(ApprovalId::parse("a1").is_ok());
+    }
+
+    #[test]
+    fn sha_accepts_only_lowercase_hex() {
+        assert!(Sha::parse(&"a".repeat(40)).is_ok());
+        assert!(Sha::parse(&"0".repeat(64)).is_ok());
+        assert!(Sha::parse(&"A".repeat(40)).is_err());
+        assert!(Sha::parse(&"a".repeat(39)).is_err());
+        assert!(Sha::parse("--upload-pack=x").is_err());
+    }
+
+    #[test]
+    fn typed_ids_decode_from_values_with_validation() {
+        assert_eq!(
+            RunId::from_value(&Value::str("r1")).map(|r| r.to_string()),
+            Some("r1".to_string())
+        );
+        assert_eq!(RunId::from_value(&Value::str("../r")), None);
+        assert_eq!(RunId::from_value(&Value::int(1)), None);
+        assert_eq!(
+            TaskId::from_value(&TaskId::from_seq(4).to_value()),
+            Some(TaskId::from_seq(4))
+        );
     }
 }

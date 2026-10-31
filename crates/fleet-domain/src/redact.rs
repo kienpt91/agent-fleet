@@ -229,6 +229,14 @@ impl StreamRedactor {
         }
     }
 
+    /// Redacts a not-yet-terminated line for display without changing the block state.
+    pub fn peek<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        if self.in_pem || (line.contains("-----BEGIN ") && line.contains("PRIVATE KEY-----")) {
+            return Cow::Borrowed("");
+        }
+        self.inner.redact(line)
+    }
+
     /// Redacts one line. Returns `None` for lines that are part of a private-key block.
     pub fn line<'a>(&mut self, line: &'a str) -> Option<Cow<'a, str>> {
         let is_begin = line.contains("-----BEGIN ") && line.contains("PRIVATE KEY-----");
