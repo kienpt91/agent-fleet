@@ -3,7 +3,7 @@
 # container with the repository mounted at /work (see README), after `cargo fetch --locked`.
 #
 #   domain       pure unit and property tests of entities, aggregates, events, sanitizer, redactor, hash chain
-#                (fleet-domain) and of the NEO crates: verification contracts, glob matcher, judging,
+#                (fleet-domain), of the fan-out crate (group state machine, comparison, ranking rule) and of the NEO crates: verification contracts, glob matcher, judging,
 #                evidence (neo-verify) and the goal ledger with its status machine (neo-goals)
 #   application  the orchestrator driven through commands with in-memory fakes for every port,
 #                and the port contract suites against those fakes
@@ -24,7 +24,7 @@ layer() {
   printf '%s\n' "$out" | grep -E '^test result' | awk -v n="$name" '{p+=$4; f+=$6} END {printf "%s: %d passed, %d failed\n", n, p, f}'
 }
 
-layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals
+layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals -p fleet-fanout
 layer application  cargo test $OPTS -p fleet-app --features testing
 layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test web_http --test origin
 layer soak         cargo test $OPTS -p fleet-infra --test soak

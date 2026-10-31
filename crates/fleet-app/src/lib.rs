@@ -1,6 +1,6 @@
 //! Application layer: the use cases of the fleet orchestrator.
 //!
-//! Depends on the domain crates (`fleet-domain`, `neo-goals`, `neo-verify`) only. Everything that
+//! Depends on the domain crates (`fleet-domain`, `fleet-fanout`, `neo-goals`, `neo-verify`) only. Everything that
 //! touches the outside world (files, git, ptys, processes, the clock) is a trait in [`ports`];
 //! adapters live in `fleet-infra`.
 

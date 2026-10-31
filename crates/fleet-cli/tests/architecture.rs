@@ -1,6 +1,6 @@
 //! Architecture rules, checked on the source tree itself with plain string parsing (no extra
 //! crates): the dependency direction between the crates (the domain crates `fleet-domain`,
-//! `neo-verify` and `neo-goals` <- `fleet-app` <- `fleet-infra` <- `fleet-cli`), no terminal
+//! `neo-verify`, `neo-goals` and `fleet-fanout` <- `fleet-app` <- `fleet-infra` <- `fleet-cli`), no terminal
 //! library or async runtime where it does not belong, pinned versions, no `unsafe`, and no
 //! `unwrap`/`expect`, clock or I/O in the pure layers. The web dashboard stays an adapter: the
 //! inner layers know nothing of networking, only the daemon touches the web module, and no HTTP,
@@ -11,29 +11,37 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CRATES: [&str; 6] = [
+const CRATES: [&str; 7] = [
     "fleet-domain",
     "neo-verify",
     "neo-goals",
+    "fleet-fanout",
     "fleet-app",
     "fleet-infra",
     "fleet-cli",
 ];
 
 /// The pure domain layer: std only (plus each other, inward), no I/O, no clock, no randomness.
-const DOMAIN: [&str; 3] = ["fleet-domain", "neo-verify", "neo-goals"];
+const DOMAIN: [&str; 4] = ["fleet-domain", "neo-verify", "neo-goals", "fleet-fanout"];
 
 /// Every crate that is not the outermost one.
-const INNER: [&str; 5] = [
+const INNER: [&str; 6] = [
     "fleet-domain",
     "neo-verify",
     "neo-goals",
+    "fleet-fanout",
     "fleet-app",
     "fleet-infra",
 ];
 
 /// The pure layers: the domain crates and the application layer.
-const PURE: [&str; 4] = ["fleet-domain", "neo-verify", "neo-goals", "fleet-app"];
+const PURE: [&str; 5] = [
+    "fleet-domain",
+    "neo-verify",
+    "neo-goals",
+    "fleet-fanout",
+    "fleet-app",
+];
 
 fn root() -> PathBuf {
     fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
@@ -178,12 +186,13 @@ fn the_base_domain_crate_has_no_dependencies_at_all() {
 }
 
 #[test]
-fn the_neo_domain_crates_depend_only_on_the_domain_crates_below_them() {
-    // neo-verify may use fleet-domain; neo-goals may use fleet-domain and neo-verify; nothing
+fn the_neo_and_fanout_domain_crates_depend_only_on_the_domain_crates_below_them() {
+    // neo-verify may use fleet-domain; neo-goals and fleet-fanout may use fleet-domain and neo-verify; nothing
     // else, not even in dev- or build-dependencies (their tests are plain std).
-    let allowed: [(&str, &[&str]); 2] = [
+    let allowed: [(&str, &[&str]); 3] = [
         ("neo-verify", &["fleet-domain"]),
         ("neo-goals", &["fleet-domain", "neo-verify"]),
+        ("fleet-fanout", &["fleet-domain", "neo-verify"]),
     ];
     for (krate, want) in allowed {
         let deps = deps_of(krate);
@@ -199,7 +208,7 @@ fn the_application_layer_depends_only_on_the_domain_crates() {
     let deps = deps_of("fleet-app");
     assert_eq!(
         names_in(&deps, "dependencies"),
-        ["fleet-domain", "neo-goals", "neo-verify"],
+        ["fleet-domain", "fleet-fanout", "neo-goals", "neo-verify"],
         "{deps:?}"
     );
     // the only thing allowed in dev-dependencies is itself (to switch on its testing feature)
@@ -656,7 +665,7 @@ fn the_neo_crates_are_part_of_the_architecture_tests() {
             "{krate} is not a workspace member"
         );
     }
-    for krate in ["neo-verify", "neo-goals"] {
+    for krate in ["neo-verify", "neo-goals", "fleet-fanout"] {
         assert!(DOMAIN.contains(&krate) && PURE.contains(&krate) && INNER.contains(&krate));
     }
 }

@@ -277,6 +277,7 @@ version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
+ "fleet-fanout",
  "neo-goals",
  "neo-verify",
 ]
@@ -296,6 +297,14 @@ dependencies = [
 [[package]]
 name = "fleet-domain"
 version = "0.1.0"
+
+[[package]]
+name = "fleet-fanout"
+version = "0.1.0"
+dependencies = [
+ "fleet-domain",
+ "neo-verify",
+]
 
 [[package]]
 name = "fleet-infra"

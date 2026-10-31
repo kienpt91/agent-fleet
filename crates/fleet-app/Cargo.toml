@@ -1,6 +1,6 @@
 [package]
 name = "fleet-app"
-description = "Application layer of agent-fleet: use cases that orchestrate the domain through ports. Depends on the domain crates (fleet-domain, neo-goals, neo-verify) only."
+description = "Application layer of agent-fleet: use cases that orchestrate the domain through ports. Depends on the domain crates (fleet-domain, fleet-fanout, neo-goals, neo-verify) only."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +18,7 @@ testing = []
 
 [dependencies]
 fleet-domain = { path = "../fleet-domain" }
+fleet-fanout = { path = "../fleet-fanout" }
 neo-goals = { path = "../neo-goals" }
 neo-verify = { path = "../neo-verify" }
 
