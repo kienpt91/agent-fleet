@@ -140,7 +140,7 @@ pub fn render(frame: &mut Frame, model: &Model) {
 }
 
 const GROUP_HINTS: &str =
-    "q quit  j/k group  PgUp/PgDn scroll  g back  r refresh  ? help   (viewing only: fleet pick <group> <task> picks)";
+    "q quit  j/k group  PgUp/PgDn scroll  g back  ? help  view only: fleet pick <group> <task>";
 
 /// The groups view: the list of fan-out groups and the comparison of the selected one, as the
 /// command line prints it. Everything in it was cleaned on the way into the model.
