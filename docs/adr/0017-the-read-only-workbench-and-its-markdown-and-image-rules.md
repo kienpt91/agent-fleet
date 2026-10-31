@@ -36,6 +36,12 @@ looser CSP, or a way to read anything outside the recorded commits.
   text or binary placeholders), at most 4 MiB, with `X-Content-Type-Options: nosniff`, `Content-Security-Policy:
   default-src 'none'; sandbox`, `Content-Disposition: inline` and no filename. The page fetches them with its session
   header and shows them through a `data:` URL (already allowed by `img-src`), so the page CSP is unchanged.
+- **Changed words.** Edited line pairs (the i-th removed and i-th added line of a run) are compared by token with Myers' O(ND)
+  algorithm in the domain (`worddiff`): at most 1024 tokens and 8 KiB per line, at most 64 differing tokens, 64 pairs per run and a
+  work budget per diff; beyond that nothing is marked. Ranges are UTF-16 offsets and the page renders them with text nodes only.
+- **Evidence.** The page is exercised in headless Chromium against a real daemon (`scripts/workbench-demo.sh`), including hostile
+  names and contents; memory under concurrent large reads reaches a plateau and does not grow (e2e test). The caps were lowered after a
+  first measurement (20000 diff lines, three concurrent reads).
 - **Limits.** At most three repository reads run at once (503 with `Retry-After` otherwise); the request target limit
   became 4096 bytes so that a maximal path fits when percent-encoded. No new listener, no new dependency.
 - **UI.** Three scripts (`app.js`, `workbench.js`, `panes.js`) and two stylesheets, all scanned by tests for forbidden
