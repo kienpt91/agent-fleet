@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod contracts;
+pub mod remote;
 
 use crate::config::{AppConfig, WorkerDef};
 use crate::orchestrator::Orchestrator;
@@ -15,7 +16,7 @@ use fleet_domain::approval::Digest;
 use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{ApprovalId, RunId, Sha, TaskId, WorkerName};
+use fleet_domain::ids::{ApprovalId, HostName, RunId, Sha, TaskId, WorkerName};
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::GateOutcome;
 use fleet_domain::status::Verdict;
@@ -831,6 +832,10 @@ impl SessionHost for FakeSessions {
 
     fn start_token(&self, pid: u32) -> Option<String> {
         self.0.lock().start_tokens.get(&pid).cloned()
+    }
+
+    fn remote_dir(&self, host: &HostName, run: &RunId, task: &TaskId) -> Result<String> {
+        Ok(format!("/remote/{host}/{run}/{task}"))
     }
 
     fn terminate_orphan(&mut self, identity: &ProcessIdentity, _grace_ms: u64) -> SignalOutcome {

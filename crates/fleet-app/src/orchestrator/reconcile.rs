@@ -22,6 +22,9 @@ impl Orchestrator {
             version: version.to_string(),
         }])?;
         self.reconcile_orphans();
+        for line in self.ports.sessions.reconcile_remote() {
+            self.warn(line);
+        }
         self.reconcile_commands();
         // Whatever the replayed history leaves unsettled in the goal ledger (a verification that
         // no longer matches the commit of its task) is settled before anything runs.

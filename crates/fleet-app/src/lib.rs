@@ -16,6 +16,7 @@ pub mod hosts;
 pub mod neo;
 pub mod orchestrator;
 pub mod ports;
+pub mod remote;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod views;

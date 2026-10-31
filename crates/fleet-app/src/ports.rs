@@ -8,7 +8,7 @@ use fleet_domain::approval::Digest;
 use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{ApprovalId, GoalId, RunId, Sha, TaskId};
+use fleet_domain::ids::{ApprovalId, GoalId, HostName, RunId, Sha, TaskId};
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::{GateFormat, GateOutcome};
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
@@ -182,6 +182,9 @@ pub struct SessionSpec {
     pub cwd: String,
     /// The complete environment of the process; nothing else is inherited.
     pub env: Vec<(String, String)>,
+    /// The remote host the worker runs on. `program`, `args` and `env` are then as they run there
+    /// (see `crate::remote`), and `cwd` is still the local task worktree.
+    pub host: Option<HostName>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,6 +252,17 @@ pub trait SessionHost: Send {
     /// Terminates the process group of a process recorded by an earlier daemon run. Verifies
     /// `identity` first; waits up to `grace_ms` between TERM and KILL.
     fn terminate_orphan(&mut self, identity: &ProcessIdentity, grace_ms: u64) -> SignalOutcome;
+    /// The worktree directory of a task on a remote host, for placeholders such as `{worktree}`.
+    /// Hosts without remote support refuse.
+    fn remote_dir(&self, _host: &HostName, _run: &RunId, _task: &TaskId) -> Result<String> {
+        Err(fleet_domain::error::FleetError::unavailable(
+            "remote hosts are not available",
+        ))
+    }
+    /// At startup: removes what an earlier daemon run left on remote hosts. One line per finding.
+    fn reconcile_remote(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 // ---- worker contract files ------------------------------------------------------------------
