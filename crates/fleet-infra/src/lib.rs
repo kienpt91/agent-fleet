@@ -16,6 +16,7 @@ pub mod procid;
 pub mod eventlog;
 pub mod logs;
 pub mod contract_fs;
+pub mod git;
 
 #[doc(hidden)]
 pub mod testutil;
