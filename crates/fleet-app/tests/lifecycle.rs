@@ -1,6 +1,8 @@
 //! Application tests: a run from creation to completion, driven through the command interface
 //! with in-memory fakes for every port.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
 use fleet_app::api::Reply;
 use fleet_app::ports::Job;
 use fleet_app::testing::{test_config, GateMode, Harness};
@@ -22,7 +24,13 @@ fn list(items: &[&str]) -> Value {
 
 fn new_run(h: &mut Harness) {
     let r = h
-        .call("run.create", obj(vec![("objective", s("ship the feature")), ("repo", s("/repo"))]))
+        .call(
+            "run.create",
+            obj(vec![
+                ("objective", s("ship the feature")),
+                ("repo", s("/repo")),
+            ]),
+        )
         .unwrap();
     assert_eq!(r.data().get("run").and_then(Value::as_str), Some("r1"));
 }
@@ -63,7 +71,10 @@ fn finish_ok(h: &mut Harness, task: &str) {
     let spec = h.world.session_spec(session).unwrap();
     h.world.write_result(
         &spec.cwd,
-        ContractRead::Valid(WorkerResult { status: ResultStatus::Done, summary: format!("{task} done") }),
+        ContractRead::Valid(WorkerResult {
+            status: ResultStatus::Done,
+            summary: format!("{task} done"),
+        }),
     );
     h.world.mark_dirty(&spec.cwd);
     h.world.exit(session, 0);
@@ -114,13 +125,19 @@ fn dispatch_builds_the_command_from_the_worker_definition_with_an_allowlisted_en
     assert_eq!(spec.args[0], "--task");
     assert_eq!(spec.args[1], "a");
     assert_eq!(spec.args[3], spec.cwd);
-    assert!(spec.args[4].contains("# Task a: task a"), "brief inlined as the last argument");
+    assert!(
+        spec.args[4].contains("# Task a: task a"),
+        "brief inlined as the last argument"
+    );
     let env: std::collections::BTreeMap<_, _> = spec.env.iter().cloned().collect();
     assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
     assert_eq!(env.get("AGENT_MODE").map(String::as_str), Some("test"));
     assert_eq!(env.get("FLEET_TASK").map(String::as_str), Some("a"));
     assert_eq!(env.get("FLEET_RUN").map(String::as_str), Some("r1"));
-    assert!(!env.contains_key("SENTINEL_TOKEN"), "the daemon's secrets are not inherited");
+    assert!(
+        !env.contains_key("SENTINEL_TOKEN"),
+        "the daemon's secrets are not inherited"
+    );
     for (k, v) in &spec.env {
         assert!(!k.contains("SOCKET") && !k.contains("STATE"), "{k}");
         assert!(!v.contains("fleet.sock"), "{v}");
@@ -145,14 +162,24 @@ fn dependencies_gate_scheduling_and_their_branches_are_merged_into_dependents() 
     assert_eq!(merges[0].1, vec!["fleet/r1/a".to_string()]);
     let briefs = h.world.briefs();
     let brief = &briefs.last().unwrap().1;
-    assert!(brief.contains("a done"), "the dependency's summary is in the brief: {brief}");
+    assert!(
+        brief.contains("a done"),
+        "the dependency's summary is in the brief: {brief}"
+    );
 }
 
 #[test]
 fn parallelism_is_limited_per_run_and_globally() {
     let mut h = Harness::new();
-    h.call("run.create", obj(vec![("objective", s("o")), ("repo", s("/repo")), ("max_parallel", Value::int(2u64))]))
-        .unwrap();
+    h.call(
+        "run.create",
+        obj(vec![
+            ("objective", s("o")),
+            ("repo", s("/repo")),
+            ("max_parallel", Value::int(2u64)),
+        ]),
+    )
+    .unwrap();
     for id in ["a", "b", "c"] {
         add(&mut h, id, &[]);
     }
@@ -169,10 +196,18 @@ fn the_global_session_cap_is_shared_between_runs() {
     cfg.max_sessions = 2;
     let mut h = Harness::with_config(cfg);
     for _ in 0..2 {
-        h.call("run.create", obj(vec![("objective", s("o")), ("repo", s("/repo"))])).unwrap();
+        h.call(
+            "run.create",
+            obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+        )
+        .unwrap();
     }
     for (run, task) in [("r1", "a"), ("r1", "b"), ("r2", "c"), ("r2", "d")] {
-        h.call("task.add", obj(vec![("run", s(run)), ("id", s(task)), ("title", s(task))])).unwrap();
+        h.call(
+            "task.add",
+            obj(vec![("run", s(run)), ("id", s(task)), ("title", s(task))]),
+        )
+        .unwrap();
     }
     h.call("run.start", obj(vec![("run", s("r1"))])).unwrap();
     h.call("run.start", obj(vec![("run", s("r2"))])).unwrap();
@@ -184,21 +219,36 @@ fn a_plan_is_loaded_atomically_and_cycles_are_rejected_without_events() {
     let mut h = Harness::new();
     let before = h.world.stored_events().len();
     let tasks = Value::array([
-        obj(vec![("id", s("a")), ("title", s("A")), ("after", list(&["b"]))]),
-        obj(vec![("id", s("b")), ("title", s("B")), ("after", list(&["a"]))]),
+        obj(vec![
+            ("id", s("a")),
+            ("title", s("A")),
+            ("after", list(&["b"])),
+        ]),
+        obj(vec![
+            ("id", s("b")),
+            ("title", s("B")),
+            ("after", list(&["a"])),
+        ]),
     ]);
     let err = h
         .call(
             "plan.load",
             obj(vec![
-                ("new_run", obj(vec![("objective", s("o")), ("repo", s("/repo"))])),
+                (
+                    "new_run",
+                    obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+                ),
                 ("tasks", tasks),
             ]),
         )
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid);
     assert!(err.message.contains("cycle"));
-    assert_eq!(h.world.stored_events().len(), before, "an invalid plan records nothing, not even the run");
+    assert_eq!(
+        h.world.stored_events().len(),
+        before,
+        "an invalid plan records nothing, not even the run"
+    );
 }
 
 #[test]
@@ -206,19 +256,33 @@ fn a_plan_creates_the_run_and_its_tasks() {
     let mut h = Harness::new();
     let tasks = Value::array([
         obj(vec![("id", s("models")), ("title", s("Models"))]),
-        obj(vec![("id", s("api")), ("title", s("API")), ("after", list(&["models"]))]),
-        obj(vec![("id", s("docs")), ("title", s("Docs")), ("after", list(&["api"]))]),
+        obj(vec![
+            ("id", s("api")),
+            ("title", s("API")),
+            ("after", list(&["models"])),
+        ]),
+        obj(vec![
+            ("id", s("docs")),
+            ("title", s("Docs")),
+            ("after", list(&["api"])),
+        ]),
     ]);
     let r = h
         .call(
             "plan.load",
             obj(vec![
-                ("new_run", obj(vec![("objective", s("o")), ("repo", s("/repo"))])),
+                (
+                    "new_run",
+                    obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+                ),
                 ("tasks", tasks),
             ]),
         )
         .unwrap();
-    assert_eq!(r.data().get("schema").and_then(Value::as_str), Some("fleet.plan/1"));
+    assert_eq!(
+        r.data().get("schema").and_then(Value::as_str),
+        Some("fleet.plan/1")
+    );
     assert_eq!(task_status(&mut h, "models"), "ready");
     assert_eq!(task_status(&mut h, "api"), "pending");
 }
@@ -229,17 +293,28 @@ fn a_plan_into_an_existing_run_validates_against_it() {
     new_run(&mut h);
     add(&mut h, "a", &[]);
     let dup = Value::array([obj(vec![("id", s("a")), ("title", s("again"))])]);
-    assert!(h.call("plan.load", obj(vec![("run", s("r1")), ("tasks", dup)])).is_err());
+    assert!(h
+        .call("plan.load", obj(vec![("run", s("r1")), ("tasks", dup)]))
+        .is_err());
     let both = h.call(
         "plan.load",
         obj(vec![
             ("run", s("r1")),
-            ("new_run", obj(vec![("objective", s("o")), ("repo", s("/repo"))])),
+            (
+                "new_run",
+                obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+            ),
             ("tasks", Value::array([obj(vec![("title", s("x"))])])),
         ]),
     );
     assert_eq!(both.unwrap_err().code, ErrorCode::Invalid);
-    let neither = h.call("plan.load", obj(vec![("tasks", Value::array([obj(vec![("title", s("x"))])]))]));
+    let neither = h.call(
+        "plan.load",
+        obj(vec![(
+            "tasks",
+            Value::array([obj(vec![("title", s("x"))])]),
+        )]),
+    );
     assert_eq!(neither.unwrap_err().code, ErrorCode::Invalid);
 }
 
@@ -247,11 +322,23 @@ fn a_plan_into_an_existing_run_validates_against_it() {
 fn creating_a_run_for_a_missing_repository_fails_cleanly() {
     let mut h = Harness::new();
     h.world.missing_repo("/nope");
-    let err = h.call("run.create", obj(vec![("objective", s("o")), ("repo", s("/nope"))])).unwrap_err();
+    let err = h
+        .call(
+            "run.create",
+            obj(vec![("objective", s("o")), ("repo", s("/nope"))]),
+        )
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
     assert!(!h.world.event_kinds().contains(&"run_created"));
     let err = h
-        .call("run.create", obj(vec![("objective", s("o")), ("repo", s("/repo")), ("base", s("--evil"))]))
+        .call(
+            "run.create",
+            obj(vec![
+                ("objective", s("o")),
+                ("repo", s("/repo")),
+                ("base", s("--evil")),
+            ]),
+        )
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid);
 }
@@ -287,9 +374,21 @@ fn gates_run_after_the_worker_and_must_pass_before_completion() {
     add(&mut h, "a", &[]);
     h.call("run.start", obj(vec![("run", s("r1"))])).unwrap();
     finish_ok(&mut h, "a");
-    assert_eq!(task_status(&mut h, "a"), "review", "waiting for the gate job");
+    assert_eq!(
+        task_status(&mut h, "a"),
+        "review",
+        "waiting for the gate job"
+    );
     let jobs = h.world.jobs_started();
-    let Job::Gates { gates, worktree, attempt, .. } = &jobs[0] else { panic!("expected a gate job") };
+    let Job::Gates {
+        gates,
+        worktree,
+        attempt,
+        ..
+    } = &jobs[0]
+    else {
+        panic!("expected a gate job")
+    };
     assert_eq!(gates[0].args[1], *worktree);
     assert_eq!(*attempt, 1);
     // the gate job is not started twice
@@ -301,7 +400,12 @@ fn gates_run_after_the_worker_and_must_pass_before_completion() {
         "r1",
         "a",
         1,
-        vec![fleet_domain::quality::GateOutcome { name: "tests".into(), passed: true, summary: "exit code 0".into(), output: String::new() }],
+        vec![fleet_domain::quality::GateOutcome {
+            name: "tests".into(),
+            passed: true,
+            summary: "exit code 0".into(),
+            output: String::new(),
+        }],
     );
     h.orch.tick();
     assert_eq!(task_status(&mut h, "a"), "completed");
@@ -320,7 +424,8 @@ fn a_failing_gate_retries_the_worker_with_the_failure_in_its_brief() {
         timeout_ms: 5000,
     });
     let mut h = Harness::with_config(cfg);
-    h.world.set_gate_mode(GateMode::Fail("FAILED test_parse: expected 3 got 4".into()));
+    h.world
+        .set_gate_mode(GateMode::Fail("FAILED test_parse: expected 3 got 4".into()));
     new_run(&mut h);
     add(&mut h, "a", &[]);
     h.call("run.start", obj(vec![("run", s("r1"))])).unwrap();
@@ -330,7 +435,10 @@ fn a_failing_gate_retries_the_worker_with_the_failure_in_its_brief() {
     let briefs = h.world.briefs();
     let brief = &briefs.last().unwrap().1;
     assert!(brief.contains("Quality gate 'tests' failed"), "{brief}");
-    assert!(brief.contains("FAILED test_parse: expected 3 got 4"), "{brief}");
+    assert!(
+        brief.contains("FAILED test_parse: expected 3 got 4"),
+        "{brief}"
+    );
     assert!(brief.contains("attempt 2"));
 }
 
@@ -370,7 +478,10 @@ fn status_reports_runs_counts_and_live_flags() {
     add(&mut h, "b", &["a"]);
     h.call("run.start", obj(vec![("run", s("r1"))])).unwrap();
     let st = status(&mut h);
-    assert_eq!(st.get("schema").and_then(Value::as_str), Some("fleet.status/1"));
+    assert_eq!(
+        st.get("schema").and_then(Value::as_str),
+        Some("fleet.status/1")
+    );
     let run = &st.get("runs").and_then(Value::as_array).unwrap()[0];
     assert_eq!(run.get("status").and_then(Value::as_str), Some("active"));
     let counts = run.get("counts").unwrap();
@@ -382,7 +493,11 @@ fn status_reports_runs_counts_and_live_flags() {
     let daemon = st.get("daemon").unwrap();
     assert_eq!(daemon.get("sessions").and_then(Value::as_u64), Some(1));
     assert_eq!(daemon.get("pid").and_then(Value::as_u64), Some(4242));
-    assert!(!st.get("recent").and_then(Value::as_array).unwrap().is_empty());
+    assert!(!st
+        .get("recent")
+        .and_then(Value::as_array)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -396,33 +511,76 @@ fn tail_send_and_attach_resolve_the_live_session() {
 
     let tail = h.call("task.tail", obj(vec![("task", s("a"))])).unwrap();
     assert_eq!(tail.data().get("live").and_then(Value::as_bool), Some(true));
-    assert_eq!(tail.data().get("text").and_then(Value::as_str), Some("hello\nworld\n"));
+    assert_eq!(
+        tail.data().get("text").and_then(Value::as_str),
+        Some("hello\nworld\n")
+    );
     let next = tail.data().get("next").and_then(Value::as_u64).unwrap();
     h.world.print(id, "more\n");
-    let again = h.call("task.tail", obj(vec![("task", s("r1/a")), ("since", Value::int(next))])).unwrap();
-    assert_eq!(again.data().get("text").and_then(Value::as_str), Some("more\n"));
+    let again = h
+        .call(
+            "task.tail",
+            obj(vec![("task", s("r1/a")), ("since", Value::int(next))]),
+        )
+        .unwrap();
+    assert_eq!(
+        again.data().get("text").and_then(Value::as_str),
+        Some("more\n")
+    );
 
-    let Reply::Input { session, bytes, .. } =
-        h.call("task.send", obj(vec![("task", s("a")), ("text", s("yes"))])).unwrap()
+    let Reply::Input { session, bytes, .. } = h
+        .call("task.send", obj(vec![("task", s("a")), ("text", s("yes"))]))
+        .unwrap()
     else {
         panic!("expected input")
     };
     assert_eq!(session, id);
     assert_eq!(bytes, b"yes\r");
     let Reply::Input { bytes, .. } = h
-        .call("task.send", obj(vec![("task", s("a")), ("text", s("yes")), ("newline", Value::Bool(false))]))
+        .call(
+            "task.send",
+            obj(vec![
+                ("task", s("a")),
+                ("text", s("yes")),
+                ("newline", Value::Bool(false)),
+            ]),
+        )
         .unwrap()
     else {
         panic!("expected input")
     };
     assert_eq!(bytes, b"yes");
-    assert!(matches!(h.call("task.attach", obj(vec![("task", s("a"))])).unwrap(), Reply::Attach { .. }));
+    assert!(matches!(
+        h.call("task.attach", obj(vec![("task", s("a"))])).unwrap(),
+        Reply::Attach { .. }
+    ));
 
     h.world.exit(id, 0);
     h.orch.tick();
-    assert_eq!(h.call("task.send", obj(vec![("task", s("a")), ("text", s("x"))])).unwrap_err().code, ErrorCode::Conflict);
-    assert_eq!(h.call("task.attach", obj(vec![("task", s("a"))])).unwrap_err().code, ErrorCode::Conflict);
+    assert_eq!(
+        h.call("task.send", obj(vec![("task", s("a")), ("text", s("x"))]))
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        h.call("task.attach", obj(vec![("task", s("a"))]))
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
     let after = h.call("task.tail", obj(vec![("task", s("a"))])).unwrap();
-    assert_eq!(after.data().get("live").and_then(Value::as_bool), Some(false));
-    assert!(after.data().get("text").and_then(Value::as_str).unwrap().contains("hello"), "finished output comes from the stored log");
+    assert_eq!(
+        after.data().get("live").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(
+        after
+            .data()
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("hello"),
+        "finished output comes from the stored log"
+    );
 }
