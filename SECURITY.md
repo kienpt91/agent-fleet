@@ -37,7 +37,7 @@ What the design tries to guarantee, and where it is tested:
 
 | Property | How | Tests |
 | --- | --- | --- |
-| A worker is kept off the control plane (best effort, see limitations) | Only the daemon creates approvals (merges, or from a worker's `question.json`); decisions need a control request. Three independent checks: (1) a per-run 256-bit capability token in `control/token` (0600, fresh at every daemon start) that every request except `ping` must carry, compared in constant time; (2) at accept, before any request is read, the peer process must be identified and must not be a worker or a descendant of one: an unknown pid, a process that is already gone or an unreadable ancestry all deny (fail closed), the decision is bound to the connection and the request is checked again; (3) workers get an allowlisted environment with no socket path, state directory or token, and `XDG_STATE_HOME` is forced to a per-task directory so a habitual `fleet` call finds no daemon | `fleet-infra::server`/`client`/`daemon` tests (token, fail-closed admit, pipelined requests), `e2e_security.rs` |
+| A worker is kept off the control plane (best effort, see limitations) | Only the daemon creates approvals (merges, or from a worker's `question.json`); decisions need a control request. Three independent checks: (1) a per-run 256-bit capability token in `control/token` (0600, fresh at every daemon start) that every request except `ping` must carry, compared in constant time; (2) at accept, before any request is read, the peer process must be identified and must not be a worker, a descendant of one, or anything else the daemon started (quality gates, approved commands, git, the undo tool, and the process groups they still occupy): an unknown pid, a process that is already gone or an unreadable ancestry all deny (fail closed), the decision is bound to the connection and the request is checked again; (3) workers get an allowlisted environment with no socket path, state directory or token, and `XDG_STATE_HOME` is forced to a per-task directory so a habitual `fleet` call finds no daemon | `fleet-infra::server`/`client`/`daemon` tests (token, fail-closed admit, pipelined requests), `e2e_security.rs` |
 | An approval covers one exact action, once | SHA-256 digest of (tool, command, arguments, task id); the digest is recomputed at use. Merge approvals include the exact commit and the merge is performed on that commit (the branch is verified to still point at it, otherwise nothing is merged). An approval is consumed when the action *starts* (recorded before the command is launched), so a daemon restart never runs it again; a command that was running when the daemon stopped is reported as `interrupted, outcome unknown`. Worker-requested commands must be absolute paths that lie outside the worktree and its repository; their working directory is the worker's worktree (see limitations). Approvals expire | `fleet-domain::approval`, `fleet-domain::fleet`, `fleet-app/tests/{merging,decisions,recovery}.rs`, `fleet-infra::git`, `fleet-infra::jobs`, `e2e_security.rs` |
 | Worker output cannot attack the terminal or the logs | Streaming sanitizer: every escape sequence removed, controls and invisible Unicode made visible, `\r` becomes a line break; separate passthrough filter for `attach` that drops OSC/DCS/APC/queries; redaction of key shapes, configured rules and secret-looking daemon variables before storage, applied to terminal output, quality-gate output, approved-command output and the text of a worker's `result.json`/`question.json` (summary, question, choices). The exact command and arguments of an approval request are not altered (the digest binds them) and are shown to the person deciding. Worker text that reaches another agent's brief is flattened or quoted so it cannot pose as fleet's own statements | `fleet-domain::sanitize`, `redact`, `output`, `brief`; `fleet-infra::pty`, `jobs`, `contract_fs`; soak test |
 | Memory stays bounded | Ring buffer per session with a hard cap; line cap; caps on messages, frames, files, connections, sessions, runs, tasks, notes, gate output, event log size | `fleet-domain::output`, `fleet-infra/tests/soak.rs`, limits tests in every adapter |
@@ -47,7 +47,7 @@ What the design tries to guarantee, and where it is tested:
 | Tamper-evident audit log | Hash chain over canonical event text plus a head file created together with the log; truncation, edits, deletions and reordering are detected at start and by `fleet verify-log`; a log with records but no head file is refused. Deleting *both* files starts a fresh history and is not detected | `fleet-domain::chain`, `fleet-infra::eventlog`, `e2e_recovery.rs` |
 | No signal reaches the wrong process | Pid plus process start time (on Linux scoped by the boot id) must match before any signal; only a process group leader is signalled as a group; orphans of an earlier daemon run are checked the same way | `fleet-domain::supervision`, `fleet-infra::procid`, `fleet-infra::pty` |
 | Control socket hygiene | 0700 directory (owner checked, symlinks refused), 0600 socket, `SO_PEERCRED`/`LOCAL_PEERCRED` uid check, flock-based single daemon, stale socket detection, bounded JSON lines, bounded frames, connection cap | `fleet-infra::server`, `statedir`, `client`, `e2e_security.rs` |
-| The web dashboard serves the operator only | Off unless `fleet daemon --web`; loopback unless `--web-allow-remote` (then a warning is printed). Per request: admission (the process holding the client end of the TCP connection must not be a worker or a descendant of one, and must be identifiable: same rule as the control socket, answered 403 before the request is read), strict `Host` check against rebinding, 256-bit per-start token (memory only, printed once on the daemon's terminal, constant-time compare, failed attempts rate limited) as bearer or as an `HttpOnly; SameSite=Strict` session cookie, and for every state-changing request `Origin`, `Sec-Fetch-Site`, a per-session CSRF token and a JSON content type. The UI offers only `status`, `events`, `task.tail`, `task.send`, `gate.resolve`, `approval.decide` and `merge`; approvals still need the displayed digest and a merge still needs its approval. Hand-written HTTP/1.1 with bounded line, head, header count, body, one deadline per request, connection and stream caps. CSP `default-src 'none'; script-src 'self'; ...`, no inline code, `textContent` only, JSON with `<>&`, controls and bidi escaped | `fleet-infra::web::{http,auth,peer,assets}`, `fleet-infra/tests/web_http.rs`, `fleet-cli/tests/e2e_web.rs`, `fleet-app/tests/hostile_text.rs`, `architecture.rs`, soak with a connected stream, `scripts/web-smoke.mjs` |
+| The web dashboard serves the operator only | Off unless `fleet daemon --web`; loopback unless `--web-allow-remote` (then a warning is printed). Each connection: a first-byte and a whole-request deadline, then the request is read within hard bounds, then **admission** (before anything is acted on: the process holding the client end of the TCP connection must not be a worker, a quality gate, an approved command, git or the undo tool, nor started by any of them, nor in the process group of one that is running, and must be identifiable; the same rule as the control socket's; answered 403), strict `Host` check against rebinding, then authentication: a 256-bit per-start token (memory only, constant-time compare, printed once, and only to a terminal unless `--web-print-login-url`) as `Authorization: Bearer` or, exchanged by `POST /api/login`, a random session id sent in an `X-Fleet-Session` header. **No cookie is ever set or read**: the id lives in the page's `sessionStorage` (per tab and per origin including the port). Every state-changing request also needs `Origin`, `Sec-Fetch-Site`, the session's CSRF token and a JSON content type; `/api/send` accepts no control characters. The UI offers only `status`, `events`, `task.tail`, `task.send`, `gate.resolve`, `approval.decide` and `merge`; approvals still need the displayed digest (mandatory in the request) and a merge still needs its approval. Hand-written HTTP/1.1 with bounded line, head, header count and body, connection, per-remote-address and stream caps; event streams end when their session does. CSP `default-src 'none'; script-src 'self'; ...`, no inline code, `textContent` only, JSON with `<>&`, controls and bidi escaped | `fleet-infra::web::{http,auth,peer,assets}`, `fleet-infra::daemon` (origin rule), `fleet-domain::supervision`, `fleet-infra/tests/web_http.rs`, `fleet-cli/tests/e2e_web.rs`, `fleet-app/tests/hostile_text.rs`, `architecture.rs`, soak with a connected stream, `scripts/web-smoke.mjs` |
 
 ## Known limitations (read these)
 
@@ -75,27 +75,47 @@ What the design tries to guarantee, and where it is tested:
 - **The audit log is tamper evident, not tamper proof.** Whoever can rewrite both `events.log` and `events.head`, or delete
   both, can forge or erase history. The head file lives next to the log, so it cannot anchor the log against an attacker
   with write access to the state directory.
-- **The web dashboard does not protect against a same-user hostile process.** The token exists only in the daemon's memory
-  and on the terminal that started it, but a process of yours can read process memory (where `ptrace` is allowed), the
-  terminal's scrollback, the browser's cookie store or its memory, and then act as the operator. Workers are kept off by
-  the admission check (they are refused before the token is even looked at, and they never receive the token), but a
-  worker that detaches from its process tree first, or that reads the operator's terminal or browser, is outside what
-  fleet can see. Run workers as another user, in a container or in a VM for a real boundary.
-- **No TLS.** The dashboard speaks plain HTTP, so it is meant for the loopback interface. The token, the session cookie
-  (which is not `Secure`) and every page cross a non-loopback network in clear text; `--web-allow-remote` exists for
-  trusted networks and prints a warning. For remote use put an SSH tunnel (`ssh -L 7878:127.0.0.1:7878 host`) in front
-  of a loopback dashboard instead. Remote peers cannot be identified (they are not processes of this machine), so for
-  them only the token protects.
-- **The web token lives until the daemon stops.** It is not rotated, and a login URL scrolled back in a terminal stays
-  valid. A session cookie is valid for 12 hours (2 hours idle) and sessions are forgotten when the daemon restarts.
-- **Failed logins lock everyone out for a minute.** Five wrong credentials within a minute lock web authentication for a
-  minute (the limiter is global because every client is a local process), so any local process that can reach the port
-  and pass admission can keep the operator out of the dashboard; the control socket is unaffected.
+- **The web credentials are defence in depth against same-user hostile code, not a boundary.** Neither the control
+  socket's token nor the web token nor a web session keeps out code that runs as you and is willing to do real work. The
+  web token exists only in the daemon's memory and on the terminal that started it, but a process of yours can read
+  process memory (where `ptrace` is allowed), the terminal's scrollback, the browser's memory or its `sessionStorage`,
+  and then act as the operator. What fleet does: workers, quality gates, approved commands, git, the undo tool and
+  everything they started are refused at the TCP connection (and at the socket), they never receive the token, and a
+  session id is not an ambient credential (it is not a cookie, so the browser does not hand it to other ports; a dev
+  server a worker started on another port of the same host never sees it). What it does not do: a process that has
+  left the tree of all of these (a double fork adopted by init that also changed process group, `setsid`, a unit started
+  with `systemd-run --user`, a terminal multiplexer) is indistinguishable from the operator's own `curl`. Run workers as
+  another user, in a container or in a VM for a real boundary.
+- **No TLS.** The dashboard speaks plain HTTP, so it is meant for the loopback interface. The token, the session id and
+  every page cross a non-loopback network in clear text; `--web-allow-remote` exists for trusted networks and prints a
+  warning. For remote use put an SSH tunnel (`ssh -L 7878:127.0.0.1:7878 host`) in front of a loopback dashboard
+  instead. Remote peers cannot be identified (they are not processes of this machine), so for them only the token
+  protects; their failed guesses are counted per address and each address is limited to 8 open connections.
+- **The web token lives until the daemon stops, and where it is printed matters.** It is not rotated, it is never a
+  one-time code (scripts use it as a bearer token), and a login URL scrolled back in a terminal stays valid. The daemon
+  prints the URL only when stderr is a terminal (or with `--web-print-login-url`): if you redirect stderr to a file,
+  `nohup.out`, a journal or a terminal logger, the URL, and with it the token, is kept there, readable by every
+  process of yours (`/proc/<daemon>/fd/2` too). Opening the URL with `xdg-open`/`open` puts it in that program's argument
+  list, visible to processes of yours, and the browser may keep the address (with the fragment) in its history until the
+  page has replaced it. A session is valid for 12 hours (2 hours idle), is forgotten when the daemon restarts, and ends an
+  open event stream within a second when it ends. A stream opened with the bearer token is not tied to a session and
+  runs until its limits (10 minutes or 4 MiB, then the page reconnects).
+- **Failed token guesses lock the token paths, per client.** Five wrong tokens within a minute lock *bearer and login*
+  attempts of that client for a minute. Live sessions keep working during a lock and an unknown session id (a stale tab, a
+  restarted daemon) is not counted. All local processes are one client, so a local process that passes admission can keep
+  the operator from logging in again (not from using a session they already have) by guessing wrongly; a remote address
+  only locks itself. The control socket is unaffected.
+- **Connection slots can still be held for a few seconds.** Connections are capped (32, plus 4 event streams and 8 per
+  remote address). A connection that sends nothing is closed after 3 seconds and costs no process-table lookup (admission
+  runs after the request was read); a local process that passes admission can still keep the slots busy by opening
+  connections as fast as they are closed, which makes the operator's page wait or get 503. Slots are not reserved for
+  authenticated sessions (nothing distinguishes a connection before it sends its credentials).
 - **Admission looks at processes, not at intent.** On Linux it needs `/proc/net/tcp*` and the readable `/proc/<pid>/fd` of
   the client (same user: readable); where that is hidden every loopback client is refused. On macOS it runs `lsof` and has
   not been run there. A client that exits before the lookup is refused (fail closed). Every process that holds the client's end
   of the connection is judged; one that has vanished by then (a child forked and exec'd while the socket was open) is skipped
-  only if another holder is there and passes, and one that is alive and refused refuses the connection.
+  only if another holder is there and passes, and one that is alive and refused refuses the connection. The daemon's own
+  threads are not refused (they are the daemon).
 - **The page shows what workers wrote.** Text is sanitized by the domain and rendered as text, so it cannot run or break
   the layout, but an operator reading a summary or a question can still be misled by its content (prompt injection
   reaches people too). The exact action and digest of an approval are shown as the daemon holds them.
