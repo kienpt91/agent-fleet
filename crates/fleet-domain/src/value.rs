@@ -210,6 +210,28 @@ impl Field for i64 {
     }
 }
 
+/// A JSON object carried inside an event (for example a verification contract). Compared by its
+/// canonical text, so that events stay `Eq` although `Value` has floats.
+#[derive(Clone, Debug)]
+pub struct Document(pub Value);
+
+impl PartialEq for Document {
+    fn eq(&self, other: &Document) -> bool {
+        self.0.canonical() == other.0.canonical()
+    }
+}
+
+impl Eq for Document {}
+
+impl Field for Document {
+    fn to_value(&self) -> Value {
+        self.0.clone()
+    }
+    fn from_value(v: &Value) -> Option<Self> {
+        v.as_object().map(|_| Document(v.clone()))
+    }
+}
+
 impl<T: Field> Field for Option<T> {
     fn to_value(&self) -> Value {
         match self {
@@ -250,6 +272,20 @@ mod tests {
             v.canonical(),
             r#"{"a":"x\"y\n\u0001","b":2,"c":[null,true]}"#
         );
+    }
+
+    #[test]
+    fn documents_compare_by_canonical_text_and_must_be_objects() {
+        let a = Document(Value::object([
+            ("x", Value::int(1)),
+            ("y", Value::Float(f64::NAN)),
+        ]));
+        let b = Document(Value::object([("y", Value::Null), ("x", Value::int(1))]));
+        assert_eq!(a, b, "NaN is written as null, so the two read the same");
+        assert_ne!(a, Document(Value::object([("x", Value::int(2))])));
+        assert_eq!(Document::from_value(&a.to_value()), Some(a));
+        assert_eq!(Document::from_value(&Value::str("x")), None);
+        assert_eq!(Document::from_value(&Value::Null), None);
     }
 
     #[test]

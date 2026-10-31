@@ -3,7 +3,7 @@
 
 use crate::ids::{ApprovalId, DecisionId, EvidenceId, GoalId, RunId, Sha, TaskId, WorkerName};
 use crate::status::{BlockKind, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
-use crate::value::{Field, Value};
+use crate::value::{Document, Field, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -148,9 +148,9 @@ define_events! {
     GoalStatusChanged = "goal_status_changed" {
         goal: GoalId, from: GoalStatus, to: GoalStatus, reason: String,
     },
-    /// A verification contract became the acceptance criteria of a goal. `contract` is its
-    /// canonical JSON, `contract_id` the SHA-256 of that text.
-    CriteriaAttached = "criteria_attached" { goal: GoalId, contract_id: String, contract: String },
+    /// A verification contract became the acceptance criteria of a goal. `contract` is the
+    /// contract document, `contract_id` the SHA-256 of its canonical text.
+    CriteriaAttached = "criteria_attached" { goal: GoalId, contract_id: String, contract: Document },
     /// One check of a contract was run by fleet itself. Immutable once recorded.
     EvidenceRecorded = "evidence_recorded" {
         id: EvidenceId, goal: GoalId, run: Option<RunId>, task: Option<TaskId>, contract_id: String,
@@ -375,7 +375,7 @@ mod tests {
             DomainEvent::CriteriaAttached {
                 goal: GoalId::parse("ship").unwrap(),
                 contract_id: "ab".repeat(32),
-                contract: "{\"checks\":[],\"version\":1}".into(),
+                contract: Document(Value::object([("version", Value::int(1))])),
             },
             DomainEvent::EvidenceRecorded {
                 id: EvidenceId::from_seq(3),
