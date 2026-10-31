@@ -1,8 +1,8 @@
 //! Domain events: the facts the system records. State is rebuilt by applying them in order, and
 //! the audit log is their serialized form, so the field names here are a stable format.
 
-use crate::ids::{ApprovalId, DecisionId, RunId, Sha, TaskId, WorkerName};
-use crate::status::{BlockKind, DecisionKind, EndKind, Purpose};
+use crate::ids::{ApprovalId, DecisionId, EvidenceId, GoalId, RunId, Sha, TaskId, WorkerName};
+use crate::status::{BlockKind, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
 use crate::value::{Field, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -140,6 +140,23 @@ define_events! {
     OrphanReconciled = "orphan_reconciled" { run: RunId, task: TaskId, action: String },
     WorktreeRemoved = "worktree_removed" { run: RunId, task: TaskId },
     Warning = "warning" { message: String },
+    /// A goal joined the ledger. `tasks` are `run/task` references of the tasks that work on it.
+    GoalAdded = "goal_added" {
+        goal: GoalId, parent: Option<GoalId>, title: String, intent: String, tasks: Vec<String>,
+    },
+    /// A goal changed status: by an operator, or by the ledger when evidence settled it.
+    GoalStatusChanged = "goal_status_changed" {
+        goal: GoalId, from: GoalStatus, to: GoalStatus, reason: String,
+    },
+    /// A verification contract became the acceptance criteria of a goal. `contract` is its
+    /// canonical JSON, `contract_id` the SHA-256 of that text.
+    CriteriaAttached = "criteria_attached" { goal: GoalId, contract_id: String, contract: String },
+    /// One check of a contract was run by fleet itself. Immutable once recorded.
+    EvidenceRecorded = "evidence_recorded" {
+        id: EvidenceId, goal: GoalId, run: Option<RunId>, task: Option<TaskId>, contract_id: String,
+        check: String, verdict: Verdict, exit_code: Option<i64>, summary: String, output: String,
+        commit: Option<Sha>, at_ms: u64,
+    },
 }
 
 impl DomainEvent {
@@ -171,6 +188,7 @@ impl DomainEvent {
             | CheckpointRecorded { run, .. }
             | OrphanReconciled { run, .. }
             | WorktreeRemoved { run, .. } => Some(run),
+            EvidenceRecorded { run, .. } => run.as_ref(),
             DaemonStarted { .. }
             | DecisionResolved { .. }
             | ApprovalDecided { .. }
@@ -178,6 +196,9 @@ impl DomainEvent {
             | ApprovalConsumed { .. }
             | ExternalCommandStarted { .. }
             | ExternalCommandRan { .. }
+            | GoalAdded { .. }
+            | GoalStatusChanged { .. }
+            | CriteriaAttached { .. }
             | Warning { .. } => None,
         }
     }
@@ -257,6 +278,16 @@ impl DomainEvent {
             OrphanReconciled { run, task, action } => format!("{run}/{task} orphan: {action}"),
             WorktreeRemoved { run, task } => format!("{run}/{task} worktree removed"),
             Warning { .. } => "warning".to_string(),
+            GoalAdded { goal, .. } => format!("goal {goal} added"),
+            GoalStatusChanged { goal, to, .. } => format!("goal {goal} is {to}"),
+            CriteriaAttached { goal, .. } => format!("goal {goal} got a verification contract"),
+            EvidenceRecorded {
+                id,
+                goal,
+                check,
+                verdict,
+                ..
+            } => format!("evidence {id}: goal {goal} check {} {verdict}", crate::ids::show(check)),
         }
     }
 }
@@ -324,6 +355,38 @@ mod tests {
                 run: run(),
                 task: task(),
                 merge_sha: Sha::parse(&"a".repeat(40)).unwrap(),
+            },
+            DomainEvent::GoalAdded {
+                goal: GoalId::parse("ship").unwrap(),
+                parent: Some(GoalId::parse("root").unwrap()),
+                title: "Ship it".into(),
+                intent: "line1\nline2".into(),
+                tasks: vec!["r1/t1".into()],
+            },
+            DomainEvent::GoalStatusChanged {
+                goal: GoalId::parse("ship").unwrap(),
+                from: GoalStatus::Open,
+                to: GoalStatus::Verified,
+                reason: "evidence".into(),
+            },
+            DomainEvent::CriteriaAttached {
+                goal: GoalId::parse("ship").unwrap(),
+                contract_id: "ab".repeat(32),
+                contract: "{\"checks\":[],\"version\":1}".into(),
+            },
+            DomainEvent::EvidenceRecorded {
+                id: EvidenceId::from_seq(3),
+                goal: GoalId::parse("ship").unwrap(),
+                run: Some(run()),
+                task: Some(task()),
+                contract_id: "ab".repeat(32),
+                check: "tests".into(),
+                verdict: Verdict::Failed,
+                exit_code: Some(1),
+                summary: "exit code 1".into(),
+                output: "boom".into(),
+                commit: Some(Sha::parse(&"c".repeat(40)).unwrap()),
+                at_ms: 99,
             },
             DomainEvent::Warning {
                 message: "w".into(),
@@ -400,6 +463,39 @@ mod tests {
             .run(),
             None
         );
+    }
+
+    #[test]
+    fn goal_events_name_a_run_only_through_evidence() {
+        let added = DomainEvent::GoalAdded {
+            goal: GoalId::parse("g").unwrap(),
+            parent: None,
+            title: "t".into(),
+            intent: String::new(),
+            tasks: vec![],
+        };
+        assert_eq!(added.run(), None);
+        let evidence = |run: Option<RunId>| DomainEvent::EvidenceRecorded {
+            id: EvidenceId::from_seq(1),
+            goal: GoalId::parse("g").unwrap(),
+            run,
+            task: None,
+            contract_id: "0".repeat(64),
+            check: "c".into(),
+            verdict: Verdict::Passed,
+            exit_code: Some(0),
+            summary: String::new(),
+            output: String::new(),
+            commit: None,
+            at_ms: 1,
+        };
+        assert_eq!(evidence(Some(run())).run(), Some(&run()));
+        assert_eq!(evidence(None).run(), None);
+        assert_eq!(
+            evidence(None).headline(),
+            "evidence e1: goal g check \"c\" passed"
+        );
+        assert_eq!(added.headline(), "goal g added");
     }
 
     #[test]
