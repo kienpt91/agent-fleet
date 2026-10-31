@@ -47,6 +47,12 @@ line and the README. When a word is used in one of those places with another mea
 | **Export** | A fresh private directory holding exactly the files of one commit (no worktree state, no git state, no outward links), in which verification checks run. |
 | **Job origin** | The process groups of the children the daemon runs on behalf of workers (gates, approved commands, checks, the undo tool, git) and their detached descendants, listed in the one shared job tracker: refused by the origin check on the control socket and on the web port, like workers. |
 | **Task verification** | How a task stands with regard to its contracts: `none`, `pending` (the worker is not done), `unverified` (the worker reported or the task is in review, and fleet has no passing evidence), `failed`, `verified`. |
+| **Host** | A remote machine a task may run its worker on (`[hosts.<name>]` in `fleet.toml`, `fleet_app::hosts::HostDef`): address, port, user, the operator's key file for it, a base directory on it, the worker commands allowed there, a session limit and the explicit environment its workers get. Only the worker's *process* is remote; the task's worktree, branch, gates, verification and merge stay local. |
+| **Host key pin** | The one public key of a host that the operator confirmed with `fleet host trust`, in `<state>/hosts/<name>.known_hosts` (0600). Every connection checks the host against it and nothing else; a host without a pin is not connected to, a changed key is refused. |
+| **Remote worktree** | `<base_dir>/<run>/<task>` on a host: a fresh git repository made from a bundle of the task branch's head tree, removed when the attempt ends. Never the source of anything fleet decides on. |
+| **Remote call** | One of the closed set of commands fleet may run on a host (`fleet_domain::remote::RemoteCall`): `/usr/bin/env -i <explicit variables> <git, an allowed worker command or /bin/sh -c <constant script>> ...`, every word quoted by one function. There is no way to pass a command line. |
+| **Quarantine ref** | `refs/fleet-remote/<run>/<task>/{sent,return}` in the local repository: where the commit that was sent and the commits a host returned are held while they are checked. Dropped when the attempt's collect ends. |
+| **Remote session** | The session of a remote task: the local `ssh -tt` client in a local pty (so the sanitizer, ring buffer, redaction, limits and origin rule apply as to any worker) plus the prepare and collect steps around it (`fleet_app::remote::RemoteSessions`). Reported as ended only after its work was collected. |
 | **Remaining** | What is left: open leaves (goals with nothing but their own criteria between them and `verified`), blockers (blocked goals, blocked or failed tasks of unfinished goals) and the tasks that can start next. |
 
 ## Layers and the dependency rule
@@ -83,6 +89,9 @@ flowchart LR
   subgraph Quality
     QG[Quality gate judgement]
   end
+  subgraph Remote
+    RH[Hosts, remote calls, remote session]
+  end
   subgraph Supervision
     PI[Process identity]
     KE[Kill escalation]
@@ -103,6 +112,8 @@ flowchart LR
   Decisions -- "unblocks task" --> Orchestration
   Orchestration -- "gate outcomes" --> Quality
   Orchestration -- "worker end" --> Supervision
+  Orchestration -- "task names a host" --> Remote
+  Remote -- "verified work as a local commit" --> Orchestration
   Orchestration -- "every change" --> Audit
   Decisions -- "every change" --> Audit
   Goals -- "contract to run" --> Verification
@@ -120,6 +131,7 @@ flowchart LR
 | Supervision | `ProcessIdentity`, `SupervisionPolicy`, `KillEscalation`, `is_worker_origin`, `OutputBuffer`, `Sanitizer`, `Redactor` | Supplier of facts (how a session ended) consumed by Orchestration. |
 | Audit | `DomainEvent`, `chain` | Published language: every other context records its facts as events. |
 | Goals | `Ledger`, `Goal` (`neo-goals`) | Customer of Verification: a goal is verified when the contract's state is `passed` and its children are verified. Linked to tasks by `run/task` names only. |
+| Remote hosts | `HostDef`, `RemoteCall`, `RemoteLayout`, `quote` (`fleet-domain::remote`, `fleet-app::hosts`), `RemoteHost` port, `RemoteSessions` | Supplier to Orchestration (it runs a task's worker elsewhere and brings the work back); Conformist to OpenSSH and to git for the transfer. Nothing it returns decides anything until the local repository has verified it. |
 | Verification | `VerificationContract`, `Check`, `Evidence`, `judge`, `Glob` (`neo-verify`) | Supplier to Goals and, through the review flow, to Orchestration: a governed task completes only after a passing run. Conformist for `refcheck-json` (same judgement as the quality gate). |
 
 Anti-corruption: git, the pty library, the optional undo tool and the refcheck report format are

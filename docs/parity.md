@@ -28,7 +28,7 @@ phases that are still to be built.
 | not planned | Deliberately out of scope. Section 5 gives reasons. |
 
 agent-fleet is a headless daemon plus a CLI, a terminal dashboard and (phase 2) a local web dashboard. It has no
-desktop GUI application, no editor, no embedded browser, no GitHub or Linear integration, no SSH worktrees and no
+desktop GUI application, no editor, no embedded browser, no GitHub or Linear integration, SSH worktrees only through the system's OpenSSH client (phase 3c) and no
 mobile app.
 
 ## 3. Matrix
@@ -68,7 +68,7 @@ mobile app.
 | Rich previews (Markdown, images, PDF) | not planned | none | Listed in public docs summary. |
 | GitHub integration (PRs, issues) | planned | none | Phase 3. |
 | Linear integration (issues, boards) | planned | none | Phase 3. |
-| SSH remote worktrees | planned | none | Phase 3. |
+| SSH remote worktrees | implemented | `fleet-infra/tests/ssh_remote.rs` (a real sshd: pinning, wrong key, forwarding, quoting, kill escalation, keepalive, jump host, the `RemoteHost` contract), `fleet-cli/tests/e2e_remote.rs` (the real binary and daemon), `scripts/ssh-demo.sh` (output in the README), ADR 17 | Compared 2026-10-31. Phase 3c: `fleet host add/list/trust/remove/doctor`, `[hosts.<name>]`, `task add --host`; host key pinning by an explicit operator step, no agent forwarding, bounded remote output, bundle transfer verified before use. Criteria 6-10 of phase 3 are met by tests against a local sshd; not verified on macOS, with real accounts or with real agents (owner-verified). Agent forwarding is not offered at all. |
 | Self-hosted server or cloud VM runtime | not planned | none | The daemon is local only (unix socket, loopback web). Listed in public docs summary. |
 | Embedded browser with element capture and design mode | planned | none | Phase 4. |
 | Mobile companion | planned | none | Phase 4. |
@@ -142,7 +142,7 @@ Acceptance criteria (each must be a test or a documented manual check recorded i
 5. Text from issues, pull requests and comments is treated as untrusted (sanitized, redacted, quoted in briefs).
 6. SSH worktrees pin the host key (no trust-on-first-use without an explicit operator step) and refuse a changed
    key.
-7. SSH agent forwarding is off by default and only enabled by an explicit per-host setting.
+7. SSH agent forwarding is off by default and only enabled by an explicit per-host setting. (Phase 3c implements the stricter variant: there is no setting that enables it; the key of the host entry is the only credential.)
 8. Remote workers are subject to the same admission, environment allowlist, sanitization, redaction and output
    bounds as local workers; a test runs the same hostile-output cases against a remote session.
 9. Remote output and remote command duration are bounded (size and time limits) and a stalled connection ends in

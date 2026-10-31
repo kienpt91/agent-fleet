@@ -53,6 +53,9 @@ What the design tries to guarantee, and where it is tested:
 
 ## Known limitations (read these)
 
+- **Remote workers** run with the full rights of their remote account, and a returned tree is verified for form (paths, size,
+  ancestry, object integrity), not for *content*: a hostile tree is as hostile as a local worker's output. See "Remote hosts"
+  below for the list of what is and is not fleet's job.
 - **Workers are not sandboxed.** A worker runs as you. It can read your `HOME`, write the repository's shared
   `.git` directory, start any program and open network connections. fleet limits what it *shares*
   (environment, socket, state directory) and what it can make *the daemon* do, not what the worker can do to
@@ -176,6 +179,58 @@ What the design tries to guarantee, and where it is tested:
 - **Quality gates and approved commands share the job-origin protection but not the export.** They run in the worktree, as
   before; their processes (like those of the undo tool and git) are listed in the shared tracker and refused by the origin
   check on the control socket and on the web port.
+
+## Remote hosts (SSH remote worktrees)
+
+A task that names a host (`task add --host build`, or `host = "build"` in a plan) runs its worker on that machine through the
+system's OpenSSH client. ADR 17 has the design; this section is what it means for security.
+
+**What the remote worker can do.** It runs **as the remote user of that host entry, with that user's full rights on that
+machine**: read and write everything that user can, start any program, open network connections (including to other machines
+that user can reach), keep processes running after the attempt and read whatever the host exposes to that account. It is not
+sandboxed there any more than a local worker is here. `allowed_workers` limits only which *command* fleet starts; the worker
+that was started can run anything. What fleet gives up when a worker runs remotely: nothing it had for local workers (its output,
+its files and its commits are untrusted exactly the same); what is new is that the machine itself is part of the attack surface.
+
+**What fleet does about the transport.**
+
+| Property | How | Tests |
+| --- | --- | --- |
+| The host is the host the operator confirmed | One plain key per host in `<state>/hosts/<name>.known_hosts` (0600), written only by `fleet host trust`, which shows the fingerprint and needs a terminal and the word `yes`; ssh runs with `StrictHostKeyChecking=yes`, only that file, `GlobalKnownHostsFile=/dev/null`, `UpdateHostKeys=no`; an unpinned host is not connected to at all; a changed key is refused with a message that says so and nothing is sent. Trust on first use does not exist. | `ssh_remote.rs::first_use_without_a_pin_is_refused_before_any_connection`, `a_changed_host_key_is_refused_with_a_clear_error_and_nothing_is_sent`, `e2e_remote.rs::adding_listing_trusting_checking_and_removing_a_host` |
+| Only the operator's key for that host is used, and nothing else | `IdentitiesOnly=yes` with the key file named in the host entry, `IdentityAgent=none`, `-F /dev/null` (no user ssh config), no agent socket, display or askpass in the client's environment, `BatchMode`, password and keyboard-interactive and host-based and GSSAPI methods off | `ssh_remote.rs::a_key_the_server_does_not_accept_is_refused`, `forwarding_agent_display_and_environment_do_not_reach_the_remote`, `fleet-infra/src/ssh/argv.rs` tests |
+| No forwarding, no local command, no multiplexing | `ForwardAgent=no`, `ForwardX11=no`, `ClearAllForwardings=yes`, `PermitLocalCommand=no`, `Tunnel=no`, `ControlMaster=no`, `ControlPath=none`; a `-R` that is added to the command line is overridden and the server's port stays closed (the test server allows all forwarding on purpose) | `ssh_remote.rs::forwarding_agent_display_and_environment_do_not_reach_the_remote` |
+| No local shell and no proxy unless the operator wrote one | The client is started with a fixed argument list (`ssh/argv.rs`, the only place that writes ssh options; `ssh/exec.rs` the only place that starts it). A jump host is configured by name; its hop is a second client with the jump host's own key and pin (a `ProxyCommand` built from validated shell-inert words; `ProxyJump` would use the user's default known_hosts and keys). Host names, users, ports and paths are validated to narrow character sets | `fleet-cli/tests/architecture.rs::only_the_executor_starts_the_ssh_client_and_no_shell_is_involved`, `ssh_remote.rs::a_jump_host_hop_uses_the_same_strict_options_and_its_processes_are_refused_as_origin`, `fleet-domain/src/remote.rs` tests |
+| The remote command line cannot be bent by a hostile worker command, argument or path | A closed set of calls (`RemoteCall`); every word through one quoting function; the worker command must be on the host's list; remote paths are `<base>/<run>/<task>` with ids that are `[a-z0-9_-]` and a base without `.` or `..`; scripts are constants that take data as positional parameters; the whole call runs under `env -i` | property tests in `fleet-domain/src/remote.rs`, `ssh_remote.rs::hostile_arguments_reach_the_remote_program_unchanged`, `random_hostile_arguments_survive_the_real_shell` |
+| The remote environment holds only what the operator wrote | `[hosts.<name>.env]` plus `FLEET_*`, `PATH` and `TERM`; nothing is copied from the daemon's environment (not even what `[env] allow` lets local workers see), the worker's `env_pass` and `env_set` are not sent, no `SendEnv` | `fleet-app/tests/remote.rs`, `ssh_remote.rs::the_remote_worker_sees_only_explicit_variables_and_no_local_secret`, `e2e_remote.rs::a_remote_worker_gets_only_the_hosts_explicit_variables_never_the_daemons_environment` |
+| What a host returns is verified before anything uses it | The bundle is fetched into a quarantine ref and must name exactly one ref, pass `git fsck --strict`, descend from the commit that was sent, touch no `.git`-like or `.fleet` path and stay within the commit, path, file and byte limits; the local worktree must be clean and the branch unmoved. Only the verified **tree** is used, as one new commit by fleet. Gates run locally in that worktree and verification contracts on an export of the commit; evidence and merges use the commit read from the local repository (ADR 16) | `fleet-infra/src/git/remote_sync.rs` tests (unrelated history, `.fleet`, a `.git` tree entry, extra refs, a moved branch, a dirty worktree, garbage), `ssh_remote.rs::a_hostile_remote_that_returns_unrelated_history_or_forbidden_paths_is_refused`, `e2e_remote.rs::quality_gates_run_locally_on_the_verified_commit_never_on_the_host` |
+| A remote worker's output is as bounded and as clean as a local one's | It is the output of a local pty process, through the same sanitizer, ring buffer, redaction and origin rule | `ssh_remote.rs::sessions::a_remote_worker_runs_in_a_local_terminal_with_sanitized_bounded_redacted_output`, `e2e_remote.rs::a_flood_of_output_from_the_host_is_bounded_like_local_output` |
+| A hung or slow host ends an attempt and never hangs the daemon | `ConnectTimeout`, `ServerAliveInterval/CountMax`; every non-terminal call has a total time, a silence limit and byte caps; a host that could not be reached is not tried again for 30 s; the worker's own idle and total limits apply to the terminal session; collecting and signalling run on helper threads | `ssh_remote.rs::a_connection_that_never_answers_ends_as_a_timed_out_call_not_a_hang`, `sessions::a_frozen_server_ends_the_attempt_through_the_keepalive_not_a_hang`, `e2e_remote.rs::a_remote_worker_that_hangs_is_stopped_by_the_idle_limit_and_dies_on_the_host` |
+| A stopped remote worker is stopped on the host | Stop sends TERM then KILL to the remote process group (recorded in a process-id file) and to the local client; at the end of every session the group is killed before the work is committed | `ssh_remote.rs::a_remote_worker_that_ignores_term_and_hangup_is_stopped_by_the_remote_kill`, `sessions::stopping_a_remote_worker_that_ignores_term_and_hangup_kills_it_on_the_host_too` |
+| Leftovers of a dead daemon are cleaned and reported | Each remote worktree is listed in `<state>/remote/live/` while it exists; at start the group is killed and the directory removed (bounded time), the result goes to the activity feed; a host that is down keeps its entries for the next start | `ssh_remote.rs::reconciliation_removes_what_a_dead_daemon_left_and_says_so`, `e2e_remote.rs::a_daemon_that_died_leaves_a_remote_worker_and_worktree_that_the_next_start_cleans_up` |
+| The ssh client and what it starts are kept off the control plane | Non-terminal calls register their process group in the shared `JobTracker` (descendants followed, including a jump host's client); the terminal client is a live worker session; both are refused as origin on the control socket and the web port (ADR 15) | `ssh_remote.rs::a_jump_host_hop_uses_the_same_strict_options_and_its_processes_are_refused_as_origin`, `sessions::stopping_a_remote_worker_...` (live session), `fleet-infra/src/ssh/exec.rs` tests |
+| The ssh program is not one a worker planted | Resolved once at daemon start: absolute entries of `PATH` (or `[remote] ssh`), canonical path, not inside a git work tree or below `.fleet-worktrees`, not writable by group or others, its directory neither, owned by root or the user; OpenSSH 7.6 or newer | `fleet-infra/src/ssh/binary.rs` tests, `ssh/doctor.rs` |
+
+**What stays the operator's responsibility.**
+- **The remote account.** Give fleet its own unprivileged user on the host, with a key that is only for fleet and a base
+  directory that nobody else uses. A host entry for `root`, for your own login or for an account with other keys, agents or
+  cloud credentials gives a worker all of that (`fleet host doctor` says so when the user is root). A worker can read the
+  other files of that account, including `~/.ssh` and anything in `/tmp`.
+- **The key.** The identity file is a long-lived credential for that account; keep it 0600, give it a passphrase-less key
+  *only* because fleet cannot answer a prompt (`BatchMode`), and use `command=`/`from=` restrictions in the host's
+  `authorized_keys` where you can. A worker on **this** machine can read the identity file (it is your file); a stolen key gets
+  its holder onto the host as that account.
+- **Comparing the fingerprint.** `fleet host trust` is only as good as the comparison you make over another channel. A key you
+  confirm without comparing is trust on first use, by your decision.
+- **The host's own security:** its login shell must be POSIX (`fleet host doctor` refuses others), its sshd configuration
+  (`ForceCommand`, `AcceptEnv`) and its patching are outside fleet. A worker that daemonizes or calls `setsid` on the host
+  escapes the process-group kill (as a local one does); fleet removes the directory but cannot hunt such processes.
+- **Network exposure.** Traffic is as private as ssh makes it; the host learns your task's source tree (the whole tree of the
+  task branch is sent) and anything the worker is given. Do not send trees that must not leave this machine.
+- **Disk and CPU on the host.** A bundle is bounded (`max_bundle_mib`) and the returned tree is bounded (100k files, 1 GiB), but
+  a worker can fill the host's disk or run it out of memory like it can here. A hostile host can make fleet fetch up to
+  `max_bundle_mib` of objects that then stay as unreachable objects in the repository until `git gc` runs.
+- **Not verified here:** macOS as the local or the remote system, real accounts, real agents, an OpenSSH other than the one in
+  the test image (9.2), `ssh-agent`-based setups (deliberately unsupported).
 
 ## Dependency policy
 
