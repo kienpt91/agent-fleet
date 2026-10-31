@@ -10,16 +10,18 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod approval;
+pub mod contract;
+pub mod dag;
+pub mod decision;
 pub mod error;
 pub mod events;
 pub mod ids;
 pub mod limits;
 pub mod output;
+pub mod quality;
 pub mod redact;
 pub mod sanitize;
 pub mod status;
-pub mod value;
-pub mod dag;
-pub mod quality;
 pub mod supervision;
-pub mod contract;
+pub mod value;
