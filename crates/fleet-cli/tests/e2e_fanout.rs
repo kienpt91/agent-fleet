@@ -227,7 +227,7 @@ fn compare_shows_facts_from_the_daemon_the_printed_rule_and_the_overlap() {
     assert!(jarr(d(&first, "verification"), "checks")
         .iter()
         .all(|c| jstr(c, "status") == "verified"));
-    assert_eq!(jbool(d(&first, "scope"), "in_scope"), true);
+    assert!(jbool(d(&first, "scope"), "in_scope"));
     assert_eq!(jnum(d(&first, "diff"), "files"), 2);
     assert_eq!(jnum(d(&first, "diff"), "insertions"), 2);
     assert_eq!(jstr(&first, "head").len(), 40);
@@ -248,7 +248,7 @@ fn compare_shows_facts_from_the_daemon_the_printed_rule_and_the_overlap() {
     assert!(jstr(&wrong, "summary").contains("ALL CHECKS PASSED"));
 
     let stray = member(&cmp, "fan1-3");
-    assert_eq!(jbool(d(&stray, "scope"), "in_scope"), false);
+    assert!(!jbool(d(&stray, "scope"), "in_scope"));
     let report = &jarr(d(&stray, "scope"), "checks")[0];
     assert_eq!(jarr(report, "outside")[0].as_str(), Some("README.md"));
     assert!(jarr(report, "allowed_touched")
@@ -453,7 +453,7 @@ fn an_approval_is_not_good_for_a_branch_that_moved_after_it() {
     assert_eq!(jstr(&group(&f), "status"), "finished");
     // and the comparison says why
     let m = member(&compare(&f), "fan1-4");
-    assert_eq!(jbool(&m, "branch_moved"), true);
+    assert!(jbool(&m, "branch_moved"));
     assert_eq!(
         jstr(d(&m, "verification"), "status"),
         "verified",
@@ -473,7 +473,7 @@ fn unverified_evidence_is_picked_only_with_the_flag_and_the_approval_says_so() {
     let cmp = compare(&f);
     assert!(jarr(&cmp, "members")
         .iter()
-        .all(|m| jstr(d(&m, "verification"), "status") == "unverified"));
+        .all(|m| jstr(d(m, "verification"), "status") == "unverified"));
     assert!(jstr(d(&member(&cmp, "fan1-1"), "verification"), "reason")
         .contains("no verification contract"));
     let refused = f.cli(&["pick", "fan1", "fan1-1"]);
