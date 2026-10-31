@@ -26,7 +26,7 @@ use fleet_app::orchestrator::Orchestrator;
 use fleet_app::ports::{EventPublisher, Ports, StoredEvent};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::MAX_CONCURRENT_JOBS;
-use fleet_domain::supervision::{is_started_by_daemon, is_worker_origin, LiveSession, ProcInfo};
+use fleet_domain::supervision::{is_started_by_daemon, is_worker_origin, Lineage, LiveSession};
 use fleet_domain::value::Value;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -401,7 +401,7 @@ impl DaemonHandler {
         // or git has running (the shared `JobTracker`), also the descendants that left their
         // group; see `Orchestrator::live_sessions`.
         let live = self.ask(|reply| EngineMsg::Live { reply })?;
-        decide_origin(peer, &live, std::process::id(), procid::ancestry)
+        decide_origin(peer, &live, std::process::id(), procid::lineage)
     }
 
     /// A repository that contains the state directory would let workers read the daemon's
@@ -493,14 +493,14 @@ fn decide_origin(
     peer: &PeerInfo,
     live: &[LiveSession],
     daemon_pid: u32,
-    ancestry: impl FnOnce(u32) -> Vec<ProcInfo>,
+    lineage: impl FnOnce(u32) -> Lineage,
 ) -> Result<()> {
     let Some(pid) = peer.pid else {
         return Err(FleetError::forbidden(
             "the connecting process could not be identified; refusing the connection",
         ));
     };
-    let chain = ancestry(pid);
+    let Lineage { chain, complete } = lineage(pid);
     if chain.first().map(|p| p.pid) != Some(pid) {
         return Err(FleetError::forbidden(
             "the connecting process has exited or cannot be inspected; refusing the connection",
@@ -509,6 +509,15 @@ fn decide_origin(
     if is_worker_origin(&chain, live) || is_started_by_daemon(&chain, daemon_pid) {
         return Err(FleetError::forbidden(
             "requests from worker processes are refused; approvals and decisions are made by a person",
+        ));
+    }
+    // The walk found no worker and not the daemon, but only a walk that reached the root of the
+    // process tree can say the daemon is not further up: a deep chain (a check that nests 70
+    // shells and detaches the leaf) or an ancestor that vanished mid-read is refused, as an
+    // unreadable peer is.
+    if !complete {
+        return Err(FleetError::forbidden(
+            "the ancestry of the connecting process could not be read to its root (it is very deep or changed while it was read); refusing the connection, try again",
         ));
     }
     Ok(())
@@ -640,6 +649,7 @@ impl AttachSession for PtyAttach {
 mod tests {
     use super::*;
     use fleet_domain::error::ErrorCode;
+    use fleet_domain::supervision::ProcInfo;
 
     fn peer(pid: Option<u32>) -> PeerInfo {
         PeerInfo { uid: Some(0), pid }
@@ -658,7 +668,14 @@ mod tests {
 
     /// The process table of a pretend machine: `fleet` (900) run by a shell (800), and `fleet`
     /// (901) started by the worker's own shell script (600) below the worker (500).
-    fn table(pid: u32) -> Vec<ProcInfo> {
+    fn table(pid: u32) -> Lineage {
+        Lineage {
+            chain: chain_of(pid),
+            complete: true,
+        }
+    }
+
+    fn chain_of(pid: u32) -> Vec<ProcInfo> {
         match pid {
             900 => vec![info(900, 800, 800), info(800, 100, 800)],
             901 => vec![info(901, 600, 500), info(600, 500, 500), info(500, 1, 500)],
@@ -780,6 +797,59 @@ mod tests {
     }
 
     #[test]
+    fn a_lineage_that_was_not_read_to_its_root_is_refused() {
+        // nothing in the chain says worker or daemon, but the walk stopped before init: a check that
+        // nests more processes than the cap and detaches the leaf, or a parent that vanished
+        let cut = |pid: u32| Lineage {
+            chain: vec![info(pid, 4000, pid), info(4000, 4001, 4000)],
+            complete: false,
+        };
+        let message = refused(decide_origin(&peer(Some(910)), &[], DAEMON, cut));
+        assert!(
+            message.contains("could not be read to its root"),
+            "{message}"
+        );
+        // the same chain, read to the root, is an ordinary process of the operator's
+        let whole = |pid: u32| Lineage {
+            chain: vec![info(pid, 4000, pid), info(4000, 1, 4000), info(1, 0, 1)],
+            complete: true,
+        };
+        assert!(decide_origin(&peer(Some(910)), &[], DAEMON, whole).is_ok());
+        // a cut walk that already shows a worker or the daemon says so, whichever rule is first
+        let cut_but_known = |pid: u32| Lineage {
+            chain: vec![info(pid, DAEMON, pid), info(DAEMON, 4001, 80)],
+            complete: false,
+        };
+        assert!(
+            refused(decide_origin(&peer(Some(911)), &[], DAEMON, cut_but_known))
+                .contains("worker processes")
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_is_init_of_its_namespace_still_refuses_what_it_started() {
+        // a container entrypoint: pid 1. A gate it started, and what init adopted, are its own...
+        let in_container = |pid: u32| match pid {
+            700 => Lineage {
+                chain: vec![info(700, 1, 700), info(1, 0, 1)],
+                complete: true,
+            },
+            // ...and a process that came in from outside (docker exec) has a parent outside
+            901 => Lineage {
+                chain: vec![info(901, 0, 901)],
+                complete: true,
+            },
+            _ => Lineage {
+                chain: Vec::new(),
+                complete: false,
+            },
+        };
+        let message = refused(decide_origin(&peer(Some(700)), &[], 1, in_container));
+        assert!(message.contains("worker processes"), "{message}");
+        assert!(decide_origin(&peer(Some(901)), &[], 1, in_container).is_ok());
+    }
+
+    #[test]
     fn everything_the_daemon_started_is_refused_even_with_no_worker_running() {
         // a gate, the script a gate runs, and a leftover of a gate's group that init adopted
         let gate_group = [LiveSession {
@@ -816,14 +886,14 @@ mod tests {
             &peer(Some(pid)),
             &[],
             DAEMON,
-            procid::ancestry,
+            procid::lineage,
         ));
         assert!(message.contains("exited"), "{message}");
         assert!(decide_origin(
             &peer(Some(std::process::id())),
             &[],
             DAEMON,
-            procid::ancestry
+            procid::lineage
         )
         .is_ok());
     }
@@ -839,7 +909,10 @@ mod tests {
             assert!(message.contains("exited"), "{message}");
         }
         // a table that answers about some other process is not an answer about the peer
-        let wrong = |_pid: u32| vec![info(123, 1, 123)];
+        let wrong = |_pid: u32| Lineage {
+            chain: vec![info(123, 1, 123)],
+            complete: true,
+        };
         refused(decide_origin(&peer(Some(777)), &[WORKER], DAEMON, wrong));
     }
 

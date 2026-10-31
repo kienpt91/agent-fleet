@@ -164,6 +164,17 @@ pub struct ProcInfo {
     pub pgid: u32,
 }
 
+/// A process and its ancestors as read from the OS, nearest first, and whether the walk is
+/// *complete*: it ended at the root of the process tree (init, or a parent outside this pid
+/// namespace), not because of a cap on its length or because an ancestor could not be read (it
+/// exited while being read, or is hidden from this user). Only a complete lineage can say that
+/// the daemon is *not* among a process's ancestors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lineage {
+    pub chain: Vec<ProcInfo>,
+    pub complete: bool,
+}
+
 /// A worker session that is currently alive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveSession {
@@ -190,8 +201,13 @@ pub fn is_worker_origin(chain: &[ProcInfo], live: &[LiveSession]) -> bool {
 /// own commands are never started by the daemon. A process that leaves the tree (a double fork
 /// that is adopted by init, `setsid`) is not caught; callers combine this with
 /// [`is_worker_origin`] over the process groups of everything the daemon has running.
+///
+/// A daemon that is pid 1 of its pid namespace (a container entrypoint) works the same way: init
+/// is the last element of every lineage, so everything started inside the container, and every
+/// process orphaned inside it, counts as started by the daemon. A process that entered the
+/// namespace from outside (`docker exec`) has a parent outside it and does not.
 pub fn is_started_by_daemon(chain: &[ProcInfo], daemon_pid: u32) -> bool {
-    daemon_pid > 1 && chain.iter().skip(1).any(|p| p.pid == daemon_pid)
+    daemon_pid > 0 && chain.iter().skip(1).any(|p| p.pid == daemon_pid)
 }
 
 #[cfg(test)]
@@ -216,9 +232,14 @@ mod tests {
         // the daemon process itself (an in-process client, a test) is not "started by" itself
         assert!(!is_started_by_daemon(&[info(100, 50, 50)], 100));
         assert!(!is_started_by_daemon(&[], 100));
-        // pid 0 and 1 never stand for the daemon
+        // pid 0 never stands for the daemon
         assert!(!is_started_by_daemon(&gate_child, 0));
-        assert!(!is_started_by_daemon(&[info(5, 1, 5), info(1, 0, 1)], 1));
+        // a daemon that is init of its namespace: everything below it is its own, a process that
+        // came in from outside (its parent is not in the namespace) is not
+        let inside = [info(5, 1, 5), info(1, 0, 1)];
+        assert!(is_started_by_daemon(&inside, 1));
+        assert!(!is_started_by_daemon(&[info(9, 0, 9)], 1));
+        assert!(!is_started_by_daemon(&[info(1, 0, 1)], 1), "itself");
     }
 
     #[test]

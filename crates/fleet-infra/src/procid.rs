@@ -7,14 +7,15 @@
 //! as a group.
 
 use fleet_app::ports::SignalOutcome;
-use fleet_domain::supervision::{ProcInfo, ProcessIdentity};
+use fleet_domain::supervision::{Lineage, ProcInfo, ProcessIdentity};
 use nix::errno::Errno;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use std::time::{Duration, Instant};
 
-/// Longest ancestry chain followed when looking for a worker ancestor.
-const MAX_ANCESTRY: usize = 32;
+/// Longest ancestry chain followed when looking for a worker ancestor. A longer one is not a
+/// complete lineage (see [`Lineage`]) and is refused by the origin check.
+const MAX_ANCESTRY: usize = 64;
 
 #[cfg(target_os = "linux")]
 fn read_stat(pid: u32) -> Option<ProcStat> {
@@ -197,20 +198,52 @@ pub fn proc_info(pid: u32) -> Option<ProcInfo> {
     }
 }
 
-/// The process and its ancestors, nearest first, ending before pid 1.
-pub fn ancestry(pid: u32) -> Vec<ProcInfo> {
+/// The process and its ancestors, nearest first. The last element is pid 1 when the walk got
+/// there (it is not read from the OS, only recorded: reading it is unnecessary and may be
+/// forbidden where processes of other users are hidden). `complete` is true only when the walk
+/// reached init or a parent outside this pid namespace; a walk that stopped at the cap or at an
+/// ancestor that could not be read is not complete.
+pub fn lineage(pid: u32) -> Lineage {
     let mut chain = Vec::new();
+    if pid <= 1 {
+        return Lineage {
+            chain,
+            complete: false,
+        };
+    }
     let mut cur = pid;
-    while chain.len() < MAX_ANCESTRY && cur > 1 {
-        let Some(info) = proc_info(cur) else { break };
+    while chain.len() < MAX_ANCESTRY {
+        let Some(info) = proc_info(cur) else {
+            return Lineage {
+                chain,
+                complete: false,
+            };
+        };
         let next = info.ppid;
         chain.push(info);
-        if next == cur {
-            break;
+        if next == 0 || next == cur {
+            return Lineage {
+                chain,
+                complete: true,
+            };
+        }
+        if next == 1 {
+            chain.push(ProcInfo {
+                pid: 1,
+                ppid: 0,
+                pgid: 1,
+            });
+            return Lineage {
+                chain,
+                complete: true,
+            };
         }
         cur = next;
     }
-    chain
+    Lineage {
+        chain,
+        complete: false,
+    }
 }
 
 fn to_pid(pid: u32) -> Option<Pid> {
@@ -436,12 +469,80 @@ mod tests {
     }
 
     #[test]
-    fn ancestry_starts_with_the_process_itself_and_is_bounded() {
-        let chain = ancestry(std::process::id());
+    fn lineage_starts_with_the_process_itself_and_is_bounded() {
+        let Lineage { chain, .. } = lineage(std::process::id());
         assert_eq!(chain.first().map(|p| p.pid), Some(std::process::id()));
         assert!(chain.len() <= MAX_ANCESTRY);
-        assert!(ancestry(0).is_empty());
-        assert!(ancestry(1).is_empty());
+        assert!(lineage(0).chain.is_empty() && !lineage(0).complete);
+        assert!(lineage(1).chain.is_empty() && !lineage(1).complete);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_normal_lineage_is_complete_and_ends_at_init() {
+        let l = lineage(std::process::id());
+        assert!(l.complete, "{:?}", l.chain);
+        let last = l.chain.last().unwrap();
+        assert!(last.pid == 1 || last.ppid == 0, "{:?}", l.chain);
+    }
+
+    /// Starts `depth` nested subshells and returns the pid of a `sleep` at the bottom.
+    #[cfg(target_os = "linux")]
+    fn nested_sleeper(depth: u32) -> (std::process::Child, u32) {
+        use std::io::{BufRead, BufReader};
+        let script = format!(
+            "f() {{ if [ \"$1\" -le 0 ]; then sleep 60 & echo $!; wait; else ( f $(($1 - 1)) ); fi; }}; f {depth}"
+        );
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let pid = line.trim().parse().unwrap();
+        (child, pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lineage_that_hits_the_cap_is_not_complete_and_a_short_one_is() {
+        let (mut shallow, pid) = nested_sleeper(3);
+        let l = lineage(pid);
+        assert!(l.chain.len() >= 4, "{:?}", l.chain);
+        assert!(l.complete, "{:?}", l.chain);
+        assert!(
+            l.chain.iter().any(|p| p.pid == std::process::id()),
+            "this process is an ancestor"
+        );
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let _ = shallow.kill();
+        let _ = shallow.wait();
+
+        let (mut deep, pid) = nested_sleeper(MAX_ANCESTRY as u32 + 6);
+        let l = lineage(pid);
+        assert_eq!(l.chain.len(), MAX_ANCESTRY);
+        assert!(
+            !l.complete,
+            "a walk that was cut short must not look complete"
+        );
+        assert!(
+            !l.chain.iter().any(|p| p.pid == std::process::id()),
+            "the daemon (this process) is beyond the cap: exactly the case that must be refused"
+        );
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let _ = deep.kill();
+        let _ = deep.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lineage_that_cannot_be_read_is_not_complete() {
+        // a pid that does not exist
+        let l = lineage(4_194_000);
+        assert!(l.chain.is_empty() && !l.complete);
     }
 
     #[test]
