@@ -172,7 +172,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stat.binary_files, 1);
-        assert_eq!(stat.size(), 4);
+        assert_eq!(stat.size(), 4 + fleet_fanout::diff::BINARY_FILE_WEIGHT);
         let png = stat.changes.iter().find(|c| c.path == "logo.png").unwrap();
         assert!(png.binary);
         assert_eq!((png.insertions, png.deletions), (0, 0));
@@ -224,6 +224,7 @@ mod tests {
     fn a_mode_only_change_without_counts_is_a_modified_file_with_none() {
         let stat = parse(b"M\0script.sh\0", b"0\t0\tscript.sh\0").unwrap();
         assert_eq!(stat.files, 1);
-        assert_eq!(stat.size(), 0);
+        // no lines, but a change: it weighs what a change without lines weighs
+        assert_eq!(stat.size(), fleet_fanout::diff::LINELESS_CHANGE_WEIGHT);
     }
 }

@@ -181,7 +181,11 @@ fn binary_files_are_listed_without_line_counts() {
     let png = stat.changes.iter().find(|c| c.path == "logo.png").unwrap();
     assert!(png.binary);
     assert_eq!((png.insertions, png.deletions), (0, 0));
-    assert_eq!(stat.size(), 2, "only the text file adds lines");
+    assert_eq!(
+        stat.size(),
+        2 + fleet_fanout::diff::BINARY_FILE_WEIGHT,
+        "two lines of text and a binary file with its weight"
+    );
 }
 
 #[test]
