@@ -45,6 +45,8 @@ pub struct StateLayout {
     pub head: PathBuf,
     pub logs_dir: PathBuf,
     /// Where verification jobs export commits and give their checks a home (emptied at start).
+    /// **Outside the state directory** (see [`verify_scratch_dir`]): the working directory of a
+    /// check must not have the control token and socket as relatives.
     pub verify_dir: PathBuf,
     pub default_config: PathBuf,
     /// The control-socket capability token, next to the socket.
@@ -60,7 +62,7 @@ impl StateLayout {
             events: root.join("events.log"),
             head: root.join("events.head"),
             logs_dir: root.join("logs"),
-            verify_dir: root.join("verify"),
+            verify_dir: verify_scratch_dir(&root, nix::unistd::geteuid().as_raw()),
             default_config: root.join("fleet.toml"),
             token: control_dir.join(TOKEN_FILE),
             control_dir,
@@ -100,6 +102,22 @@ impl StateLayout {
         }
         Ok(())
     }
+}
+
+/// Where the exports of verification checks live for the daemon of state directory `root`:
+/// `<temp>/fleet-verify-<uid>/<first 16 hex of the sha256 of the state path>`. Not below `root`:
+/// the working directory of a check, `getcwd()` and `../..` would otherwise lead to the control
+/// token and socket. The name is derived from the state path, so a daemon that was killed leaves
+/// something the next one for the same state directory finds and removes; two state directories
+/// of one user do not share a directory. The directories are created private (0700, owned by
+/// this user) when the daemon starts.
+pub fn verify_scratch_dir(root: &Path, uid: u32) -> PathBuf {
+    use fleet_domain::approval::Digest as _;
+    let text = canonical_lenient(root);
+    let hash = crate::digest::Sha256Digest.sha256_hex(text.as_os_str().as_encoded_bytes());
+    std::env::temp_dir()
+        .join(format!("fleet-verify-{uid}"))
+        .join(hash.get(..16).unwrap_or(&hash))
 }
 
 /// Canonicalizes the longest existing prefix and appends the rest, so a state directory that
@@ -330,6 +348,44 @@ impl DaemonLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_verification_scratch_directory_is_outside_the_state_directory() {
+        let a = StateLayout::new(PathBuf::from("/var/lib/fleet-a"));
+        let b = StateLayout::new(PathBuf::from("/var/lib/fleet-b"));
+        for l in [&a, &b] {
+            assert!(
+                !l.verify_dir.starts_with(&l.root),
+                "{} is below {}",
+                l.verify_dir.display(),
+                l.root.display()
+            );
+            assert!(
+                !l.root.starts_with(&l.verify_dir),
+                "the state directory is below the scratch directory"
+            );
+            assert!(l.verify_dir.starts_with(std::env::temp_dir()));
+            // nothing in the path names the state directory or what lives in it
+            let shown = l.verify_dir.to_string_lossy().to_string();
+            assert!(
+                !shown.contains("fleet-a") && !shown.contains("fleet-b"),
+                "{shown}"
+            );
+            assert!(!shown.contains("control"), "{shown}");
+        }
+        // stable for one state directory (a restarted daemon finds what the last one left),
+        // different for two
+        assert_eq!(
+            a.verify_dir,
+            StateLayout::new(PathBuf::from("/var/lib/fleet-a")).verify_dir
+        );
+        assert_ne!(a.verify_dir, b.verify_dir);
+        // and per user
+        assert_ne!(
+            verify_scratch_dir(Path::new("/var/lib/fleet-a"), 1000),
+            verify_scratch_dir(Path::new("/var/lib/fleet-a"), 1001)
+        );
+    }
     use crate::testutil::TempDir;
     use fleet_domain::error::ErrorCode;
     use std::os::unix::fs::symlink;

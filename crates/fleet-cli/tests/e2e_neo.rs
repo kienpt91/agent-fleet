@@ -756,7 +756,10 @@ printf '{"version":1,"status":"done","summary":"d"}\n' > .fleet/result.json
     let test = find("test");
     assert_eq!(jstr(&test, "verdict"), "failed", "{}", test.canonical());
     let shown = jstr(&find("show"), "output").to_string();
-    assert!(shown.contains("/verify/job-"), "{shown}");
+    assert!(
+        shown.contains("/fleet-verify-") && shown.contains("/job-"),
+        "{shown}"
+    );
     assert!(
         !shown.contains(&real_home),
         "the operator's home leaked: {shown}"
@@ -769,11 +772,68 @@ printf '{"version":1,"status":"done","summary":"d"}\n' > .fleet/result.json
     assert_eq!(jstr(&find("show"), "tree").len(), 40);
     assert_eq!(find("show").get("dirty"), Some(&Value::Bool(false)));
     // the export directory is gone once the job is over
-    let leftovers: Vec<_> = fs::read_dir(f.state.join("verify"))
-        .unwrap()
-        .flatten()
-        .collect();
+    let cwd = shown
+        .split("cwd=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("");
+    let scratch = Path::new(cwd)
+        .ancestors()
+        .find(|a| {
+            a.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("job-"))
+        })
+        .and_then(Path::parent)
+        .expect("the working directory is inside a job directory")
+        .to_path_buf();
+    let leftovers: Vec<_> = fs::read_dir(&scratch).unwrap().flatten().collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn a_check_has_no_way_from_its_working_directory_to_the_state_directory() {
+    let (f, files) = fleet_with(LIAR, "0");
+    load_plan(&f);
+    // looks upwards from the working directory for what lives in the state directory
+    let probe = f.script(
+        "tools/probe.sh",
+        r#"#!/bin/sh
+echo "cwd=$(pwd -P)"
+for up in .. ../.. ../../.. ../../../.. ../../../../..; do
+  for name in control token fleet.sock events.log events.head daemon.lock; do
+    if [ -e "$up/$name" ]; then echo "FOUND $up/$name"; fi
+  done
+done
+echo probed
+"#,
+    );
+    let contract = format!(
+        r#"{{"version":1,"checks":[
+  {{"id":"answer","kind":"file","path":"answer.txt","assert":"contains","value":"ready"}},
+  {{"id":"probe","kind":"command","program":"{}","mandatory":false}}
+]}}"#,
+        probe.display()
+    );
+    add_goal(&f, &files, &contract);
+    f.ok(&["start", "--run", "r1"]);
+    f.wait_task("r1", "a", &["failed"]);
+    let goal = show(&f, "feature");
+    let history = jarr(&goal, "history");
+    let out = history
+        .iter()
+        .find(|e| jstr(e, "check") == "probe")
+        .map(|e| jstr(e, "output").to_string())
+        .expect("the probe ran");
+    assert!(out.contains("probed"), "the probe finished: {out}");
+    assert!(
+        !out.contains("FOUND"),
+        "the state directory is reachable: {out}"
+    );
+    let state = fs::canonicalize(&f.state).unwrap().display().to_string();
+    assert!(
+        !out.contains(&state) && !out.contains(f.state.to_str().unwrap()),
+        "the state directory is named in the working directory: {out}"
+    );
 }
 
 #[test]

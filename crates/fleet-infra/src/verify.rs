@@ -4,10 +4,10 @@
 //! judges (`neo_verify::judge`).
 //!
 //! **What runs where.** The checks do not run in the task's worktree. The commit that was
-//! recorded for the task is exported into a fresh directory of its own below the state directory
-//! (`git checkout-index` from a temporary index: the worktree's files, ignored and untracked files,
-//! index and local git state are never read), commands run with that directory as their working
-//! directory, and the directory is removed afterwards. So planted uncommitted files, a Makefile
+//! recorded for the task is exported into a fresh directory of its own, in a private directory
+//! outside the state directory (`git checkout-index` from a temporary index: the worktree's files,
+//! ignored and untracked files, index and local git state are never read), commands run with that
+//! directory as their working directory (nothing above it leads to the state directory), and the directory is removed afterwards. So planted uncommitted files, a Makefile
 //! that only exists in the worktree and a worker-local git configuration are never executed, and
 //! what is proven is the commit that will be merged. Each job has a home directory and a
 //! temporary directory of its own, empty, in place of the operator's.
@@ -16,7 +16,9 @@
 //! path that is not inside the task's worktree, its repository or the export
 //! ([`trusted_program`]), the operator's environment allowlist (minus everything that would lead
 //! to the operator's home or to fleet's state) and nothing else, a `PATH` cut down to absolute
-//! directories that are not in a repository and that nobody else may write to, no stdin, its own
+//! directories that are not in a repository and that no group or other user may write to (a
+//! directory the operator owns, such as `~/.local/bin`, is kept, and a worker running as the
+//! operator can write there), no stdin, its own
 //! process group, a timeout and a cap on captured output; processes that leave the group are
 //! tracked and stopped too (see `Sweeper` in `jobs`). Everything that is reported back is redacted
 //! first. Files are opened below the export root without following any symlink
@@ -59,9 +61,13 @@ pub struct VerifyHost {
 const JOB_DIR_PREFIX: &str = "job-";
 
 impl VerifyHost {
-    /// Prepares `scratch` (a private directory below the state directory) and removes what an
-    /// earlier daemon run left in it.
+    /// Prepares `scratch` (a private directory outside the state directory, see
+    /// `statedir::verify_scratch_dir`, below a private directory of the same user) and removes what
+    /// an earlier daemon run left in it.
     pub fn new(git: GitVcs, scratch: PathBuf) -> Result<VerifyHost> {
+        if let Some(parent) = scratch.parent() {
+            fsx::ensure_private_dir(parent)?;
+        }
         fsx::ensure_private_dir(&scratch)?;
         if let Ok(entries) = fs::read_dir(&scratch) {
             for entry in entries.flatten() {
