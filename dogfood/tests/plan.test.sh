@@ -42,6 +42,24 @@ grep -A6 'id = "n4-props"' "$work/stage2.toml" | grep -q 'after = \["n4-meter", 
 "$pw" "$plan" n4-meter > "$work/m.toml"
 grep -A6 'id = "n4-props"' "$work/m.toml" | grep -q 'after = \["n4-policy", "n4-estimator"\]' && ok || bad "one dependency was not removed from the list"
 grep -q 'id = "n4-meter"' "$work/m.toml" && bad "the task is still there" || ok
+# the raw plan names no repository; the stage names the one it is for
+grep -q '^repo = "/ABSOLUTE/PATH/OF/THE/THROWAWAY/CLONE"' "$plan" && ok || bad "the plan must carry a placeholder repository, not a relative one"
+if grep -q '^repo = "\."' "$plan"; then bad "a relative repo in the plan would be resolved against the daemon's working directory"; else ok; fi
+"$pw" --repo /work/clone-1 --run-id stage-2 "$plan" starter-error-tests > "$work/s2.toml"
+grep -q '^repo = "/work/clone-1"$' "$work/s2.toml" && ok || bad "--repo was not applied"
+grep -q '^id = "stage-2"$' "$work/s2.toml" && ok || bad "--run-id was not applied"
+grep -q '^id = "neo-roadmap"' "$work/s2.toml" && bad "the old run id is still there" || ok
+expect_eq "only the run table is rewritten" "$((tasks - 1))" "$(grep -c '^\[\[tasks\]\]' "$work/s2.toml")"
+"$pw" --repo /work/c "$plan" none > "$work/all.toml"
+expect_eq "none keeps every task" "$tasks" "$(grep -c '^\[\[tasks\]\]' "$work/all.toml")"
+cmp -s "$plan" "$work/all.toml" && bad "none with --repo must change the repository line" || ok
+expect_exit 2 "a relative --repo" "$pw" --repo clone "$plan" none
+expect_exit 2 "a --repo with .." "$pw" --repo /a/../b "$plan" none
+expect_exit 2 "a --repo with characters that could change the file" "$pw" --repo '/a"b' "$plan" none
+expect_exit 2 "a bad --run-id" "$pw" --run-id 'Stage 2' "$plan" none
+expect_exit 2 "a --run-id that starts with a dash" "$pw" --run-id -x "$plan" none
+printf '[run]\nobjective = "x"\n[[tasks]]\nid = "a"\ntitle = "A"\n' > "$work/norun.toml"
+expect_exit 2 "--repo without a [run] repo key" "$pw" --repo /x "$work/norun.toml" none
 expect_exit 2 "an id that is not in the plan" "$pw" "$plan" no-such-task
 expect_exit 2 "an id with bad characters" "$pw" "$plan" 'Starter;x'
 expect_exit 2 "no ids" "$pw" "$plan" ""

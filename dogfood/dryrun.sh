@@ -82,8 +82,8 @@ for id in $all_ids; do
   case " $keep_ids " in *" $id "*) ;; *) drop="$drop,$id" ;; esac
 done
 drop=${drop#,}
-say "sh dogfood/plan-without.sh dogfood/plan.neo-roadmap.toml <all but $(echo "$keep_ids" | wc -w | tr -d ' ') tasks> > stage.toml"
-sh "$clone/dogfood/plan-without.sh" "$clone/dogfood/plan.neo-roadmap.toml" "$drop" > "$work/stage.toml"
+say "sh dogfood/plan-without.sh --repo <clone> dogfood/plan.neo-roadmap.toml <all but $(echo "$keep_ids" | wc -w | tr -d ' ') tasks> > stage.toml"
+sh "$clone/dogfood/plan-without.sh" --repo "$clone" "$clone/dogfood/plan.neo-roadmap.toml" "$drop" > "$work/stage.toml"
 grep -c '^\[\[tasks\]\]' "$work/stage.toml" | sed 's/^/tasks in the stage: /'
 
 cd "$clone"
@@ -97,10 +97,11 @@ run "$fleet" goals remaining
 
 run "$fleet" start --run neo-roadmap --max-parallel 1
 
-# wait until nothing is waiting, running or in review (a contract run can take many minutes)
+# wait until the three starters completed and nothing is waiting, running or in review (a contract
+# run can take many minutes); give up after 90 minutes
 i=0
-until "$fleet" status | grep -q 'ready 0, running 0, review 0'; do
-  i=$((i + 1)); [ "$i" -lt 7200 ] || { echo "timed out" >&2; exit 1; }
+until "$fleet" status | grep -q 'ready 0, running 0, review 0, completed 3'; do
+  i=$((i + 1)); [ "$i" -lt 5400 ] || { echo "timed out; last status:" >&2; "$fleet" status >&2; exit 1; }
   sleep 1
 done
 sleep 1

@@ -41,7 +41,8 @@ case "$task" in
     ;;
   # The starter tasks of dogfood/plan.neo-roadmap.toml, for the dry run of dogfood/RUNBOOK.md.
   starter-docs-glossary)
-    # three rows after the last row of the glossary table of docs/domain.md
+    # three rows after the last row of the glossary table of docs/domain.md (once: a retry finds them there)
+    if ! grep -q '^| \*\*Protected path\*\* ' docs/domain.md; then
     last=$(grep -n '^| \*\*Remaining\*\* ' docs/domain.md | head -n 1 | cut -d: -f1)
     head -n "$last" docs/domain.md > docs/domain.md.new
     cat >> docs/domain.md.new <<'ROWS'
@@ -51,9 +52,11 @@ case "$task" in
 ROWS
     tail -n +"$((last + 1))" docs/domain.md >> docs/domain.md.new
     mv docs/domain.md.new docs/domain.md
+    fi
     result "added three glossary rows"
     ;;
   starter-error-tests)
+    if ! grep -q '^mod tests' crates/fleet-domain/src/error.rs; then
     cat >> crates/fleet-domain/src/error.rs <<'RUST'
 
 #[cfg(test)]
@@ -127,17 +130,22 @@ mod tests {
     }
 }
 RUST
+    fi
     result "added the unit tests of error.rs"
     ;;
   starter-value-property)
+    # a careless first attempt also "tidies" a sentence of the security policy; a retry that is told
+    # which check failed takes its own line out again (the line was appended, so the file is as it was)
     if ! grep -q 'protected-diff' "$brief"; then
-      # a careless first attempt: it also "fixes" a sentence of the security policy
       echo "agent: tidying SECURITY.md while I am here"
-      printf '\nA note added by the agent.\n' >> SECURITY.md
+      printf 'A note added by the agent.\n' >> SECURITY.md
     else
-      echo "agent: the verification complained about a protected path; leaving SECURITY.md alone"
+      echo "agent: the verification complained about a protected path; taking my note out of SECURITY.md"
+      grep -v '^A note added by the agent\.$' SECURITY.md > SECURITY.md.new || true
+      mv SECURITY.md.new SECURITY.md
     fi
-    # the test goes before the closing brace of the existing test module
+    # the test goes before the closing brace of the existing test module (once)
+    if ! grep -q 'canonical_text_is_the_same_whatever_the_order_of_the_pairs' crates/fleet-domain/src/value.rs; then
     sed '$d' crates/fleet-domain/src/value.rs > crates/fleet-domain/src/value.rs.new
     cat >> crates/fleet-domain/src/value.rs.new <<'RUST'
 
@@ -229,6 +237,7 @@ RUST
 }
 RUST
     mv crates/fleet-domain/src/value.rs.new crates/fleet-domain/src/value.rs
+    fi
     result "added a property test of the canonical form"
     ;;
   *)

@@ -11,7 +11,10 @@
 #     dependents wait behind it. dogfood/human-only.md lists them and what the person does.
 #   - fleet cannot mark a task completed by hand either. When a person has done the work of a
 #     human-only task (or an earlier run merged a task), start the next stage from
-#     `dogfood/plan-without.sh <this file> <done ids>`.
+#     `dogfood/plan-without.sh --repo <the clone> --run-id <new id> <this file> <done ids>`.
+#   - ALWAYS load the plan through plan-without.sh with --repo (`none` as the list of ids keeps every task):
+#     fleet does not make the `repo` of a plan file absolute, so a relative one would be resolved
+#     by the daemon against its own working directory. The `repo` below names no repository on purpose.
 #   - All other tasks use the worker `agent` and may change ONE named file (the contract's diff
 #     check allows only that), never a protected path (dogfood/PROTECTED_PATHS.md).
 #   - N3 to N5 assume milestone N2 (context compiler) is merged to main before the plan is loaded.
@@ -19,7 +22,7 @@
 [run]
 id = "neo-roadmap"
 objective = "Build NEO milestones N3, N4 and N5 under human control: agents write pure domain code and docs in named files, people do everything that touches the guardrails"
-repo = "."
+repo = "/ABSOLUTE/PATH/OF/THE/THROWAWAY/CLONE"   # a placeholder that names no repository: give the real one with plan-without.sh --repo
 max_parallel = 1
 
 # ---- starters: validate the loop end to end with small, safe tasks -----------------------------------
