@@ -11,3 +11,5 @@
 
 pub mod args;
 pub mod render;
+pub mod attach;
+pub mod tui;
