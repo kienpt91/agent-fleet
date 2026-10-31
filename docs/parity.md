@@ -41,7 +41,7 @@ mobile app.
 | Per-task branches | implemented | `fleet-cli/tests/e2e_flow.rs::demo_flow_end_to_end` | Branch `fleet/<run>/<task>`; see the README section "A real run". |
 | Fan one prompt across several agents and compare | partial | `fleet-app/tests/lifecycle.rs::parallelism_is_limited_per_run_and_globally` | Several independent tasks with the same spec can run in parallel. There is no built-in "same prompt, N agents, pick the winner" command and no comparison view. Listed in public docs summary. |
 | Terminal (pty) sessions per agent | implemented | `fleet-infra/src/pty.rs::runs_a_command_and_captures_sanitized_output`, `fleet-cli/tests/e2e_cli.rs::attach_with_piped_stdin_echoes_input_and_detaches_leaving_the_worker_running` | Each worker has its own pty, session and process group. `fleet attach` is a raw-terminal passthrough, tested with piped stdin only. |
-| Terminal splits and tabs | not planned | none | The terminal dashboard shows one output pane. |
+| Terminal splits and tabs | planned | `scripts/web-smoke.mjs` (the dock hosts the read-only panes only) | Phase 5.2 puts live terminal panes in the dock. The dock (tabs, splits, keyboard resizing, validated saved layout) hosts runs, task output, goals, approvals and the review panes today. |
 | Scrollback that survives restarts | partial | `fleet-infra/tests/contracts.rs::file_output_logs_satisfy_the_contract` | Bounded sanitized output is saved per attempt. It is not restored into an interactive terminal emulator. |
 | Any CLI agent | implemented | `fleet-app/tests/lifecycle.rs::dispatch_builds_the_command_from_the_worker_definition_with_an_allowlisted_environment`, `scripts/demo.sh` | A worker is any command from `fleet.toml`. Only scripted fake agents were run; no specific commercial agent was tested. |
 | Task DAG | implemented | `fleet-domain/src/dag.rs::dependencies_come_first`, `fleet-domain/src/dag.rs::cycles_are_rejected_with_the_path`, `fleet-app/tests/lifecycle.rs::dependencies_gate_scheduling_and_their_branches_are_merged_into_dependents` | Dependencies, cycle rejection, concurrency limits per run and globally. |
@@ -62,10 +62,11 @@ mobile app.
 
 | Capability | Status in agent-fleet | Evidence | Notes |
 | --- | --- | --- | --- |
-| Source-control view and diff view | not planned | none | Use `git` or your own tools on the branches. Not scheduled in any phase below. |
+| Source-control view and diff view | partial | `fleet-infra/tests/repo_read.rs::renames_are_detected_with_their_similarity_and_old_path`, `fleet-cli/tests/e2e_web.rs::the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository`, `scripts/web-smoke-panes.mjs` | Read-only diff of a task's commit against the run's base, unified and side by side (ADR 17). No staging, no working-tree status. Exercised by Rust tests and a fake DOM; not loaded in a real browser yet. |
 | Diff annotation (comments sent back to the agent) | not planned | none | A person can answer a gate or send text to a live worker (see the web rows and `fleet send`). |
-| File editor and file explorer | not planned | none | No editor is bundled. |
-| Rich previews (Markdown, images, PDF) | not planned | none | Listed in public docs summary. |
+| File editor | planned | none | Phase 5.4 (edits through a daemon API with path containment). Nothing edits files today. |
+| File explorer and file viewer | partial | `fleet-infra/tests/repo_read.rs::the_git_reader_satisfies_the_contract`, `fleet-cli/tests/e2e_web.rs::clients_cannot_name_paths_commits_or_tasks_the_daemon_did_not_record`, `scripts/web-smoke-panes.mjs` | Read-only tree and file view at the recorded commit, never the worktree (ADR 17). Not loaded in a real browser yet. |
+| Rich previews (Markdown, images; PDF) | partial | `fleet-domain/src/repo/markdown.rs` (property and adversarial tests), `fleet-cli/tests/e2e_web.rs::the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository`, `scripts/web-smoke-panes.mjs` | Markdown subset and png/jpeg/gif/webp images only (SVG excluded). PDF is planned for phase 5.5 (first step: the system viewer). Not loaded in a real browser yet. |
 | GitHub integration (PRs, issues) | planned | none | Phase 3. |
 | Linear integration (issues, boards) | planned | none | Phase 3. |
 | SSH remote worktrees | planned | none | Phase 3. |
@@ -182,10 +183,10 @@ Acceptance criteria:
 
 ## 5. Not planned
 
-- Desktop GUI application: agent-fleet is a daemon with terminal and local web front ends; a GUI app would
-  multiply the surface to maintain and secure for little gain.
-- Bundled editor and file explorer: people already have editors; the worktrees are ordinary git worktrees.
-- Diff view and diff annotation: left to git tooling; review happens before the approved merge.
+- (Reversed: the graphical workbench is in scope, see the plan below.) It is built as a web UI served by the daemon
+  (phase 5.x); read-only review panes exist (phase 5.1, ADR 17); the terminal panes, interactive terminal, editor, PDF
+  viewing and a thin desktop shell are **planned** in phases 5.2 to 5.6 (the shell is verified by the owner on macOS, not
+  in CI). Diff annotation (comments back to the agent) is planned for phase 5.2.
 - Sandboxing of workers: it needs containers, VMs or another user and cannot be done honestly with the current
   no-`unsafe`, small-dependency design; SECURITY.md states that workers are not sandboxed and recommends outside
   isolation.
