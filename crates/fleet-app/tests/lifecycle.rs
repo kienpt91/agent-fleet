@@ -97,7 +97,10 @@ fn a_task_naming_an_undefined_host_is_rejected_and_nothing_is_recorded() {
         )
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid, "{err:?}");
-    assert!(err.message.contains("is not defined in the configuration"), "{err:?}");
+    assert!(
+        err.message.contains("is not defined in the configuration"),
+        "{err:?}"
+    );
     assert!(!h.world.event_kinds().contains(&"task_added"));
 }
 

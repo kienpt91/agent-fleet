@@ -3,6 +3,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+pub mod sshd;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;

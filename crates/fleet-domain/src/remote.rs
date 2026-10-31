@@ -107,9 +107,7 @@ pub fn validate_user(user: &str) -> Result<()> {
 pub fn validate_port(port: u32) -> Result<u16> {
     match u16::try_from(port) {
         Ok(p) if p != 0 => Ok(p),
-        _ => Err(FleetError::invalid(
-            "the port must be between 1 and 65535",
-        )),
+        _ => Err(FleetError::invalid("the port must be between 1 and 65535")),
     }
 }
 
@@ -118,19 +116,27 @@ pub fn validate_port(port: u32) -> Result<u16> {
 /// splits option values at white space, so none of those is accepted.
 pub fn validate_local_path(what: &str, path: &str) -> Result<()> {
     if !path.starts_with('/') || path.len() > 300 {
-        return Err(bad(what, path, "must be an absolute path of at most 300 bytes"));
+        return Err(bad(
+            what,
+            path,
+            "must be an absolute path of at most 300 bytes",
+        ));
     }
-    if !path
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '+' | ':' | ',' | '.' | '/' | '-' | '='))
-    {
+    if !path.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '@' | '+' | ':' | ',' | '.' | '/' | '-' | '=')
+    }) {
         return Err(bad(
             what,
             path,
             "may only contain letters, digits and _ @ + : , . = / - (no spaces, '~' or '%')",
         ));
     }
-    if path.len() > 1 && path[1..].split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+    if path.len() > 1
+        && path[1..]
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+    {
         return Err(bad(what, path, "has an empty, '.' or '..' component"));
     }
     Ok(())
@@ -169,7 +175,11 @@ pub fn validate_remote_program(program: &str) -> Result<()> {
 /// One explicit variable for a remote worker: a valid name and a value without NUL, bounded.
 pub fn validate_remote_env(name: &str, value: &str) -> Result<()> {
     if !is_valid_name(name) {
-        return Err(bad("remote environment variable name", name, "is not valid"));
+        return Err(bad(
+            "remote environment variable name",
+            name,
+            "is not valid",
+        ));
     }
     if value.contains('\0') || value.len() > MAX_REMOTE_ENV_VALUE {
         return Err(FleetError::invalid(format!(
@@ -271,7 +281,10 @@ run=${dir%/*}; mkdir -p -- \"$run\"; \
 mkdir -- \"$dir\"; cd -- \"$dir\"; \
 g init -q .; \
 cat > .git/fleet-in.bundle; \
-g fetch -q --no-tags .git/fleet-in.bundle +refs/heads/fleet-sent:refs/heads/fleet-sent; \
+g -c protocol.file.allow=always fetch -q --no-tags .git/fleet-in.bundle '+refs/fleet-remote/*:refs/fleet-in/*'; \
+sent=$(g for-each-ref --count=1 --format='%(objectname)' refs/fleet-in/); \
+[ -n \"$sent\" ] || { echo 'fleet: the bundle holds no ref' >&2; exit 73; }; \
+g update-ref refs/heads/fleet-sent \"$sent\"; \
 rm -f .git/fleet-in.bundle; \
 printf '.fleet/\\n' >> .git/info/exclude; \
 g checkout -q -b work fleet-sent";
@@ -321,7 +334,8 @@ rm -rf -- \"$dir\" \"$pidfile\"";
 
 /// Script of [`RemoteCall::CheckBase`]: `$1` base. Creates it when needed and says `ok` when it is
 /// a plain, writable directory.
-const CHECK_BASE: &str = "umask 077; mkdir -p -- \"$1\" && [ -d \"$1\" ] && [ ! -L \"$1\" ] && [ -w \"$1\" ] && echo ok";
+const CHECK_BASE: &str =
+    "umask 077; mkdir -p -- \"$1\" && [ -d \"$1\" ] && [ ! -L \"$1\" ] && [ -w \"$1\" ] && echo ok";
 
 /// Script of [`RemoteCall::RoundTrip`]: prints every argument followed by a NUL, then `uname -s`.
 const ROUND_TRIP: &str = "printf '%s\\0' \"$@\"; uname -s";
@@ -721,9 +735,49 @@ mod tests {
     }
 
     const NASTY: &[&str] = &[
-        "'", "\"", "\\", "$", "`", ";", "&", "|", "<", ">", "(", ")", "{", "}", "*", "?", "!", "#",
-        "~", " ", "\n", "\t", "\r", "=", "%", "\u{1b}", "\u{7f}", "é", "日", "\u{202e}", "a", "b",
-        "-", "/", "..", "$(id)", "`id`", "'; id; '", "\\'", "''", "\"'\"", "${IFS}", "\n; rm -rf /\n",
+        "'",
+        "\"",
+        "\\",
+        "$",
+        "`",
+        ";",
+        "&",
+        "|",
+        "<",
+        ">",
+        "(",
+        ")",
+        "{",
+        "}",
+        "*",
+        "?",
+        "!",
+        "#",
+        "~",
+        " ",
+        "\n",
+        "\t",
+        "\r",
+        "=",
+        "%",
+        "\u{1b}",
+        "\u{7f}",
+        "é",
+        "日",
+        "\u{202e}",
+        "a",
+        "b",
+        "-",
+        "/",
+        "..",
+        "$(id)",
+        "`id`",
+        "'; id; '",
+        "\\'",
+        "''",
+        "\"'\"",
+        "${IFS}",
+        "\n; rm -rf /\n",
     ];
 
     fn random_word(rng: &mut Lcg) -> String {
@@ -758,7 +812,9 @@ mod tests {
     fn property_a_quoted_word_is_read_back_unchanged_and_nothing_stays_unquoted() {
         let mut rng = Lcg(7);
         for _ in 0..5000 {
-            let words: Vec<String> = (0..1 + rng.below(5)).map(|_| random_word(&mut rng)).collect();
+            let words: Vec<String> = (0..1 + rng.below(5))
+                .map(|_| random_word(&mut rng))
+                .collect();
             let line = words
                 .iter()
                 .map(|w| quote(w).unwrap())
@@ -823,12 +879,39 @@ mod tests {
         let calls = [
             RemoteCall::GitVersion,
             RemoteCall::CheckBase { base: "/srv/fleet" },
-            RemoteCall::Prepare { layout: &l, run: &run, task: &task },
-            RemoteCall::PutBrief { layout: &l, run: &run, task: &task },
-            RemoteCall::ReadContract { layout: &l, run: &run, task: &task, file: ContractFile::Result },
-            RemoteCall::Finalize { layout: &l, run: &run, task: &task, sent: &sent },
-            RemoteCall::Signal { layout: &l, run: &run, task: &task, signal: RemoteSignal::Kill },
-            RemoteCall::Remove { layout: &l, run: &run, task: &task },
+            RemoteCall::Prepare {
+                layout: &l,
+                run: &run,
+                task: &task,
+            },
+            RemoteCall::PutBrief {
+                layout: &l,
+                run: &run,
+                task: &task,
+            },
+            RemoteCall::ReadContract {
+                layout: &l,
+                run: &run,
+                task: &task,
+                file: ContractFile::Result,
+            },
+            RemoteCall::Finalize {
+                layout: &l,
+                run: &run,
+                task: &task,
+                sent: &sent,
+            },
+            RemoteCall::Signal {
+                layout: &l,
+                run: &run,
+                task: &task,
+                signal: RemoteSignal::Kill,
+            },
+            RemoteCall::Remove {
+                layout: &l,
+                run: &run,
+                task: &task,
+            },
         ];
         for call in calls {
             let line = call.assemble("/usr/bin:/bin").unwrap();
@@ -844,7 +927,9 @@ mod tests {
                 let at = words.iter().position(|w| w == "-c").unwrap();
                 let script = &words[at + 1];
                 assert!(
-                    SCRIPTS.iter().any(|(_, s)| script == s || script == &format!("{GIT_FN}{s}")),
+                    SCRIPTS
+                        .iter()
+                        .any(|(_, s)| script == s || script == &format!("{GIT_FN}{s}")),
                     "script not in the constant set"
                 );
             }
@@ -870,7 +955,16 @@ mod tests {
         };
         assert!(call("agent").is_ok());
         assert!(call("/opt/bin/other").is_ok());
-        for refused in ["sh", "rm", "agent; id", "-agent", "", "../agent", "a b", "agent\n"] {
+        for refused in [
+            "sh",
+            "rm",
+            "agent; id",
+            "-agent",
+            "",
+            "../agent",
+            "a b",
+            "agent\n",
+        ] {
             assert!(call(refused).is_err(), "{refused:?}");
         }
     }
@@ -883,15 +977,26 @@ mod tests {
         let big = vec!["x".repeat(MAX_REMOTE_COMMAND)];
         let launch = |args: &[String], env: &[(String, String)]| {
             RemoteCall::Launch {
-                layout: &l, run: &run, task: &task, program: "agent", allowed: &allowed, args, env,
+                layout: &l,
+                run: &run,
+                task: &task,
+                program: "agent",
+                allowed: &allowed,
+                args,
+                env,
             }
             .assemble(DEFAULT_REMOTE_PATH)
         };
-        assert_eq!(launch(&big, &[]).unwrap_err().code, crate::error::ErrorCode::Limit);
+        assert_eq!(
+            launch(&big, &[]).unwrap_err().code,
+            crate::error::ErrorCode::Limit
+        );
         assert!(launch(&["a\0b".to_string()], &[]).is_err());
         assert!(launch(&[], &[("A B".to_string(), "x".to_string())]).is_err());
         assert!(launch(&[], &[("A".to_string(), "x\0".to_string())]).is_err());
-        let many: Vec<(String, String)> = (0..=MAX_REMOTE_ENV).map(|i| (format!("V{i}"), "1".into())).collect();
+        let many: Vec<(String, String)> = (0..=MAX_REMOTE_ENV)
+            .map(|i| (format!("V{i}"), "1".into()))
+            .collect();
         assert!(launch(&[], &many).is_err());
         let args: Vec<String> = (0..=MAX_REMOTE_ARGS).map(|_| "a".to_string()).collect();
         assert!(launch(&args, &[]).is_err());
@@ -899,19 +1004,53 @@ mod tests {
 
     #[test]
     fn addresses_users_ports_and_paths_are_validated() {
-        for ok in ["example.com", "build-1.internal", "10.0.0.7", "::1", "fe80::1:2", "2001:db8::7", "a"] {
+        for ok in [
+            "example.com",
+            "build-1.internal",
+            "10.0.0.7",
+            "::1",
+            "fe80::1:2",
+            "2001:db8::7",
+            "a",
+        ] {
             assert!(validate_address(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "", "-oProxyCommand=x", "a b", "a;b", "user@host", "host:22", "[::1]", "a..b", ".a", "a.", "a/b",
-            "fe80::1%eth0", "-", "a_b", "host\n", "$(id)", &"a".repeat(254), ":::", "g::1",
+            "",
+            "-oProxyCommand=x",
+            "a b",
+            "a;b",
+            "user@host",
+            "host:22",
+            "[::1]",
+            "a..b",
+            ".a",
+            "a.",
+            "a/b",
+            "fe80::1%eth0",
+            "-",
+            "a_b",
+            "host\n",
+            "$(id)",
+            &"a".repeat(254),
+            ":::",
+            "g::1",
         ] {
             assert!(validate_address(bad).is_err(), "{bad:?}");
         }
         for ok in ["alice", "_svc", "a.b-c_d", "A1"] {
             assert!(validate_user(ok).is_ok());
         }
-        for bad in ["", "-o", "1abc", "a b", "a@b", "a:b", &"a".repeat(33), "a\n"] {
+        for bad in [
+            "",
+            "-o",
+            "1abc",
+            "a b",
+            "a@b",
+            "a:b",
+            &"a".repeat(33),
+            "a\n",
+        ] {
             assert!(validate_user(bad).is_err(), "{bad:?}");
         }
         assert_eq!(validate_port(22).unwrap(), 22);
@@ -921,11 +1060,28 @@ mod tests {
             assert!(validate_remote_base(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "/", "srv", "", "~/x", "/a/../b", "/a/./b", "/a//b", "/a/b/", "/a b", "/a;b", "/a'b", "/a$b", "/a%b",
-            "/a\nb", "/a/..", &format!("/{}", "a".repeat(300)),
+            "/",
+            "srv",
+            "",
+            "~/x",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a/b/",
+            "/a b",
+            "/a;b",
+            "/a'b",
+            "/a$b",
+            "/a%b",
+            "/a\nb",
+            "/a/..",
+            &format!("/{}", "a".repeat(300)),
         ] {
             assert!(validate_remote_base(bad).is_err(), "{bad:?}");
-            assert!(validate_local_path("p", bad).is_err() || bad == "/", "{bad:?}");
+            assert!(
+                validate_local_path("p", bad).is_err() || bad == "/",
+                "{bad:?}"
+            );
         }
         assert!(validate_local_path("identity file", "/home/me/.ssh/id_ed25519").is_ok());
     }
@@ -946,7 +1102,10 @@ mod tests {
     fn the_worker_environment_holds_only_explicit_values_and_fleets_own() {
         let host = vec![
             ("PATH".to_string(), "/opt/x/bin:/usr/bin".to_string()),
-            ("API_BASE".to_string(), "https://example.invalid".to_string()),
+            (
+                "API_BASE".to_string(),
+                "https://example.invalid".to_string(),
+            ),
         ];
         let env = worker_env(&host, &id_run(), &id_task(), "/srv/fleet/r1/t1");
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
@@ -959,7 +1118,12 @@ mod tests {
         let plain = worker_env(&[], &id_run(), &id_task(), "/w");
         assert_eq!(get_in(&plain, "PATH"), Some(DEFAULT_REMOTE_PATH));
         // A host entry cannot override what fleet sets.
-        let sneaky = worker_env(&[("FLEET_RUN".into(), "other".into())], &id_run(), &id_task(), "/w");
+        let sneaky = worker_env(
+            &[("FLEET_RUN".into(), "other".into())],
+            &id_run(),
+            &id_task(),
+            "/w",
+        );
         assert_eq!(get_in(&sneaky, "FLEET_RUN"), Some("r1"));
     }
 

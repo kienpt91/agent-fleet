@@ -101,7 +101,8 @@ impl RemoteHost for FakeRemote {
         }
         g.prepared.push(req.clone());
         g.sha_counter += 1;
-        let sent = Sha::parse(&format!("{:040x}", g.sha_counter)).unwrap_or_else(|_| unreachable_sha());
+        let sent =
+            Sha::parse(&format!("{:040x}", g.sha_counter)).unwrap_or_else(|_| unreachable_sha());
         Ok(Prepared {
             dir: dir_of(&req.task),
             sent,
@@ -114,7 +115,11 @@ impl RemoteHost for FakeRemote {
             return Err(FleetError::internal(m));
         }
         g.launched.push(req.clone());
-        let mut args = vec!["-tt".to_string(), req.task.host.to_string(), req.program.clone()];
+        let mut args = vec![
+            "-tt".to_string(),
+            req.task.host.to_string(),
+            req.program.clone(),
+        ];
         args.extend(req.args.iter().cloned());
         Ok(LocalCommand {
             program: "/usr/bin/ssh".to_string(),
@@ -189,7 +194,10 @@ impl crate::ports::SessionHost for NoSessions {
         Err(FleetError::internal("no sessions"))
     }
     fn poll(&mut self, _: crate::ports::SessionId) -> crate::ports::SessionState {
-        crate::ports::SessionState::Exited { code: None, signal: None }
+        crate::ports::SessionState::Exited {
+            code: None,
+            signal: None,
+        }
     }
     fn reading(&self, _: crate::ports::SessionId) -> Option<crate::ports::SessionReading> {
         None
@@ -200,11 +208,19 @@ impl crate::ports::SessionHost for NoSessions {
     fn snapshot(&self, _: crate::ports::SessionId, _: usize) -> Option<String> {
         None
     }
-    fn read_since(&self, _: crate::ports::SessionId, _: u64, _: usize) -> Option<fleet_domain::output::Chunk> {
+    fn read_since(
+        &self,
+        _: crate::ports::SessionId,
+        _: u64,
+        _: usize,
+    ) -> Option<fleet_domain::output::Chunk> {
         None
     }
     fn release(&mut self, _: crate::ports::SessionId) -> crate::ports::SessionOutput {
-        crate::ports::SessionOutput { text: String::new(), stripped: 0 }
+        crate::ports::SessionOutput {
+            text: String::new(),
+            stripped: 0,
+        }
     }
     fn live(&self) -> Vec<fleet_domain::supervision::LiveSession> {
         Vec::new()

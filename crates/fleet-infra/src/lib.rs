@@ -25,6 +25,7 @@ pub mod procid;
 pub mod protocol;
 pub mod pty;
 pub mod server;
+pub mod ssh;
 pub mod statedir;
 pub mod toolrun;
 pub mod undo;

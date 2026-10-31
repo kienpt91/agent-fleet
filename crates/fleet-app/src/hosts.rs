@@ -118,7 +118,9 @@ impl HostDef {
             return Err(what("proxy_jump names the host itself".into()));
         }
         if !(1..=120).contains(&self.connect_timeout_secs) {
-            return Err(what("connect_timeout_secs must be between 1 and 120".into()));
+            return Err(what(
+                "connect_timeout_secs must be between 1 and 120".into(),
+            ));
         }
         if !(1..=300).contains(&self.server_alive_secs) {
             return Err(what("server_alive_secs must be between 1 and 300".into()));
@@ -204,19 +206,44 @@ mod tests {
 
     #[test]
     fn every_field_is_checked() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut HostDef)>)> = vec![
-            ("address", Box::new(|h| h.address = "-oProxyCommand=x".into())),
+        type Change = Box<dyn Fn(&mut HostDef)>;
+        let cases: Vec<(&str, Change)> = vec![
+            (
+                "address",
+                Box::new(|h| h.address = "-oProxyCommand=x".into()),
+            ),
             ("user", Box::new(|h| h.user = "a b".into())),
             ("port", Box::new(|h| h.port = 0)),
-            ("identity", Box::new(|h| h.identity_file = "relative/key".into())),
-            ("identity chars", Box::new(|h| h.identity_file = "/k ey".into())),
+            (
+                "identity",
+                Box::new(|h| h.identity_file = "relative/key".into()),
+            ),
+            (
+                "identity chars",
+                Box::new(|h| h.identity_file = "/k ey".into()),
+            ),
             ("base", Box::new(|h| h.base_dir = "/srv/../etc".into())),
-            ("worker", Box::new(|h| h.allowed_workers = vec!["rm -rf".into()])),
+            (
+                "worker",
+                Box::new(|h| h.allowed_workers = vec!["rm -rf".into()]),
+            ),
             ("sessions", Box::new(|h| h.max_sessions = 0)),
-            ("env name", Box::new(|h| h.env = vec![("A B".into(), "x".into())])),
-            ("env fleet", Box::new(|h| h.env = vec![("FLEET_RUN".into(), "x".into())])),
-            ("env nul", Box::new(|h| h.env = vec![("A".into(), "x\0".into())])),
-            ("self jump", Box::new(|h| h.proxy_jump = Some(h.name.clone()))),
+            (
+                "env name",
+                Box::new(|h| h.env = vec![("A B".into(), "x".into())]),
+            ),
+            (
+                "env fleet",
+                Box::new(|h| h.env = vec![("FLEET_RUN".into(), "x".into())]),
+            ),
+            (
+                "env nul",
+                Box::new(|h| h.env = vec![("A".into(), "x\0".into())]),
+            ),
+            (
+                "self jump",
+                Box::new(|h| h.proxy_jump = Some(h.name.clone())),
+            ),
             ("connect", Box::new(|h| h.connect_timeout_secs = 0)),
             ("alive", Box::new(|h| h.server_alive_secs = 301)),
             ("count", Box::new(|h| h.server_alive_count = 0)),

@@ -502,7 +502,11 @@ fn check_task(index: usize, task: &Value) -> Result<()> {
     let obj = task
         .as_object()
         .ok_or_else(|| invalid(format!("{what} must be a table")))?;
-    check_keys(&what, obj, &["id", "title", "spec", "after", "worker", "host"])?;
+    check_keys(
+        &what,
+        obj,
+        &["id", "title", "spec", "after", "worker", "host"],
+    )?;
     check_string(&what, obj, "title", true)?;
     for key in ["id", "spec", "worker", "host"] {
         check_string(&what, obj, key, false)?;

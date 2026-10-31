@@ -105,18 +105,32 @@ fn a_remote_task_is_prepared_launched_and_sees_remote_paths_and_only_explicit_va
     let prepared = remote.prepared();
     assert_eq!(prepared.len(), 1);
     assert_eq!(prepared[0].task.host.as_str(), "build");
-    assert!(prepared[0].worktree.contains("a"), "the local worktree is what is sent");
+    assert!(
+        prepared[0].worktree.contains("a"),
+        "the local worktree is what is sent"
+    );
     let launched = remote.launched();
     assert_eq!(launched.len(), 1);
     let l = &launched[0];
     assert_eq!(l.program, "run-agent");
-    assert_eq!(l.args[3], "/remote/build/r1/a", "{{worktree}} is the remote directory");
+    assert_eq!(
+        l.args[3], "/remote/build/r1/a",
+        "{{worktree}} is the remote directory"
+    );
     let env: std::collections::BTreeMap<_, _> = l.env.iter().cloned().collect();
-    assert_eq!(env.get("API_BASE").map(String::as_str), Some("https://api.invalid"));
-    assert_eq!(env.get("FLEET_WORKTREE").map(String::as_str), Some("/remote/build/r1/a"));
+    assert_eq!(
+        env.get("API_BASE").map(String::as_str),
+        Some("https://api.invalid")
+    );
+    assert_eq!(
+        env.get("FLEET_WORKTREE").map(String::as_str),
+        Some("/remote/build/r1/a")
+    );
     assert_eq!(env.get("FLEET_TASK").map(String::as_str), Some("a"));
     assert!(
-        !env.contains_key("SENTINEL_TOKEN") && !env.contains_key("HOME") && !env.contains_key("AGENT_MODE"),
+        !env.contains_key("SENTINEL_TOKEN")
+            && !env.contains_key("HOME")
+            && !env.contains_key("AGENT_MODE"),
         "nothing of the local environment or of the local worker settings is sent: {env:?}"
     );
     // The local session runs the ssh command the adapter built, in the local worktree.
@@ -145,7 +159,11 @@ fn the_session_ends_only_after_the_work_was_collected_and_then_the_task_complete
     h.world.exit(id, 0);
 
     h.orch.tick();
-    assert_eq!(remote.collects().len(), 1, "collecting starts when the local command ended");
+    assert_eq!(
+        remote.collects().len(),
+        1,
+        "collecting starts when the local command ended"
+    );
     assert_eq!(task_status(&mut h, "a"), "running", "still collecting");
     h.orch.tick();
     assert_eq!(task_status(&mut h, "a"), "running");
@@ -155,7 +173,10 @@ fn the_session_ends_only_after_the_work_was_collected_and_then_the_task_complete
     assert_eq!(task_status(&mut h, "a"), "completed");
     assert_eq!(remote.collects()[0].sent, sha_of_first_prepare(&remote));
     let log = h.world.saved_log("r1", "a").unwrap();
-    assert!(log.contains("fleet: remote: 1 commit brought back"), "{log}");
+    assert!(
+        log.contains("fleet: remote: 1 commit brought back"),
+        "{log}"
+    );
 }
 
 fn sha_of_first_prepare(_remote: &FakeRemote) -> Sha {
@@ -201,7 +222,11 @@ fn a_stop_signals_the_remote_worker_and_the_local_client() {
     h.call("task.stop", obj(vec![("task", s("r1/a"))])).unwrap();
     h.orch.tick();
     let sent = remote.signals();
-    assert!(sent.iter().any(|(t, sig)| t.task.as_str() == "a" && *sig == Signal::Term), "{sent:?}");
+    assert!(
+        sent.iter()
+            .any(|(t, sig)| t.task.as_str() == "a" && *sig == Signal::Term),
+        "{sent:?}"
+    );
     assert!(h.world.signals(id).contains(&Signal::Term));
 }
 
@@ -221,7 +246,11 @@ fn preparing_or_launching_that_fails_is_a_failed_attempt_and_no_process_is_left(
         let events = h.world.event_kinds();
         assert!(events.contains(&"session_ended"), "{label}: {events:?}");
         if !fail_prepare {
-            assert_eq!(remote.abandoned().len(), 1, "the half-made remote worktree is removed");
+            assert_eq!(
+                remote.abandoned().len(),
+                1,
+                "the half-made remote worktree is removed"
+            );
         }
     }
 }
@@ -249,8 +278,16 @@ fn a_host_with_no_free_slot_leaves_its_tasks_ready_while_local_tasks_start() {
     add_remote(&mut h, "c", None);
     start(&mut h);
     assert_eq!(task_status(&mut h, "a"), "running");
-    assert_eq!(task_status(&mut h, "b"), "ready", "waits for the host's slot");
-    assert_eq!(task_status(&mut h, "c"), "running", "a local task is not held up");
+    assert_eq!(
+        task_status(&mut h, "b"),
+        "ready",
+        "waits for the host's slot"
+    );
+    assert_eq!(
+        task_status(&mut h, "c"),
+        "running",
+        "a local task is not held up"
+    );
     assert_eq!(remote.prepared().len(), 1);
     // The first one ends; the waiting one starts.
     let id = h.world.session_for("a").unwrap();
@@ -272,7 +309,10 @@ fn a_local_task_never_touches_the_remote_host() {
     let id = h.world.session_for("a").unwrap();
     let spec = h.world.session_spec(id).unwrap();
     assert_eq!(spec.program, "run-agent");
-    assert!(spec.env.iter().any(|(k, _)| k == "SENTINEL_TOKEN"), "locally the allowlist applies as before");
+    assert!(
+        spec.env.iter().any(|(k, _)| k == "SENTINEL_TOKEN"),
+        "locally the allowlist applies as before"
+    );
 }
 
 #[test]

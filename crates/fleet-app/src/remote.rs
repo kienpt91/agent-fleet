@@ -124,8 +124,14 @@ pub trait RemoteHost: Send + Sync {
 
 enum Phase {
     Running,
-    Collecting { id: CollectId, exit: SessionState },
-    Done { exit: SessionState, notes: Vec<String> },
+    Collecting {
+        id: CollectId,
+        exit: SessionState,
+    },
+    Done {
+        exit: SessionState,
+        notes: Vec<String>,
+    },
 }
 
 struct Remote {
@@ -162,15 +168,16 @@ impl RemoteSessions {
     }
 
     fn sessions_on(&self, host: &HostName) -> usize {
-        self.active.values().filter(|r| r.task.host == *host).count()
+        self.active
+            .values()
+            .filter(|r| r.task.host == *host)
+            .count()
     }
 }
 
 fn collect_failed(exit: &SessionState) -> SessionState {
     match exit {
-        SessionState::Exited {
-            code: Some(0), ..
-        } => SessionState::Exited {
+        SessionState::Exited { code: Some(0), .. } => SessionState::Exited {
             code: Some(EXIT_COLLECT_FAILED),
             signal: None,
         },

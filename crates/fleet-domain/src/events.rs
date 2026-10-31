@@ -1,7 +1,9 @@
 //! Domain events: the facts the system records. State is rebuilt by applying them in order, and
 //! the audit log is their serialized form, so the field names here are a stable format.
 
-use crate::ids::{ApprovalId, DecisionId, EvidenceId, GoalId, HostName, RunId, Sha, TaskId, WorkerName};
+use crate::ids::{
+    ApprovalId, DecisionId, EvidenceId, GoalId, HostName, RunId, Sha, TaskId, WorkerName,
+};
 use crate::status::{BlockKind, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
 use crate::value::{Document, Field, Value};
 use std::collections::BTreeMap;
