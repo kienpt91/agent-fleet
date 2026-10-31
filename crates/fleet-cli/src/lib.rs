@@ -13,6 +13,7 @@ pub mod args;
 pub mod attach;
 pub mod commands;
 pub mod render;
+pub mod render_fanout;
 pub mod render_neo;
 pub mod tui;
 

@@ -7,13 +7,14 @@
 
 use crate::args::Parsed;
 use crate::render;
+use crate::render_fanout;
 use crate::render_neo;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::show;
 use fleet_domain::limits::{MAX_ID_LEN, MAX_SPEC};
 use fleet_domain::value::Value;
 use fleet_infra::client::Client;
-use fleet_infra::config_file::{load_contract, load_plan};
+use fleet_infra::config_file::{load_contract, load_plan, load_spec};
 use fleet_infra::daemon::{run_daemon, DaemonOptions};
 use fleet_infra::doctor::{self, DoctorInput};
 use fleet_infra::eventlog::verify_file;
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Every subcommand, as typed. The help text must mention each (a test enforces it).
-pub const SUBCOMMANDS: [&str; 32] = [
+pub const SUBCOMMANDS: [&str; 37] = [
     "daemon",
     "run create",
     "task add",
@@ -58,6 +59,11 @@ pub const SUBCOMMANDS: [&str; 32] = [
     "goals show",
     "goals remaining",
     "verify",
+    "fanout",
+    "compare",
+    "pick",
+    "groups list",
+    "groups show",
 ];
 
 pub const HELP: &str = "\
@@ -127,6 +133,25 @@ goals and verification (NEO):
                                      run the contracts independently of the worker and record
                                      evidence; exit 6 when a mandatory check did not pass
 
+fan-out (one prompt, several agents):
+  fanout --run <run> --title <text> (--spec <text>|-|--spec-file <file>) --workers a,b,c
+         [--count N] [--contract <file.json>] [--id <group>]
+                                     make N sibling tasks per worker (2 to 16 in all, the same worker
+                                     may repeat), each with the same spec and contract in its own
+                                     worktree and branch; the run's limits decide how many run at once
+  compare <group> [--rank criterion,...]
+                                     structured comparison from facts the daemon knows: status, tries,
+                                     time, diff against the base, scope, gates, evidence per check
+                                     (verified/unverified/failed, bound to commit and tree), overlap
+                                     between members and an advisory ranking (the rule is printed)
+  pick <group> <task> [--allow-unverified] [--remove-others]
+                                     choose the winner: asks for the normal merge approval of the exact
+                                     action (it states unverified evidence), merges, then marks the
+                                     others superseded; --remove-others deletes their worktrees and
+                                     branches now, otherwise `fleet cleanup` does
+  groups list                        the fan-out groups with their status and winner
+  groups show <group>                one group and its members
+
 dashboard:
   tui                                terminal dashboard
 
@@ -182,6 +207,20 @@ pub enum View {
     GoalList,
     GoalShow,
     GoalRemaining,
+    GroupFanout,
+    GroupList,
+    GroupShow,
+    GroupCompare,
+    GroupPick,
+}
+
+/// Where the prompt of a fan-out comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FanoutSpec {
+    /// Given on the command line, or read from stdin by the parser (`--spec -`).
+    Text(String),
+    /// `--spec-file`: read when the command runs, bounded and without following links.
+    File(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,6 +271,16 @@ pub enum Command {
     GoalAttach {
         goal: String,
         contract: PathBuf,
+    },
+    Fanout {
+        id: Option<String>,
+        run: String,
+        title: String,
+        /// The prompt itself (or read from stdin by the parser), or the file it is in.
+        spec: FanoutSpec,
+        workers: Vec<String>,
+        count: Option<u32>,
+        contract: Option<PathBuf>,
     },
     Verify {
         target: String,
@@ -671,6 +720,116 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                 timeout_secs: timeout.unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS),
             }
         }
+        "fanout" => {
+            let run = required(&mut p, "--run")?;
+            let title = required(&mut p, "--title")?;
+            let spec = p.opt("--spec")?;
+            let spec_file = p.opt("--spec-file")?;
+            let workers = required(&mut p, "--workers")?;
+            let count = opt_uint(&mut p, "--count")?;
+            let contract = p.opt("--contract")?.map(PathBuf::from);
+            let id = p.opt("--id")?;
+            no_args(p)?;
+            let spec = match (spec, spec_file) {
+                (Some(s), None) => FanoutSpec::Text(read_spec(s, stdin)?),
+                (None, Some(f)) => FanoutSpec::File(PathBuf::from(f)),
+                (Some(_), Some(_)) => {
+                    return Err(FleetError::usage(
+                        "give the prompt with --spec or --spec-file, not both",
+                    ))
+                }
+                (None, None) => {
+                    return Err(FleetError::usage(
+                        "the prompt is required: --spec <text>, --spec - or --spec-file <file>",
+                    ))
+                }
+            };
+            let workers: Vec<String> = workers.split(',').map(|w| w.trim().to_string()).collect();
+            if workers.iter().any(String::is_empty) {
+                return Err(FleetError::usage(
+                    "--workers is a comma separated list of worker names without empty entries",
+                ));
+            }
+            let count = match count {
+                None => None,
+                Some(n) => Some(
+                    u32::try_from(n)
+                        .map_err(|_| FleetError::usage("option --count is too large"))?,
+                ),
+            };
+            Command::Fanout {
+                id,
+                run,
+                title,
+                spec,
+                workers,
+                count,
+                contract,
+            }
+        }
+        "compare" => {
+            let rank = p.opt("--rank")?;
+            let group = one_arg(p, "<group>")?;
+            let rank = match rank {
+                None => None,
+                Some(r) => {
+                    let names: Vec<String> = r.split(',').map(|n| n.trim().to_string()).collect();
+                    if names.iter().any(String::is_empty) {
+                        return Err(FleetError::usage(
+                            "--rank is a comma separated list of criteria without empty entries",
+                        ));
+                    }
+                    Some(Value::array(names.into_iter().map(Value::Str)))
+                }
+            };
+            request(
+                "group.compare",
+                obj(vec![("group", st(group)), ("rank", rank)]),
+                View::GroupCompare,
+            )
+        }
+        "pick" => {
+            let allow = p.flag("--allow-unverified");
+            let remove = p.flag("--remove-others");
+            let mut words = p.finish()?.into_iter();
+            let group = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing <group>"))?;
+            let task = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing <task>"))?;
+            if let Some(extra) = words.next() {
+                return Err(FleetError::usage(format!(
+                    "unexpected argument {}",
+                    show(&extra)
+                )));
+            }
+            request(
+                "group.pick",
+                obj(vec![
+                    ("group", st(group)),
+                    ("task", st(task)),
+                    ("allow_unverified", Some(Value::Bool(allow))),
+                    ("remove_others", Some(Value::Bool(remove))),
+                ]),
+                View::GroupPick,
+            )
+        }
+        "groups" => {
+            let sub = p.take_word();
+            match sub.as_deref() {
+                Some("list") => {
+                    no_args(p)?;
+                    request("group.list", obj(vec![]), View::GroupList)
+                }
+                Some("show") => request(
+                    "group.show",
+                    obj(vec![("group", st(one_arg(p, "<group>")?))]),
+                    View::GroupShow,
+                ),
+                other => return Err(subcommand_error("groups", other, "list or show")),
+            }
+        }
         other => {
             return Err(FleetError::usage(format!(
                 "unknown command {}",
@@ -821,6 +980,11 @@ fn render_view(view: &View, data: &Value) -> String {
         View::GoalList => render_neo::render_goal_list(data),
         View::GoalShow => render_neo::render_goal_show(data),
         View::GoalRemaining => render_neo::render_goal_remaining(data),
+        View::GroupFanout => render_fanout::render_fanout(data),
+        View::GroupList => render_fanout::render_group_list(data),
+        View::GroupShow => render_fanout::render_group_show(data),
+        View::GroupCompare => render_fanout::render_compare(data),
+        View::GroupPick => render_fanout::render_pick(data),
     }
 }
 
@@ -1206,6 +1370,38 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
                 cmd: "goal.attach",
                 args: obj(vec![("goal", st(goal)), ("contract", Some(contract))]),
                 view: View::GoalAttached,
+            };
+            execute_request(req, &mut connect(ctx)?, ctx.json, out)?;
+        }
+        Command::Fanout {
+            id,
+            run,
+            title,
+            spec,
+            workers,
+            count,
+            contract,
+        } => {
+            let spec = match spec {
+                FanoutSpec::Text(t) => t,
+                FanoutSpec::File(f) => load_spec(&f)?,
+            };
+            let contract = contract.map(|p| load_contract(&p)).transpose()?;
+            let req = Request {
+                cmd: "group.fanout",
+                args: obj(vec![
+                    ("id", id.and_then(st)),
+                    ("run", st(run)),
+                    ("title", st(title)),
+                    ("spec", st(spec)),
+                    (
+                        "workers",
+                        Some(Value::array(workers.into_iter().map(Value::Str))),
+                    ),
+                    ("count", count.map(Value::int)),
+                    ("contract", contract),
+                ]),
+                view: View::GroupFanout,
             };
             execute_request(req, &mut connect(ctx)?, ctx.json, out)?;
         }
@@ -2775,5 +2971,284 @@ mod tests {
         assert_eq!(token(""), "\"\"");
         assert!(token("x\u{1b}").contains("\\u{1b}"));
         assert!(token(&"a".repeat(500)).ends_with("…\""));
+    }
+
+    #[test]
+    fn fanout_compare_pick_and_groups_parse() {
+        match parse_ok(&[
+            "fanout",
+            "--run",
+            "r1",
+            "--title",
+            "T",
+            "--spec",
+            "do it",
+            "--workers",
+            "a, b,a",
+            "--count",
+            "2",
+            "--contract",
+            "c.json",
+            "--id",
+            "try1",
+        ]) {
+            Command::Fanout {
+                id,
+                run,
+                title,
+                spec,
+                workers,
+                count,
+                contract,
+            } => {
+                assert_eq!(id.as_deref(), Some("try1"));
+                assert_eq!((run.as_str(), title.as_str()), ("r1", "T"));
+                assert_eq!(spec, FanoutSpec::Text("do it".to_string()));
+                assert_eq!(workers, ["a", "b", "a"]);
+                assert_eq!(count, Some(2));
+                assert_eq!(contract, Some(PathBuf::from("c.json")));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&[
+            "fanout",
+            "--run=r1",
+            "--title=T",
+            "--spec-file=prompt.md",
+            "--workers=a",
+        ]) {
+            Command::Fanout {
+                spec,
+                count,
+                contract,
+                id,
+                ..
+            } => {
+                assert_eq!(spec, FanoutSpec::File(PathBuf::from("prompt.md")));
+                assert!(count.is_none() && contract.is_none() && id.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        // `--spec -` reads the prompt from stdin
+        let cli = parse_cli(
+            &argv(&[
+                "fanout",
+                "--run",
+                "r1",
+                "--title",
+                "T",
+                "--spec",
+                "-",
+                "--workers",
+                "a,b",
+            ]),
+            &mut Cursor::new(b"from stdin".to_vec()),
+        )
+        .unwrap();
+        assert!(matches!(
+            &cli.command,
+            Command::Fanout { spec: FanoutSpec::Text(t), .. } if t == "from stdin"
+        ));
+
+        assert_eq!(
+            parse_ok(&["compare", "fan1"]),
+            req(
+                "group.compare",
+                vec![("group", s("fan1"))],
+                View::GroupCompare
+            )
+        );
+        assert_eq!(
+            parse_ok(&["compare", "fan1", "--rank", "diff,time"]),
+            req(
+                "group.compare",
+                vec![
+                    ("group", s("fan1")),
+                    ("rank", Value::array([s("diff"), s("time")]))
+                ],
+                View::GroupCompare
+            )
+        );
+        assert_eq!(
+            parse_ok(&["pick", "fan1", "r1/fan1-2"]),
+            req(
+                "group.pick",
+                vec![
+                    ("group", s("fan1")),
+                    ("task", s("r1/fan1-2")),
+                    ("allow_unverified", Value::Bool(false)),
+                    ("remove_others", Value::Bool(false)),
+                ],
+                View::GroupPick
+            )
+        );
+        assert_eq!(
+            parse_ok(&["pick", "--allow-unverified", "fan1", "t", "--remove-others"]),
+            req(
+                "group.pick",
+                vec![
+                    ("group", s("fan1")),
+                    ("task", s("t")),
+                    ("allow_unverified", Value::Bool(true)),
+                    ("remove_others", Value::Bool(true)),
+                ],
+                View::GroupPick
+            )
+        );
+        assert_eq!(
+            parse_ok(&["groups", "list"]),
+            req("group.list", vec![], View::GroupList)
+        );
+        assert_eq!(
+            parse_ok(&["groups", "show", "fan1"]),
+            req("group.show", vec![("group", s("fan1"))], View::GroupShow)
+        );
+    }
+
+    #[test]
+    fn fanout_and_pick_usage_errors() {
+        let base = ["fanout", "--run", "r1", "--title", "T", "--workers", "a,b"];
+        let with = |extra: &[&str]| {
+            let mut a: Vec<&str> = base.to_vec();
+            a.extend_from_slice(extra);
+            parse(&a).unwrap_err().message
+        };
+        assert!(with(&[]).contains("the prompt is required"));
+        assert!(with(&["--spec", "x", "--spec-file", "f"]).contains("not both"));
+        assert!(with(&["--spec", "x", "--count", "many"]).contains("whole number"));
+        assert!(with(&["--spec", "x", "--count", "99999999999"]).contains("too large"));
+        assert!(with(&["--spec", "x", "extra"]).contains("unexpected argument"));
+        for bad in ["a,,b", "a,", ","] {
+            let err = parse(&[
+                "fanout",
+                "--run",
+                "r1",
+                "--title",
+                "T",
+                "--spec",
+                "x",
+                "--workers",
+                bad,
+            ])
+            .unwrap_err();
+            assert!(
+                err.message.contains("empty entries"),
+                "{bad}: {}",
+                err.message
+            );
+        }
+        assert!(
+            parse(&["fanout", "--title", "T", "--spec", "x", "--workers", "a"])
+                .unwrap_err()
+                .message
+                .contains("--run")
+        );
+        assert!(parse(&["compare"])
+            .unwrap_err()
+            .message
+            .contains("missing <group>"));
+        assert!(parse(&["compare", "g", "--rank", "a,,b"])
+            .unwrap_err()
+            .message
+            .contains("empty entries"));
+        assert!(parse(&["pick", "g"])
+            .unwrap_err()
+            .message
+            .contains("missing <task>"));
+        assert!(parse(&["pick"])
+            .unwrap_err()
+            .message
+            .contains("missing <group>"));
+        assert!(parse(&["pick", "g", "t", "u"])
+            .unwrap_err()
+            .message
+            .contains("unexpected argument"));
+        assert!(parse(&["groups"])
+            .unwrap_err()
+            .message
+            .contains("needs a subcommand"));
+        assert!(parse(&["groups", "nope"])
+            .unwrap_err()
+            .message
+            .contains("unknown groups subcommand"));
+        assert!(parse(&["groups", "show"])
+            .unwrap_err()
+            .message
+            .contains("missing <group>"));
+    }
+
+    #[test]
+    fn fanout_sends_the_prompt_from_a_file_and_the_contract_to_the_daemon() {
+        let dir = TempDir::new("cli-fanout");
+        let prompt = dir.write("prompt.md", "Make it right.\n");
+        let contract = dir.write("c.json", "{\"version\": 1, \"checks\": []}");
+        // the daemon is not running: the request is built (and its files read) before connecting
+        let sock = dir.join("none.sock");
+        let ctx = Context {
+            state_dir: dir.path().to_path_buf(),
+            socket: sock,
+            json: false,
+            env: vec![],
+        };
+        let mut out = Vec::new();
+        let err = execute(
+            Command::Fanout {
+                id: None,
+                run: "r1".into(),
+                title: "T".into(),
+                spec: FanoutSpec::File(prompt),
+                workers: vec!["a".into(), "b".into()],
+                count: None,
+                contract: Some(contract),
+            },
+            &ctx,
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DaemonDown, "{}", err.message);
+        // and a prompt file that cannot be read is reported before any connection is tried
+        let err = execute(
+            Command::Fanout {
+                id: None,
+                run: "r1".into(),
+                title: "T".into(),
+                spec: FanoutSpec::File(dir.join("missing.md")),
+                workers: vec!["a".into(), "b".into()],
+                count: None,
+                contract: None,
+            },
+            &ctx,
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound, "{}", err.message);
+    }
+
+    #[test]
+    fn group_requests_render_their_views_and_pass_the_daemons_json_through() {
+        let mut f = Fake::new(vec![Ok(Value::object([("groups", Value::array([]))]))]);
+        let (r, out) = exec(parse_ok(&["groups", "list"]), &mut f, false);
+        r.unwrap();
+        assert_eq!(out, "no fan-out groups\n");
+        assert_eq!(f.calls[0].0, "group.list");
+        let mut f = Fake::new(vec![Ok(Value::object([("groups", Value::array([]))]))]);
+        let (r, out) = exec(parse_ok(&["groups", "list"]), &mut f, true);
+        r.unwrap();
+        assert_eq!(out, "{\"groups\":[]}\n");
+        // the approval a pick asks for is the error: its exit code and the hint to approve it
+        let mut f = Fake::new(vec![Err(FleetError::new(
+            ErrorCode::ApprovalRequired,
+            "picking r1/a needs approval a3",
+        )
+        .with_subject("a3"))]);
+        let (r, _) = exec(parse_ok(&["pick", "fan1", "a"]), &mut f, false);
+        let e = r.unwrap_err();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = report_error(&e, false, &mut out, &mut err);
+        assert_eq!(code, ErrorCode::ApprovalRequired.exit_code());
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("run: fleet approve a3"));
     }
 }

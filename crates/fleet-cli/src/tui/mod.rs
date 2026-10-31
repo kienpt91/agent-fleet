@@ -5,6 +5,8 @@
 //! second and the selected task's `task.tail` twice a second, and turns [`keys::Action`]s into
 //! control-socket requests. A failed poll never ends the dashboard; the daemon may be restarting.
 
+#[cfg(test)]
+mod groups_tests;
 pub mod keys;
 pub mod model;
 pub mod ui;
@@ -27,10 +29,12 @@ use ratatui::Terminal;
 
 use self::keys::{handle_key, Action};
 use self::model::Model;
+use crate::render_fanout;
 
 const EVENT_POLL: Duration = Duration::from_millis(250);
 const STATUS_EVERY: Duration = Duration::from_secs(1);
 const TAIL_EVERY: Duration = Duration::from_millis(500);
+const GROUPS_EVERY: Duration = Duration::from_secs(3);
 const TAIL_MAX: i128 = 16 * 1024;
 const BACKOFF_BASE_MS: u64 = 250;
 const BACKOFF_MAX_MS: u64 = 4000;
@@ -211,6 +215,7 @@ struct App {
     socket: PathBuf,
     last_status: Option<Instant>,
     last_tail: Option<Instant>,
+    last_groups: Option<Instant>,
 }
 
 impl App {
@@ -249,9 +254,28 @@ impl App {
         }
     }
 
+    /// Read only: the list of groups and the comparison of the selected one.
+    fn poll_groups(&mut self) {
+        self.last_groups = Some(Instant::now());
+        if let Ok(list) = self.link.call("group.list", Value::object::<&str, _>([])) {
+            self.model.update_groups(&list);
+        }
+        let Some(id) = self.model.selected_group().map(|g| g.id.clone()) else {
+            return;
+        };
+        let args = Value::object([("group", Value::str(id.as_str()))]);
+        if let Ok(v) = self.link.call("group.compare", args) {
+            self.model
+                .set_group_text(&id, &render_fanout::render_compare(&v));
+        }
+    }
+
     fn refresh_now(&mut self) {
         self.poll_status();
         self.poll_tail();
+        if self.model.groups_view {
+            self.poll_groups();
+        }
     }
 
     fn execute(&mut self, guard: &mut TerminalGuard, action: Action) -> Flow {
@@ -317,6 +341,9 @@ impl App {
             if Self::due(self.last_tail, TAIL_EVERY) {
                 self.poll_tail();
             }
+            if self.model.groups_view && Self::due(self.last_groups, GROUPS_EVERY) {
+                self.poll_groups();
+            }
         }
     }
 }
@@ -332,6 +359,7 @@ pub fn run_tui(socket: &Path) -> Result<()> {
         socket: socket.to_path_buf(),
         last_status: None,
         last_tail: None,
+        last_groups: None,
     };
     let outcome = catch_unwind(AssertUnwindSafe(|| app.run(&mut guard)));
     guard.leave();

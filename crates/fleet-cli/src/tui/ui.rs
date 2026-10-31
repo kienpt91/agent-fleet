@@ -15,7 +15,7 @@ pub const MIN_WIDTH: u16 = 40;
 pub const MIN_HEIGHT: u16 = 10;
 const DIGEST_PREFIX: usize = 12;
 const KEY_HINTS: &str =
-    "q quit  j/k move  Tab focus  Enter attach/answer  a/d approve/deny  s stop  t retry  m merge  r refresh  ? help";
+    "q quit  j/k move  Tab focus  Enter attach/answer  a/d approve/deny  s stop  t retry  m merge  g groups  r refresh  ? help";
 
 pub fn status_style(status: &str) -> Style {
     match status {
@@ -111,6 +111,10 @@ pub fn render(frame: &mut Frame, model: &Model) {
         frame.render_widget(Paragraph::new("terminal too small"), area);
         return;
     }
+    if model.groups_view {
+        render_groups_view(frame, model, area);
+        return;
+    }
     let bottom = (area.height / 4).clamp(4, 8);
     let [header, body, panels, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -130,6 +134,107 @@ pub fn render(frame: &mut Frame, model: &Model) {
     render_approvals(frame, model, approvals);
     render_gates(frame, model, gates);
     render_footer(frame, model, footer);
+    if model.show_help {
+        render_help(frame, area);
+    }
+}
+
+const GROUP_HINTS: &str =
+    "q quit  j/k group  PgUp/PgDn scroll  g back  r refresh  ? help   (viewing only: fleet pick <group> <task> picks)";
+
+/// The groups view: the list of fan-out groups and the comparison of the selected one, as the
+/// command line prints it. Everything in it was cleaned on the way into the model.
+fn render_groups_view(frame: &mut Frame, model: &Model, area: Rect) {
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .areas(area);
+    render_header(frame, model, header);
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(body);
+
+    let block = panel(format!("Fan-out groups ({})", model.groups.len()), true);
+    let inner = block.inner(left);
+    frame.render_widget(block, left);
+    let width = usize::from(inner.width);
+    if model.groups.is_empty() {
+        frame.render_widget(Paragraph::new("There are no fan-out groups."), inner);
+    } else {
+        let visible = usize::from(inner.height);
+        let start = window_start(model.group_selected, visible);
+        let rows: Vec<Line> = model
+            .groups
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(i, g)| {
+                let winner = if g.winner.is_empty() {
+                    String::new()
+                } else {
+                    format!(" -> {}", g.winner)
+                };
+                let text = fit(
+                    &format!(
+                        "{} [{}] {}/{} ok{} {}",
+                        g.id, g.status, g.completed, g.members, winner, g.title
+                    ),
+                    width,
+                );
+                Line::from(Span::styled(
+                    text,
+                    selection_style(i == model.group_selected),
+                ))
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(rows), inner);
+    }
+
+    let title = match model.selected_group() {
+        Some(g) => format!("Comparison of {} (advisory ranking)", g.id),
+        None => "Comparison".to_string(),
+    };
+    let block = panel(title, false);
+    let inner = block.inner(right);
+    frame.render_widget(block, right);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+    let lines: Vec<Line> = if model.group_text.is_empty() {
+        vec![Line::from(Span::styled(
+            if model.groups.is_empty() {
+                "Create one with: fleet fanout --run <run> --title <text> --spec <text> --workers a,b"
+            } else {
+                "(loading the comparison)"
+            },
+            Style::new().fg(Color::DarkGray),
+        ))]
+    } else {
+        model
+            .group_text
+            .lines()
+            .skip(model.group_scroll)
+            .take(height)
+            .map(|l| {
+                Line::from(fit(
+                    &sanitize_text(l.replace('\t', "    ").as_bytes()),
+                    width,
+                ))
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let hints = Line::from(Span::styled(
+        fit(GROUP_HINTS, usize::from(footer.width)),
+        Style::new().fg(Color::DarkGray),
+    ));
+    let message = Line::from(Span::styled(
+        fit(&clean_line(&model.message), usize::from(footer.width)),
+        Style::new().fg(Color::Yellow),
+    ));
+    frame.render_widget(Paragraph::new(vec![hints, message]), footer);
     if model.show_help {
         render_help(frame, area);
     }
@@ -445,6 +550,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "Enter on decision  type an answer, Enter sends",
         "a / d              approve / deny (approvals panel)",
         "s / t / m          stop / retry / merge task",
+        "g                  fan-out groups and comparison (view only)",
         "r                  refresh now",
         "?                  close this help",
         "q, Esc             quit",

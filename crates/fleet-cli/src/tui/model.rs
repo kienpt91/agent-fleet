@@ -133,6 +133,19 @@ pub struct EventLine {
     pub line: String,
 }
 
+/// One fan-out group in the groups view (read only).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GroupRow {
+    pub id: String,
+    pub run: String,
+    pub title: String,
+    pub status: String,
+    pub winner: String,
+    pub members: u64,
+    pub completed: u64,
+    pub failed: u64,
+}
+
 #[derive(Debug)]
 pub struct Model {
     pub daemon: DaemonInfo,
@@ -157,6 +170,14 @@ pub struct Model {
     /// True once a status document has been applied.
     pub loaded: bool,
     pub connected: bool,
+    /// The groups view is shown instead of the task panels.
+    pub groups_view: bool,
+    pub groups: Vec<GroupRow>,
+    pub group_selected: usize,
+    /// The comparison of the selected group as text, and the group it is about.
+    pub group_text: String,
+    pub group_text_for: Option<String>,
+    pub group_scroll: usize,
 }
 
 impl Default for Model {
@@ -180,6 +201,12 @@ impl Default for Model {
             input: None,
             loaded: false,
             connected: true,
+            groups_view: false,
+            groups: Vec::new(),
+            group_selected: 0,
+            group_text: String::new(),
+            group_text_for: None,
+            group_scroll: 0,
         }
     }
 }
@@ -376,6 +403,79 @@ impl Model {
 
     pub fn selected_approval(&self) -> Option<&ApprovalRow> {
         self.approvals.get(self.approval_selected)
+    }
+
+    pub fn selected_group(&self) -> Option<&GroupRow> {
+        self.groups.get(self.group_selected)
+    }
+
+    /// Replaces the groups with a `fleet.group.list/1` document; the selection follows the group
+    /// it was on.
+    pub fn update_groups(&mut self, list: &Value) {
+        let previous = self.selected_group().map(|g| g.id.clone());
+        self.groups = list_of(list, "groups")
+            .iter()
+            .take(MAX_ROWS)
+            .map(|g| {
+                let c = g.get("counts").cloned().unwrap_or(Value::Null);
+                GroupRow {
+                    id: text_of(g, "id"),
+                    run: text_of(g, "run"),
+                    title: text_of(g, "title"),
+                    status: text_of(g, "status"),
+                    winner: text_of(g, "winner"),
+                    members: num_of(&c, "members"),
+                    completed: num_of(&c, "completed"),
+                    failed: num_of(&c, "failed"),
+                }
+            })
+            .collect();
+        self.group_selected = previous
+            .and_then(|id| self.groups.iter().position(|g| g.id == id))
+            .unwrap_or(self.group_selected);
+        self.group_selected = clamp_index(self.group_selected, self.groups.len());
+        if self.selected_group().map(|g| g.id.as_str()) != self.group_text_for.as_deref() {
+            self.group_text.clear();
+            self.group_text_for = None;
+            self.group_scroll = 0;
+        }
+    }
+
+    /// Moves the selection in the groups list.
+    pub fn move_group_selection(&mut self, delta: i32) {
+        let step = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
+        let moved = if delta < 0 {
+            self.group_selected.saturating_sub(step)
+        } else {
+            self.group_selected.saturating_add(step)
+        };
+        self.group_selected = clamp_index(moved, self.groups.len());
+    }
+
+    /// Scrolls the comparison by `delta` lines, never past its end.
+    pub fn scroll_group_text(&mut self, delta: i32) {
+        let last = self.group_text.lines().count().saturating_sub(1);
+        let step = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
+        let moved = if delta < 0 {
+            self.group_scroll.saturating_sub(step)
+        } else {
+            self.group_scroll.saturating_add(step)
+        };
+        self.group_scroll = moved.min(last);
+    }
+
+    /// Stores the comparison text of group `id`. Text for a group that is no longer selected is
+    /// dropped, like a late tail.
+    pub fn set_group_text(&mut self, id: &str, text: &str) {
+        if self.selected_group().map(|g| g.id.as_str()) != Some(id) {
+            return;
+        }
+        let kept = fleet_domain::sanitize::head_str(text, MAX_TAIL_BYTES);
+        self.group_text = sanitize_text(kept.as_bytes());
+        if self.group_text_for.as_deref() != Some(id) {
+            self.group_scroll = 0;
+        }
+        self.group_text_for = Some(id.to_string());
     }
 
     /// Moves the selection of the focused list by `delta`, clamped to the list.

@@ -13,7 +13,7 @@ use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::{show, WorkerName};
 use fleet_domain::limits::{
-    DEFAULT_RING_BYTES, MAX_CONFIG_FILE, MAX_PLAN_FILE, MAX_REDACT_RULES, MAX_RING_BYTES,
+    DEFAULT_RING_BYTES, MAX_CONFIG_FILE, MAX_PLAN_FILE, MAX_REDACT_RULES, MAX_RING_BYTES, MAX_SPEC,
     MAX_TOTAL_TASKS,
 };
 use fleet_domain::quality::GateFormat;
@@ -430,6 +430,15 @@ pub fn load_contract(path: &Path) -> Result<Value> {
     Ok(doc)
 }
 
+/// Reads the prompt of a fan-out from a file (`--spec-file`): a regular file of at most
+/// [`MAX_SPEC`] bytes, UTF-8 text. Links and special files are refused before a byte is read.
+pub fn load_spec(path: &Path) -> Result<String> {
+    let bytes =
+        read_regular(path, MAX_SPEC as u64).map_err(|e| read_error("the spec file", path, &e))?;
+    String::from_utf8(bytes)
+        .map_err(|_| invalid(format!("{}: the spec is not valid UTF-8", shown_path(path))))
+}
+
 fn toml_to_value(v: &toml::Value, depth: usize) -> Result<Value> {
     if depth > MAX_PLAN_DEPTH {
         return Err(invalid("the plan is nested too deeply"));
@@ -578,6 +587,31 @@ mod tests {
         std::os::unix::fs::symlink(&good, &link).unwrap();
         assert!(load_contract(&link).is_err(), "a symlink is refused");
         let missing = load_contract(&dir.join("nope.json")).unwrap_err();
+        assert!(!missing.message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn spec_files_are_read_as_bounded_regular_utf8_text() {
+        let dir = TempDir::new("spec-file");
+        let good = dir.write(
+            "prompt.md",
+            "Make the parser reject trailing commas.\n\nKeep the error text.\n",
+        );
+        assert_eq!(
+            load_spec(&good).unwrap(),
+            "Make the parser reject trailing commas.\n\nKeep the error text.\n"
+        );
+        let big = dir.write("big.md", &"x".repeat(MAX_SPEC + 1));
+        assert_eq!(load_spec(&big).unwrap_err().code, ErrorCode::Limit);
+        let binary = dir.join("binary.md");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(load_spec(&binary).unwrap_err().code, ErrorCode::Invalid);
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert!(load_spec(&link).is_err(), "a symlink is refused");
+        assert!(load_spec(dir.path()).is_err(), "a directory is refused");
+        let missing = load_spec(&dir.join("nope\u{1b}.md")).unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
         assert!(!missing.message.contains('\u{1b}'));
     }
 
