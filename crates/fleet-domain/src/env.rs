@@ -67,6 +67,14 @@ impl EnvPolicy {
                 out.insert(name.clone(), value.clone());
             }
         }
+        if let Some(path) = out.get_mut("PATH") {
+            let kept: Vec<&str> = path.split(':').filter(|e| e.starts_with('/')).collect();
+            if kept.is_empty() {
+                out.remove("PATH");
+            } else {
+                *path = kept.join(":");
+            }
+        }
         out.into_iter().collect()
     }
 }
@@ -190,5 +198,42 @@ mod tests {
                 !lower.contains("token") && !lower.contains("secret") && !lower.contains("key")
             );
         }
+    }
+
+    #[test]
+    fn path_keeps_only_absolute_entries_from_every_source() {
+        let parent = pairs(&[("PATH", "/usr/bin::bin:./tools:/opt/x/bin:..")]);
+        let env = EnvPolicy::default_policy().build(&parent, &[], &[], &[]);
+        assert_eq!(env, pairs(&[("PATH", "/usr/bin:/opt/x/bin")]));
+
+        let env = EnvPolicy::default_policy().build(
+            &pairs(&[("PATH", "/bin")]),
+            &[],
+            &pairs(&[("PATH", "rel:/set/bin")]),
+            &[],
+        );
+        assert_eq!(env, pairs(&[("PATH", "/set/bin")]));
+
+        let env = EnvPolicy::default_policy().build(
+            &pairs(&[("PATH", "/bin")]),
+            &[],
+            &[],
+            &pairs(&[("PATH", "/forced:.:/last")]),
+        );
+        assert_eq!(env, pairs(&[("PATH", "/forced:/last")]));
+    }
+
+    #[test]
+    fn a_path_without_absolute_entries_is_removed_not_left_empty() {
+        let parent = pairs(&[("PATH", ":.:bin"), ("HOME", "/h")]);
+        let env = EnvPolicy::default_policy().build(&parent, &[], &[], &[]);
+        assert_eq!(env, pairs(&[("HOME", "/h")]));
+    }
+
+    #[test]
+    fn other_variables_are_not_touched_by_the_path_rule() {
+        let parent = pairs(&[("PATH", "/bin"), ("LANG", ":rel:")]);
+        let env = EnvPolicy::default_policy().build(&parent, &[], &[], &[]);
+        assert_eq!(env, pairs(&[("LANG", ":rel:"), ("PATH", "/bin")]));
     }
 }
