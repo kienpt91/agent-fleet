@@ -592,6 +592,13 @@ fn the_blob_api_serves_images_and_nothing_else() {
     ] {
         let e = ask(&b, &t, "repo.blob", vec![("path", s(path))]).unwrap_err();
         assert_eq!(e.code, code, "{path}: {}", e.message);
+        // the dashboard answers "not an image" with 415 by this subject, a directory with 400
+        let not_image = !matches!(path, "src" | "big.png" | "big.bin" | "nope.png");
+        assert_eq!(
+            e.subject.as_deref() == Some(fleet_app::browse::NOT_AN_IMAGE),
+            not_image,
+            "{path}"
+        );
     }
 }
 

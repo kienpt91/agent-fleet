@@ -106,6 +106,10 @@ fn arguments(route: RepoRoute, query: &str) -> Result<Value, Response> {
     Ok(Value::object(args))
 }
 
+/// The `subject` the application gives the error "this file is not an image"
+/// (`fleet_app::browse::NOT_AN_IMAGE`; an end-to-end test keeps the two in step).
+const NOT_AN_IMAGE: &str = "not_an_image";
+
 /// What the backend sent as an image, checked once more here: the type must be one of the four and
 /// the size within the limit, whatever the backend says.
 fn image_response(content_type: &'static str, bytes: Vec<u8>) -> Response {
@@ -127,8 +131,12 @@ pub(crate) fn handle(
     if route == RepoRoute::Blob {
         return match shared.backend.image(args) {
             Ok(image) => Ok(image_response(image.content_type, image.bytes)),
-            // anything but an image is "unsupported media", not a malformed request
-            Err(e) if e.code == ErrorCode::Invalid => Err(unsupported(&e)),
+            // a file that is not an image is "unsupported media"; a malformed request is a 400
+            Err(e)
+                if e.code == ErrorCode::Invalid && e.subject.as_deref() == Some(NOT_AN_IMAGE) =>
+            {
+                Err(unsupported(&e))
+            }
             Err(e) => Err(fleet_error_response(&e)),
         };
     }

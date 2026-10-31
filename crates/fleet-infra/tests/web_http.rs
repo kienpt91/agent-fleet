@@ -2362,16 +2362,24 @@ fn an_image_is_sent_with_a_closed_policy_nosniff_and_one_of_four_types() {
         r.get_bearer("/api/repo/blob?task=r1%2Fa&path=x").status,
         500
     );
-    // errors: not an image, too large, missing
+    // errors: not an image (415), a malformed request (400), too large, missing
     use fleet_domain::error::ErrorCode;
-    for (code, status) in [
-        (ErrorCode::Invalid, 415),
-        (ErrorCode::Limit, 413),
-        (ErrorCode::NotFound, 404),
+    for (code, subject, status) in [
+        (ErrorCode::Invalid, Some("not_an_image"), 415),
+        (ErrorCode::Invalid, None, 400),
+        (ErrorCode::Invalid, Some("something_else"), 400),
+        (ErrorCode::Limit, None, 413),
+        (ErrorCode::NotFound, None, 404),
     ] {
-        r.fake.on_image(move |_| Err(FleetError::new(code, "no")));
+        r.fake.on_image(move |_| {
+            let e = FleetError::new(code, "no");
+            Err(match subject {
+                Some(s) => e.with_subject(s),
+                None => e,
+            })
+        });
         let resp = r.get_bearer("/api/repo/blob?task=r1%2Fa&path=x");
-        assert_eq!(resp.status, status);
+        assert_eq!(resp.status, status, "{code:?} {subject:?}");
         assert_hardened(&resp);
     }
 }

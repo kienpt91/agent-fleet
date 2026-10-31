@@ -25,6 +25,10 @@ use fleet_domain::value::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+/// The `subject` of the error that says a file is not an image (the dashboard answers it with
+/// 415, unsupported media type, and every other invalid request with 400).
+pub const NOT_AN_IMAGE: &str = "not_an_image";
+
 /// The commits the daemon recorded for a task, and where its repository is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoTarget {
@@ -464,9 +468,10 @@ impl RepoBrowser {
     fn blob(&self, repo: &str, commit: &Sha, path: &RepoPath) -> Result<RepoImage> {
         let read = self.read_file(repo, commit, path)?;
         if read.stat.kind != EntryKind::File {
-            return Err(FleetError::invalid(
-                "only images are served, and this is not a file",
-            ));
+            return Err(
+                FleetError::invalid("only images are served, and this is not a file")
+                    .with_subject(NOT_AN_IMAGE),
+            );
         }
         let Some(bytes) = read.content else {
             return Err(FleetError::limit(format!(
@@ -482,7 +487,8 @@ impl RepoBrowser {
             Some(kind) => Ok(RepoImage { kind, bytes }),
             None => Err(FleetError::invalid(
                 "only png, jpeg, gif and webp images are served (decided by the file's first bytes)",
-            )),
+            )
+            .with_subject(NOT_AN_IMAGE)),
         }
     }
 
