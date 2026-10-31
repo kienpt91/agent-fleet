@@ -3,6 +3,7 @@
 use super::{Key, Orchestrator};
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
+use fleet_domain::fleet::INTERRUPTED_COMMAND;
 use fleet_domain::status::{EndKind, TaskStatus};
 use fleet_domain::supervision::{orphan_action, OrphanAction, ProcessIdentity};
 
@@ -21,7 +22,29 @@ impl Orchestrator {
             version: version.to_string(),
         }])?;
         self.reconcile_orphans();
+        self.reconcile_commands();
         Ok(())
+    }
+
+    /// An approved command that was started but never reported back was cut off by the previous
+    /// daemon run. It is recorded as unfinished with an unknown outcome and is never started
+    /// again (its approval was consumed when it started); the task that waited for it goes back
+    /// in line with a note saying so.
+    fn reconcile_commands(&mut self) {
+        let ids: Vec<String> = self
+            .state
+            .interrupted_commands()
+            .iter()
+            .map(|a| a.id.to_string())
+            .collect();
+        let events = self.state.abandon_interrupted();
+        if let Err(e) = self.commit(events) {
+            self.warn(e.message);
+            return;
+        }
+        for id in ids {
+            self.warn(format!("approval {id}: {INTERRUPTED_COMMAND}"));
+        }
     }
 
     fn reconcile_orphans(&mut self) {

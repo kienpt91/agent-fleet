@@ -66,6 +66,8 @@ struct Inner {
     integration_created: BTreeSet<String>,
     merges: Vec<(String, String)>,
     worktree_merges: Vec<(String, Vec<String>)>,
+    branch_heads: BTreeMap<String, Sha>,
+    merge_requests: Vec<IntegrationMerge>,
     removed: Vec<(String, bool)>,
     merged_branches: BTreeSet<String>,
     sha_counter: u64,
@@ -174,6 +176,14 @@ impl World {
     }
     pub fn worktree_merges(&self) -> Vec<(String, Vec<String>)> {
         self.lock().worktree_merges.clone()
+    }
+    /// Makes `branch` point at `head` (every other branch points at `ccc...c`).
+    pub fn set_branch_head(&self, branch: &str, head: Sha) {
+        self.lock().branch_heads.insert(branch.to_string(), head);
+    }
+    /// Every request that reached `merge_into_integration` (conflicting ones included).
+    pub fn merge_requests(&self) -> Vec<IntegrationMerge> {
+        self.lock().merge_requests.clone()
     }
     pub fn removed_worktrees(&self) -> Vec<(String, bool)> {
         self.lock().removed.clone()
@@ -494,12 +504,16 @@ impl Vcs for FakeVcs {
         }
     }
 
-    fn branch_head(&self, _repo: &str, _branch: &str) -> Result<Sha> {
-        Sha::parse(&"c".repeat(40))
+    fn branch_head(&self, _repo: &str, branch: &str) -> Result<Sha> {
+        match self.0.lock().branch_heads.get(branch) {
+            Some(head) => Ok(head.clone()),
+            None => Sha::parse(&"c".repeat(40)),
+        }
     }
 
     fn merge_into_integration(&self, req: &IntegrationMerge) -> Result<IntegrationResult> {
         let mut g = self.0.lock();
+        g.merge_requests.push(req.clone());
         let created = g.integration_created.insert(req.run.to_string());
         if g.conflict_branches.contains(&req.task_branch) {
             return Ok(IntegrationResult {
@@ -750,6 +764,16 @@ pub struct FakeJobs(World);
 impl JobRunner for FakeJobs {
     fn start(&mut self, job: Job) -> Result<()> {
         let mut g = self.0.lock();
+        if let Job::Command { approval, .. } = &job {
+            let recorded = g.events.iter().any(|e| {
+                matches!(&e.event, DomainEvent::ExternalCommandStarted { id } if id == approval)
+            });
+            if !recorded {
+                return Err(FleetError::internal(
+                    "a command was launched before its start was recorded",
+                ));
+            }
+        }
         if let Job::Gates {
             run,
             task,

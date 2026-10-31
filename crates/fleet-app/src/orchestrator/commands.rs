@@ -476,6 +476,7 @@ impl Orchestrator {
                     base,
                     integration_branch: integration.clone(),
                     task_branch: branch.clone(),
+                    head: head.clone(),
                     message: format!("fleet: merge {} into {integration}: {title}", key.1),
                     identity: self.cfg.author.clone(),
                 })?;

@@ -139,8 +139,53 @@ fn dispatch_builds_the_command_from_the_worker_definition_with_an_allowlisted_en
         "the daemon's secrets are not inherited"
     );
     for (k, v) in &spec.env {
-        assert!(!k.contains("SOCKET") && !k.contains("STATE"), "{k}");
+        if k != "XDG_STATE_HOME" {
+            assert!(!k.contains("SOCKET") && !k.contains("STATE"), "{k}");
+        }
         assert!(!v.contains("fleet.sock"), "{v}");
+    }
+}
+
+#[test]
+fn workers_get_a_private_state_directory_so_a_fleet_run_by_an_agent_cannot_find_the_daemon() {
+    // The operator's own state location is allowlisted for the worker on purpose: fleet still
+    // overrides it.
+    let mut cfg = test_config();
+    cfg.parent_env.push((
+        "XDG_STATE_HOME".to_string(),
+        "/home/test/.local/state".to_string(),
+    ));
+    cfg.parent_env.push((
+        "FLEET_STATE_DIR".to_string(),
+        "/home/test/.local/state/fleet".to_string(),
+    ));
+    for def in cfg.workers.values_mut() {
+        def.env_pass = vec!["XDG_STATE_HOME".to_string(), "FLEET_STATE_DIR".to_string()];
+        def.env_set = vec![("XDG_STATE_HOME".to_string(), "/elsewhere".to_string())];
+    }
+    let mut h = Harness::with_config(cfg);
+    new_run(&mut h);
+    add(&mut h, "a", &[]);
+    h.call("run.start", obj(vec![("run", s("r1"))])).unwrap();
+    let spec = h
+        .world
+        .session_spec(h.world.session_for("a").unwrap())
+        .unwrap();
+    let env: std::collections::BTreeMap<_, _> = spec.env.iter().cloned().collect();
+    assert_eq!(
+        env.get("XDG_STATE_HOME"),
+        Some(&format!("{}/.fleet/xdg-state", spec.cwd))
+    );
+    assert!(!env.contains_key("FLEET_STATE_DIR"));
+    for (k, v) in &spec.env {
+        assert!(!v.contains("/home/test/.local/state"), "{k}={v}");
+        assert!(!v.contains("fleet.sock"), "{k}={v}");
+        // No capability token (64 hex characters) is ever handed to a worker.
+        let looks_like_token = v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit());
+        assert!(!looks_like_token, "{k}");
+    }
+    for arg in &spec.args {
+        assert!(!arg.contains("fleet.sock"));
     }
 }
 

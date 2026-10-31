@@ -16,7 +16,7 @@ use crate::limits::{
     MAX_TASKS_PER_RUN, MAX_TITLE,
 };
 use crate::quality::{gate_feedback, GateOutcome};
-use crate::sanitize::{head_str, tail_str};
+use crate::sanitize::{flatten_line, head_str, quote_lines, tail_str};
 use crate::status::{BlockKind, EndKind, TaskStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -438,8 +438,8 @@ impl Run {
         };
         let mut note = format!("Attempt {} failed: {reason}.", t.attempt);
         if !output_tail.trim().is_empty() {
-            note.push_str("\nLast output:\n");
-            note.push_str(tail_str(output_tail.trim_end(), 1500));
+            note.push_str("\nWhat the worker printed last (quoted):\n");
+            note.push_str(&quote_lines(tail_str(output_tail.trim_end(), 1500)));
         }
         vec![
             DomainEvent::RetryQueued {
@@ -783,6 +783,9 @@ pub fn validate_parallel(n: u32) -> Result<()> {
     Ok(())
 }
 
+/// Longest worker-written summary kept inside a failure reason.
+const MAX_REASON_SUMMARY: usize = 300;
+
 enum Verdict {
     Stopped,
     Success(String),
@@ -799,7 +802,10 @@ fn classify(end: &WorkerEnd) -> Verdict {
             .unwrap_or_default()
     };
     let with_summary = |base: String| match reported_failure {
-        Some(r) if !r.summary.is_empty() => format!("{base}; worker reported: {}", r.summary),
+        Some(r) if !r.summary.is_empty() => format!(
+            "{base}; worker reported: {}",
+            flatten_line(&r.summary, MAX_REASON_SUMMARY)
+        ),
         _ => base,
     };
     match end.outcome {
@@ -810,7 +816,10 @@ fn classify(end: &WorkerEnd) -> Verdict {
                     reason: if r.summary.is_empty() {
                         "worker reported failure".to_string()
                     } else {
-                        format!("worker reported failure: {}", r.summary)
+                        format!(
+                            "worker reported failure: {}",
+                            flatten_line(&r.summary, MAX_REASON_SUMMARY)
+                        )
                     },
                     counts: true,
                 },
@@ -833,7 +842,7 @@ fn classify(end: &WorkerEnd) -> Verdict {
                 } else {
                     format!(
                         "worker reported failure before the daemon stopped: {}",
-                        r.summary
+                        flatten_line(&r.summary, MAX_REASON_SUMMARY)
                     )
                 },
                 counts: true,

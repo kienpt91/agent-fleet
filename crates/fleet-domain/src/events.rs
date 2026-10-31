@@ -127,6 +127,9 @@ define_events! {
     ApprovalDecided = "approval_decided" { id: ApprovalId, approved: bool },
     ApprovalExpired = "approval_expired" { id: ApprovalId },
     ApprovalConsumed = "approval_consumed" { id: ApprovalId },
+    /// An approved command was started; its approval was consumed at that moment, so the command
+    /// is never started a second time, whatever happens to the daemon afterwards.
+    ExternalCommandStarted = "external_command_started" { id: ApprovalId },
     ExternalCommandRan = "external_command_ran" {
         id: ApprovalId, exit_code: Option<i64>, summary: String, output_tail: String,
     },
@@ -173,6 +176,7 @@ impl DomainEvent {
             | ApprovalDecided { .. }
             | ApprovalExpired { .. }
             | ApprovalConsumed { .. }
+            | ExternalCommandStarted { .. }
             | ExternalCommandRan { .. }
             | Warning { .. } => None,
         }
@@ -242,6 +246,7 @@ impl DomainEvent {
             }
             ApprovalExpired { id } => format!("approval {id} expired"),
             ApprovalConsumed { id } => format!("approval {id} consumed"),
+            ExternalCommandStarted { id } => format!("approval {id} command started"),
             ExternalCommandRan { id, .. } => format!("approval {id} command ran"),
             TaskMerged { run, task, .. } => format!("{run}/{task} merged"),
             MergeConflicted { run, task, .. } => format!("{run}/{task} merge conflict"),
@@ -311,6 +316,9 @@ mod tests {
                 digest: "ab".repeat(32),
                 requested_ms: 10,
                 expires_ms: 20,
+            },
+            DomainEvent::ExternalCommandStarted {
+                id: ApprovalId::from_seq(1),
             },
             DomainEvent::TaskMerged {
                 run: run(),

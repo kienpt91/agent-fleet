@@ -5,7 +5,7 @@
 //!
 //! `result.json`:   `{"version":1,"status":"done"|"failed","summary":"..."}`
 //! `question.json`: `{"version":1,"kind":"question"|"approval","text":"...","choices":["..."],
-//!                    "action":{"tool":"shell","command":"...","args":["..."]}}`
+//!                    "action":{"command":"/absolute/path","args":["..."]}}`
 
 use crate::ids::is_invisible;
 use crate::limits::{MAX_ACTION_ARGS, MAX_ACTION_ARG_LEN, MAX_CHOICES, MAX_SUMMARY};
@@ -74,10 +74,10 @@ pub enum QuestionKind {
     Approval,
 }
 
-/// An action a worker asks permission for.
+/// An action a worker asks permission for. The command is an absolute path; the label under which
+/// the human sees it is fixed by fleet (`Action::command`), never chosen by the worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionRequest {
-    pub tool: String,
     pub command: String,
     pub args: Vec<String>,
 }
@@ -100,14 +100,6 @@ fn exact_text(label: &str, s: &str, max: usize) -> Result<String, String> {
         return Err(format!("{label} contains control or invisible characters"));
     }
     Ok(s.to_string())
-}
-
-fn valid_tool(tool: &str) -> bool {
-    !tool.is_empty()
-        && tool.len() <= 32
-        && tool
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 impl WorkerQuestion {
@@ -168,15 +160,13 @@ fn parse_action(a: &Value) -> Result<ActionRequest, String> {
     if a.as_object().is_none() {
         return Err("action must be an object".to_string());
     }
-    let tool = match a.get("tool") {
-        None | Some(Value::Null) => "shell".to_string(),
-        Some(Value::Str(t)) if valid_tool(t) => t.clone(),
-        Some(_) => return Err("action.tool must be 1-32 characters of [a-z0-9._-]".to_string()),
-    };
     let command = match a.get("command").and_then(Value::as_str) {
         Some(c) if !c.trim().is_empty() => exact_text("action.command", c, MAX_COMMAND_LEN)?,
         _ => return Err("action.command must be a non-empty string".to_string()),
     };
+    if !command.starts_with('/') {
+        return Err("action.command must be an absolute path (it starts with '/')".to_string());
+    }
     let mut args = Vec::new();
     match a.get("args") {
         None | Some(Value::Null) => {}
@@ -195,11 +185,7 @@ fn parse_action(a: &Value) -> Result<ActionRequest, String> {
         }
         Some(_) => return Err("action.args must be an array".to_string()),
     }
-    Ok(ActionRequest {
-        tool,
-        command,
-        args,
-    })
+    Ok(ActionRequest { command, args })
 }
 
 #[cfg(test)]
@@ -293,15 +279,14 @@ mod tests {
             (
                 "action",
                 Value::object([
-                    ("command", Value::str("npm")),
+                    ("command", Value::str("/usr/bin/npm")),
                     ("args", Value::array([Value::str("publish")])),
                 ]),
             ),
         ]);
         let parsed = WorkerQuestion::from_value(&v).unwrap();
         let action = parsed.action.unwrap();
-        assert_eq!(action.tool, "shell");
-        assert_eq!(action.command, "npm");
+        assert_eq!(action.command, "/usr/bin/npm");
         assert_eq!(action.args, vec!["publish"]);
     }
 
@@ -352,34 +337,33 @@ mod tests {
     #[test]
     fn action_is_validated_exactly() {
         let bad = [
-            Value::str("ls"),
+            Value::str("/bin/ls"),
             Value::object([("command", Value::str(""))]),
             Value::object([("command", Value::int(1))]),
-            Value::object([("command", Value::str("ls\n-la"))]),
-            Value::object([("command", Value::str("l\u{202e}s"))]),
+            Value::object([("command", Value::str("/bin/ls\n-la"))]),
+            Value::object([("command", Value::str("/bin/l\u{202e}s"))]),
             Value::object([
-                ("command", Value::str("ls")),
-                ("tool", Value::str("Bad Tool")),
+                ("command", Value::str("/bin/ls")),
+                ("args", Value::str("x")),
             ]),
-            Value::object([("command", Value::str("ls")), ("args", Value::str("x"))]),
             Value::object([
-                ("command", Value::str("ls")),
+                ("command", Value::str("/bin/ls")),
                 ("args", Value::array([Value::int(1)])),
             ]),
             Value::object([
-                ("command", Value::str("ls")),
+                ("command", Value::str("/bin/ls")),
                 ("args", Value::array([Value::str("a\0b")])),
             ]),
             Value::object([
-                ("command", Value::str("ls")),
+                ("command", Value::str("/bin/ls")),
                 (
                     "args",
                     Value::array((0..65).map(|i| Value::str(format!("a{i}")))),
                 ),
             ]),
-            Value::object([("command", Value::str("x".repeat(5000)))]),
+            Value::object([("command", Value::str(format!("/{}", "x".repeat(5000))))]),
             Value::object([
-                ("command", Value::str("ls")),
+                ("command", Value::str("/bin/ls")),
                 ("args", Value::array([Value::str("y".repeat(5000))])),
             ]),
         ];
@@ -392,13 +376,58 @@ mod tests {
     }
 
     #[test]
+    fn the_command_must_be_an_absolute_path() {
+        for relative in [
+            "npm",
+            "ls",
+            "./run.sh",
+            "../x",
+            "bin/tool",
+            "~/bin/tool",
+            " /bin/ls",
+            "$HOME/x",
+            "C:\\x",
+        ] {
+            let err = WorkerQuestion::from_value(&approval_with(Value::object([(
+                "command",
+                Value::str(relative),
+            )])))
+            .unwrap_err();
+            assert!(err.contains("absolute"), "{relative:?}: {err}");
+        }
+        for ok in ["/bin/ls", "/usr/local/bin/npm", "/"] {
+            let a = WorkerQuestion::from_value(&approval_with(Value::object([(
+                "command",
+                Value::str(ok),
+            )])))
+            .unwrap()
+            .action
+            .unwrap();
+            assert_eq!(a.command, ok);
+        }
+    }
+
+    #[test]
+    fn a_worker_chosen_tool_label_is_ignored() {
+        let with_tool = approval_with(Value::object([
+            ("command", Value::str("/bin/ls")),
+            ("tool", Value::str("Operator Approved Safe Tool")),
+        ]));
+        let without = approval_with(Value::object([("command", Value::str("/bin/ls"))]));
+        assert_eq!(
+            WorkerQuestion::from_value(&with_tool).unwrap(),
+            WorkerQuestion::from_value(&without).unwrap()
+        );
+    }
+
+    #[test]
     fn exact_text_is_not_rewritten() {
         let v = approval_with(Value::object([
-            ("command", Value::str("  echo ")),
+            ("command", Value::str("/bin/echo ")),
             ("args", Value::array([Value::str("a  b")])),
         ]));
         let a = WorkerQuestion::from_value(&v).unwrap().action.unwrap();
-        assert_eq!(a.command, "  echo ");
+        assert_eq!(a.command, "/bin/echo ");
         assert_eq!(a.args, vec!["a  b"]);
     }
 

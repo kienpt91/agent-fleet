@@ -346,7 +346,7 @@ fn a_decision_made_before_a_restart_is_still_valid_after_it() {
     )
     .unwrap();
     assert_eq!(task_status(&mut h, "c"), "running");
-    assert!(last_brief(&h).contains("Answer: sqlite"));
+    assert!(last_brief(&h).contains("Operator says: sqlite"));
     h.call(
         "approval.decide",
         obj(vec![("id", s("a1")), ("approve", Value::Bool(true))]),

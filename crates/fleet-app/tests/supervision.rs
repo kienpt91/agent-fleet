@@ -608,8 +608,14 @@ fn the_retry_note_carries_the_exit_code_and_the_last_output() {
         brief.contains("Attempt 1 failed: worker exited with code 2."),
         "{brief}"
     );
-    assert!(brief.contains("Last output:"), "{brief}");
-    assert!(brief.contains("cannot find crate `serde`"), "{brief}");
+    assert!(
+        brief.contains("What the worker printed last (quoted):"),
+        "{brief}"
+    );
+    assert!(
+        brief.contains("> error: cannot find crate `serde`"),
+        "{brief}"
+    );
     assert!(brief.contains("This is attempt 2."), "{brief}");
     let saved = h
         .world

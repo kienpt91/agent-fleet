@@ -42,6 +42,16 @@ impl Action {
         }
     }
 
+    /// A worker-requested command: always labelled `command`, whatever the worker called it, and
+    /// always an absolute program path (checked when the request is parsed).
+    pub fn command(command: &str, args: &[String]) -> Action {
+        Action {
+            tool: "command".to_string(),
+            command: command.to_string(),
+            args: args.to_vec(),
+        }
+    }
+
     /// A request that has no executable form: the worker only wants a yes or no.
     pub fn manual(question: &str) -> Action {
         Action {
@@ -86,6 +96,15 @@ impl Action {
     }
 }
 
+/// How far an approved external command got. Consuming the approval and starting the command are
+/// one step, so `Started` means the approval is gone and the command is never started again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandProgress {
+    NotStarted,
+    Started,
+    Finished,
+}
+
 /// When an approval is requested and how long it stays usable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
@@ -104,6 +123,7 @@ pub struct Approval {
     pub requested_ms: u64,
     pub expires_ms: u64,
     pub status: ApprovalStatus,
+    pub command: CommandProgress,
 }
 
 impl Approval {
@@ -159,6 +179,7 @@ impl Approval {
                 requested_ms: *requested_ms,
                 expires_ms: *expires_ms,
                 status: ApprovalStatus::Pending,
+                command: CommandProgress::NotStarted,
             }),
             _ => None,
         }
@@ -262,6 +283,24 @@ impl Approval {
         })
     }
 
+    /// Starts an approved external command: consumes the approval (it must be approved, unexpired
+    /// and match `action`) and records that the command was started. Both events are recorded
+    /// before the command is launched, so no restart or delay can make it run twice.
+    pub fn start_command(
+        &self,
+        action: &Action,
+        now_ms: u64,
+        hasher: &dyn Digest,
+    ) -> Result<Vec<DomainEvent>> {
+        let consumed = self.consume(action, now_ms, hasher)?;
+        Ok(vec![
+            consumed,
+            DomainEvent::ExternalCommandStarted {
+                id: self.id.clone(),
+            },
+        ])
+    }
+
     pub fn apply(&mut self, ev: &DomainEvent) {
         match ev {
             DomainEvent::ApprovalDecided { id, approved } if *id == self.id => {
@@ -276,6 +315,14 @@ impl Approval {
             }
             DomainEvent::ApprovalConsumed { id } if *id == self.id => {
                 self.status = ApprovalStatus::Consumed
+            }
+            DomainEvent::ExternalCommandStarted { id }
+                if *id == self.id && self.command == CommandProgress::NotStarted =>
+            {
+                self.command = CommandProgress::Started;
+            }
+            DomainEvent::ExternalCommandRan { id, .. } if *id == self.id => {
+                self.command = CommandProgress::Finished;
             }
             _ => {}
         }
@@ -514,6 +561,105 @@ mod tests {
         let ev = used.consume(&act, 2000, &FakeDigest).unwrap();
         used.apply(&ev);
         assert!(used.expiry_event(99_999).is_none());
+    }
+
+    fn approved_command(ttl: u64) -> Approval {
+        let action = Action::command("/usr/bin/make", &["deploy".to_string()]);
+        let ev = Approval::request(
+            ApprovalId::from_seq(2),
+            RunId::parse("r1").unwrap(),
+            TaskId::parse("t1").unwrap(),
+            Purpose::ExternalCommand,
+            &action,
+            Window {
+                now_ms: 1000,
+                ttl_ms: ttl,
+            },
+            &FakeDigest,
+        )
+        .unwrap();
+        let mut a = Approval::from_event(&ev).unwrap();
+        let decided = a.decide(true, None, 1001, &FakeDigest).unwrap();
+        a.apply(&decided);
+        a
+    }
+
+    #[test]
+    fn worker_commands_always_carry_the_fixed_tool_label() {
+        let a = Action::command("/bin/ls", &["-l".to_string()]);
+        assert_eq!(a.tool, "command");
+        assert_eq!(a.display(), "command: \"/bin/ls\" \"-l\"");
+    }
+
+    #[test]
+    fn starting_a_command_consumes_the_approval_and_records_the_start() {
+        let mut a = approved_command(5000);
+        assert_eq!(a.command, CommandProgress::NotStarted);
+        let act = a.action.clone();
+        let events = a.start_command(&act, 1500, &FakeDigest).unwrap();
+        let kinds: Vec<&str> = events.iter().map(DomainEvent::kind).collect();
+        assert_eq!(kinds, vec!["approval_consumed", "external_command_started"]);
+        for e in &events {
+            a.apply(e);
+        }
+        assert_eq!(a.status, ApprovalStatus::Consumed);
+        assert_eq!(a.command, CommandProgress::Started);
+        a.apply(&DomainEvent::ExternalCommandRan {
+            id: a.id.clone(),
+            exit_code: Some(0),
+            summary: String::new(),
+            output_tail: String::new(),
+        });
+        assert_eq!(a.command, CommandProgress::Finished);
+    }
+
+    #[test]
+    fn a_started_command_cannot_be_started_again_even_if_it_runs_past_expiry() {
+        let mut a = approved_command(5000);
+        let act = a.action.clone();
+        for e in a.start_command(&act, 1500, &FakeDigest).unwrap() {
+            a.apply(&e);
+        }
+        for now in [1500, 5999, 6000, 1_000_000] {
+            assert!(a.start_command(&act, now, &FakeDigest).is_err(), "{now}");
+        }
+        // The run outliving the approval's window does not make the approval lapse.
+        assert!(a.expiry_event(1_000_000).is_none());
+    }
+
+    #[test]
+    fn commands_are_not_started_without_a_live_matching_approval() {
+        let pending = {
+            let action = Action::command("/usr/bin/make", &[]);
+            let ev = Approval::request(
+                ApprovalId::from_seq(3),
+                RunId::parse("r1").unwrap(),
+                TaskId::parse("t1").unwrap(),
+                Purpose::ExternalCommand,
+                &action,
+                Window {
+                    now_ms: 1000,
+                    ttl_ms: 5000,
+                },
+                &FakeDigest,
+            )
+            .unwrap();
+            Approval::from_event(&ev).unwrap()
+        };
+        let act = pending.action.clone();
+        assert!(pending.start_command(&act, 1500, &FakeDigest).is_err());
+
+        let approved = approved_command(5000);
+        let act = approved.action.clone();
+        assert!(approved.start_command(&act, 6000, &FakeDigest).is_err());
+        let other = Action::command("/usr/bin/make", &["clean".to_string()]);
+        assert_eq!(
+            approved
+                .start_command(&other, 1500, &FakeDigest)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
     }
 
     #[test]

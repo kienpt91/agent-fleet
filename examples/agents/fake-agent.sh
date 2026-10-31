@@ -17,8 +17,8 @@ case "$task" in
     result "added the users table"
     ;;
   api)
-    if grep -q '^Answer: ' "$brief"; then
-      framework=$(sed -n 's/^Answer: //p' "$brief" | head -n 1)
+    if grep -q '^ *Operator says: ' "$brief"; then
+      framework=$(sed -n 's/^ *Operator says: //p' "$brief" | head -n 1)
       echo "framework: $framework" > api.txt
       result "built the API with $framework"
     else

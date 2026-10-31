@@ -77,6 +77,10 @@ pub struct IntegrationMerge {
     pub base: Sha,
     pub integration_branch: String,
     pub task_branch: String,
+    /// The commit of the task branch that was read, gated and (when required) approved. The
+    /// adapter merges exactly this commit and fails with a conflict when the branch no longer
+    /// points at it, so a branch that moved after the approval is never merged.
+    pub head: Sha,
     pub message: String,
     pub identity: Identity,
 }

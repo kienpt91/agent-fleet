@@ -213,8 +213,8 @@ fn sample_events() -> Vec<DomainEvent> {
             run: run.clone(),
             task: t1.clone(),
             purpose: Purpose::ExternalCommand,
-            tool: "shell".into(),
-            command: "git push \"origin\" main".into(),
+            tool: "command".into(),
+            command: "/usr/bin/git push \"origin\" main".into(),
             args: vec![
                 "--flag".into(),
                 "has space".into(),
@@ -234,6 +234,9 @@ fn sample_events() -> Vec<DomainEvent> {
             id: approval.clone(),
         },
         DomainEvent::ApprovalConsumed {
+            id: approval.clone(),
+        },
+        DomainEvent::ExternalCommandStarted {
             id: approval.clone(),
         },
         DomainEvent::ExternalCommandRan {

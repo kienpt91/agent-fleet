@@ -9,6 +9,7 @@ use fleet_app::testing::{test_config, Harness};
 use fleet_domain::contract::{ContractRead, ResultStatus, WorkerResult};
 use fleet_domain::error::{ErrorCode, FleetError};
 use fleet_domain::events::DomainEvent;
+use fleet_domain::ids::Sha;
 use fleet_domain::value::Value;
 
 fn obj(pairs: Vec<(&str, Value)>) -> Value {
@@ -293,6 +294,65 @@ fn after_approval_the_merge_succeeds_and_is_recorded() {
     assert_eq!(count(&h, "task_merged"), 1);
     assert_eq!(count(&h, "approval_consumed"), 1);
     assert_eq!(approval_status(&mut h, "a1"), "consumed");
+}
+
+fn sha_of(c: char) -> Sha {
+    Sha::parse(&c.to_string().repeat(40)).unwrap()
+}
+
+#[test]
+fn the_adapter_is_asked_to_merge_exactly_the_commit_that_was_approved() {
+    let mut h = completed(&["a"], |_| {});
+    h.world.set_branch_head("fleet/r1/a", sha_of('e'));
+    merge(&mut h, "a").unwrap_err();
+    let approved_args: Vec<String> = approvals(&mut h)[0]
+        .get("args")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert_eq!(approved_args[2], "e".repeat(40));
+    decide(&mut h, "a1", true).unwrap();
+
+    merge(&mut h, "a").unwrap();
+    let requests = h.world.merge_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].task_branch, "fleet/r1/a");
+    assert_eq!(requests[0].head, sha_of('e'));
+}
+
+#[test]
+fn a_branch_that_moved_after_the_approval_is_not_sent_to_the_adapter_and_needs_a_new_approval() {
+    let mut h = completed(&["a"], |_| {});
+    h.world.set_branch_head("fleet/r1/a", sha_of('e'));
+    merge(&mut h, "a").unwrap_err();
+    decide(&mut h, "a1", true).unwrap();
+
+    h.world.set_branch_head("fleet/r1/a", sha_of('f'));
+    let err = merge(&mut h, "a").unwrap_err();
+    assert_eq!(err.code, ErrorCode::ApprovalRequired);
+    assert_eq!(err.subject.as_deref(), Some("a2"));
+    assert!(h.world.merge_requests().is_empty());
+    assert_eq!(approval_status(&mut h, "a1"), "approved");
+    assert_eq!(count(&h, "approval_consumed"), 0);
+
+    // The new approval is for the new commit, and that is what gets merged.
+    decide(&mut h, "a2", true).unwrap();
+    merge(&mut h, "a").unwrap();
+    let requests = h.world.merge_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].head, sha_of('f'));
+}
+
+#[test]
+fn without_approvals_the_adapter_still_gets_the_head_that_was_read() {
+    let mut h = completed(&["a"], no_approval);
+    h.world.set_branch_head("fleet/r1/a", sha_of('e'));
+    merge(&mut h, "a").unwrap();
+    let requests = h.world.merge_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].head, sha_of('e'));
 }
 
 #[test]

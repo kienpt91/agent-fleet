@@ -443,17 +443,9 @@ impl Orchestrator {
                     output,
                 } => {
                     self.command_jobs.remove(&approval);
-                    let now = self.now();
                     let result = self
                         .state
-                        .external_ran(
-                            &approval,
-                            exit_code,
-                            &summary,
-                            &output,
-                            now,
-                            self.ports.digest.as_ref(),
-                        )
+                        .external_ran(&approval, exit_code, &summary, &output)
                         .and_then(|e| self.commit(e));
                     if let Err(e) = result {
                         self.warn(format!("approval {approval}: {}", e.message));
@@ -464,7 +456,10 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Runs commands that a human approved on behalf of a worker.
+    /// Runs commands that a human approved on behalf of a worker. The approval is consumed, and
+    /// the start recorded, *before* anything is launched: a restart, a slow command or an
+    /// expired window can never make the same approval run a command twice. What happens to a
+    /// command that was started and never reported back is settled in `startup`.
     pub(crate) fn start_commands(&mut self) -> Result<()> {
         let runnable: Vec<(
             fleet_domain::ids::ApprovalId,
@@ -490,6 +485,21 @@ impl Orchestrator {
         for (id, run, task, program, args) in runnable {
             if self.ports.jobs.running() >= MAX_CONCURRENT_JOBS {
                 break;
+            }
+            let now = self.now();
+            let started = self
+                .state
+                .start_command(&id, now, self.ports.digest.as_ref())
+                .and_then(|events| self.commit(events));
+            if let Err(e) = started {
+                // Nothing was recorded, so nothing runs; the approval is looked at again later.
+                self.warn(format!("approval {id}: {}", e.message));
+                continue;
+            }
+            if !program.starts_with('/') {
+                let _ =
+                    self.finish_command(&id, None, "refused: the command is not an absolute path");
+                continue;
             }
             let worktree = self
                 .state
@@ -538,16 +548,17 @@ impl Orchestrator {
         code: Option<i64>,
         summary: &str,
     ) -> Result<()> {
-        let now = self.now();
         let events = self
             .state
-            .external_ran(id, code, summary, "", now, self.ports.digest.as_ref())
+            .external_ran(id, code, summary, "")
             .map_err(|e| FleetError::new(e.code, e.message))?;
         self.commit(events)
     }
 }
 
-/// Variables fleet itself sets for children. Never the socket or state directory.
+/// Variables fleet itself sets for children. Never the socket, the state directory or a token:
+/// `XDG_STATE_HOME` points inside the worktree, so a `fleet` run by an agent looks for the
+/// daemon's socket in a directory that is not the operator's.
 fn fleet_env(run: &RunId, task: &TaskId, worktree: &str) -> Vec<(String, String)> {
     vec![
         ("FLEET_RUN".to_string(), run.to_string()),
@@ -556,6 +567,10 @@ fn fleet_env(run: &RunId, task: &TaskId, worktree: &str) -> Vec<(String, String)
         (
             "FLEET_BRIEF_FILE".to_string(),
             format!("{worktree}/.fleet/brief.md"),
+        ),
+        (
+            "XDG_STATE_HOME".to_string(),
+            format!("{worktree}/.fleet/xdg-state"),
         ),
     ]
 }
