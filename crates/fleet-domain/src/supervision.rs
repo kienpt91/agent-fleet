@@ -183,9 +183,43 @@ pub fn is_worker_origin(chain: &[ProcInfo], live: &[LiveSession]) -> bool {
     })
 }
 
+/// True when the connecting process was started, directly or through other processes, by the
+/// daemon itself: one of its ancestors (not the process itself) is the daemon. The daemon starts
+/// workers, quality gates, approved commands, git and the undo tool, and all of them run code or
+/// read files an agent wrote, so none of them may talk to the daemon's interfaces. The operator's
+/// own commands are never started by the daemon. A process that leaves the tree (a double fork
+/// that is adopted by init, `setsid`) is not caught; callers combine this with
+/// [`is_worker_origin`] over the process groups of everything the daemon has running.
+pub fn is_started_by_daemon(chain: &[ProcInfo], daemon_pid: u32) -> bool {
+    daemon_pid > 1 && chain.iter().skip(1).any(|p| p.pid == daemon_pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(pid: u32, ppid: u32, pgid: u32) -> ProcInfo {
+        ProcInfo { pid, ppid, pgid }
+    }
+
+    #[test]
+    fn a_process_started_by_the_daemon_is_recognized_by_its_ancestry_only() {
+        // daemon 100, gate script 200, the gate's child 300; the operator's shell 50 and fleet 60
+        let gate_child = [info(300, 200, 200), info(200, 100, 200), info(100, 50, 50)];
+        assert!(is_started_by_daemon(&gate_child, 100));
+        assert!(
+            is_started_by_daemon(&gate_child[1..], 100),
+            "the job leader itself"
+        );
+        let operator = [info(60, 50, 60), info(50, 1, 50)];
+        assert!(!is_started_by_daemon(&operator, 100));
+        // the daemon process itself (an in-process client, a test) is not "started by" itself
+        assert!(!is_started_by_daemon(&[info(100, 50, 50)], 100));
+        assert!(!is_started_by_daemon(&[], 100));
+        // pid 0 and 1 never stand for the daemon
+        assert!(!is_started_by_daemon(&gate_child, 0));
+        assert!(!is_started_by_daemon(&[info(5, 1, 5), info(1, 0, 1)], 1));
+    }
 
     #[test]
     fn identity_requires_a_known_matching_start_token() {
