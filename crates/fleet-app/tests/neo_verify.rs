@@ -550,6 +550,37 @@ fn a_contract_replaced_during_the_run_drops_the_result_and_runs_again() {
 }
 
 #[test]
+fn a_goal_added_during_the_run_is_verified_too_before_the_task_completes() {
+    let mut h = governed(&[("tests", true)], |_| {});
+    h.world.set_verify_mode(VerifyMode::Manual);
+    finish_ok(&mut h, "a");
+    ticks(&mut h);
+    h.call(
+        "goal.add",
+        obj(vec![
+            ("id", s("late")),
+            ("title", s("late")),
+            ("tasks", list(&["r1/a"])),
+            ("contract", contract(&[("docs", true)])),
+        ]),
+    )
+    .unwrap();
+    // the running job knows only goal g; its pass is not enough any more
+    h.world.complete_verify("r1", "a", &[]);
+    ticks(&mut h);
+    assert_eq!(task_status(&mut h, "a"), "review");
+    assert_eq!(count(&h, "task_completed"), 0);
+    let jobs = h.world.verify_jobs();
+    assert_eq!(jobs.len(), 2, "a second run covers both goals");
+    assert_eq!(jobs[1].targets.len(), 2);
+    h.world.complete_verify("r1", "a", &[]);
+    ticks(&mut h);
+    assert_eq!(task_status(&mut h, "a"), "completed");
+    assert_eq!(goal_status(&mut h, "g"), "verified");
+    assert_eq!(goal_status(&mut h, "late"), "verified");
+}
+
+#[test]
 fn a_restart_during_verification_runs_it_again_and_keeps_the_ledger() {
     let mut h = governed(&[("tests", true)], |_| {});
     h.world.set_verify_mode(VerifyMode::Manual);

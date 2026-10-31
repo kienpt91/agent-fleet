@@ -156,7 +156,16 @@ impl Orchestrator {
             self.fail_task(&key, format!("the verification cannot be recorded: {why}"));
             return;
         }
-        if recorded && self.ledger.task_contract(&key.0, &key.1) == TaskContract::Passed {
+        // The pass must be this run's: every contract that guards the task now (not only those
+        // that did when the job started) must be among the results, so that evidence of an earlier
+        // run of another contract, or of the same one on another commit, never stands in for it.
+        let covered = self.verification_targets(&key.0, &key.1).iter().all(|t| {
+            done.results
+                .iter()
+                .any(|r| r.goal == t.goal && r.contract_id == t.contract_id)
+        });
+        if recorded && covered && self.ledger.task_contract(&key.0, &key.1) == TaskContract::Passed
+        {
             self.verified.insert(rkey);
             return;
         }
