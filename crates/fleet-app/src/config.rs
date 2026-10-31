@@ -11,7 +11,12 @@ use fleet_domain::limits::{
     MAX_WORKERS_CONFIGURED,
 };
 use fleet_domain::quality::GateFormat;
+use fleet_domain::redact::Redactor;
+use neo_context::estimate::Profile;
+use neo_context::input::GlossaryEntry;
+use neo_context::layer::UnverifiedPolicy;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerDef {
@@ -25,6 +30,85 @@ pub struct WorkerDef {
     pub env_set: Vec<(String, String)>,
     pub timeout_ms: Option<u64>,
     pub idle_timeout_ms: Option<u64>,
+    /// The context profile (`[context.profile.<name>]`) of the model this worker runs; the
+    /// context's default profile when absent.
+    pub profile: Option<String>,
+}
+
+/// Settings of the context compiler (`[context]` of the configuration file).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextConfig {
+    /// Model profiles by name. `default` always exists.
+    pub profiles: BTreeMap<String, Profile>,
+    /// The profile of a worker that names none.
+    pub default_profile: String,
+    /// What to do with text agents wrote (layer 7): label it UNVERIFIED, or leave it out.
+    pub policy: UnverifiedPolicy,
+    /// Constraints shown in layer 2.
+    pub constraints: Vec<String>,
+    /// Glossary entries shown in layer 2 after the built-in ones.
+    pub glossary: Vec<GlossaryEntry>,
+    /// The static knowledge file (layer 5), an absolute path.
+    pub knowledge: Option<String>,
+}
+
+impl Default for ContextConfig {
+    fn default() -> ContextConfig {
+        let standard = Profile::standard();
+        let name = standard.name().to_string();
+        ContextConfig {
+            profiles: BTreeMap::from([(name.clone(), standard)]),
+            default_profile: name,
+            policy: UnverifiedPolicy::Label,
+            constraints: Vec::new(),
+            glossary: Vec::new(),
+            knowledge: None,
+        }
+    }
+}
+
+impl ContextConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.profiles.contains_key(&self.default_profile) {
+            return Err(FleetError::invalid(format!(
+                "the default context profile {} is not defined",
+                show(&self.default_profile)
+            )));
+        }
+        if self.profiles.len() > 16 {
+            return Err(FleetError::invalid(
+                "more than 16 context profiles are configured",
+            ));
+        }
+        for (name, p) in &self.profiles {
+            if name != p.name() {
+                return Err(FleetError::invalid("profile table key and name differ"));
+            }
+        }
+        if self.constraints.len() > neo_context::limits::MAX_CONSTRAINTS
+            || self.glossary.len() > neo_context::limits::MAX_GLOSSARY
+        {
+            return Err(FleetError::invalid(
+                "too many context constraints or glossary entries",
+            ));
+        }
+        if let Some(path) = &self.knowledge {
+            if !path.starts_with('/') || path.chars().any(char::is_control) {
+                return Err(FleetError::invalid(
+                    "the knowledge file must be an absolute path without control characters",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The profile named `name`, or the default one.
+    pub fn profile_for(&self, name: Option<&str>) -> Result<&Profile> {
+        let wanted = name.unwrap_or(&self.default_profile);
+        self.profiles.get(wanted).ok_or_else(|| {
+            FleetError::invalid(format!("context profile {} is not defined", show(wanted)))
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,10 +143,15 @@ pub struct AppConfig {
     pub gates: Vec<GateDef>,
     /// Silence after which a question file makes the supervisor stop the worker.
     pub question_grace_ms: u64,
+    pub context: ContextConfig,
+    /// Redacts every piece of text a context pack is made of (the daemon sets its own).
+    pub redactor: Arc<Redactor>,
 }
 
 impl AppConfig {
     pub fn new(parent_env: Vec<(String, String)>) -> AppConfig {
+        let mut redactor = Redactor::builtin();
+        redactor.add_env_values(parent_env.iter().cloned());
         AppConfig {
             max_sessions: 8,
             default_worker: None,
@@ -81,6 +170,8 @@ impl AppConfig {
             workers: BTreeMap::new(),
             gates: Vec::new(),
             question_grace_ms: 2000,
+            context: ContextConfig::default(),
+            redactor: Arc::new(redactor),
         }
     }
 
@@ -120,6 +211,17 @@ impl AppConfig {
             return Err(FleetError::invalid(format!(
                 "more than {MAX_GATES_CONFIGURED} quality gates are configured"
             )));
+        }
+        self.context.validate()?;
+        for (name, w) in &self.workers {
+            if let Some(p) = &w.profile {
+                if !self.context.profiles.contains_key(p) {
+                    return Err(FleetError::invalid(format!(
+                        "worker {name}: context profile {} is not defined",
+                        show(p)
+                    )));
+                }
+            }
         }
         if let Some(d) = &self.default_worker {
             if !self.workers.contains_key(d) {
@@ -227,6 +329,7 @@ mod tests {
             env_set: vec![],
             timeout_ms: Some(1000),
             idle_timeout_ms: None,
+            profile: None,
         }
     }
 

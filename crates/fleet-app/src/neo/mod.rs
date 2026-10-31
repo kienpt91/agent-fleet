@@ -7,10 +7,14 @@
 //! evidence; the scheduler rule (a task with a contract completes only after fleet's own run
 //! passed it) is enforced in the review flow (`verify.rs`).
 
+mod context;
+mod context_cmds;
+mod context_state;
 mod goals;
 mod verify;
 pub mod views;
 
+pub(crate) use context_state::ContextState;
 pub(crate) use verify::{VerifyOutcome, Verifying};
 
 use crate::api::Reply;

@@ -1,0 +1,280 @@
+//! What the orchestrator remembers for the context compiler, rebuilt from the event log like the
+//! fleet state and the goal ledger: the newest handoff packet of each task, which handoffs were
+//! already made (so a restart does not make them twice) and a short history of each task's events.
+
+use crate::orchestrator::Key;
+use fleet_domain::approval::Digest;
+use fleet_domain::events::DomainEvent;
+use neo_context::handoff::{HandoffPacket, HandoffTrigger};
+use neo_context::input::EventLine;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Events remembered per task.
+const HISTORY_KEPT: usize = 64;
+
+/// Handoffs are made once per attempt and class: one when the attempt ends the task, one when it
+/// ends and the task goes back in line (a retry, or found running after a crash).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum HandoffClass {
+    TaskEnd,
+    Restart,
+}
+
+impl HandoffClass {
+    pub(crate) fn of(trigger: HandoffTrigger) -> Option<HandoffClass> {
+        match trigger {
+            HandoffTrigger::TaskCompleted | HandoffTrigger::TaskFailed => {
+                Some(HandoffClass::TaskEnd)
+            }
+            HandoffTrigger::Retry | HandoffTrigger::Recovery => Some(HandoffClass::Restart),
+            HandoffTrigger::OnDemand => None,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ContextState {
+    handoffs: BTreeMap<Key, HandoffPacket>,
+    made: BTreeSet<(Key, u32, HandoffClass)>,
+    history: BTreeMap<Key, VecDeque<EventLine>>,
+    /// The sequence number of the `context_compiled` event of each pack: what the pack was made
+    /// from is the state before that event.
+    compiled: BTreeMap<(Key, String), u64>,
+}
+
+impl ContextState {
+    pub(crate) fn apply(&mut self, seq: u64, event: &DomainEvent, hasher: &dyn Digest) {
+        match event {
+            DomainEvent::HandoffCreated {
+                run,
+                task,
+                attempt,
+                trigger,
+                packet,
+                ..
+            } => {
+                // A packet that does not match its own digest was edited after it was written:
+                // it is not a handoff.
+                let Ok(packet) = HandoffPacket::from_value(&packet.0, hasher) else {
+                    return;
+                };
+                let key = (run.clone(), task.clone());
+                if let Some(class) = HandoffTrigger::parse(trigger).and_then(HandoffClass::of) {
+                    self.made.insert((key.clone(), *attempt, class));
+                }
+                self.handoffs.insert(key, packet);
+            }
+            DomainEvent::ContextCompiled {
+                run,
+                task,
+                pack_digest,
+                ..
+            } => {
+                self.compiled
+                    .insert(((run.clone(), task.clone()), pack_digest.clone()), seq);
+            }
+            DomainEvent::Warning { .. } => {}
+            other => {
+                if let (Some(run), Some(task)) = (other.run(), other.task()) {
+                    let list = self.history.entry((run.clone(), task.clone())).or_default();
+                    list.push_back(EventLine {
+                        seq,
+                        text: other.headline(),
+                    });
+                    while list.len() > HISTORY_KEPT {
+                        list.pop_front();
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handoff(&self, key: &Key) -> Option<&HandoffPacket> {
+        self.handoffs.get(key)
+    }
+
+    pub(crate) fn was_made(&self, key: &Key, attempt: u32, class: HandoffClass) -> bool {
+        self.made.contains(&(key.clone(), attempt, class))
+    }
+
+    /// The remembered events of a task, oldest first.
+    pub(crate) fn history(&self, key: &Key) -> Vec<EventLine> {
+        self.history
+            .get(key)
+            .map(|l| l.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Forgets a task (its worktree and records were cleaned up).
+    pub(crate) fn forget(&mut self, key: &Key) {
+        self.handoffs.remove(key);
+        self.history.remove(key);
+        self.made.retain(|(k, _, _)| k != key);
+        self.compiled.retain(|(k, _), _| k != key);
+    }
+
+    /// Where in the log the pack with this digest was recorded.
+    pub(crate) fn compiled_at(&self, key: &Key, digest: &str) -> Option<u64> {
+        self.compiled
+            .get(&(key.clone(), digest.to_string()))
+            .copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::ToyDigest;
+    use fleet_domain::ids::{RunId, Sha, TaskId};
+    use fleet_domain::value::{Document, Value};
+    use neo_context::layer::UnverifiedPolicy;
+    use neo_context::testing::{compiler, sample_handoff};
+
+    fn key(t: &str) -> Key {
+        (RunId::parse("r1").unwrap(), TaskId::parse(t).unwrap())
+    }
+
+    fn created(packet: &HandoffPacket, attempt: u32, trigger: &str) -> DomainEvent {
+        DomainEvent::HandoffCreated {
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse("api").unwrap(),
+            attempt,
+            trigger: trigger.to_string(),
+            digest: packet.digest().to_string(),
+            packet: Document(packet.to_value()),
+        }
+    }
+
+    fn packet() -> HandoffPacket {
+        // made with the toy digest the application tests use, so that it verifies here
+        let c = compiler(8192, UnverifiedPolicy::Label);
+        let pack = c
+            .compile(&neo_context::testing::sample_input(), &ToyDigest)
+            .unwrap();
+        let _ = sample_handoff;
+        HandoffPacket::new(
+            neo_context::handoff::HandoffParts {
+                run: "r1".into(),
+                task: "api".into(),
+                attempt: 1,
+                trigger: HandoffTrigger::Retry,
+                verification: vec![],
+                evidence: vec![],
+                summary: None,
+            },
+            &pack,
+            c.hygiene(),
+            &ToyDigest,
+        )
+    }
+
+    #[test]
+    fn a_handoff_event_is_remembered_with_its_class() {
+        let mut s = ContextState::default();
+        let p = packet();
+        s.apply(5, &created(&p, 1, "retry"), &ToyDigest);
+        assert_eq!(s.handoff(&key("api")).map(|h| h.digest()), Some(p.digest()));
+        assert!(s.was_made(&key("api"), 1, HandoffClass::Restart));
+        assert!(!s.was_made(&key("api"), 1, HandoffClass::TaskEnd));
+        assert!(!s.was_made(&key("api"), 2, HandoffClass::Restart));
+        s.apply(6, &created(&p, 2, "task-completed"), &ToyDigest);
+        assert!(s.was_made(&key("api"), 2, HandoffClass::TaskEnd));
+        s.apply(7, &created(&p, 3, "on-demand"), &ToyDigest);
+        assert!(!s.was_made(&key("api"), 3, HandoffClass::Restart));
+        assert!(
+            !s.was_made(&key("api"), 3, HandoffClass::TaskEnd),
+            "an on-demand handoff is never automatic"
+        );
+    }
+
+    #[test]
+    fn a_packet_that_does_not_match_its_digest_is_not_a_handoff() {
+        let mut s = ContextState::default();
+        let p = packet();
+        let mut doc = p.to_value().as_object().unwrap().clone();
+        doc.insert("attempt".to_string(), Value::int(9u64));
+        let forged = DomainEvent::HandoffCreated {
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse("api").unwrap(),
+            attempt: 9,
+            trigger: "retry".into(),
+            digest: p.digest().to_string(),
+            packet: Document(Value::Object(doc)),
+        };
+        s.apply(1, &forged, &ToyDigest);
+        assert!(s.handoff(&key("api")).is_none());
+        assert!(!s.was_made(&key("api"), 9, HandoffClass::Restart));
+    }
+
+    #[test]
+    fn history_keeps_the_newest_events_of_a_task_and_skips_meta_events() {
+        let mut s = ContextState::default();
+        let run = RunId::parse("r1").unwrap();
+        let t = TaskId::parse("api").unwrap();
+        for n in 0..100u64 {
+            s.apply(
+                n,
+                &DomainEvent::TaskReady {
+                    run: run.clone(),
+                    task: t.clone(),
+                },
+                &ToyDigest,
+            );
+        }
+        s.apply(
+            200,
+            &DomainEvent::ContextCompiled {
+                run: run.clone(),
+                task: t.clone(),
+                attempt: 1,
+                profile: "p".into(),
+                pack_digest: "a".repeat(64),
+                stable_digest: "b".repeat(64),
+                tokens: 1,
+                manifest: Document(Value::object([("k", Value::Null)])),
+            },
+            &ToyDigest,
+        );
+        s.apply(
+            201,
+            &DomainEvent::Warning {
+                message: "w".into(),
+            },
+            &ToyDigest,
+        );
+        s.apply(
+            202,
+            &DomainEvent::RunStarted {
+                run: run.clone(),
+                max_parallel: 1,
+            },
+            &ToyDigest,
+        );
+        let h = s.history(&key("api"));
+        assert_eq!(h.len(), HISTORY_KEPT);
+        assert_eq!(h.first().map(|e| e.seq), Some(36));
+        assert_eq!(h.last().map(|e| e.seq), Some(99));
+        assert_eq!(h.last().map(|e| e.text.as_str()), Some("r1/api ready"));
+        assert!(s.history(&key("other")).is_empty());
+        let _ = Sha::parse(&"a".repeat(40));
+    }
+
+    #[test]
+    fn forgetting_a_task_forgets_everything_about_it() {
+        let mut s = ContextState::default();
+        let p = packet();
+        s.apply(1, &created(&p, 1, "retry"), &ToyDigest);
+        s.apply(
+            2,
+            &DomainEvent::TaskReady {
+                run: RunId::parse("r1").unwrap(),
+                task: TaskId::parse("api").unwrap(),
+            },
+            &ToyDigest,
+        );
+        s.forget(&key("api"));
+        assert!(s.handoff(&key("api")).is_none());
+        assert!(s.history(&key("api")).is_empty());
+        assert!(!s.was_made(&key("api"), 1, HandoffClass::Restart));
+    }
+}

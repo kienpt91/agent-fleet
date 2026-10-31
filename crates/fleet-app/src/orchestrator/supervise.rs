@@ -119,6 +119,7 @@ impl Orchestrator {
                 key.0, key.1, e.message
             ));
         }
+        self.stash_worker_summary(key, &live.worktree);
         let end = self.worker_end(
             &live.worktree,
             live.attempt,

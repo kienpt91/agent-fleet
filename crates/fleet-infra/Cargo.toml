@@ -16,6 +16,7 @@ path = "src/lib.rs"
 fleet-domain = { path = "../fleet-domain" }
 fleet-app = { path = "../fleet-app" }
 neo-verify = { path = "../neo-verify" }
+neo-context = { path = "../neo-context" }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
 sha2 = { version = "=0.11.1", default-features = false }
@@ -25,6 +26,7 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal", "so
 
 [dev-dependencies]
 fleet-app = { path = "../fleet-app", features = ["testing"] }
+neo-context = { path = "../neo-context", features = ["testing"] }
 
 [lints]
 workspace = true

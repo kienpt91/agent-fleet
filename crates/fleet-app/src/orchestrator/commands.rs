@@ -118,6 +118,13 @@ impl Orchestrator {
                 task,
                 ticket,
             } => self.verify_status(&target, task.as_deref(), ticket),
+            Command::ContextShow { task, digest } => self.context_show(&task, digest.as_deref()),
+            Command::ContextDiff { task, a, b } => self.context_diff(&task, &a, &b),
+            Command::ContextVerify { task } => self.context_verify(&task),
+            Command::ContextExplain { task, profile } => {
+                self.context_explain(task.as_deref(), profile.as_deref())
+            }
+            Command::Handoff { task } => self.handoff_command(&task),
             Command::Shutdown => {
                 self.shutdown_requested = true;
                 self.begin_shutdown();
@@ -611,6 +618,8 @@ impl Orchestrator {
                             task: item.key.1.clone(),
                         }])?;
                         self.ports.logs.remove(&item.key.0, &item.key.1);
+                        self.ports.context.remove(&item.key.0, &item.key.1);
+                        self.context.forget(&item.key);
                         removed.push(Value::str(&name));
                     }
                     Err(e) => self.warn(format!("{name}: cleanup failed: {}", e.message)),

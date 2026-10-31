@@ -44,6 +44,8 @@ pub struct StateLayout {
     pub events: PathBuf,
     pub head: PathBuf,
     pub logs_dir: PathBuf,
+    /// Compiled context packs and handoff packets, `<run>/<task>/...`.
+    pub context_dir: PathBuf,
     /// Where verification jobs export commits and give their checks a home (emptied at start).
     /// **Outside the state directory** (see [`verify_scratch_dir`]): the working directory of a
     /// check must not have the control token and socket as relatives.
@@ -62,6 +64,7 @@ impl StateLayout {
             events: root.join("events.log"),
             head: root.join("events.head"),
             logs_dir: root.join("logs"),
+            context_dir: root.join("context"),
             verify_dir: verify_scratch_dir(&root, nix::unistd::geteuid().as_raw()),
             default_config: root.join("fleet.toml"),
             token: control_dir.join(TOKEN_FILE),
@@ -82,6 +85,7 @@ impl StateLayout {
         fsx::ensure_private_dir(&self.root)?;
         fsx::ensure_private_dir(&self.control_dir)?;
         fsx::ensure_private_dir(&self.logs_dir)?;
+        fsx::ensure_private_dir(&self.context_dir)?;
         Ok(())
     }
 
@@ -400,6 +404,7 @@ mod tests {
         assert_eq!(l.events, Path::new("/s/events.log"));
         assert_eq!(l.head, Path::new("/s/events.head"));
         assert_eq!(l.logs_dir, Path::new("/s/logs"));
+        assert_eq!(l.context_dir, Path::new("/s/context"));
         assert_eq!(l.default_config, Path::new("/s/fleet.toml"));
         assert_eq!(l.token, Path::new("/s/control/token"));
         assert_eq!(
@@ -443,7 +448,7 @@ mod tests {
         let t = TempDir::new("state-prepare");
         let l = StateLayout::new(t.join("s"));
         l.prepare().unwrap();
-        for d in [&l.root, &l.control_dir, &l.logs_dir] {
+        for d in [&l.root, &l.control_dir, &l.logs_dir, &l.context_dir] {
             assert_eq!(fs::metadata(d).unwrap().mode() & 0o777, 0o700, "{d:?}");
         }
         // Loosened permissions are tightened on the next start.

@@ -5,13 +5,15 @@
 //! fakes for tests. Every port is `Send` so the orchestrator can live on its own thread.
 
 use fleet_domain::approval::Digest;
-use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
+use fleet_domain::contract::{ContractRead, WorkerHandoff, WorkerQuestion, WorkerResult};
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{ApprovalId, GoalId, RunId, Sha, TaskId};
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::{GateFormat, GateOutcome};
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
+use fleet_domain::value::Value;
+use neo_context::input::Fact;
 use neo_verify::contract::{ContractId, VerificationContract};
 use neo_verify::judge::CheckReport;
 
@@ -165,6 +167,21 @@ pub trait Vcs: Send {
     /// git directory says; a worktree that does not belong to the repository, or is not on its
     /// task's branch, is refused.
     fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState>;
+    /// The regular files of `commit` as the repository itself has them (never through a worktree),
+    /// in path order, at most `max` of them. Symbolic links and submodules are not listed.
+    fn tree_files(&self, repo: &str, commit: &Sha, max: usize) -> Result<TreeListing>;
+    /// At most `max` bytes from the start of the blob `blob`, read from the repository itself.
+    /// `blob` comes from [`Vcs::tree_files`], so it is a regular file's content.
+    fn read_blob(&self, repo: &str, blob: &Sha, max: usize) -> Result<Vec<u8>>;
+    /// The paths the commits `base..head` changed, sorted, at most `max`; and whether there were more.
+    /// Read from the repository itself.
+    fn changed_paths(
+        &self,
+        repo: &str,
+        base: &Sha,
+        head: &Sha,
+        max: usize,
+    ) -> Result<(Vec<String>, bool)>;
 }
 
 // ---- sessions -----------------------------------------------------------------------------
@@ -260,6 +277,13 @@ pub trait ContractFiles: Send {
     fn read_result(&self, worktree: &str) -> ContractRead<WorkerResult>;
     /// Cheap check used while the worker runs: does a question file exist?
     fn question_present(&self, worktree: &str) -> bool;
+    /// Writes the compiled context into `.fleet/` (`context.md`, `context.json`) for the worker
+    /// to read. Fleet never reads these files back: whatever the worker does to them changes
+    /// nothing fleet decides.
+    fn prepare_context(&self, worktree: &str, text: &str, manifest_json: &str) -> Result<()>;
+    /// The summary a worker left for its successor (`.fleet/handoff.json`), read with the same
+    /// rules as `result.json`. Always treated as UNVERIFIED.
+    fn read_handoff(&self, worktree: &str) -> ContractRead<WorkerHandoff>;
 }
 
 // ---- background jobs ------------------------------------------------------------------------
@@ -425,4 +449,83 @@ pub struct Ports {
     pub undo: Box<dyn UndoTool>,
     pub digest: Box<dyn SendDigest>,
     pub publisher: Box<dyn EventPublisher>,
+    pub context: Box<dyn ContextStore>,
+    pub knowledge: Box<dyn KnowledgeSource>,
+}
+
+// ---- context packs ---------------------------------------------------------------------------------
+
+/// A regular file of a commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeFile {
+    pub path: String,
+    pub size: u64,
+    /// The repository's id of the file's content.
+    pub blob: Sha,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct TreeListing {
+    pub files: Vec<TreeFile>,
+    /// The commit has more files than were listed.
+    pub truncated: bool,
+}
+
+/// A compiled pack as it is stored: its digest, its rendered text and its JSON document
+/// (digest and manifest).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredPack {
+    pub digest: String,
+    pub text: String,
+    /// The pack's JSON document (`neo_context::pack::Pack::document`): its digest and manifest.
+    /// The adapter writes its canonical text and parses it back; the application layer has no
+    /// JSON parser.
+    pub document: Value,
+}
+
+/// Where compiled packs and handoff packets are kept, for `fleet context show`, `diff` and
+/// `verify` and so that a worker that rewrites its own copy changes nothing. Bounded: an adapter
+/// keeps the newest few per task and forgets the rest.
+pub trait ContextStore: Send {
+    fn save_pack(&mut self, run: &RunId, task: &TaskId, pack: &StoredPack) -> Result<()>;
+    /// The saved pack whose digest starts with `digest` (at least 8 hex digits; more than one
+    /// match is an error), or the newest saved when `digest` is `None`.
+    fn load_pack(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        digest: Option<&str>,
+    ) -> Result<Option<StoredPack>>;
+    /// Digests of the saved packs, oldest first.
+    fn list_packs(&self, run: &RunId, task: &TaskId) -> Result<Vec<String>>;
+    /// Keeps a handoff packet (its JSON document) under its digest.
+    fn save_handoff(
+        &mut self,
+        run: &RunId,
+        task: &TaskId,
+        digest: &str,
+        packet: &Value,
+    ) -> Result<()>;
+    /// The handoff packet whose digest starts with `digest`, or the newest; with its digest.
+    fn load_handoff(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        digest: Option<&str>,
+    ) -> Result<Option<(String, Value)>>;
+    /// Forgets everything kept for a task.
+    fn remove(&mut self, run: &RunId, task: &TaskId);
+}
+
+/// A fact of the static knowledge file with the paths it is about (none: it applies everywhere).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeEntry {
+    pub fact: Fact,
+    pub paths: Vec<String>,
+}
+
+/// The human-written knowledge file (layer 5 until the knowledge store of milestone N3 exists).
+pub trait KnowledgeSource: Send {
+    /// Every fact of the file. A fact without a source is an error, not a fact.
+    fn entries(&self) -> Result<Vec<KnowledgeEntry>>;
 }

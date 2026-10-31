@@ -132,6 +132,32 @@ pub enum Command {
         /// The ticket `verify` returned: report on that run.
         ticket: Option<u64>,
     },
+    /// The compiled context pack of a task: the newest, or the one whose digest starts with
+    /// `digest`.
+    ContextShow {
+        task: String,
+        digest: Option<String>,
+    },
+    /// Layer-by-layer comparison of two stored packs of a task.
+    ContextDiff {
+        task: String,
+        a: String,
+        b: String,
+    },
+    /// Compiles the task's pack from the current state and compares it with the newest stored one.
+    ContextVerify {
+        task: String,
+    },
+    /// Layer order, budgets and the shrink order of a profile (the profile of a task's worker, a
+    /// named one, or the default).
+    ContextExplain {
+        task: Option<String>,
+        profile: Option<String>,
+    },
+    /// Makes a handoff packet for a task now (and shows it).
+    Handoff {
+        task: String,
+    },
     Shutdown,
 }
 
@@ -420,6 +446,21 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
             task: a.opt_str("task")?.map(str::to_string),
             ticket: a.opt_u64("ticket")?,
         },
+        "context.show" => Command::ContextShow {
+            task: task()?,
+            digest: a.opt_str("digest")?.map(str::to_string),
+        },
+        "context.diff" => Command::ContextDiff {
+            task: task()?,
+            a: a.req_str("a")?.to_string(),
+            b: a.req_str("b")?.to_string(),
+        },
+        "context.verify" => Command::ContextVerify { task: task()? },
+        "context.explain" => Command::ContextExplain {
+            task: a.opt_str("task")?.map(str::to_string),
+            profile: a.opt_str("profile")?.map(str::to_string),
+        },
+        "handoff" => Command::Handoff { task: task()? },
         "shutdown" => Command::Shutdown,
         other => {
             return Err(FleetError::invalid(format!(
@@ -445,6 +486,10 @@ pub fn is_read_only(cmd: &Command) -> bool {
             | Command::GoalShow { .. }
             | Command::GoalRemaining
             | Command::VerifyStatus { .. }
+            | Command::ContextShow { .. }
+            | Command::ContextDiff { .. }
+            | Command::ContextVerify { .. }
+            | Command::ContextExplain { .. }
     )
 }
 

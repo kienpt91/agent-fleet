@@ -3,12 +3,8 @@
 //! with them) and fixtures shared by the tests of this crate and of the layers above it. Checked
 //! against the FIPS 180-4 test vectors below.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::needless_range_loop
-)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(clippy::needless_range_loop)]
 
 use crate::compile::Compiler;
 use crate::estimate::Profile;

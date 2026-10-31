@@ -10,6 +10,7 @@
 pub mod client;
 pub mod clock;
 pub mod config_file;
+pub mod context_store;
 pub mod contract_fs;
 pub mod daemon;
 pub mod digest;
@@ -19,6 +20,7 @@ pub mod fsx;
 pub mod git;
 pub mod jobs;
 pub mod json;
+pub mod knowledge;
 pub mod logs;
 pub mod memory;
 pub mod procid;
