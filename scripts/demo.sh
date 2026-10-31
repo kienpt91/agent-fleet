@@ -62,6 +62,10 @@ run "$FLEET" plan "$WORK/plan.toml"
 run "$FLEET" start --run r1 --max-parallel 2
 
 wait_for '"kind":"question"'
+if [ -n "${DEMO_SNAPSHOT_DIR:-}" ]; then
+  "$FLEET" status --json > "$DEMO_SNAPSHOT_DIR/status.json"
+  "$FLEET" tail schema > "$DEMO_SNAPSHOT_DIR/tail.txt"
+fi
 run "$FLEET" status
 run "$FLEET" gate list
 run "$FLEET" gate resolve g1 --answer axum

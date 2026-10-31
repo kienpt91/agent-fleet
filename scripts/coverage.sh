@@ -7,7 +7,7 @@
 #   docker run --rm -v "$PWD:/work" -v fleet-target:/target -w /work fleet-dev scripts/coverage.sh
 #
 # What is counted: the library and binary code of each crate. Not counted: files under tests/,
-# the in-memory fakes (crates/fleet-app/src/testing*), test helpers (testutil.rs) and everything
+# examples, the in-memory fakes (crates/fleet-app/src/testing*), test helpers (testutil.rs) and everything
 # after the first `#[cfg(test)]` of a source file (the unit tests themselves, which would otherwise
 # inflate every number). Processes killed with SIGKILL by the recovery tests write no profile, so
 # their coverage is lost; coverage of the daemon comes from the runs that stop it normally.
@@ -36,7 +36,7 @@ for o in $objects; do
 done
 # shellcheck disable=SC2086
 "$BIN/llvm-cov" export --format=lcov --instr-profile="$COV/all.profdata" \
-  --ignore-filename-regex='(/\.cargo/|/cargo/registry/|/rustc/|/tests/|/testing|testutil\.rs)' \
+  --ignore-filename-regex='(/\.cargo/|/cargo/registry/|/rustc/|/tests/|/examples/|/testing|testutil\.rs)' \
   "$first" $rest > "$COV/lcov.info"
 
 awk '
@@ -58,10 +58,13 @@ awk '
   }
   END {
     printf "%-16s %8s %8s %8s\n", "layer", "lines", "covered", "percent"
-    for (c in total) {
+    n = split("domain application infrastructure cli other", order, " ")
+    for (i = 1; i <= n; i++) {
+      c = order[i]
+      if (total[c] == 0) continue
       printf "%-16s %8d %8d %7.1f%%\n", c, total[c], covered[c], 100 * covered[c] / total[c]
       all += total[c]; allc += covered[c]
     }
     printf "%-16s %8d %8d %7.1f%%\n", "overall", all, allc, 100 * allc / all
   }
-' "$COV/lcov.info" | sort | tee "$COV/summary.txt"
+' "$COV/lcov.info" | tee "$COV/summary.txt"
