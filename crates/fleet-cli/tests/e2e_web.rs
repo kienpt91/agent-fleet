@@ -1754,3 +1754,677 @@ fn a_process_started_by_an_approved_command_cannot_use_the_web_ui() {
     );
     assert_operator_unaffected(&f, &web, &lib);
 }
+
+// ---- 12. goals and evidence, served read-only -----------------------------------------------------------------------
+
+fn is_hex40(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// A fleet with one worker script, started with the dashboard, whose retries are on.
+fn goal_fleet(worker_body: &str) -> (Fleet, WebInfo) {
+    let mut f = Fleet::new();
+    let s = f.script("w.sh", worker_body);
+    f.write_cfg(&simple_cfg(&s, "").set("max_retries", "2"));
+    let info = f.start_web(&[]);
+    (f, info)
+}
+
+/// Loads a plan with the single task `r1/a` (not started).
+fn load_plan_a(f: &Fleet) {
+    let file = f
+        .tmp
+        .write("plan.toml", &plan_toml(&f.repo, "r1", 1, &[t("a")]));
+    f.ok(&["plan", file.to_str().unwrap()]);
+}
+
+/// `fleet goals add` with a contract file, naming `r1/a`.
+fn add_feature_goal(f: &Fleet, files: &TempDir, contract: &str) {
+    let path = files.write("contract.json", contract);
+    f.ok(&[
+        "goals",
+        "add",
+        "--id",
+        "feature",
+        "--title",
+        "The answer is ready",
+        "--intent",
+        "answer.txt says ready",
+        "--task",
+        "r1/a",
+        "--contract",
+        path.to_str().unwrap(),
+    ]);
+}
+
+/// Polls a `GET` document until `pred` holds for it.
+fn poll(web: &Web, path: &str, what: &str, mut pred: impl FnMut(&Value) -> bool) -> Value {
+    let start = Instant::now();
+    loop {
+        let r = web.get(path);
+        assert_eq!(r.status, 200, "{path}: {}", r.text());
+        let doc = r.json();
+        if pred(&doc) {
+            return doc;
+        }
+        if start.elapsed() > Duration::from_millis(WAIT_MS) {
+            panic!("timed out waiting for {what}: {}", doc.canonical());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn goal_row<'a>(doc: &'a Value, id: &str) -> &'a Value {
+    jarr(doc, "goals")
+        .iter()
+        .find(|g| jstr(g, "id") == id)
+        .unwrap_or_else(|| panic!("no goal {id} in {}", doc.canonical()))
+}
+
+fn task_verification_of(doc: &Value, id: &str) -> String {
+    jstr(&jarr(goal_row(doc, id), "tasks")[0], "verification").to_string()
+}
+
+#[test]
+fn goals_and_evidence_are_served_read_only() {
+    let out = TempDir::new("o");
+    let files = TempDir::new("files");
+    // attempt 1 writes the wrong answer; a retry whose brief quotes the failed check writes the
+    // right one. The worker waits for `go`, so the states in between can be looked at.
+    let worker = fill(
+        "set -eu\nwhile [ ! -f @OUT@/go ]; do sleep 0.1; done\nif grep -q 'verify feature' \"$FLEET_BRIEF_FILE\"; then echo ready > answer.txt; else echo wrong > answer.txt; fi\nprintf '{\"version\":1,\"status\":\"done\",\"summary\":\"all done\"}\\n' > .fleet/result.json\n",
+        &[("OUT", out.path())],
+    );
+    let (f, info) = goal_fleet(&worker);
+    let web = Web::new(&info);
+    load_plan_a(&f);
+    // the last check waits for `verify-go`, so that the task can be seen between "the worker
+    // said done" and "fleet's own run finished"
+    let contract = fill(
+        r#"{"version":1,"checks":[
+  {"id":"answer","kind":"file","path":"answer.txt","assert":"contains","value":"ready"},
+  {"id":"exists","kind":"command","program":"/bin/sh","args":["-c","test -f answer.txt"]},
+  {"id":"slow","kind":"command","program":"/bin/sh","args":["-c","while [ ! -f @OUT@/verify-go ]; do sleep 0.1; done"]}
+]}"#,
+        &[("OUT", out.path())],
+    );
+    add_feature_goal(&f, &files, &contract);
+
+    // before anything runs: the goal is open, its task pending, and it is the next thing to do
+    let list = web.get("/api/goals");
+    assert_eq!(list.status, 200, "{}", list.text());
+    let doc = list.json();
+    assert_eq!(jstr(&doc, "schema"), "fleet.goals.list/1");
+    assert_eq!(jnum(&doc, "total"), 1);
+    let row = goal_row(&doc, "feature");
+    assert_eq!(jstr(row, "status"), "open", "{}", row.canonical());
+    assert_eq!(jstr(row, "contract"), "pending");
+    assert_eq!(task_verification_of(&doc, "feature"), "pending");
+    let rem = web.get("/api/remaining");
+    assert_eq!(rem.status, 200, "{}", rem.text());
+    let rem = rem.json();
+    assert_eq!(jstr(&rem, "schema"), "fleet.goals.remaining/1");
+    assert_eq!(jarr(&rem, "open_leaves").len(), 1, "{}", rem.canonical());
+    assert_eq!(jstr(&jarr(&rem, "open_leaves")[0], "id"), "feature");
+    let next = jarr(&rem, "next_ready");
+    assert_eq!(next.len(), 1, "{}", rem.canonical());
+    assert_eq!(jstr(&next[0], "task"), "r1/a");
+    assert_eq!(jstr(&next[0], "goal"), "feature");
+    assert!(jarr(&rem, "blockers").is_empty());
+    assert_eq!(jnum(&rem, "verified"), 0);
+
+    // running, the worker has not said anything: still pending
+    f.ok(&["start", "--run", "r1"]);
+    f.wait_live("r1", "a");
+    let doc = web.get("/api/goals").json();
+    assert_eq!(task_verification_of(&doc, "feature"), "pending");
+    assert_eq!(
+        jstr(&jarr(goal_row(&doc, "feature"), "tasks")[0], "status"),
+        "running"
+    );
+    let rem = web.get("/api/remaining").json();
+    assert!(
+        jarr(&rem, "next_ready").is_empty(),
+        "a running task is not next: {}",
+        rem.canonical()
+    );
+
+    // the worker claims success with the wrong answer; fleet's own run is not finished, so the
+    // claim is "unverified" and nothing is completed
+    fs::write(out.join("go"), "").unwrap();
+    let doc = poll(&web, "/api/goals", "the task to leave pending", |d| {
+        task_verification_of(d, "feature") != "pending"
+    });
+    assert_eq!(
+        task_verification_of(&doc, "feature"),
+        "unverified",
+        "{}",
+        doc.canonical()
+    );
+    let tasks = jarr(goal_row(&doc, "feature"), "tasks");
+    assert_eq!(jstr(&tasks[0], "status"), "review");
+    assert_eq!(jstr(goal_row(&doc, "feature"), "status"), "open");
+    let first_commit = safe_git(&f.repo, &["rev-parse", "fleet/r1/a"]);
+    assert!(is_hex40(&first_commit), "{first_commit}");
+    let unverified = web.get("/api/verify?target=r1/a");
+    assert_eq!(unverified.status, 200, "{}", unverified.text());
+    let doc = unverified.json();
+    assert_eq!(jstr(&doc, "schema"), "fleet.verify/1");
+    assert_eq!(jstr(&doc, "verification"), "unverified");
+    assert!(!jbool(&doc, "passed"));
+
+    // fleet's run finishes: the wrong answer fails its contract, the retry fixes it
+    fs::write(out.join("verify-go"), "").unwrap();
+    let doc = poll(&web, "/api/goals", "the goal to be verified", |d| {
+        jstr(goal_row(d, "feature"), "status") == "verified"
+    });
+    assert_eq!(jstr(goal_row(&doc, "feature"), "contract"), "passed");
+    assert_eq!(task_verification_of(&doc, "feature"), "verified");
+    assert_eq!(jnum(&doc, "verified"), 1);
+    f.wait_task("r1", "a", &["completed"]);
+
+    let head = safe_git(&f.repo, &["rev-parse", "fleet/r1/a"]);
+    let tree = safe_git(&f.repo, &["rev-parse", &format!("{head}^{{tree}}")]);
+    assert!(is_hex40(&head) && is_hex40(&tree));
+    assert_ne!(head, first_commit, "the retry committed new work");
+
+    let shown = web.get("/api/goal?id=feature");
+    assert_eq!(shown.status, 200, "{}", shown.text());
+    let goal = shown.json();
+    assert_eq!(jstr(&goal, "schema"), "fleet.goals.show/1");
+    assert_eq!(jstr(&goal, "id"), "feature");
+    assert_eq!(jstr(&goal, "status"), "verified");
+    assert_eq!(jstr(&goal, "contract"), "passed");
+    assert_eq!(jstr(&goal, "intent"), "answer.txt says ready");
+    // the newest evidence of every check names the commit and the tree that were checked, and
+    // counts: it is what the task's review recorded
+    let checks = jarr(&goal, "checks");
+    assert_eq!(
+        checks.iter().map(|c| jstr(c, "check")).collect::<Vec<_>>(),
+        ["answer", "exists", "slow"]
+    );
+    for c in checks {
+        let latest = c
+            .get("latest")
+            .filter(|l| !l.is_null())
+            .unwrap_or_else(|| panic!("no evidence for {}", c.canonical()));
+        assert_eq!(jstr(latest, "verdict"), "passed", "{}", c.canonical());
+        assert_eq!(jstr(latest, "commit"), head, "{}", c.canonical());
+        assert_eq!(jstr(latest, "tree"), tree, "{}", c.canonical());
+        assert!(jbool(latest, "counts"), "{}", c.canonical());
+        assert!(!jbool(latest, "dirty"), "{}", c.canonical());
+        assert_eq!(jstr(latest, "task"), "a");
+    }
+    // the history is newest first and keeps the failed run of attempt 1, bound to the commit
+    // that run checked
+    let history = jarr(&goal, "history");
+    assert_eq!(history.len(), 6, "{}", goal.canonical());
+    let times: Vec<u64> = history.iter().map(|e| jnum(e, "at_ms")).collect();
+    assert!(times.windows(2).all(|w| w[0] >= w[1]), "{times:?}");
+    assert_eq!(jstr(&history[0], "verdict"), "passed");
+    assert_eq!(jstr(&history[0], "commit"), head);
+    let failed: Vec<&Value> = history
+        .iter()
+        .filter(|e| jstr(e, "verdict") == "failed")
+        .collect();
+    assert!(!failed.is_empty(), "{}", goal.canonical());
+    for e in &failed {
+        assert_eq!(jstr(e, "check"), "answer");
+        assert_eq!(jstr(e, "commit"), first_commit, "{}", e.canonical());
+        assert_eq!(
+            jstr(e, "tree"),
+            safe_git(&f.repo, &["rev-parse", &format!("{first_commit}^{{tree}}")])
+        );
+        assert!(!jbool(e, "counts"), "a stale run counts: {}", e.canonical());
+    }
+    for e in history {
+        assert!(is_hex40(jstr(e, "commit")) && is_hex40(jstr(e, "tree")));
+    }
+
+    // nothing is left to do
+    let rem = web.get("/api/remaining").json();
+    assert!(jarr(&rem, "open_leaves").is_empty(), "{}", rem.canonical());
+    assert!(jarr(&rem, "next_ready").is_empty());
+    assert!(jarr(&rem, "blockers").is_empty());
+    assert_eq!(jnum(&rem, "verified"), 1);
+    // the state of the verification of the task, and of the goal
+    for target in ["r1/a", "feature"] {
+        let v = web.get(&format!("/api/verify?target={target}"));
+        assert_eq!(v.status, 200, "{}", v.text());
+        let v = v.json();
+        assert_eq!(jstr(&v, "schema"), "fleet.verify/1");
+        assert!(
+            jbool(&v, "passed") && !jbool(&v, "running"),
+            "{}",
+            v.canonical()
+        );
+        let goals = jarr(&v, "goals");
+        assert_eq!(goals.len(), 1);
+        assert_eq!(jstr(&goals[0], "goal"), "feature");
+        assert_eq!(jstr(&goals[0], "contract"), "passed");
+    }
+    // the dashboard and the command line tell the same story
+    let cli = f.json(&["goals", "show", "feature"]);
+    assert_eq!(cli.canonical(), goal.canonical());
+    // an unknown goal is a 404 document
+    let none = web.get("/api/goal?id=nosuch");
+    assert_eq!(none.status, 404, "{}", none.text());
+    assert_eq!(web.get("/api/goal").status, 400);
+    assert_eq!(web.get("/api/verify").status, 400);
+}
+
+// ---- 13. the goal documents cannot be changed over HTTP ---------------------------------------------------------------
+
+#[test]
+fn goal_documents_cannot_be_changed_over_http() {
+    let files = TempDir::new("files");
+    let (f, info) = goal_fleet("exit 0");
+    let web = Web::new(&info);
+    load_plan_a(&f);
+    add_feature_goal(
+        &f,
+        &files,
+        r#"{"version":1,"checks":[{"id":"answer","kind":"file","path":"answer.txt","assert":"exists"}]}"#,
+    );
+    let goals_before = f.json(&["goals", "list"]);
+    let events_before = f.events_raw();
+    let status_before = f.status();
+    let body = Value::object([
+        ("id", Value::str("injected")),
+        ("title", Value::str("injected")),
+        ("goal", Value::str("feature")),
+        ("status", Value::str("abandoned")),
+        ("target", Value::str("feature")),
+    ])
+    .canonical();
+
+    // the four documents have a GET and nothing else
+    for path in ["/api/goals", "/api/goal", "/api/remaining", "/api/verify"] {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let r = http(
+                web.port,
+                method,
+                path,
+                &[("Authorization", &web.bearer())],
+                (method != "DELETE").then_some(body.as_str()),
+            );
+            assert!(
+                r.status == 405 || r.status == 404,
+                "{method} {path} -> {} {}",
+                r.status,
+                r.text()
+            );
+            if method == "POST" {
+                assert_eq!(r.status, 405, "{path}: {}", r.text());
+                assert_eq!(r.header("allow"), Some("GET"), "{path}");
+            }
+        }
+    }
+    // and there is no route that could add, change or verify anything
+    for path in [
+        "/api/goals/add",
+        "/api/goals/attach",
+        "/api/goals/status",
+        "/api/goal/add",
+        "/api/goal/status",
+        "/api/goal/attach",
+        "/api/verify/start",
+        "/api/verify/run",
+        "/api/goals/verify",
+        "/api/command",
+        "/api/goal.add",
+    ] {
+        let r = web.post_raw(path, &body);
+        assert_eq!(r.status, 404, "POST {path}: {}", r.text());
+        let r = web.get(path);
+        assert_eq!(r.status, 404, "GET {path}: {}", r.text());
+    }
+    // a command name in the query is not a thing the dashboard understands: the request is
+    // refused rather than ignored, and it changes nothing
+    for path in [
+        "/api/goals?cmd=goal.add&title=injected",
+        "/api/goals?command=verify",
+        "/api/goal?id=feature&cmd=goal.status",
+        "/api/goal?id=feature&status=abandoned",
+        "/api/remaining?cmd=verify",
+        "/api/verify?target=feature&cmd=verify",
+        "/api/verify?target=feature&run=1",
+        "/api/verify?target=feature&command=goal.add",
+        "/api/status?cmd=shutdown",
+        "/api/events?command=shutdown",
+    ] {
+        let r = web.get(path);
+        assert_eq!(r.status, 400, "{path}: {}", r.text());
+        assert_eq!(r.code(), "invalid", "{path}");
+    }
+    // reading the verification state starts nothing
+    for _ in 0..2 {
+        for path in ["/api/verify?target=feature", "/api/verify?target=r1/a"] {
+            let r = web.get(path);
+            assert_eq!(r.status, 200, "{path}: {}", r.text());
+            let v = r.json();
+            assert!(
+                !jbool(&v, "running") && !jbool(&v, "passed"),
+                "{}",
+                v.canonical()
+            );
+        }
+    }
+    // an unauthenticated attempt gets nowhere either
+    let r = http(web.port, "GET", "/api/goals", &[], None);
+    assert_eq!(r.status, 401);
+
+    // nothing changed: the ledger, the audit log and the runs are what they were
+    let goals_after = f.json(&["goals", "list"]);
+    assert_eq!(goals_after.canonical(), goals_before.canonical());
+    assert_eq!(jarr(&goals_after, "goals").len(), 1);
+    assert_eq!(jstr(&jarr(&goals_after, "goals")[0], "status"), "open");
+    assert_eq!(f.events_raw(), events_before, "something was recorded");
+    let status_after = f.status();
+    assert_eq!(
+        jarr(&status_after, "runs")[0].canonical(),
+        jarr(&status_before, "runs")[0].canonical()
+    );
+    assert_eq!(jstr(&f.task("r1", "a"), "status"), "ready");
+    // and the daemon is still there
+    assert_eq!(web.get("/api/goals").status, 200);
+}
+
+// ---- 14. hostile goal text and evidence --------------------------------------------------------------------------------
+
+#[test]
+fn hostile_goal_text_is_inert_over_http() {
+    let files = TempDir::new("files");
+    let (f, info) = goal_fleet("echo ready > answer.txt\nprintf '{\"version\":1,\"status\":\"done\",\"summary\":\"d\"}\\n' > .fleet/result.json\n");
+    let web = Web::new(&info);
+    load_plan_a(&f);
+    let title = "<script>alert(1)</script> & \"quotes\" <img src=x onerror=alert(1)>";
+    let intent = "intent <b>bold</b> & more";
+    f.ok(&[
+        "goals", "add", "--id", "hostile", "--title", title, "--intent", intent,
+    ]);
+
+    // control characters and bidi overrides in a title are refused, so they cannot be served
+    for (what, bad) in [
+        ("ESC", "red \u{1b}[31mx"),
+        ("OSC", "osc \u{1b}]0;pwned\u{7} x"),
+        ("bidi", "bidi \u{202e}evil"),
+    ] {
+        let out = f.cli(&["goals", "add", "--id", "bad", "--title", bad]);
+        assert_eq!(out.code, 7, "{what}: {out:?}");
+        let out = f.cli(&[
+            "goals", "add", "--id", "bad", "--title", "ok", "--intent", bad,
+        ]);
+        assert_eq!(out.code, 7, "{what} (intent): {out:?}");
+    }
+    assert_eq!(jarr(&web.get("/api/goals").json(), "goals").len(), 1);
+
+    // a check whose output holds escape sequences, markup and a token-shaped string (assembled by
+    // the check itself, so that no file of this test holds one)
+    let token = format!("ghp_{}", "a1B2".repeat(10));
+    let noisy = r#"{"version":1,"checks":[
+  {"id":"present","kind":"file","path":"answer.txt","assert":"exists"},
+  {"id":"noisy","kind":"command","mandatory":false,"program":"/bin/sh","args":["-c","t=ghp_; for i in 1 2 3 4 5 6 7 8 9 10; do t=\"${t}a1B2\"; done; printf '\\033]0;owned\\007\\033[31mred\\033[0m token=%s <b>x</b> & done\\n' \"$t\"; exit 3"]}
+]}"#;
+    add_feature_goal(&f, &files, noisy);
+    f.ok(&["start", "--run", "r1"]);
+    poll(&web, "/api/goals", "the goal to be verified", |d| {
+        jstr(goal_row(d, "feature"), "status") == "verified"
+    });
+
+    let documents = [
+        web.get("/api/goals"),
+        web.get("/api/goal?id=hostile"),
+        web.get("/api/goal?id=feature"),
+        web.get("/api/remaining"),
+        web.get("/api/verify?target=feature"),
+        web.get("/api/events?limit=100"),
+        web.get("/api/status"),
+    ];
+    for doc in &documents {
+        assert_eq!(doc.status, 200, "{}", doc.text());
+        for b in [b'<', b'>', b'&'] {
+            assert!(
+                !doc.body.contains(&b),
+                "raw {:?} in {}",
+                b as char,
+                doc.text()
+            );
+        }
+        assert!(
+            doc.body.iter().all(|b| *b >= 0x20 && *b != 0x7f),
+            "a control byte in {}",
+            doc.text()
+        );
+        assert!(!has_bytes(&doc.body, "\u{202e}".as_bytes()));
+        assert!(!has_bytes(&doc.body, b"\\u001b") && !has_bytes(&doc.body, b"\\u0007"));
+        assert!(
+            !doc.text().contains(&token),
+            "the token-shaped string was served"
+        );
+    }
+    // the strings are data: parsed back they are exactly what was entered
+    let list = documents[0].json();
+    assert_eq!(jstr(goal_row(&list, "hostile"), "title"), title);
+    assert!(documents[0]
+        .text()
+        .contains("\\u003cscript\\u003ealert(1)\\u003c/script\\u003e"));
+    let shown = documents[1].json();
+    assert_eq!(jstr(&shown, "title"), title);
+    assert_eq!(jstr(&shown, "intent"), intent);
+    let rem = documents[3].json();
+    let leaf = jarr(&rem, "open_leaves")
+        .iter()
+        .find(|g| jstr(g, "id") == "hostile")
+        .unwrap_or_else(|| panic!("{}", rem.canonical()));
+    assert_eq!(jstr(leaf, "title"), title);
+
+    // the evidence output is sanitized and redacted before it is served
+    let feature = documents[2].json();
+    let noisy_evidence = jarr(&feature, "history")
+        .iter()
+        .find(|e| jstr(e, "check") == "noisy")
+        .unwrap_or_else(|| panic!("{}", feature.canonical()))
+        .clone();
+    assert_eq!(jstr(&noisy_evidence, "verdict"), "failed");
+    let output = jstr(&noisy_evidence, "output");
+    assert!(output.contains("red token="), "{output:?}");
+    assert!(output.contains("<b>x</b> & done"), "{output:?}");
+    assert!(output.contains("[REDACTED"), "{output:?}");
+    assert!(!output.contains(&token) && !output.contains(&"a1B2".repeat(10)));
+    // line breaks are text; every other control character and every bidi override is gone
+    assert!(
+        !output
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'),
+        "{output:?}"
+    );
+    assert!(documents[2]
+        .text()
+        .contains("\\u003cb\\u003ex\\u003c/b\\u003e"));
+    // the optional check failed, the mandatory one holds: the goal is verified
+    assert_eq!(jstr(&feature, "status"), "verified");
+    assert!(
+        !f.events_raw().contains(&token),
+        "the audit log holds the secret"
+    );
+}
+
+// ---- 15. a verification check cannot use the dashboard ----------------------------------------------------------------
+
+/// The requests a check process tries: log in with the token, read the goals, and ask the control
+/// socket. `vrun` makes them as the check itself, from a subshell, from a separate `bash`, and
+/// from a grandchild that leaves the process group and the session (`setsid`). The grandchild's
+/// parent stays alive long enough for the daemon to see the chain and then exits, so the
+/// grandchild is orphaned while the check is still running and keeps trying (`vorphan`).
+const VERIFY_FUNCS: &str = r#"
+vattack() {
+  local tag=$1
+  req POST /api/login "{\"token\":\"$TOKEN\"}" "$OUT/$tag-login.txt"
+  req GET /api/goals "" "$OUT/$tag-goals.txt"
+  "$FLEETBIN" --state-dir "$STATE" status > "$OUT/$tag-socket.txt" 2>&1
+  echo "exit=$?" >> "$OUT/$tag-socket.txt"
+}
+vorphan() {
+  local i=0 n=0
+  echo $$ > "$OUT/detached.pid"
+  while [ $i -lt 100 ]; do
+    i=$((i+1))
+    if kill -0 "$MID" 2>/dev/null; then echo alive > "$OUT/d$i.parent"; else echo gone > "$OUT/d$i.parent"; n=$((n+1)); fi
+    vattack "d$i"
+    : > "$OUT/d$i.fin"
+    [ $n -ge 2 ] && : > "$OUT/orphaned.enough"
+    sleep 0.3
+  done
+}
+vrun() {
+  vattack self
+  ( vattack sub )
+  bash -c 'source "$LIB"; vattack child'
+  # the middle process stays for at least a second (the daemon looks every 200 ms) and until the
+  # grandchild has made its first attempt, then exits and orphans it
+  bash -c 'MID=$$; export MID; setsid bash -c "source \"$LIB\"; vorphan" < /dev/null > /dev/null 2>&1 & n=0; while { [ ! -e "$OUT/d1.fin" ] || [ $n -lt 10 ]; } && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done' &
+  # the check lives until the orphan has made two attempts of its own (bounded)
+  n=0
+  while [ ! -e "$OUT/orphaned.enough" ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done
+}
+"#;
+
+const VERIFY_MODES: [&str; 3] = ["self", "sub", "child"];
+
+/// Every request of a probe tag was refused as coming from the daemon's own processes.
+fn assert_probe_refused(out: &Path, tag: &str, token: &str) {
+    for name in ["login", "goals"] {
+        let file = format!("{tag}-{name}.txt");
+        assert_refused_as_worker(out, &file);
+        let text = fs::read_to_string(out.join(&file)).unwrap();
+        assert!(!text.contains("fleet.goals"), "{file}: {text}");
+        assert!(!text.contains(token), "{file} echoes the token");
+        assert!(!text.contains("\"session\":\""), "{file}: {text}");
+    }
+    let file = format!("{tag}-socket.txt");
+    let text = fs::read_to_string(out.join(&file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+    assert!(text.contains("worker processes"), "{file}: {text}");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("exit=") && l != "exit=0"),
+        "{file}: the control socket answered: {text}"
+    );
+    assert!(!text.contains("r1/"), "{file} shows the runs: {text}");
+}
+
+/// Covers the origin rule for verification: the checks of a contract are programs the daemon runs
+/// for a task, with paths and arguments that an agent's work can influence. The token is handed to
+/// this one on purpose (in the contract's arguments). The check, a subshell and a child of it, and a
+/// grandchild that left its process group and session (and, once its parent exited, has no
+/// ancestor to give it away) must all be refused on the dashboard and on the control socket, while
+/// the verification itself completes and the same requests from this process work.
+#[test]
+fn a_verification_check_process_cannot_use_the_web_ui() {
+    let out = TempDir::new("o");
+    let files = TempDir::new("files");
+    let (mut f, info) = {
+        let mut f = Fleet::new();
+        let s = f.script(
+            "w.sh",
+            "echo ready > answer.txt\nprintf '{\"version\":1,\"status\":\"done\",\"summary\":\"d\"}\\n' > .fleet/result.json\n",
+        );
+        f.write_cfg(&simple_cfg(&s, ""));
+        let info = f.start_web(&[]);
+        (f, info)
+    };
+    let web = Web::new(&info);
+    let lib = f
+        .tmp
+        .write("verify-lib.sh", &format!("{BASH_REQ}{VERIFY_FUNCS}"));
+    let check = f.tmp.script(
+        "vcheck.sh",
+        "#!/bin/bash\nexport PATH=/usr/local/bin:/usr/bin:/bin\nPORT=$1 TOKEN=$2 FLEETBIN=$3 STATE=$4 OUT=$5 LIB=$6\nexport PORT TOKEN FLEETBIN STATE OUT LIB\nsource \"$LIB\"\nvrun\nexit 0\n",
+    );
+    load_plan_a(&f);
+    let contract = format!(
+        r#"{{"version":1,"checks":[{{"id":"spy","kind":"command","timeout_ms":120000,"program":{},"args":[{},{},{},{},{},{}]}}]}}"#,
+        q(&check.to_string_lossy()),
+        q(&info.port.to_string()),
+        q(&info.token),
+        q(FLEET_BIN),
+        q(&f.state.to_string_lossy()),
+        q(&out.path().to_string_lossy()),
+        q(&lib.to_string_lossy()),
+    );
+    add_feature_goal(&f, &files, &contract);
+    f.ok(&["start", "--run", "r1"]);
+
+    // the verification completes, whatever its check's processes were refused
+    let doc = poll(&web, "/api/goals", "the goal to be verified", |d| {
+        jstr(goal_row(d, "feature"), "status") == "verified"
+    });
+    assert_eq!(jstr(goal_row(&doc, "feature"), "contract"), "passed");
+
+    for tag in VERIFY_MODES {
+        assert_probe_refused(out.path(), tag, &info.token);
+    }
+    // the grandchild that left the process group and the session kept trying for as long as the
+    // check lived: first while its parent was alive, then orphaned (only what the daemon
+    // remembers about the processes of its jobs can tell where that one came from)
+    let mut attempts: Vec<String> = fs::read_dir(out.path())
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let tag = name.strip_suffix(".fin")?;
+            tag.starts_with('d').then(|| tag.to_string())
+        })
+        .collect();
+    attempts.sort();
+    assert!(attempts.len() >= 3, "too few attempts: {attempts:?}");
+    let mut orphaned = 0;
+    for tag in &attempts {
+        assert_probe_refused(out.path(), tag, &info.token);
+        if out.read(&format!("{tag}.parent")).trim() == "gone" {
+            orphaned += 1;
+        }
+    }
+    assert!(
+        orphaned >= 2,
+        "too few attempts after the grandchild was orphaned: {attempts:?}"
+    );
+    // and it did not outlive the check
+    let pid: u32 = out.read("detached.pid").trim().parse().unwrap();
+    assert!(
+        wait_until(10_000, || !pid_alive(pid)),
+        "the detached grandchild {pid} outlived its check"
+    );
+
+    // the same script from this process, which the daemon did not start, is answered
+    let dir = TempDir::new("op");
+    let ran = std::process::Command::new("bash")
+        .env_clear()
+        .env("PATH", system_path())
+        .env("PORT", web.port.to_string())
+        .env("TOKEN", &web.token)
+        .env("OUT", dir.path())
+        .env("STATE", &f.state)
+        .env("FLEETBIN", FLEET_BIN)
+        .env("LIB", &lib)
+        .args(["-c", "source \"$LIB\"; vattack operator"])
+        .status()
+        .unwrap();
+    assert!(ran.success());
+    let read = |name: &str| fs::read_to_string(dir.join(&format!("operator-{name}.txt"))).unwrap();
+    let login = read("login");
+    assert!(login.starts_with("HTTP/1.1 200"), "{login}");
+    assert!(login.contains("fleet.web.session/1"), "{login}");
+    let goals = read("goals");
+    assert!(goals.starts_with("HTTP/1.1 200"), "{goals}");
+    assert!(goals.contains("fleet.goals.list/1"), "{goals}");
+    assert!(read("socket").lines().any(|l| l == "exit=0"));
+    assert_eq!(jstr(&f.status(), "schema"), "fleet.status/1");
+    assert_eq!(web.get("/api/goals").status, 200);
+
+    // the ledger is as the verification left it: one goal, verified, nothing injected
+    let list = f.json(&["goals", "list"]);
+    assert_eq!(jarr(&list, "goals").len(), 1, "{}", list.canonical());
+    assert_eq!(jstr(&jarr(&list, "goals")[0], "status"), "verified");
+    f.shutdown();
+}
