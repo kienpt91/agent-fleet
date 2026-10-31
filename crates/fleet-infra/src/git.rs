@@ -3550,7 +3550,7 @@ mod tests {
         fs::write(&pointer, "gitdir: /x\ngitdir: /y\n").unwrap();
         refused("two lines");
         fs::remove_file(&pointer).unwrap();
-        std::os::unix::fs::symlink(&own.trim().replace("gitdir: ", ""), &pointer).unwrap();
+        std::os::unix::fs::symlink(own.trim().replace("gitdir: ", ""), &pointer).unwrap();
         refused("the pointer itself a symbolic link");
         fs::remove_file(&pointer).unwrap();
         fs::create_dir(&pointer).unwrap();
