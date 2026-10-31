@@ -277,6 +277,7 @@ version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
+ "fleet-forge",
  "neo-goals",
  "neo-verify",
 ]
@@ -298,11 +299,19 @@ name = "fleet-domain"
 version = "0.1.0"
 
 [[package]]
+name = "fleet-forge"
+version = "0.1.0"
+dependencies = [
+ "fleet-domain",
+]
+
+[[package]]
 name = "fleet-infra"
 version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
+ "fleet-forge",
  "neo-verify",
  "nix 0.31.3",
  "portable-pty",

@@ -159,6 +159,19 @@ define_events! {
         check: String, verdict: Verdict, exit_code: Option<i64>, summary: String, output: String,
         commit: Sha, tree: Sha, dirty: bool, at_ms: u64,
     },
+    /// A task was made from an issue of a forge (`repo` is `host/owner/name`).
+    IssueLinked = "issue_linked" { run: RunId, task: TaskId, repo: String, number: u64 },
+    /// A pull request is being opened for an approved action; its approval was consumed at this
+    /// moment, so the publication is never started a second time, whatever happens afterwards.
+    PullRequestStarted = "pull_request_started" {
+        id: ApprovalId, run: RunId, task: TaskId, repo: String, base: String, branch: String, head: Sha,
+    },
+    /// The branch was pushed and the forge created the pull request.
+    PullRequestOpened = "pull_request_opened" {
+        id: ApprovalId, run: RunId, task: TaskId, repo: String, number: u64, url: String, head: Sha,
+    },
+    /// The publication did not complete, or its outcome is unknown (the daemon stopped meanwhile).
+    PullRequestFailed = "pull_request_failed" { id: ApprovalId, run: RunId, task: TaskId, reason: String },
 }
 
 impl DomainEvent {
@@ -190,7 +203,11 @@ impl DomainEvent {
             | CheckpointRecorded { run, .. }
             | OrphanReconciled { run, .. }
             | WorktreeRemoved { run, .. }
-            | EvidenceRecorded { run, .. } => Some(run),
+            | EvidenceRecorded { run, .. }
+            | IssueLinked { run, .. }
+            | PullRequestStarted { run, .. }
+            | PullRequestOpened { run, .. }
+            | PullRequestFailed { run, .. } => Some(run),
             DaemonStarted { .. }
             | DecisionResolved { .. }
             | ApprovalDecided { .. }
@@ -293,6 +310,16 @@ impl DomainEvent {
                 "evidence {id}: goal {goal} check {} {verdict}",
                 crate::ids::show(check)
             ),
+            IssueLinked {
+                run, task, number, ..
+            } => format!("{run}/{task} linked to issue #{number}"),
+            PullRequestStarted { run, task, .. } => format!("{run}/{task} pull request started"),
+            PullRequestOpened {
+                run, task, number, ..
+            } => {
+                format!("{run}/{task} pull request #{number} opened")
+            }
+            PullRequestFailed { run, task, .. } => format!("{run}/{task} pull request failed"),
         }
     }
 }

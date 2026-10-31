@@ -324,6 +324,36 @@ fn sample_events() -> Vec<DomainEvent> {
             dirty: true,
             at_ms: 4_294_967_296,
         },
+        DomainEvent::IssueLinked {
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse("t1").unwrap(),
+            repo: "github.com/o/r".into(),
+            number: 7,
+        },
+        DomainEvent::PullRequestStarted {
+            id: ApprovalId::from_seq(2),
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse("t1").unwrap(),
+            repo: "github.com/o/r".into(),
+            base: "main".into(),
+            branch: "fleet/r1/t1".into(),
+            head: sha(&"c".repeat(40)),
+        },
+        DomainEvent::PullRequestOpened {
+            id: ApprovalId::from_seq(2),
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse("t1").unwrap(),
+            repo: "github.com/o/r".into(),
+            number: 12,
+            url: tricky.into(),
+            head: sha(&"c".repeat(40)),
+        },
+        DomainEvent::PullRequestFailed {
+            id: ApprovalId::from_seq(2),
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse("t1").unwrap(),
+            reason: tricky.into(),
+        },
     ]
 }
 

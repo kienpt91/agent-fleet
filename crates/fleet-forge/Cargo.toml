@@ -1,0 +1,19 @@
+[package]
+name = "fleet-forge"
+description = "Forge model of agent-fleet: repositories, issues, pull requests, the strict schemas their text is read with, the untrusted-text rules, the pull request digest and the rate gate. Pure; depends on fleet-domain and std only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "fleet_forge"
+path = "src/lib.rs"
+
+[dependencies]
+fleet-domain = { path = "../fleet-domain" }
+
+[lints]
+workspace = true
