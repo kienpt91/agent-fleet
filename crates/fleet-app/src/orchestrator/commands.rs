@@ -10,7 +10,7 @@ use fleet_domain::fleet::{MergeGate, NewRun};
 use fleet_domain::ids::{RunId, TaskId};
 use fleet_domain::run::NewTask;
 use fleet_domain::sanitize::sanitize_text;
-use fleet_domain::status::{EndKind, TaskStatus};
+use fleet_domain::status::{ContextMode, EndKind, TaskStatus};
 use fleet_domain::value::Value;
 use neo_goals::ledger::TaskContract;
 use std::collections::BTreeSet;
@@ -220,6 +220,7 @@ impl Orchestrator {
             base_ref: base.ref_name,
             base_sha: base.sha,
             max_parallel,
+            context: args.context.unwrap_or(ContextMode::Off),
         })
     }
 

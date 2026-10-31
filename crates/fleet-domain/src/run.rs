@@ -17,7 +17,7 @@ use crate::limits::{
 };
 use crate::quality::{gate_feedback, GateOutcome};
 use crate::sanitize::{flatten_line, head_str, quote_lines, tail_str};
-use crate::status::{BlockKind, EndKind, TaskStatus};
+use crate::status::{BlockKind, ContextMode, EndKind, TaskStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +107,8 @@ pub struct Run {
     pub base_ref: String,
     pub base_sha: Sha,
     pub max_parallel: u32,
+    /// How the run's workers are briefed; fixed when the run is created.
+    pub context: ContextMode,
     pub started: bool,
     pub integration_ready: bool,
     tasks: Vec<Task>,
@@ -122,6 +124,7 @@ impl Run {
                 base_ref,
                 base_sha,
                 max_parallel,
+                context,
             } => Some(Run {
                 id: run.clone(),
                 objective: objective.clone(),
@@ -129,6 +132,7 @@ impl Run {
                 base_ref: base_ref.clone(),
                 base_sha: base_sha.clone(),
                 max_parallel: *max_parallel,
+                context: context.unwrap_or(ContextMode::Off),
                 started: false,
                 integration_ready: false,
                 tasks: Vec::new(),
@@ -899,6 +903,7 @@ pub(crate) mod test_support {
             base_ref: "main".into(),
             base_sha: sha('a'),
             max_parallel,
+            context: None,
         })
         .unwrap()
     }

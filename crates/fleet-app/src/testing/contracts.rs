@@ -56,7 +56,9 @@ use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{
     ApprovalId, DecisionId, EvidenceId, GoalId, RunId, Sha, TaskId, WorkerName,
 };
-use fleet_domain::status::{BlockKind, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
+use fleet_domain::status::{
+    BlockKind, ContextMode, DecisionKind, EndKind, GoalStatus, Purpose, Verdict,
+};
 use fleet_domain::value::{Document, Value};
 use std::fmt::Debug;
 
@@ -95,6 +97,7 @@ fn sample_events() -> Vec<DomainEvent> {
             base_ref: "main".into(),
             base_sha: sha(&"a".repeat(40)),
             max_parallel: 3,
+            context: Some(ContextMode::Compiled),
         },
         DomainEvent::RunStarted {
             run: run.clone(),
@@ -306,6 +309,30 @@ fn sample_events() -> Vec<DomainEvent> {
                         ("note", Value::str(tricky)),
                     ])]),
                 ),
+            ])),
+        },
+        DomainEvent::ContextCompiled {
+            run: run.clone(),
+            task: t1.clone(),
+            attempt: 2,
+            profile: "default".into(),
+            pack_digest: "ab".repeat(32),
+            stable_digest: "cd".repeat(32),
+            tokens: 4_294_967_296,
+            manifest: Document(Value::object([
+                ("schema", Value::str("neo-context-manifest/1")),
+                ("note", Value::str(tricky)),
+            ])),
+        },
+        DomainEvent::HandoffCreated {
+            run: run.clone(),
+            task: t1.clone(),
+            attempt: 2,
+            trigger: "retry".into(),
+            digest: "ef".repeat(32),
+            packet: Document(Value::object([
+                ("schema", Value::str("neo-handoff/1")),
+                ("summary", Value::str(tricky)),
             ])),
         },
         DomainEvent::EvidenceRecorded {

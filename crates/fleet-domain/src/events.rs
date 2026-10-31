@@ -2,7 +2,7 @@
 //! the audit log is their serialized form, so the field names here are a stable format.
 
 use crate::ids::{ApprovalId, DecisionId, EvidenceId, GoalId, RunId, Sha, TaskId, WorkerName};
-use crate::status::{BlockKind, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
+use crate::status::{BlockKind, ContextMode, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
 use crate::value::{Document, Field, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -85,6 +85,7 @@ define_events! {
     DaemonStarted = "daemon_started" { pid: u64, version: String },
     RunCreated = "run_created" {
         run: RunId, objective: String, repo: String, base_ref: String, base_sha: Sha, max_parallel: u32,
+        context: Option<ContextMode>,
     },
     RunStarted = "run_started" { run: RunId, max_parallel: u32 },
     TaskAdded = "task_added" {
@@ -159,6 +160,19 @@ define_events! {
         check: String, verdict: Verdict, exit_code: Option<i64>, summary: String, output: String,
         commit: Sha, tree: Sha, dirty: bool, at_ms: u64,
     },
+    /// A context pack was compiled for an attempt of a task (`neo-context`). `manifest` lists each
+    /// layer with its token count, digest and what was left out; `pack_digest` covers the manifest
+    /// and the rendered text, `stable_digest` the layers that hold nothing an agent wrote.
+    ContextCompiled = "context_compiled" {
+        run: RunId, task: TaskId, attempt: u32, profile: String, pack_digest: String,
+        stable_digest: String, tokens: u64, manifest: Document,
+    },
+    /// A handoff packet was made for a task: `packet` is the packet document (its pack slice, the
+    /// open verification state, pointers to evidence, and a worker-written summary stored as
+    /// UNVERIFIED), `digest` its digest and `trigger` why it was made.
+    HandoffCreated = "handoff_created" {
+        run: RunId, task: TaskId, attempt: u32, trigger: String, digest: String, packet: Document,
+    },
 }
 
 impl DomainEvent {
@@ -190,7 +204,9 @@ impl DomainEvent {
             | CheckpointRecorded { run, .. }
             | OrphanReconciled { run, .. }
             | WorktreeRemoved { run, .. }
-            | EvidenceRecorded { run, .. } => Some(run),
+            | EvidenceRecorded { run, .. }
+            | ContextCompiled { run, .. }
+            | HandoffCreated { run, .. } => Some(run),
             DaemonStarted { .. }
             | DecisionResolved { .. }
             | ApprovalDecided { .. }
@@ -198,6 +214,51 @@ impl DomainEvent {
             | ApprovalConsumed { .. }
             | ExternalCommandStarted { .. }
             | ExternalCommandRan { .. }
+            | GoalAdded { .. }
+            | GoalStatusChanged { .. }
+            | CriteriaAttached { .. }
+            | Warning { .. } => None,
+        }
+    }
+
+    /// The task an event is about, when it names one.
+    pub fn task(&self) -> Option<&TaskId> {
+        use DomainEvent::*;
+        match self {
+            TaskAdded { task, .. }
+            | TaskReady { task, .. }
+            | TaskDispatched { task, .. }
+            | SessionEnded { task, .. }
+            | TaskCommitted { task, .. }
+            | TaskReviewing { task, .. }
+            | GateChecked { task, .. }
+            | TaskCompleted { task, .. }
+            | TaskFailed { task, .. }
+            | RetryQueued { task, .. }
+            | RetryReset { task, .. }
+            | NoteAdded { task, .. }
+            | TaskBlocked { task, .. }
+            | TaskUnblocked { task, .. }
+            | DecisionOpened { task, .. }
+            | ApprovalRequested { task, .. }
+            | TaskMerged { task, .. }
+            | MergeConflicted { task, .. }
+            | CheckpointRecorded { task, .. }
+            | OrphanReconciled { task, .. }
+            | WorktreeRemoved { task, .. }
+            | EvidenceRecorded { task, .. }
+            | ContextCompiled { task, .. }
+            | HandoffCreated { task, .. } => Some(task),
+            DaemonStarted { .. }
+            | RunCreated { .. }
+            | RunStarted { .. }
+            | DecisionResolved { .. }
+            | ApprovalDecided { .. }
+            | ApprovalExpired { .. }
+            | ApprovalConsumed { .. }
+            | ExternalCommandStarted { .. }
+            | ExternalCommandRan { .. }
+            | IntegrationCreated { .. }
             | GoalAdded { .. }
             | GoalStatusChanged { .. }
             | CriteriaAttached { .. }
@@ -292,6 +353,22 @@ impl DomainEvent {
             } => format!(
                 "evidence {id}: goal {goal} check {} {verdict}",
                 crate::ids::show(check)
+            ),
+            ContextCompiled {
+                run,
+                task,
+                attempt,
+                pack_digest,
+                ..
+            } => format!(
+                "{run}/{task} context compiled (attempt {attempt}, {})",
+                pack_digest.get(..12).unwrap_or(pack_digest)
+            ),
+            HandoffCreated {
+                run, task, digest, ..
+            } => format!(
+                "{run}/{task} handoff made ({})",
+                digest.get(..12).unwrap_or(digest)
             ),
         }
     }
@@ -395,6 +472,33 @@ mod tests {
                 dirty: true,
                 at_ms: 99,
             },
+            DomainEvent::RunCreated {
+                run: run(),
+                objective: "o".into(),
+                repo: "/r".into(),
+                base_ref: "main".into(),
+                base_sha: Sha::parse(&"a".repeat(40)).unwrap(),
+                max_parallel: 2,
+                context: Some(ContextMode::Compiled),
+            },
+            DomainEvent::ContextCompiled {
+                run: run(),
+                task: task(),
+                attempt: 2,
+                profile: "default".into(),
+                pack_digest: "ab".repeat(32),
+                stable_digest: "cd".repeat(32),
+                tokens: 1234,
+                manifest: Document(Value::object([("layers", Value::array([]))])),
+            },
+            DomainEvent::HandoffCreated {
+                run: run(),
+                task: task(),
+                attempt: 2,
+                trigger: "retry".into(),
+                digest: "ef".repeat(32),
+                packet: Document(Value::object([("schema", Value::str("neo-handoff/1"))])),
+            },
             DomainEvent::Warning {
                 message: "w".into(),
             },
@@ -443,6 +547,105 @@ mod tests {
             DomainEvent::from_value(&bad_id),
             Err(DecodeError::BadField("run".into()))
         );
+    }
+
+    #[test]
+    fn a_run_created_before_context_packs_existed_decodes_as_a_plain_run() {
+        let old = Value::object([
+            ("type", Value::str("run_created")),
+            ("run", Value::str("r1")),
+            ("objective", Value::str("o")),
+            ("repo", Value::str("/r")),
+            ("base_ref", Value::str("main")),
+            ("base_sha", Value::str("a".repeat(40))),
+            ("max_parallel", Value::int(2u64)),
+        ]);
+        let Ok(DomainEvent::RunCreated { context, .. }) = DomainEvent::from_value(&old) else {
+            panic!("an old run_created must still decode");
+        };
+        assert_eq!(context, None);
+        let bad = Value::object([
+            ("type", Value::str("run_created")),
+            ("run", Value::str("r1")),
+            ("objective", Value::str("o")),
+            ("repo", Value::str("/r")),
+            ("base_ref", Value::str("main")),
+            ("base_sha", Value::str("a".repeat(40))),
+            ("max_parallel", Value::int(2u64)),
+            ("context", Value::str("maybe")),
+        ]);
+        assert_eq!(
+            DomainEvent::from_value(&bad),
+            Err(DecodeError::BadField("context".into()))
+        );
+    }
+
+    #[test]
+    fn the_task_accessor_names_the_task_of_task_events_only() {
+        assert_eq!(
+            DomainEvent::TaskReady {
+                run: run(),
+                task: task()
+            }
+            .task(),
+            Some(&task())
+        );
+        assert_eq!(
+            DomainEvent::HandoffCreated {
+                run: run(),
+                task: task(),
+                attempt: 1,
+                trigger: "retry".into(),
+                digest: "a".repeat(64),
+                packet: Document(Value::object([("k", Value::Null)])),
+            }
+            .task(),
+            Some(&task())
+        );
+        assert_eq!(
+            DomainEvent::RunStarted {
+                run: run(),
+                max_parallel: 1
+            }
+            .task(),
+            None
+        );
+        assert_eq!(
+            DomainEvent::Warning {
+                message: String::new()
+            }
+            .task(),
+            None
+        );
+    }
+
+    #[test]
+    fn context_events_have_headlines_without_free_text() {
+        let compiled = DomainEvent::ContextCompiled {
+            run: run(),
+            task: task(),
+            attempt: 2,
+            profile: "default\u{1b}".into(),
+            pack_digest: "ab".repeat(32),
+            stable_digest: "cd".repeat(32),
+            tokens: 1,
+            manifest: Document(Value::object([("x", Value::Null)])),
+        };
+        assert_eq!(
+            compiled.headline(),
+            "r1/t1 context compiled (attempt 2, abababababab)"
+        );
+        let handoff = DomainEvent::HandoffCreated {
+            run: run(),
+            task: task(),
+            attempt: 1,
+            trigger: "recovery".into(),
+            digest: "ef".repeat(32),
+            packet: Document(Value::object([("x", Value::Null)])),
+        };
+        assert_eq!(handoff.headline(), "r1/t1 handoff made (efefefefefef)");
+        assert_eq!(compiled.run(), Some(&run()));
+        assert_eq!(handoff.run(), Some(&run()));
     }
 
     #[test]

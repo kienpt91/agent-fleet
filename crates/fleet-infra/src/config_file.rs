@@ -486,10 +486,16 @@ fn check_run(run: &Value) -> Result<()> {
     check_keys(
         "run",
         obj,
-        &["objective", "repo", "base", "id", "max_parallel"],
+        &["objective", "repo", "base", "id", "max_parallel", "context"],
     )?;
     for key in ["objective", "repo", "base", "id"] {
         check_string("run", obj, key, false)?;
+    }
+    check_string("run", obj, "context", false)?;
+    if let Some(Value::Str(mode)) = obj.get("context") {
+        if fleet_domain::status::ContextMode::parse(mode).is_none() {
+            return Err(invalid("run: context must be \"off\" or \"compiled\""));
+        }
     }
     match obj.get("max_parallel") {
         None | Some(Value::Int(_)) => Ok(()),

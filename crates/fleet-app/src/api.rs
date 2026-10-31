@@ -8,7 +8,7 @@ use fleet_domain::error::{FleetError, Result};
 use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, RunId, TaskId, WorkerName};
 use fleet_domain::limits::MAX_SEND_BYTES;
 use fleet_domain::run::NewTask;
-use fleet_domain::status::GoalStatus;
+use fleet_domain::status::{ContextMode, GoalStatus};
 use fleet_domain::value::{Document, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,6 +18,8 @@ pub struct NewRunArgs {
     pub repo: String,
     pub base: Option<String>,
     pub max_parallel: Option<u32>,
+    /// How the run's workers are briefed; the plain brief when absent.
+    pub context: Option<ContextMode>,
 }
 
 /// A goal to add to the goal ledger.
@@ -282,6 +284,13 @@ fn parse_new_run(v: &Value) -> Result<NewRunArgs> {
         repo: a.req_str("repo")?.to_string(),
         base: a.opt_str("base")?.map(str::to_string),
         max_parallel: a.opt_u32("max_parallel")?,
+        context: a
+            .opt_str("context")?
+            .map(|s| {
+                ContextMode::parse(s)
+                    .ok_or_else(|| FleetError::invalid("`context` must be \"off\" or \"compiled\""))
+            })
+            .transpose()?,
     })
 }
 

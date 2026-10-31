@@ -83,6 +83,7 @@ daemon:
 
 runs and tasks:
   run create --objective <text> --repo <path> [--base <ref>] [--id <id>] [--max-parallel N]
+             [--context off|compiled]
   task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--id <id>]
                                      (--spec - reads the spec from stdin, at most 16 KiB)
   plan <file.toml|file.json> [--run <run>]
@@ -422,6 +423,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                     let base = p.opt("--base")?;
                     let id = p.opt("--id")?;
                     let parallel = max_parallel(&mut p)?;
+                    let context = p.opt("--context")?;
                     no_args(p)?;
                     let view = View::RunCreated(id.clone());
                     request(
@@ -432,6 +434,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                             ("base", base.and_then(st)),
                             ("id", id.and_then(st)),
                             ("max_parallel", parallel),
+                            ("context", context.and_then(st)),
                         ]),
                         view,
                     )
