@@ -142,6 +142,9 @@ pub trait Vcs: Send {
         -> Result<Option<Sha>>;
     /// The commit a branch points at.
     fn branch_head(&self, repo: &str, branch: &str) -> Result<Sha>;
+    /// The tree object of `commit`, read from the repository itself (never through a worktree),
+    /// ignoring replacement objects: what a merge of that commit brings in.
+    fn commit_tree(&self, repo: &str, commit: &Sha) -> Result<Sha>;
     /// Merges a task branch into the run's integration branch, creating that branch first when
     /// needed. A conflict aborts the merge and leaves the integration branch as it was.
     fn merge_into_integration(&self, req: &IntegrationMerge) -> Result<IntegrationResult>;
@@ -156,8 +159,11 @@ pub trait Vcs: Send {
     ) -> Result<()>;
     /// True when `branch` is contained in `into`.
     fn is_merged(&self, repo: &str, branch: &str, into: &str) -> Result<bool>;
-    /// The commit, its tree, the paths it changed since `base` and whether the worktree has
-    /// uncommitted changes.
+    /// The commit the task's branch points at, its tree, the paths it changed since `base` and
+    /// whether the worktree has uncommitted changes. Commit and tree are read from the
+    /// repository (the branch the worktree has checked out), not from whatever the worktree's own
+    /// git directory says; a worktree that does not belong to the repository, or is not on its
+    /// task's branch, is refused.
     fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState>;
 }
 

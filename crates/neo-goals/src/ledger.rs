@@ -150,15 +150,16 @@ impl Ledger {
     }
 
     /// True when `e` may count: its checks ran on a clean export of a commit and that commit is the
-    /// one it has to be. `head` names the commit explicitly (the merge gate asks about the branch
-    /// head it is about to merge); without it the commit recorded for the evidence's own task in
-    /// review counts. A task that has no recorded commit has no valid evidence.
-    fn valid(&self, e: &Evidence, head: Option<&Sha>) -> bool {
+    /// one it has to be. `at` names the commit and its tree explicitly (the merge gate asks about
+    /// the branch head it is about to merge, with the tree the repository has for it); without it
+    /// the commit recorded for the evidence's own task in review counts. A task that has no
+    /// recorded commit has no valid evidence.
+    fn valid(&self, e: &Evidence, at: Option<(&Sha, &Sha)>) -> bool {
         if !e.counts() {
             return false;
         }
-        match head {
-            Some(h) => e.commit() == h,
+        match at {
+            Some((commit, tree)) => e.commit() == commit && e.tree() == tree,
             None => self
                 .heads
                 .get(&TaskRef::new(e.run().clone(), e.task().clone()))
@@ -174,14 +175,19 @@ impl Ledger {
 
     /// The contract of `g` judged on the valid evidence of one task (`task`) or of any task
     /// (`None`).
-    fn goal_state(&self, g: &Goal, task: Option<&TaskRef>, head: Option<&Sha>) -> ContractState {
+    fn goal_state(
+        &self,
+        g: &Goal,
+        task: Option<&TaskRef>,
+        at: Option<(&Sha, &Sha)>,
+    ) -> ContractState {
         let Some(c) = &g.contract else {
             return ContractState::Pending;
         };
         let evidence: Vec<&Evidence> = self
             .evidence_of(&g.id)
             .into_iter()
-            .filter(|e| self.valid(e, head))
+            .filter(|e| self.valid(e, at))
             .filter(|e| task.is_none_or(|t| e.run() == &t.run && e.task() == &t.task))
             .collect();
         c.contract.state(&c.id, &evidence)
@@ -235,13 +241,25 @@ impl Ledger {
         self.task_contract_for(run, task, None)
     }
 
-    /// Like [`Ledger::task_contract`], but only evidence of exactly `commit` counts: the question
-    /// "is this the commit that was proven?" asked about a commit that is about to be merged.
-    pub fn task_contract_at(&self, run: &RunId, task: &TaskId, commit: &Sha) -> TaskContract {
-        self.task_contract_for(run, task, Some(commit))
+    /// Like [`Ledger::task_contract`], but only evidence of exactly `commit` *and* `tree` counts:
+    /// the question "is this the commit that was proven, with the tree that was checked?" asked
+    /// about a commit that is about to be merged, with the tree the repository itself has for it.
+    pub fn task_contract_at(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        commit: &Sha,
+        tree: &Sha,
+    ) -> TaskContract {
+        self.task_contract_for(run, task, Some((commit, tree)))
     }
 
-    fn task_contract_for(&self, run: &RunId, task: &TaskId, head: Option<&Sha>) -> TaskContract {
+    fn task_contract_for(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        at: Option<(&Sha, &Sha)>,
+    ) -> TaskContract {
         let governing = self.governing(run, task);
         if governing.is_empty() {
             return TaskContract::NotGoverned;
@@ -249,7 +267,7 @@ impl Ledger {
         let me = TaskRef::new(run.clone(), task.clone());
         let mut pending = false;
         for g in governing {
-            match self.goal_state(g, Some(&me), head) {
+            match self.goal_state(g, Some(&me), at) {
                 ContractState::Failed => return TaskContract::Failed,
                 ContractState::Pending => pending = true,
                 ContractState::Passed => {}
@@ -1467,11 +1485,17 @@ mod tests {
         assert_eq!(l.task_contract(&r1, &t1), TaskContract::Pending);
         // asked about the commit that was proven, the answer is yes; about any other, no
         assert_eq!(
-            l.task_contract_at(&r1, &t1, &sha('e')),
+            l.task_contract_at(&r1, &t1, &sha('e'), &sha('9')),
             TaskContract::Passed
         );
         assert_eq!(
-            l.task_contract_at(&r1, &t1, &sha('a')),
+            l.task_contract_at(&r1, &t1, &sha('a'), &sha('9')),
+            TaskContract::Pending
+        );
+        // the commit is the proven one, but the repository has another tree for it than the one
+        // the checks ran on: that is not what was proven
+        assert_eq!(
+            l.task_contract_at(&r1, &t1, &sha('e'), &sha('8')),
             TaskContract::Pending
         );
         assert_eq!(l.head_of(&r1, &t1), Some(&sha('a')));

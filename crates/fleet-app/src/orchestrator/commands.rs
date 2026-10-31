@@ -463,7 +463,10 @@ impl Orchestrator {
         let head = self.ports.vcs.branch_head(&repo, &branch)?;
         // A task a verification contract guards is merged only as the commit that was proven:
         // the branch may have moved since (a worker process, a commit made while the gates ran).
-        match self.ledger.task_contract_at(&key.0, &key.1, &head) {
+        // The tree is asked of the repository again, so evidence that was taken on another tree
+        // than the one this commit has (the repository changed under fleet) does not count.
+        let tree = self.ports.vcs.commit_tree(&repo, &head)?;
+        match self.ledger.task_contract_at(&key.0, &key.1, &head, &tree) {
             TaskContract::NotGoverned | TaskContract::Passed => {}
             _ => {
                 return Err(FleetError::conflict(format!(

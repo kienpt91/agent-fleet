@@ -103,6 +103,8 @@ struct Inner {
     worktree_truncated: bool,
     fail_worktree_state: bool,
     worktree_dirty: bool,
+    /// What `commit_tree` answers instead of the tree `worktree_state` reports.
+    commit_tree: Option<Sha>,
     jobs_started: Vec<Job>,
     jobs_done: VecDeque<JobDone>,
     jobs_running: usize,
@@ -319,6 +321,11 @@ impl World {
     pub fn set_verify_mode(&self, mode: VerifyMode) {
         self.lock().verify_mode = Some(mode);
     }
+    /// The tree the repository reports for any commit (default: the one `worktree_state` reports).
+    pub fn set_commit_tree(&self, tree: Option<Sha>) {
+        self.lock().commit_tree = tree;
+    }
+
     /// The paths the fake worktrees report as changed (for diff constraints).
     pub fn set_worktree_changes(&self, paths: &[&str], truncated: bool) {
         let mut g = self.lock();
@@ -600,6 +607,13 @@ impl Vcs for FakeVcs {
         match self.0.lock().branch_heads.get(branch) {
             Some(head) => Ok(head.clone()),
             None => Sha::parse(&"c".repeat(40)),
+        }
+    }
+
+    fn commit_tree(&self, _repo: &str, _commit: &Sha) -> Result<Sha> {
+        match &self.0.lock().commit_tree {
+            Some(t) => Ok(t.clone()),
+            None => Sha::parse(&"e".repeat(40)),
         }
     }
 

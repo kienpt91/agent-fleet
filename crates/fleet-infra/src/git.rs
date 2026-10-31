@@ -28,7 +28,9 @@ use fleet_app::ports::{
 };
 use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
-use fleet_domain::ids::{is_invisible, show, validate_ref_name, RunId, Sha, TaskId};
+use fleet_domain::ids::{
+    integration_branch, is_invisible, show, task_branch, validate_ref_name, RunId, Sha, TaskId,
+};
 use neo_verify::limits::MAX_CHANGED_PATHS;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
@@ -49,7 +51,7 @@ const WORKTREES: &str = ".fleet-worktrees";
 const INTEGRATION_DIR: &str = "_integration";
 
 /// Settings pinned on every call, before the subcommand.
-const STATIC_CONFIG: [(&str, &str); 23] = [
+const STATIC_CONFIG: [(&str, &str); 24] = [
     ("core.hooksPath", "/dev/null"),
     ("core.fsmonitor", "false"),
     ("core.pager", "cat"),
@@ -68,6 +70,9 @@ const STATIC_CONFIG: [(&str, &str); 23] = [
     ("merge.renormalize", "false"),
     ("merge.verifySignatures", "false"),
     ("core.symlinks", "true"),
+    // Replacement objects would let a ref in the shared repository make a commit mean another
+    // tree than the one it has: fleet looks at the objects as they are.
+    ("core.useReplaceRefs", "false"),
     ("rerere.enabled", "false"),
     ("gpg.program", "false"),
     ("gpg.openpgp.program", "false"),
@@ -75,13 +80,14 @@ const STATIC_CONFIG: [(&str, &str); 23] = [
     ("gpg.ssh.program", "false"),
 ];
 
-const FIXED_ENV: [(&str, &str); 8] = [
+const FIXED_ENV: [(&str, &str); 9] = [
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_SYSTEM", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_OPTIONAL_LOCKS", "0"),
     ("GIT_ATTR_NOSYSTEM", "1"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
     ("GIT_PAGER", "cat"),
     ("LC_ALL", "C"),
 ];
@@ -318,6 +324,73 @@ fn ensure_real_dir(p: &Path) -> Result<()> {
     }
 }
 
+/// A fleet worktree whose `.git` pointer was checked against the repository it belongs to: it
+/// points at `<repo>/.git/worktrees/<name>`, that entry points back, and its `commondir` is the
+/// repository's own. Git commands that read state which evidence or a merge depends on are run
+/// with these paths in the environment (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`), so the
+/// pointer file, which the worker can rewrite at any time, is not consulted again.
+struct Worktree {
+    path: PathBuf,
+    repo: PathBuf,
+    admin: PathBuf,
+    common: PathBuf,
+    /// The directory name below `.fleet-worktrees/<run>/`.
+    name: String,
+    run: String,
+    /// The branch the worktree has checked out; `None` when its head is detached.
+    branch: Option<String>,
+}
+
+impl Worktree {
+    /// The branch fleet created for this worktree: `fleet/<run>/<task>`, or the integration
+    /// branch for the integration worktree.
+    fn expected_branch(&self) -> String {
+        if self.name == INTEGRATION_DIR {
+            integration_branch(&self.run)
+        } else {
+            task_branch(&self.run, &self.name)
+        }
+    }
+
+    /// The environment that pins git to this worktree and its repository.
+    fn env(&self) -> [(&'static str, &OsStr); 3] {
+        [
+            ("GIT_DIR", self.admin.as_os_str()),
+            ("GIT_COMMON_DIR", self.common.as_os_str()),
+            ("GIT_WORK_TREE", self.path.as_os_str()),
+        ]
+    }
+}
+
+/// Most bytes read from the small pointer files of a worktree.
+const MAX_POINTER_FILE: u64 = 4096;
+
+/// Files that make objects come from somewhere else than the repository's own store, or history
+/// differ from what its commits say. With any of them fleet cannot tell what a commit contains.
+const FOREIGN_OBJECT_SOURCES: [(&str, &str); 3] = [
+    ("objects/info/alternates", "alternates"),
+    ("objects/info/http-alternates", "http-alternates"),
+    ("info/grafts", "grafts"),
+];
+
+fn pointer_error(what: &str) -> FleetError {
+    FleetError::forbidden(format!(
+        "the .git file of this worktree {what}; it must point at its own entry in the repository (the worktree was changed, or is not a fleet worktree)"
+    ))
+}
+
+/// A bounded, regular, UTF-8 file of the git administration, without its trailing line break.
+fn read_pointer_file(path: &Path, what: &str) -> Result<String> {
+    let bytes = crate::fsx::read_regular(path, MAX_POINTER_FILE).map_err(|_| {
+        pointer_error(&format!(
+            "has {what} that is missing, linked or not a plain file"
+        ))
+    })?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| pointer_error(&format!("has {what} that is not text")))?;
+    Ok(text.strip_suffix('\n').unwrap_or(&text).to_string())
+}
+
 pub struct GitVcs {
     env: Vec<(String, String)>,
     timeout: Duration,
@@ -541,7 +614,7 @@ impl GitVcs {
         extra_env: &[(&str, &OsStr)],
         args: &[&str],
     ) -> Result<Out> {
-        let listing = self.run_raw(cwd, None, &[], &["config", "--list", "-z"])?;
+        let listing = self.run_raw_env(cwd, None, &[], extra_env, &["config", "--list", "-z"])?;
         let overrides = if listing.ok() {
             dynamic_overrides(&listing.stdout)?
         } else {
@@ -674,17 +747,36 @@ impl GitVcs {
         let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
             return Err(FleetError::internal("unexpected output from git rev-parse"));
         };
-        if self.canonical_line(git_dir)? != self.canonical_line(common)? {
+        let common = self.canonical_line(common)?;
+        if self.canonical_line(git_dir)? != common {
             return Err(FleetError::forbidden(format!(
                 "{} is a linked worktree, not a main repository",
                 show(repo)
             )));
         }
+        self.guard_object_sources(&common)?;
         Ok(dir)
     }
 
-    /// A worktree fleet manages: below `.fleet-worktrees` and its own top level.
-    fn check_worktree(&self, worktree: &str) -> Result<PathBuf> {
+    /// Refuses a repository whose objects can come from elsewhere (alternates) or whose history
+    /// is rewritten by grafts: evidence names a commit and a tree, and both must mean what the
+    /// repository's own store says.
+    fn guard_object_sources(&self, common: &Path) -> Result<()> {
+        for (rel, what) in FOREIGN_OBJECT_SOURCES {
+            if fs::symlink_metadata(common.join(rel)).is_ok() {
+                return Err(FleetError::forbidden(format!(
+                    "the repository uses {what} ({}): fleet cannot tell what a commit contains when objects come from elsewhere or history is rewritten; run `git repack -a -d` and remove the file",
+                    show_path(&common.join(rel))
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// A worktree fleet manages: `<repo>/.fleet-worktrees/<run>/<name>`, its own top level, and
+    /// with a `.git` pointer that is what git wrote when fleet created it (see [`Worktree`]).
+    /// Anything else is refused, with a message that names what is wrong.
+    fn check_worktree(&self, worktree: &str) -> Result<Worktree> {
         if worktree.is_empty() || worktree.contains('\0') {
             return Err(FleetError::invalid("worktree path is empty or invalid"));
         }
@@ -700,23 +792,183 @@ impl GitVcs {
         }
         let canon =
             fs::canonicalize(p).map_err(|e| FleetError::io("cannot resolve worktree", &e))?;
-        if !canon
+        let not_ours =
+            || FleetError::forbidden(format!("{} is not a fleet worktree", show(worktree)));
+        let canon_for_parts = canon.clone();
+        let parts: Vec<&OsStr> = canon_for_parts
             .components()
-            .any(|c| c.as_os_str() == OsStr::new(WORKTREES))
-        {
-            return Err(FleetError::forbidden(format!(
-                "{} is not a fleet worktree",
-                show(worktree)
-            )));
+            .map(|c| c.as_os_str())
+            .collect();
+        let at = parts
+            .iter()
+            .rposition(|c| *c == OsStr::new(WORKTREES))
+            .ok_or_else(not_ours)?;
+        let (Some(run), Some(name), None) =
+            (parts.get(at + 1), parts.get(at + 2), parts.get(at + 3))
+        else {
+            return Err(not_ours());
+        };
+        let (Some(run), Some(name)) = (run.to_str(), name.to_str()) else {
+            return Err(not_ours());
+        };
+        let repo_path: PathBuf = parts.iter().take(at).collect();
+        let repo = self.open_repo(path_str(&repo_path)?)?;
+        let common = {
+            let out = self.run_ok(
+                &repo,
+                None,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )?;
+            self.canonical_line(&out.text())?
+        };
+
+        // The pointer: a plain file saying `gitdir: <repo>/.git/worktrees/<entry>`, exactly.
+        let text = read_pointer_file(&canon.join(".git"), "a `.git` entry")?;
+        let target = text
+            .strip_prefix("gitdir: ")
+            .filter(|t| !t.is_empty() && !t.contains('\n') && !t.contains('\0'))
+            .ok_or_else(|| pointer_error("is not a `gitdir:` line"))?;
+        let target = Path::new(target);
+        if !target.is_absolute() {
+            return Err(pointer_error("is not an absolute path"));
         }
-        let top = self.run_ok(&canon, None, &["rev-parse", "--show-toplevel"])?;
-        if self.canonical_line(&top.text())? != canon {
+        let admin = fs::canonicalize(target)
+            .map_err(|_| pointer_error("names an entry that does not exist"))?;
+        if admin != target {
+            return Err(pointer_error("goes through a link or a relative component"));
+        }
+        if admin.parent() != Some(common.join("worktrees").as_path())
+            || admin.file_name().is_none()
+            || !crate::fsx::is_real_dir(&admin)
+        {
+            return Err(pointer_error(
+                "does not name an entry below this repository's `.git/worktrees`",
+            ));
+        }
+        // The entry must belong to this worktree and to this repository.
+        let back = read_pointer_file(&admin.join("gitdir"), "its entry's `gitdir`")?;
+        if fs::canonicalize(&back).ok().as_deref() != Some(canon.join(".git").as_path()) {
+            return Err(pointer_error(
+                "names an entry that belongs to another worktree",
+            ));
+        }
+        let commondir = read_pointer_file(&admin.join("commondir"), "its entry's `commondir`")?;
+        if fs::canonicalize(admin.join(&commondir)).ok().as_deref() != Some(common.as_path()) {
+            return Err(pointer_error(
+                "names an entry that belongs to another repository",
+            ));
+        }
+        let head = read_pointer_file(&admin.join("HEAD"), "its entry's `HEAD`")?;
+        let branch = match head.strip_prefix("ref: ") {
+            Some(r) => Some(
+                r.strip_prefix("refs/heads/")
+                    .filter(|b| validate_ref_name(b).is_ok())
+                    .ok_or_else(|| pointer_error("is on something other than a branch"))?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        // What git itself makes of it must agree.
+        let dirs = self.run_env_ok(
+            &canon,
+            &[
+                ("GIT_DIR", admin.as_os_str()),
+                ("GIT_COMMON_DIR", common.as_os_str()),
+                ("GIT_WORK_TREE", canon.as_os_str()),
+            ],
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+            ],
+        )?;
+        let text = dirs.text();
+        let mut lines = text.lines();
+        let (Some(a), Some(c), Some(t)) = (lines.next(), lines.next(), lines.next()) else {
+            return Err(FleetError::internal("unexpected output from git rev-parse"));
+        };
+        if fs::canonicalize(t).ok().as_deref() != Some(canon.as_path()) {
             return Err(FleetError::forbidden(format!(
                 "{} is not the top level of a worktree",
                 show(worktree)
             )));
         }
-        Ok(canon)
+        if fs::canonicalize(a).ok().as_deref() != Some(admin.as_path())
+            || fs::canonicalize(c).ok().as_deref() != Some(common.as_path())
+        {
+            return Err(pointer_error("is not understood the way fleet read it"));
+        }
+        Ok(Worktree {
+            path: canon,
+            repo,
+            admin,
+            common,
+            name: name.to_string(),
+            run: run.to_string(),
+            branch,
+        })
+    }
+
+    /// The commit `branch` points at in the repository itself, ignoring replacement objects.
+    fn real_branch_head(&self, repo: &Path, branch: &str) -> Result<Sha> {
+        validate_ref_name(branch)?;
+        let spec = format!("refs/heads/{branch}^{{commit}}");
+        let out = self.run(
+            repo,
+            None,
+            &["rev-parse", "--verify", "--end-of-options", &spec],
+        )?;
+        if !out.ok() {
+            return Err(FleetError::not_found(format!(
+                "branch {} does not exist",
+                show(branch)
+            )));
+        }
+        Sha::parse(out.text().trim())
+    }
+
+    /// The tree of a commit in the repository itself.
+    fn real_tree_of(&self, repo: &Path, commit: &Sha) -> Result<Sha> {
+        let spec = format!("{}^{{tree}}", commit.as_str());
+        let out = self.run_ok(
+            repo,
+            None,
+            &["rev-parse", "--verify", "--end-of-options", &spec],
+        )?;
+        Sha::parse(out.text().trim())
+    }
+
+    /// The worktree's branch, which must be the one fleet made for it: commits made on any other
+    /// branch are not the work that evidence and merges are about.
+    fn task_branch_of(&self, w: &Worktree) -> Result<String> {
+        let expected = w.expected_branch();
+        match &w.branch {
+            Some(b) if *b == expected => Ok(expected),
+            Some(b) => Err(FleetError::forbidden(format!(
+                "the worktree is on branch {} instead of {}; its work is not on the branch that is merged",
+                show(b),
+                show(&expected)
+            ))),
+            None => Err(FleetError::forbidden(format!(
+                "the worktree has a detached head instead of branch {}; its work is not on the branch that is merged",
+                show(&expected)
+            ))),
+        }
+    }
+
+    /// Runs git in the worktree with the pinned directories of `w`.
+    fn run_in(&self, w: &Worktree, ident: Option<&Identity>, args: &[&str]) -> Result<Out> {
+        self.run_env(&w.path, ident, &w.env(), args)
+    }
+
+    fn run_in_ok(&self, w: &Worktree, ident: Option<&Identity>, args: &[&str]) -> Result<Out> {
+        let out = self.run_in(w, ident, args)?;
+        if out.ok() {
+            return Ok(out);
+        }
+        Err(self.failure(args, &out))
     }
 
     fn head_sha(&self, cwd: &Path) -> Result<Sha> {
@@ -1035,26 +1287,21 @@ impl GitVcs {
         dest: &Path,
         index: &Path,
     ) -> Result<Export> {
-        let wt = self.check_worktree(worktree)?;
+        let w = self.check_worktree(worktree)?;
+        // The commit and its tree are read from the repository, not through the worktree.
         let spec_commit = format!("{}^{{commit}}", commit.as_str());
-        let resolved = self.run_ok(
-            &wt,
+        let resolved = self.run(
+            &w.repo,
             None,
             &["rev-parse", "--verify", "--end-of-options", &spec_commit],
         )?;
-        if resolved.text().trim() != commit.as_str() {
+        if !resolved.ok() || resolved.text().trim() != commit.as_str() {
             return Err(FleetError::not_found(format!(
                 "commit {} does not exist",
                 commit.as_str()
             )));
         }
-        let spec_tree = format!("{}^{{tree}}", commit.as_str());
-        let tree = self.run_ok(
-            &wt,
-            None,
-            &["rev-parse", "--verify", "--end-of-options", &spec_tree],
-        )?;
-        let tree = Sha::parse(tree.text().trim())?;
+        let tree = self.real_tree_of(&w.repo, commit)?;
         if !crate::fsx::is_real_dir(dest) {
             return Err(FleetError::invalid("the export directory does not exist"));
         }
@@ -1074,9 +1321,15 @@ impl GitVcs {
             .to_str()
             .ok_or_else(|| FleetError::invalid("the export directory is not valid UTF-8"))?
             .to_string();
-        let env = [("GIT_INDEX_FILE", index.as_os_str())];
+        let pinned = w.env();
+        let env = [
+            pinned[0],
+            pinned[1],
+            pinned[2],
+            ("GIT_INDEX_FILE", index.as_os_str()),
+        ];
         self.run_env_ok(
-            &wt,
+            &w.path,
             &env,
             &[
                 "-c",
@@ -1086,8 +1339,15 @@ impl GitVcs {
                 commit.as_str(),
             ],
         )?;
+        // What was read into the index is the tree evidence will name.
+        let written = self.run_env_ok(&w.path, &env, &["write-tree"])?;
+        if written.text().trim() != tree.as_str() {
+            return Err(FleetError::internal(
+                "the tree that was read for the export is not the tree of the commit",
+            ));
+        }
         self.run_env_ok(
-            &wt,
+            &w.path,
             &env,
             &[
                 "-c",
@@ -1226,7 +1486,8 @@ impl Vcs for GitVcs {
         for b in branches {
             validate_ref_name(b)?;
         }
-        let wt = self.check_worktree(worktree)?;
+        let w = self.check_worktree(worktree)?;
+        let wt = w.path.clone();
         for b in branches {
             if let conflict @ MergeOutcome::Conflict { .. } =
                 self.merge_one(&wt, identity, "--ff", None, b, None)?
@@ -1246,42 +1507,40 @@ impl Vcs for GitVcs {
         identity: &Identity,
     ) -> Result<Option<Sha>> {
         validate_identity(identity)?;
-        let wt = self.check_worktree(worktree)?;
+        let w = self.check_worktree(worktree)?;
+        let branch = self.task_branch_of(&w)?;
         let message = clean_message(message, "fleet: task changes");
-        self.run_ok(&wt, None, &["add", "-A"])?;
+        self.run_in_ok(&w, None, &["add", "-A"])?;
         // Fleet's own directory must never reach a commit, even when something force-added it.
-        self.run_ok(&wt, None, &["reset", "-q", "--", ".fleet"])?;
-        match self.exit_code(&wt, &["diff", "--cached", "--quiet", "--no-ext-diff"])? {
-            0 => return Ok(None),
-            1 => {}
+        self.run_in_ok(&w, None, &["reset", "-q", "--", ".fleet"])?;
+        match self
+            .run_in(&w, None, &["diff", "--cached", "--quiet", "--no-ext-diff"])?
+            .code
+        {
+            Some(0) => return Ok(None),
+            Some(1) => {}
             _ => {
                 return Err(FleetError::internal("git diff --cached failed"));
             }
         }
-        self.run_ok(
-            &wt,
+        self.run_in_ok(
+            &w,
             Some(identity),
             &["commit", "--no-verify", "--no-gpg-sign", "-m", &message],
         )?;
-        Ok(Some(self.head_sha(&wt)?))
+        // The commit that was made, as the repository itself has it on the task's branch.
+        Ok(Some(self.real_branch_head(&w.repo, &branch)?))
     }
 
     fn branch_head(&self, repo: &str, branch: &str) -> Result<Sha> {
         validate_ref_name(branch)?;
-        let dir = self.repo_dir(repo)?;
-        let spec = format!("refs/heads/{branch}^{{commit}}");
-        let out = self.run(
-            &dir,
-            None,
-            &["rev-parse", "--verify", "--end-of-options", &spec],
-        )?;
-        if !out.ok() {
-            return Err(FleetError::not_found(format!(
-                "branch {} does not exist",
-                show(branch)
-            )));
-        }
-        Sha::parse(out.text().trim())
+        let dir = self.open_repo(repo)?;
+        self.real_branch_head(&dir, branch)
+    }
+
+    fn commit_tree(&self, repo: &str, commit: &Sha) -> Result<Sha> {
+        let dir = self.open_repo(repo)?;
+        self.real_tree_of(&dir, commit)
     }
 
     fn merge_into_integration(&self, req: &IntegrationMerge) -> Result<IntegrationResult> {
@@ -1372,18 +1631,16 @@ impl Vcs for GitVcs {
     }
 
     fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState> {
-        let wt = self.check_worktree(worktree)?;
-        let head = self.head_sha(&wt)?;
-        let tree = self.run_ok(
-            &wt,
-            None,
-            &["rev-parse", "--verify", "--end-of-options", "HEAD^{tree}"],
-        )?;
-        let tree = Sha::parse(tree.text().trim())?;
+        let w = self.check_worktree(worktree)?;
+        // Commit and tree come from the repository's branch, never from what the worktree's own
+        // git directory says: this is what a merge brings in.
+        let branch = self.task_branch_of(&w)?;
+        let head = self.real_branch_head(&w.repo, &branch)?;
+        let tree = self.real_tree_of(&w.repo, &head)?;
         // What the commits changed since the base: this, not the working state, is what a merge
         // brings in. Every path is listed, `.fleet/` ones included.
         let diff = self.run_ok(
-            &wt,
+            &w.repo,
             None,
             &[
                 "diff",
@@ -1403,8 +1660,8 @@ impl Vcs for GitVcs {
         let truncated = paths.len() > MAX_CHANGED_PATHS;
         // Uncommitted work: staged, modified or untracked files (ignored ones are not work and
         // are not in any commit), apart from fleet's own directory.
-        let status = self.run_ok(
-            &wt,
+        let status = self.run_in_ok(
+            &w,
             None,
             &[
                 "status",
@@ -3076,6 +3333,360 @@ mod tests {
             list.extend_from_slice(format!("pager.cmd{i}\nx\0").as_bytes());
         }
         assert_eq!(dynamic_overrides(&list).unwrap_err().code, ErrorCode::Limit);
+    }
+
+    // ---- a worker that rewrites what its worktree points at ---------------------------------
+    //
+    // A linked worktree's `.git` is a plain file in the worker's own tree. Git does not check where
+    // it points, so a worker can aim it at a repository it prepared (alternates onto the real object
+    // store, a replace ref for the task's head). Anything read through that gitdir, a tree for
+    // instance, then describes what the worker chose, not what the real branch holds and what a
+    // merge brings in.
+
+    /// A repository the worker made: its objects come from the real store through alternates, it
+    /// has the task's branch checked out at the real head, and `refs/replace/<head>` names a
+    /// commit with another tree (`forged.txt` instead of the real files). The worktree's files and
+    /// index are those of the forged tree, so as far as the forged repository is concerned the
+    /// worktree is clean.
+    struct Forgery {
+        real_head: Sha,
+        real_tree: String,
+        forged_tree: String,
+        gitdir: PathBuf,
+    }
+
+    fn forge(fx: &Fx, wt: &str, branch: &str) -> Forgery {
+        let real_head = Sha::parse(&git(
+            fx.repo.as_path(),
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        ))
+        .unwrap();
+        let real_tree = git(
+            fx.repo.as_path(),
+            &["rev-parse", &format!("{}^{{tree}}", real_head.as_str())],
+        );
+        let gitdir = fx.tmp.join("forged.git");
+        fs::create_dir_all(&gitdir).unwrap();
+        git(&gitdir, &["init", "-q", "--bare", "."]);
+        git(&gitdir, &["config", "core.bare", "false"]);
+        git(&gitdir, &["config", "core.worktree", wt]);
+        let objects = fx.repo.join(".git/objects");
+        fs::write(
+            gitdir.join("objects/info/alternates"),
+            format!("{}\n", objects.display()),
+        )
+        .unwrap();
+        let file = fx.tmp.join("forged-file");
+        fs::write(&file, "the forged content\n").unwrap();
+        let blob = git(&gitdir, &["hash-object", "-w", file.to_str().unwrap()]);
+        let mktree_input = fx.tmp.join("mktree-input");
+        fs::write(&mktree_input, format!("100644 blob {blob}\tforged.txt\n")).unwrap();
+        let tree = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("git mktree < \"$1\"")
+            .arg("sh")
+            .arg(&mktree_input)
+            .env("GIT_DIR", &gitdir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        let forged_tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+        assert_eq!(
+            forged_tree.len(),
+            40,
+            "{}",
+            String::from_utf8_lossy(&tree.stderr)
+        );
+        let replacement = git(&gitdir, &["commit-tree", "-m", "replacement", &forged_tree]);
+        git(
+            &gitdir,
+            &[
+                "update-ref",
+                &format!("refs/heads/{branch}"),
+                real_head.as_str(),
+            ],
+        );
+        git(
+            &gitdir,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        );
+        git(
+            &gitdir,
+            &[
+                "update-ref",
+                &format!("refs/replace/{}", real_head.as_str()),
+                &replacement,
+            ],
+        );
+        // the worktree now says: my gitdir is the forged one
+        fs::write(
+            Path::new(wt).join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        // make its files and index those of the forged tree (the forged repository sees a clean tree)
+        let wtp = Path::new(wt);
+        for entry in fs::read_dir(wtp).unwrap().flatten() {
+            let name = entry.file_name();
+            if name == ".git" || name == ".fleet" {
+                continue;
+            }
+            let p = entry.path();
+            if p.is_dir() {
+                fs::remove_dir_all(&p).unwrap();
+            } else {
+                fs::remove_file(&p).unwrap();
+            }
+        }
+        fs::write(wtp.join("forged.txt"), "the forged content\n").unwrap();
+        let out = std::process::Command::new("git")
+            .args(["read-tree", real_head.as_str()])
+            .env("GIT_DIR", &gitdir)
+            .env("GIT_WORK_TREE", wt)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Forgery {
+            real_head,
+            real_tree,
+            forged_tree,
+            gitdir,
+        }
+    }
+
+    #[test]
+    fn a_worker_that_repoints_its_gitdir_cannot_make_evidence_describe_another_tree() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        let branch = "fleet/r1/t1";
+        // honest worktree: head and tree are the real branch's
+        let honest = fx.vcs.worktree_state(&wt, &base).unwrap();
+        let f = forge(&fx, &wt, branch);
+        assert_eq!(honest.head, f.real_head);
+        assert_eq!(honest.tree.as_str(), f.real_tree);
+        assert_ne!(f.forged_tree, f.real_tree);
+        // review: committing the worker's output through the forged gitdir is refused
+        let err = fx.vcs.commit_all(&wt, "review", &ident()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "{err:?}");
+        assert!(err.message.contains(".git"), "{}", err.message);
+        // verification: neither the state nor an export may be read through it
+        let err = fx.vcs.worktree_state(&wt, &base).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "{err:?}");
+        let dest = fx.tmp.join("export/tree");
+        fs::create_dir_all(&dest).unwrap();
+        let err = fx
+            .vcs
+            .export_commit(&wt, &f.real_head, &dest, &fx.tmp.join("export/index"))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "{err:?}");
+        assert!(
+            fs::read_dir(&dest).unwrap().next().is_none(),
+            "nothing was exported"
+        );
+        // merging into it is refused as well
+        let err = fx
+            .vcs
+            .merge_into_worktree(&wt, &["fleet/r1/other".to_string()], &ident())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "{err:?}");
+        // the real branch was not touched by any of it
+        assert_eq!(
+            fx.vcs.branch_head(fx.repo_s(), branch).unwrap(),
+            f.real_head
+        );
+        let _ = f.gitdir;
+    }
+
+    #[test]
+    fn every_other_way_of_pointing_a_worktree_somewhere_else_is_refused() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        let other = fx.prepare("r1", "t2");
+        let pointer = Path::new(&wt).join(".git");
+        let own = fs::read_to_string(&pointer).unwrap();
+        assert!(fx.vcs.worktree_state(&wt, &base).is_ok());
+        let refused = |what: &str| {
+            let err = fx.vcs.worktree_state(&wt, &base).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden, "{what}: {err:?}");
+        };
+        // the entry of a sibling worktree
+        let sibling = fs::read_to_string(Path::new(&other).join(".git")).unwrap();
+        fs::write(&pointer, &sibling).unwrap();
+        refused("the pointer of a sibling worktree");
+        // a relative path, the main repository's own .git, a path with a link in it
+        fs::write(&pointer, "gitdir: ../../../.git\n").unwrap();
+        refused("a relative path");
+        fs::write(
+            &pointer,
+            format!("gitdir: {}\n", fx.repo.join(".git").display()),
+        )
+        .unwrap();
+        refused("the main .git directory");
+        let link = fx.tmp.join("link-to-admin");
+        let admin = own.trim().strip_prefix("gitdir: ").unwrap().to_string();
+        std::os::unix::fs::symlink(&admin, &link).unwrap();
+        fs::write(&pointer, format!("gitdir: {}\n", link.display())).unwrap();
+        refused("a symbolic link to the right entry");
+        // junk and a pointer that is not a regular file
+        for junk in [
+            "",
+            "gitdir:",
+            "gitdir: \n",
+            "not a pointer\n",
+            "gitdir: /nonexistent\n",
+        ] {
+            fs::write(&pointer, junk).unwrap();
+            refused(junk);
+        }
+        fs::write(&pointer, "gitdir: /x\ngitdir: /y\n").unwrap();
+        refused("two lines");
+        fs::remove_file(&pointer).unwrap();
+        std::os::unix::fs::symlink(&own.trim().replace("gitdir: ", ""), &pointer).unwrap();
+        refused("the pointer itself a symbolic link");
+        fs::remove_file(&pointer).unwrap();
+        fs::create_dir(&pointer).unwrap();
+        refused("the pointer a directory");
+        fs::remove_dir(&pointer).unwrap();
+        // the right pointer works again
+        fs::write(&pointer, &own).unwrap();
+        assert!(fx.vcs.worktree_state(&wt, &base).is_ok());
+        // the entry itself was changed: its back pointer, its commondir, its HEAD
+        let adm = PathBuf::from(admin);
+        let back = fs::read_to_string(adm.join("gitdir")).unwrap();
+        fs::write(adm.join("gitdir"), "/somewhere/else/.git\n").unwrap();
+        refused("an entry that does not point back");
+        fs::write(adm.join("gitdir"), &back).unwrap();
+        let common = fs::read_to_string(adm.join("commondir")).unwrap();
+        fs::write(
+            adm.join("commondir"),
+            format!("{}\n", fx.tmp.join("forged.git").display()),
+        )
+        .unwrap();
+        refused("a commondir elsewhere");
+        fs::write(adm.join("commondir"), &common).unwrap();
+        assert!(fx.vcs.worktree_state(&wt, &base).is_ok());
+        let head = fs::read_to_string(adm.join("HEAD")).unwrap();
+        fs::write(adm.join("HEAD"), "ref: refs/heads/fleet/r1/t2\n").unwrap();
+        refused("a worktree on another task's branch");
+        fs::write(adm.join("HEAD"), format!("{}\n", fx.base().as_str())).unwrap();
+        refused("a detached head");
+        fs::write(adm.join("HEAD"), &head).unwrap();
+        assert!(fx.vcs.worktree_state(&wt, &base).is_ok());
+    }
+
+    #[test]
+    fn replace_refs_never_change_what_fleet_sees() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        let head = fx.edit_and_commit(&wt, "src/new.txt", "new\n");
+        let real_tree = git(
+            fx.repo.as_path(),
+            &[
+                "--no-replace-objects",
+                "rev-parse",
+                &format!("{}^{{tree}}", head.as_str()),
+            ],
+        );
+        // a replacement commit with a different tree, in the shared repository
+        let blob_file = fx.tmp.join("other-file");
+        fs::write(&blob_file, "replaced\n").unwrap();
+        let blob = git(
+            &fx.repo,
+            &["hash-object", "-w", blob_file.to_str().unwrap()],
+        );
+        let tree_input = fx.tmp.join("tree-input");
+        fs::write(&tree_input, format!("100644 blob {blob}\tREPLACED.txt\n")).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("git mktree < \"$1\"")
+            .arg("sh")
+            .arg(&tree_input)
+            .current_dir(&fx.repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        let other_tree = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let replacement = git(&fx.repo, &["commit-tree", "-m", "replacement", &other_tree]);
+        git(
+            &fx.repo,
+            &[
+                "update-ref",
+                &format!("refs/replace/{}", head.as_str()),
+                &replacement,
+            ],
+        );
+        // fleet's git ignores it: the state, the head and the export are the real ones
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert_eq!(s.head, head);
+        assert_eq!(
+            s.tree.as_str(),
+            real_tree,
+            "the tree of the commit, not of its replacement"
+        );
+        let dest = fx.tmp.join("export/tree");
+        fs::create_dir_all(&dest).unwrap();
+        let out = fx
+            .vcs
+            .export_commit(&wt, &head, &dest, &fx.tmp.join("export/index"))
+            .unwrap();
+        assert_eq!(out.tree.as_str(), real_tree);
+        assert!(dest.join("src/new.txt").exists());
+        assert!(!dest.join("REPLACED.txt").exists());
+        assert_eq!(
+            fx.vcs.branch_head(fx.repo_s(), "fleet/r1/t1").unwrap(),
+            head
+        );
+        assert_eq!(
+            fx.vcs.commit_tree(fx.repo_s(), &head).unwrap().as_str(),
+            real_tree
+        );
+    }
+
+    #[test]
+    fn a_repository_with_alternates_or_grafts_is_refused() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        let objects = fx.repo.join(".git/objects/info");
+        fs::create_dir_all(&objects).unwrap();
+        for (what, path) in [
+            ("alternates", objects.join("alternates")),
+            ("http-alternates", objects.join("http-alternates")),
+            ("grafts", fx.repo.join(".git/info/grafts")),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("{}\n", fx.tmp.join("elsewhere").display())).unwrap();
+            let err = fx.vcs.worktree_state(&wt, &base).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden, "{what}: {err:?}");
+            assert!(err.message.contains(what), "{what}: {}", err.message);
+            assert_eq!(
+                fx.vcs
+                    .prepare_worktree(fx.repo_s(), &rid("r1"), &tid("t9"), "fleet/r1/t9", &base)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Forbidden,
+                "{what}"
+            );
+            assert_eq!(
+                fx.vcs.commit_tree(fx.repo_s(), &base).unwrap_err().code,
+                ErrorCode::Forbidden,
+                "{what}"
+            );
+            fs::remove_file(&path).unwrap();
+            assert!(fx.vcs.worktree_state(&wt, &base).is_ok(), "{what} removed");
+        }
     }
 
     #[test]

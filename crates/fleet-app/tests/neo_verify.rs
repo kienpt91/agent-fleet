@@ -1061,6 +1061,35 @@ fn a_governed_task_is_not_merged_unless_the_branch_is_the_commit_that_was_proven
 }
 
 #[test]
+fn a_governed_task_is_not_merged_when_the_repository_has_another_tree_for_the_proven_commit() {
+    let mut h = governed(&[("tests", true)], |c| c.merge_needs_approval = false);
+    finish_ok(&mut h, "a");
+    ticks(&mut h);
+    assert_eq!(task_status(&mut h, "a"), "completed");
+    // the commit is the proven one, but the repository now answers another tree for it than the
+    // one the checks ran on (a replacement object, an object store that changed under fleet)
+    h.world.set_commit_tree(Some(sha_of('1')));
+    let err = h.call("merge", obj(vec![("task", s("r1/a"))])).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+    assert!(
+        err.message.contains("verification contract"),
+        "{}",
+        err.message
+    );
+    assert!(h.world.merges().is_empty());
+    assert_eq!(count(&h, "task_merged"), 0);
+    // with the tree the evidence was taken on it merges
+    h.world.set_commit_tree(None);
+    h.call("merge", obj(vec![("task", s("r1/a"))])).unwrap();
+    assert_eq!(count(&h, "task_merged"), 1);
+    // a task no contract guards does not care which tree the repository reports
+    finish_ok(&mut h, "b");
+    ticks(&mut h);
+    h.world.set_commit_tree(Some(sha_of('2')));
+    h.call("merge", obj(vec![("task", s("r1/b"))])).unwrap();
+}
+
+#[test]
 fn only_a_few_verifications_run_at_once() {
     let mut cfg = test_config();
     cfg.max_sessions = 4;
