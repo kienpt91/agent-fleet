@@ -474,8 +474,8 @@ secret-shaped string; nothing edited afterwards):
 
 ```text
 
-$ /target/release/fleet plan /tmp/tmp.sdTmFQveHR/plan.toml
-plan loaded into run r1 (2 tasks)
+$ /target/release/fleet plan /tmp/tmp.jeBkxT2alE/plan.toml
+plan loaded into run r1 (2 tasks) and 1 message channel(s)
 
 $ /target/release/fleet start --run r1 --max-parallel 2
 run r1 started
@@ -508,13 +508,13 @@ body (unverified peer content, quoted):
 
 $ /target/release/fleet events --limit 12
 #13 message m2 from task:docs to 1 on design
-#14 message m3 blocked (secret-shape)
-#15 r1/docs session exited
-#16 r1/docs in review
-#17 r1/docs committed
-#18 r1/docs completed
-#19 channel design muted (endpoint-ended)
-#20 message m2 delivered to api
+#14 message m2 delivered to api
+#15 message m3 blocked (secret-shape)
+#16 r1/docs session exited
+#17 r1/docs in review
+#18 r1/docs committed
+#19 r1/docs completed
+#20 channel design muted (endpoint-ended)
 #21 r1/api session exited
 #22 r1/api in review
 #23 r1/api committed
@@ -927,7 +927,7 @@ the goals page (one goal verified through fleet's own run, one task `unverified`
   because the tracker also lists the groups, so the ancestry rule has its own test with real child processes
   ([`origin.rs`](crates/fleet-infra/tests/origin.rs)), which fails without it.
 - **The page script** is checked three ways: a source scan test that fails on `innerHTML`, `EventSource`, cookies and their
-  relatives, a node script ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), 334 checks against a hand-written fake DOM, hostile
+  relatives, a node script ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), 378 checks against a hand-written fake DOM, hostile
   strings and a frame-splitting stream reader included) and the headless Chromium run above, which loaded the real page, logged in
   through the fragment, and found the expected text in the rendered DOM and in the screenshots. The live page was in its
   "Streaming live output" state with two ticks; the check does not distinguish what came from the first read and what from the stream.
@@ -960,15 +960,15 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1385 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1542 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 317 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 298 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | 509 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); messaging: channel and message rules, the board (policy order, rates with a fake clock, loop and storm detection, duplicates, secret shapes, mutes, approvals, replay), the secret-shape scanner against every rule of `scripts/secret-scan.sh` | 410 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); messaging: delivery, refusals and floods, loops with their gate, expiry, approvals, restart, adapter failures, operator commands; the outbox and inbox contract suites against the fakes | 320 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; the outbox and inbox adapters (FIFO, link, oversize, partial write, forged files, an inbox swapped for a link) and the same contract suites against them; the web messages routes | 526 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | 260 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; messaging with the real binary: two workers exchanging messages, a worker refused on `fleet msg`, secret and hostile text, a ping-pong that mutes with its gate, expiry, a restart without loss or repeat, the operator on a `to_lead` channel, hostile subjects in a brief, the read-only web routes | 285 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -983,11 +983,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               4852     4726    97.4%
-application          2634     2485    94.3%
-infrastructure       5420     4998    92.2%
-cli                  2705     2433    89.9%
-overall             15611    14642    93.8%
+domain               6802     6602    97.1%
+application          3474     3279    94.4%
+infrastructure       5775     5285    91.5%
+cli                  3072     2751    89.6%
+overall             19123    17917    93.7%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -1076,13 +1076,15 @@ remove it from the tree and rewrite the history if it was not published.
 
 ## Verification
 
-What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
-dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
-warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
-`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
-`node scripts/web-smoke.mjs` (334 checks) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
-working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
+What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, on fresh
+cargo and target volumes, dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy
+--all-targets -- -D warnings`, `scripts/test-layers.sh` (1542 tests, the soak at its default 20 seconds; the 120 second
+soak of an earlier run was not repeated), `scripts/coverage.sh`, the release build, `scripts/demo.sh`,
+`scripts/neo-demo.sh`, `scripts/msg-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the
+`docker/Dockerfile.web` image), `node scripts/web-smoke.mjs` (378 checks) and `check-crates-age` (121 locked crates, every
+version published on or before 2026-10-24: 0 too new). A secret scan of the working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
+Not verified: macOS, real coding agents (only scripted ones), and how a model behaves when it reads injected messages.
 
 ## Development
 
