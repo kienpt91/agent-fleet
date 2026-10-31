@@ -1019,9 +1019,13 @@ fleet handoff <task> [--json]
 ```
 
 What is tested: determinism (golden digests, two SHA-256 implementations), layer order, budgets and the shrink order,
-layers 1-6 free of agent-written text, labelled UNVERIFIED text in layer 7, delimiter and control-character attacks, secret
-rules, crash re-briefing with identical layers 1-5. What is not claimed: that a pack makes a model correct or reduces
-hallucination; token counts are estimates. Not built yet: the knowledge store (N3), the token governor (N4), the credential broker (N5).
+layers 1-5 free of agent-written text (layer 6 shows repository files at the base commit; which ones follows the worker's
+committed paths), labelled UNVERIFIED text in layer 7, delimiter and control-character attacks, secret rules (worst-case lines in
+linear time), stored packs re-hashed against the audit log (an edited, truncated, swapped or missing pack is `tampered`, exit
+11, no content), and crash re-briefing with identical layers 1-5 *for the same plan and ledger state* (they change when the
+plan or a check result does). What is not claimed: that a pack makes a model correct or reduces hallucination; token counts
+are estimates; the secret rules are a filter, not a guarantee. Not built yet: the knowledge store (N3), the token governor
+(N4), the credential broker (N5).
 
 Output of [`scripts/neo-n2-demo.sh`](scripts/neo-n2-demo.sh), run in a throwaway container with a fake HOME, a fake repository and the
 fake agent `examples/agents/n2-agent.sh` (its first attempt is wrong, its second reads layer 4 of its pack; abridged only by the

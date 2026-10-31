@@ -23,4 +23,7 @@ attempt and recording its handoff.
 
 ## Consequences
 A summary is lost only if the worker's worktree is gone. A handoff can be made later than the end of its attempt, never
-skipped. The cost is one more compile at dispatch for a task that was retried.
+skipped. The cost is one more compile at dispatch for a task that was retried. The wait is bounded: if the handoff cannot be
+recorded for 5 ticks in a row, the task is failed with the reason instead of being tried again by every tick (an operator can
+retry it). An on-demand packet (`fleet handoff`) is not the source of the next brief while a packet made by the flow exists,
+so asking for one does not replace what a worker left.

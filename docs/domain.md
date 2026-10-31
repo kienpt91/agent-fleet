@@ -132,7 +132,7 @@ the domain.
 | --- | --- |
 | **Context pack** | What an agent is told before it starts, compiled by `neo-context` from fleet's own state in eight layers in a fixed order, within a token budget, with a SHA-256 digest and a canonical manifest. Opt-in per run (`context = "compiled"`). |
 | **Layer** | One numbered part of a pack: 1 invariants, 2 charter, 3 plan position, 4 task and acceptance contract, 5 verified knowledge, 6 working set, 7 recent events, 8 scratch. A lower layer never displaces a higher one. |
-| **Stable digest** | The digest over layers 1-5 of a pack. The same state gives the same one; it does not change between attempts or across a crash. |
+| **Stable digest** | The digest over layers 1-5 of a pack. For the same plan, goal ledger, results of fleet's own checks and configuration it is the same on every attempt and after a crash; it changes when that state does (layer 3 lists the plan, layer 4 what fleet's own runs said). |
 | **UNVERIFIED** | The label on text an agent or a program it controls wrote. Only in layer 7, quoted with `> `, or excluded by policy. |
 | **Profile** | `[context.profile.<name>]`: `max_tokens`, `chars_per_token`, `safety_percent`; how much context a model gets and how its size is estimated. |
 | **Handoff packet** | What is carried between attempts: the pack's manifest and stable digest, fleet's open verification state, pointers to evidence, and the worker's summary stored as UNVERIFIED. Event `HandoffCreated`. |
