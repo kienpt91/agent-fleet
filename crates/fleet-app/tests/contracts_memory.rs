@@ -32,3 +32,10 @@ fn memory_verify_jobs_satisfy_the_contract() {
     let mut harness = MemoryVerifyHarness::new(World::new());
     verify_jobs_contract(&mut harness);
 }
+
+#[test]
+fn the_fake_remote_host_satisfies_the_contract() {
+    fleet_app::testing::remote::remote_host_contract(
+        &mut fleet_app::testing::remote::MemoryRemoteHarness::new(),
+    );
+}

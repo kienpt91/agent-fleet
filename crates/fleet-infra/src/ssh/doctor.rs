@@ -372,7 +372,10 @@ mod tests {
             parse_openssh_version("OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"),
             Some((8, 9))
         );
-        assert_eq!(parse_openssh_version("OpenSSH_for_Windows_8.1p1"), Some((8, 1)));
+        assert_eq!(
+            parse_openssh_version("OpenSSH_for_Windows_8.1p1"),
+            Some((8, 1))
+        );
         assert_eq!(parse_openssh_version("OpenSSH_9"), None);
         assert_eq!(parse_openssh_version("dropbear v2022.83"), None);
         assert_eq!(parse_openssh_version(""), None);

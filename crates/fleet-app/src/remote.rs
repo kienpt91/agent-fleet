@@ -405,3 +405,335 @@ impl SessionHost for RemoteSessions {
         self.remote.reconcile()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::remote::FakeRemote;
+    use crate::testing::World;
+    use fleet_domain::error::ErrorCode;
+
+    fn host(name: &str, sessions: usize) -> HostDef {
+        let mut h = HostDef::new(
+            HostName::parse(name).unwrap(),
+            "h.example",
+            "u",
+            "/k",
+            "/srv/f",
+        );
+        h.allowed_workers = vec!["agent".to_string()];
+        h.max_sessions = sessions;
+        h
+    }
+
+    struct Rig {
+        sessions: RemoteSessions,
+        world: World,
+        remote: FakeRemote,
+    }
+
+    fn rig(max: usize) -> Rig {
+        let world = World::new();
+        let remote = FakeRemote::new();
+        let hosts = std::iter::once(("build", host("build", max)))
+            .map(|(n, h)| (HostName::parse(n).unwrap(), h))
+            .collect();
+        let sessions = RemoteSessions::new(world.ports().sessions, Arc::new(remote.clone()), hosts);
+        Rig {
+            sessions,
+            world,
+            remote,
+        }
+    }
+
+    fn spec(task: &str, program: &str, host: Option<&str>) -> SessionSpec {
+        SessionSpec {
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse(task).unwrap(),
+            attempt: 1,
+            program: program.to_string(),
+            args: vec!["--go".to_string()],
+            cwd: "/wt".to_string(),
+            env: vec![("A".to_string(), "b".to_string())],
+            host: host.map(|h| HostName::parse(h).unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_session_without_a_host_is_the_inner_session_untouched() {
+        let mut r = rig(1);
+        let s = r.sessions.spawn(&spec("a", "run-agent", None)).unwrap();
+        assert_eq!(r.sessions.poll(s.id), SessionState::Running);
+        r.world.exit(s.id, 0);
+        assert!(matches!(
+            r.sessions.poll(s.id),
+            SessionState::Exited { code: Some(0), .. }
+        ));
+        assert!(r.remote.prepared().is_empty() && r.remote.collects().is_empty());
+        assert_eq!(r.sessions.signal(s.id, Signal::Term), SignalOutcome::Gone);
+        let out = r.sessions.release(s.id);
+        assert_eq!(out.text, "");
+        assert!(r.remote.abandoned().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_host_a_worker_that_is_not_allowed_and_a_full_host_are_refused_before_the_host_is_touched(
+    ) {
+        let mut r = rig(1);
+        let err = r
+            .sessions
+            .spawn(&spec("a", "agent", Some("nowhere")))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        let err = r
+            .sessions
+            .spawn(&spec("a", "rm", Some("build")))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert!(r.remote.prepared().is_empty());
+        let first = r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .unwrap();
+        let err = r
+            .sessions
+            .spawn(&spec("b", "agent", Some("build")))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Limit);
+        assert_eq!(r.remote.prepared().len(), 1);
+        // The slot is free again once the first session was released.
+        r.world.exit(first.id, 0);
+        while r.sessions.poll(first.id) == SessionState::Running {}
+        r.sessions.release(first.id);
+        assert!(r.sessions.spawn(&spec("b", "agent", Some("build"))).is_ok());
+    }
+
+    #[test]
+    fn a_launch_or_spawn_that_fails_removes_the_remote_worktree_it_made() {
+        let mut r = rig(2);
+        r.remote.fail_launch(Some("no command"));
+        assert!(r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .is_err());
+        assert_eq!(r.remote.abandoned().len(), 1);
+        r.remote.fail_launch(None);
+        r.world.fail_spawn(Some("no pty"));
+        assert!(r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .is_err());
+        assert_eq!(r.remote.abandoned().len(), 2);
+        r.world.fail_spawn(None);
+        r.remote.fail_prepare(Some("down"));
+        assert!(r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .is_err());
+        assert_eq!(
+            r.remote.abandoned().len(),
+            2,
+            "nothing was made, nothing to remove"
+        );
+    }
+
+    #[test]
+    fn the_remote_launch_gets_the_program_arguments_and_environment_of_the_spec() {
+        let mut r = rig(1);
+        r.sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .unwrap();
+        let l = &r.remote.launched()[0];
+        assert_eq!(
+            (l.program.as_str(), l.args.clone()),
+            ("agent", vec!["--go".to_string()])
+        );
+        assert_eq!(l.env, vec![("A".to_string(), "b".to_string())]);
+        assert_eq!(
+            r.sessions
+                .remote_dir(
+                    &HostName::parse("build").unwrap(),
+                    &RunId::parse("r1").unwrap(),
+                    &TaskId::parse("a").unwrap()
+                )
+                .unwrap(),
+            "/remote/build/r1/a"
+        );
+        let s = r.world.session_for("a").unwrap();
+        assert_eq!(r.world.session_spec(s).unwrap().program, "/usr/bin/ssh");
+    }
+
+    #[test]
+    fn the_end_waits_for_collecting_and_a_failure_to_collect_turns_a_clean_exit_into_a_failure() {
+        let mut r = rig(1);
+        let s = r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .unwrap();
+        r.remote.polls_before_done(1);
+        r.remote.collect_answer(Err("refused".to_string()));
+        r.world.exit(s.id, 0);
+        assert_eq!(
+            r.sessions.poll(s.id),
+            SessionState::Running,
+            "collecting started"
+        );
+        assert_eq!(r.sessions.reading(s.id).unwrap().idle_ms, 0);
+        assert_eq!(
+            r.sessions.signal(s.id, Signal::Kill),
+            SignalOutcome::Gone,
+            "nothing left to signal"
+        );
+        assert_eq!(
+            r.sessions.poll(s.id),
+            SessionState::Running,
+            "still collecting"
+        );
+        assert_eq!(
+            r.sessions.poll(s.id),
+            SessionState::Exited {
+                code: Some(EXIT_COLLECT_FAILED),
+                signal: None
+            }
+        );
+        assert_eq!(
+            r.sessions.poll(s.id),
+            SessionState::Exited {
+                code: Some(EXIT_COLLECT_FAILED),
+                signal: None
+            }
+        );
+        let out = r.sessions.release(s.id);
+        assert!(
+            out.text.contains("could not be brought back: refused"),
+            "{}",
+            out.text
+        );
+        assert!(
+            r.remote.abandoned().is_empty(),
+            "collecting cleans up by itself"
+        );
+    }
+
+    #[test]
+    fn exits_that_were_already_failures_keep_their_code_and_signal() {
+        for (code, signal) in [(3, None), (0, Some("SIGKILL"))] {
+            let mut r = rig(1);
+            r.remote.collect_answer(Err("x".to_string()));
+            let s = r
+                .sessions
+                .spawn(&spec("a", "agent", Some("build")))
+                .unwrap();
+            match signal {
+                Some(name) => r.world.exit_by_signal(s.id, name),
+                None => r.world.exit(s.id, code),
+            }
+            let state = loop {
+                let st = r.sessions.poll(s.id);
+                if st != SessionState::Running {
+                    break st;
+                }
+            };
+            match signal {
+                Some(name) => assert_eq!(
+                    state,
+                    SessionState::Exited {
+                        code: None,
+                        signal: Some(name.to_string())
+                    }
+                ),
+                None => assert_eq!(
+                    state,
+                    SessionState::Exited {
+                        code: Some(3),
+                        signal: None
+                    }
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn a_collect_that_cannot_even_start_is_reported_and_the_exit_is_a_failure() {
+        let mut r = rig(1);
+        let s = r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .unwrap();
+        r.remote.fail_begin_collect(Some("too many operations"));
+        r.world.exit(s.id, 0);
+        assert!(matches!(
+            r.sessions.poll(s.id),
+            SessionState::Exited {
+                code: Some(EXIT_COLLECT_FAILED),
+                ..
+            }
+        ));
+        assert!(r
+            .sessions
+            .release(s.id)
+            .text
+            .contains("could not be collected: too many operations"));
+    }
+
+    #[test]
+    fn a_stop_reaches_the_host_first_and_then_the_local_client() {
+        let mut r = rig(1);
+        let s = r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .unwrap();
+        assert_eq!(r.sessions.signal(s.id, Signal::Term), SignalOutcome::Sent);
+        assert_eq!(r.remote.signals().len(), 1);
+        assert_eq!(r.remote.signals()[0].1, Signal::Term);
+        assert_eq!(r.world.signals(s.id), vec![Signal::Term]);
+    }
+
+    #[test]
+    fn releasing_a_session_whose_work_was_never_collected_abandons_the_remote_worktree() {
+        let mut r = rig(1);
+        let s = r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .unwrap();
+        let out = r.sessions.release(s.id);
+        assert!(out.text.contains("abandoned"), "{}", out.text);
+        assert_eq!(r.remote.abandoned().len(), 1);
+        // Mid-collect is the same.
+        let mut r = rig(1);
+        r.remote.polls_before_done(5);
+        let s = r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .unwrap();
+        r.world.exit(s.id, 0);
+        assert_eq!(r.sessions.poll(s.id), SessionState::Running);
+        r.sessions.release(s.id);
+        assert_eq!(r.remote.abandoned().len(), 1);
+    }
+
+    #[test]
+    fn reconciling_and_the_local_views_pass_through() {
+        let mut r = rig(1);
+        r.remote.set_reconcile(&["one", "two"]);
+        assert_eq!(
+            r.sessions.reconcile_remote(),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        let s = r
+            .sessions
+            .spawn(&spec("a", "agent", Some("build")))
+            .unwrap();
+        r.world.print(s.id, "hello\n");
+        assert!(r.sessions.snapshot(s.id, 100).unwrap().contains("hello"));
+        assert_eq!(r.sessions.read_since(s.id, 0, 100).unwrap().text, "hello\n");
+        assert_eq!(r.sessions.live().len(), 1);
+        assert!(r.sessions.start_token(s.identity.pid).is_none());
+        r.world
+            .set_running_process(s.identity.pid, &s.identity.start_token);
+        assert_eq!(
+            r.sessions.terminate_orphan(&s.identity, 10),
+            SignalOutcome::Sent
+        );
+    }
+}

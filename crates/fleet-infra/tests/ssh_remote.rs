@@ -1314,3 +1314,87 @@ mod sessions {
         );
     }
 }
+
+// ---- the port contract -------------------------------------------------------------------------------
+
+struct SshHarness<'a> {
+    fx: &'a Fx,
+    remote: SshRemoteHost,
+    host: HostDef,
+    wt: String,
+}
+
+impl fleet_app::testing::remote::RemoteHarness for SshHarness<'_> {
+    fn host(&self) -> &dyn RemoteHost {
+        &self.remote
+    }
+    fn task(&self) -> RemoteTask {
+        rt("build", "r1", "t1")
+    }
+    fn worktree(&self) -> String {
+        self.wt.clone()
+    }
+    fn worker(&self, change: &fleet_app::testing::remote::WorkerChange) -> (String, Vec<String>) {
+        use fleet_app::testing::remote::WorkerChange;
+        let script = match change {
+            WorkerChange::Nothing => "true".to_string(),
+            WorkerChange::WriteFile { name, content } => {
+                format!(
+                    "printf '%s\\n' '{}' > {name}",
+                    content.trim_end_matches('\n')
+                )
+            }
+        };
+        ("sh".to_string(), vec!["-c".to_string(), script])
+    }
+    fn worker_env(&self) -> Vec<(String, String)> {
+        let dir = self.remote.remote_dir(&self.task()).unwrap();
+        worker_env(&self.host.env, &rid("r1"), &tid("t1"), &dir)
+    }
+    fn run_local(
+        &mut self,
+        command: &fleet_app::remote::LocalCommand,
+        _change: &fleet_app::testing::remote::WorkerChange,
+    ) -> i32 {
+        let done = exec::run(
+            &Spec {
+                program: PathBuf::from(&command.program),
+                args: command.args.clone(),
+                env: command.env.clone(),
+                input: Input::None,
+                output: Output::Capture { max: 1 << 20 },
+                limits: Limits {
+                    total: Duration::from_secs(60),
+                    stall: Duration::from_secs(60),
+                },
+            },
+            &JobTracker::new(),
+        );
+        done.code().unwrap_or(-1)
+    }
+    fn local_file(&self, relative: &str) -> Option<String> {
+        std::fs::read_to_string(format!("{}/{relative}", self.wt)).ok()
+    }
+    fn local_head(&self) -> String {
+        git(std::path::Path::new(&self.wt), &["rev-parse", "HEAD"])
+    }
+    fn remote_exists(&self) -> bool {
+        self.fx.remote_dir(&self.host, "r1", "t1").exists()
+    }
+}
+
+#[test]
+fn the_ssh_adapter_satisfies_the_remote_host_contract() {
+    let Some(fx) = Fx::new() else { return };
+    let host = fx.host(&["sh"]);
+    let remote = fx.remote(vec![host.clone()]);
+    fx.trust(&remote, &host);
+    let wt = fx.worktree("r1", "t1");
+    let mut harness = SshHarness {
+        fx: &fx,
+        remote,
+        host,
+        wt,
+    };
+    fleet_app::testing::remote::remote_host_contract(&mut harness);
+}

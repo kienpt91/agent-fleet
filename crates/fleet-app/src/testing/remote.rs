@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Default)]
 struct State {
+    /// Worker commands that may be launched; empty means every command.
+    allowed: Vec<String>,
+    /// Worktrees that exist on the fake host now.
+    existing: std::collections::BTreeSet<String>,
     prepared: Vec<PrepareRequest>,
     launched: Vec<LaunchRequest>,
     collects: Vec<CollectRequest>,
@@ -48,6 +52,11 @@ impl FakeRemote {
         }
     }
 
+    /// Only these worker commands may be launched (like a host's `allowed_workers`).
+    pub fn allow_workers(&self, commands: &[&str]) {
+        self.lock().allowed = commands.iter().map(|c| c.to_string()).collect();
+    }
+
     pub fn fail_prepare(&self, message: Option<&str>) {
         self.lock().fail_prepare = message.map(str::to_string);
     }
@@ -66,6 +75,11 @@ impl FakeRemote {
     }
     pub fn set_reconcile(&self, lines: &[&str]) {
         self.lock().reconcile_lines = lines.iter().map(|l| l.to_string()).collect();
+    }
+
+    /// True while the task's worktree exists on the fake host.
+    pub fn exists(&self, task: &RemoteTask) -> bool {
+        self.lock().existing.contains(&dir_of(task))
     }
 
     pub fn prepared(&self) -> Vec<PrepareRequest> {
@@ -100,6 +114,7 @@ impl RemoteHost for FakeRemote {
             return Err(FleetError::internal(m));
         }
         g.prepared.push(req.clone());
+        g.existing.insert(dir_of(&req.task));
         g.sha_counter += 1;
         let sent =
             Sha::parse(&format!("{:040x}", g.sha_counter)).unwrap_or_else(|_| unreachable_sha());
@@ -113,6 +128,9 @@ impl RemoteHost for FakeRemote {
         let mut g = self.lock();
         if let Some(m) = g.fail_launch.clone() {
             return Err(FleetError::internal(m));
+        }
+        if !g.allowed.is_empty() && !g.allowed.contains(&req.program) {
+            return Err(FleetError::forbidden("worker command is not allowed"));
         }
         g.launched.push(req.clone());
         let mut args = vec![
@@ -134,6 +152,7 @@ impl RemoteHost for FakeRemote {
             return Err(FleetError::internal(m));
         }
         g.collects.push(req.clone());
+        g.existing.remove(&dir_of(&req.task));
         g.next += 1;
         let id = g.next;
         let answer = g.collect_result.clone().unwrap_or(Ok(Collected {
@@ -147,7 +166,9 @@ impl RemoteHost for FakeRemote {
 
     fn poll_collect(&self, id: CollectId) -> Option<Result<Collected>> {
         let mut g = self.lock();
-        let (left, _) = g.pending.get_mut(&id.0)?;
+        let Some((left, _)) = g.pending.get_mut(&id.0) else {
+            return Some(Err(FleetError::internal("unknown collect job")));
+        };
         if *left > 0 {
             *left -= 1;
             return None;
@@ -161,7 +182,9 @@ impl RemoteHost for FakeRemote {
     }
 
     fn abandon(&self, task: &RemoteTask) {
-        self.lock().abandoned.push(task.clone());
+        let mut g = self.lock();
+        g.abandoned.push(task.clone());
+        g.existing.remove(&dir_of(task));
     }
 
     fn reconcile(&self) -> Vec<String> {
@@ -234,5 +257,263 @@ impl crate::ports::SessionHost for NoSessions {
         _: u64,
     ) -> crate::ports::SignalOutcome {
         crate::ports::SignalOutcome::Gone
+    }
+}
+
+// ---- the contract every RemoteHost must satisfy ----------------------------------------------------
+
+/// What the worker of a contract run does to its worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerChange {
+    Nothing,
+    WriteFile { name: String, content: String },
+}
+
+/// Everything the contract suite needs from a medium: the adapter, a prepared local task worktree
+/// and a way to run the command the adapter built (a real ssh client for the real adapter).
+pub trait RemoteHarness {
+    fn host(&self) -> &dyn RemoteHost;
+    fn task(&self) -> RemoteTask;
+    /// A local task worktree on its task branch with a commit and `.fleet/brief.md`.
+    fn worktree(&self) -> String;
+    /// The worker command the host allows and the arguments that make it do `change`.
+    fn worker(&self, change: &WorkerChange) -> (String, Vec<String>);
+    /// The environment given to the remote worker.
+    fn worker_env(&self) -> Vec<(String, String)>;
+    /// Runs the local command to the end and returns its exit code.
+    fn run_local(&mut self, command: &LocalCommand, change: &WorkerChange) -> i32;
+    /// Content of a file of the local worktree.
+    fn local_file(&self, relative: &str) -> Option<String>;
+    /// The commit the local task branch points at.
+    fn local_head(&self) -> String;
+    /// True while the worktree of the task exists on the host.
+    fn remote_exists(&self) -> bool;
+}
+
+fn collect_to_end(h: &dyn RemoteHarness, req: &CollectRequest) -> Result<Collected> {
+    let id = h.host().begin_collect(req).expect("begin_collect");
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(answer) = h.host().poll_collect(id) {
+            return answer;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(120),
+            "collecting did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The behaviour of a [`RemoteHost`], whatever it talks to.
+pub fn remote_host_contract(h: &mut dyn RemoteHarness) {
+    let task = h.task();
+    let worktree = h.worktree();
+
+    // The directory is stable and below the host's own naming (its last parts are run and task).
+    let dir = h.host().remote_dir(&task).expect("remote_dir");
+    assert_eq!(
+        dir,
+        h.host().remote_dir(&task).expect("remote_dir"),
+        "remote_dir is stable"
+    );
+    assert!(
+        dir.ends_with(&format!("/{}/{}", task.run, task.task)),
+        "{dir} does not end in run/task"
+    );
+    assert!(dir.starts_with('/') && !dir.contains(".."), "{dir}");
+
+    // Preparing makes the worktree; preparing again replaces what an earlier attempt left.
+    let request = PrepareRequest {
+        task: task.clone(),
+        attempt: 1,
+        worktree: worktree.clone(),
+    };
+    let first = h.host().prepare(&request).expect("prepare");
+    assert_eq!(first.dir, dir);
+    assert!(h.remote_exists(), "prepare made no remote worktree");
+    let second = h.host().prepare(&request).expect("prepare again");
+    assert_eq!(second.dir, dir);
+
+    // A worker command the host does not allow cannot be launched.
+    let refused = h.host().launch_command(&LaunchRequest {
+        task: task.clone(),
+        program: "definitely-not-allowed".to_string(),
+        args: vec![],
+        env: h.worker_env(),
+    });
+    assert!(
+        refused.is_err(),
+        "a command the host does not allow was launched"
+    );
+
+    // A worker that writes a file: the file and a new head come back, the remote is removed.
+    let change = WorkerChange::WriteFile {
+        name: "from-the-host.txt".to_string(),
+        content: "made remotely\n".to_string(),
+    };
+    let (program, args) = h.worker(&change);
+    let command = h
+        .host()
+        .launch_command(&LaunchRequest {
+            task: task.clone(),
+            program,
+            args,
+            env: h.worker_env(),
+        })
+        .expect("launch_command");
+    assert!(
+        command.program.starts_with('/'),
+        "the local program is not an absolute path"
+    );
+    let before = h.local_head();
+    assert_eq!(h.run_local(&command, &change), 0);
+    let got = collect_to_end(
+        h,
+        &CollectRequest {
+            task: task.clone(),
+            worktree: worktree.clone(),
+            sent: second.sent.clone(),
+            attempt: 1,
+        },
+    )
+    .expect("collect");
+    let head = got.head.expect("a changed file comes back as a new head");
+    assert_eq!(
+        head.as_str(),
+        h.local_head(),
+        "the reported head is the local branch head"
+    );
+    assert_ne!(h.local_head(), before);
+    assert_eq!(
+        h.local_file("from-the-host.txt").as_deref(),
+        Some("made remotely\n")
+    );
+    assert!(!h.remote_exists(), "the remote worktree was not removed");
+
+    // A worker that changes nothing leaves the head alone.
+    let again = h
+        .host()
+        .prepare(&request)
+        .expect("prepare after collecting");
+    let nothing = WorkerChange::Nothing;
+    let (program, args) = h.worker(&nothing);
+    let command = h
+        .host()
+        .launch_command(&LaunchRequest {
+            task: task.clone(),
+            program,
+            args,
+            env: h.worker_env(),
+        })
+        .expect("launch_command");
+    let before = h.local_head();
+    assert_eq!(h.run_local(&command, &nothing), 0);
+    let got = collect_to_end(
+        h,
+        &CollectRequest {
+            task: task.clone(),
+            worktree,
+            sent: again.sent,
+            attempt: 2,
+        },
+    )
+    .expect("collect");
+    assert_eq!(got.head, None);
+    assert_eq!(h.local_head(), before);
+
+    // Giving up removes the worktree, and an answer for an unknown job is an error, not a hang.
+    h.host().prepare(&request).expect("prepare for abandon");
+    assert!(h.remote_exists());
+    h.host().abandon(&task);
+    let start = std::time::Instant::now();
+    while h.remote_exists() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "abandon did not remove the remote worktree"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(matches!(
+        h.host().poll_collect(CollectId(u64::MAX)),
+        Some(Err(_))
+    ));
+}
+
+/// A harness for [`FakeRemote`]: the "local command" is a no-op and the worker's effect is
+/// scripted into the fake.
+pub struct MemoryRemoteHarness {
+    remote: FakeRemote,
+    files: BTreeMap<String, String>,
+    head: u64,
+}
+
+impl MemoryRemoteHarness {
+    pub fn new() -> MemoryRemoteHarness {
+        let remote = FakeRemote::new();
+        remote.allow_workers(&["agent"]);
+        MemoryRemoteHarness {
+            remote,
+            files: BTreeMap::new(),
+            head: 1,
+        }
+    }
+
+    fn head_sha(&self) -> Sha {
+        Sha::parse(&format!("{:040x}", self.head)).expect("a valid sha")
+    }
+}
+
+impl Default for MemoryRemoteHarness {
+    fn default() -> Self {
+        MemoryRemoteHarness::new()
+    }
+}
+
+impl RemoteHarness for MemoryRemoteHarness {
+    fn host(&self) -> &dyn RemoteHost {
+        &self.remote
+    }
+    fn task(&self) -> RemoteTask {
+        RemoteTask {
+            host: fleet_domain::ids::HostName::parse("build").expect("host"),
+            run: fleet_domain::ids::RunId::parse("r1").expect("run"),
+            task: fleet_domain::ids::TaskId::parse("t1").expect("task"),
+        }
+    }
+    fn worktree(&self) -> String {
+        "/local/wt".to_string()
+    }
+    fn worker(&self, _change: &WorkerChange) -> (String, Vec<String>) {
+        ("agent".to_string(), vec![])
+    }
+    fn worker_env(&self) -> Vec<(String, String)> {
+        vec![("A".to_string(), "b".to_string())]
+    }
+    fn run_local(&mut self, _command: &LocalCommand, change: &WorkerChange) -> i32 {
+        match change {
+            WorkerChange::Nothing => self.remote.collect_answer(Ok(Collected {
+                head: None,
+                notes: vec![],
+            })),
+            WorkerChange::WriteFile { name, content } => {
+                self.files.insert(name.clone(), content.clone());
+                self.head += 1;
+                self.remote.collect_answer(Ok(Collected {
+                    head: Some(self.head_sha()),
+                    notes: vec![],
+                }));
+            }
+        }
+        0
+    }
+    fn local_file(&self, relative: &str) -> Option<String> {
+        self.files.get(relative).cloned()
+    }
+    fn local_head(&self) -> String {
+        self.head_sha().as_str().to_string()
+    }
+    fn remote_exists(&self) -> bool {
+        self.remote.exists(&self.task())
     }
 }
