@@ -1,7 +1,8 @@
 //! Architecture rules, checked on the source tree itself with plain string parsing (no extra
 //! crates): the dependency direction between the four crates, no terminal library or async
 //! runtime where it does not belong, pinned versions, no `unsafe`, and no `unwrap`/`expect` in
-//! the pure layers.
+//! the pure layers. The web dashboard stays an adapter: the inner layers know nothing of networking,
+//! only the daemon touches the web module, and no HTTP, async or TLS crate is a dependency.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -544,5 +545,446 @@ fn the_pure_layers_do_not_touch_the_outside_world() {
             "{}",
             file.display()
         );
+    }
+}
+
+// ---- the web dashboard is an outer adapter -----------------------------------------------------------
+
+fn rust_files_in(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out.sort();
+    out
+}
+
+fn relative(file: &Path) -> String {
+    file.strip_prefix(root())
+        .unwrap_or(file)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// True when `path` occurs and is not the tail of a longer identifier (`web::` matches
+/// `crate::web::x` and `web::x` but not `cobweb::x`).
+fn mentions_path(code: &str, path: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(path)
+        .any(|(i, _)| !code[..i].chars().next_back().is_some_and(is_ident))
+}
+
+#[test]
+fn mentions_path_matches_whole_paths_only() {
+    assert!(mentions_path("use crate::web::X;", "web::"));
+    assert!(mentions_path("web::x()", "web::"));
+    assert!(!mentions_path("cobweb::x()", "web::"));
+    assert!(!mentions_path(&code_only("// web::x"), "web::"));
+}
+
+#[test]
+fn the_inner_layers_know_nothing_of_networking_or_the_web_adapter() {
+    // Every source, test and in-memory fake of the domain and the application layer, comments
+    // and doc strings excluded (the words may appear there).
+    let needles = [
+        "fleet_infra",
+        "fleet_cli",
+        "std::net",
+        "TcpListener",
+        "TcpStream",
+        "UdpSocket",
+        "SocketAddr",
+        "crate::web",
+        "web::",
+    ];
+    let mut files = rust_sources("fleet-domain");
+    files.extend(rust_sources("fleet-app"));
+    files.extend(rust_files_in(&crate_dir("fleet-domain").join("tests")));
+    files.extend(rust_files_in(&crate_dir("fleet-app").join("tests")));
+    let mut saw_fakes = false;
+    for file in &files {
+        let rel = relative(file);
+        saw_fakes |= rel.contains("fleet-app/src/testing");
+        let code = code_only(&read(file));
+        for needle in needles {
+            let found = if needle == "web::" {
+                mentions_path(&code, needle)
+            } else {
+                code.contains(needle)
+            };
+            assert!(!found, "{rel} mentions {needle}");
+        }
+    }
+    assert!(saw_fakes, "the in-memory fakes were not scanned");
+    assert!(files.len() >= 25, "only {} files were scanned", files.len());
+}
+
+#[test]
+fn the_inner_manifests_list_no_outer_crate_in_any_section() {
+    for (krate, forbidden) in [
+        (
+            "fleet-domain",
+            &["fleet-app", "fleet-infra", "fleet-cli"][..],
+        ),
+        ("fleet-app", &["fleet-infra", "fleet-cli"][..]),
+    ] {
+        let text = manifest_text(krate);
+        for dep in deps_of(krate) {
+            assert!(
+                !forbidden.contains(&dep.name.as_str()),
+                "{krate} depends on {} ({})",
+                dep.name,
+                dep.section
+            );
+        }
+        for name in forbidden {
+            assert!(
+                !text.contains(&format!("\"../{name}\"")),
+                "{krate}'s manifest points at {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn only_the_daemon_uses_the_web_module_inside_the_infrastructure_crate() {
+    let src = crate_dir("fleet-infra").join("src");
+    let mut users = Vec::new();
+    for file in rust_files_in(&src) {
+        let rel = file
+            .strip_prefix(&src)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if rel.starts_with("web/") || rel == "web.rs" {
+            continue;
+        }
+        let code = code_only(&read(&file));
+        if mentions_path(&code, "web::") || code.contains("crate::web") {
+            users.push(rel.clone());
+        }
+        // a brace import such as `use crate::{web, git}` is a way around the path check
+        for line in code.lines().filter(|l| l.contains("crate::{")) {
+            assert!(!has_word(line, "web"), "{rel}: {line}");
+        }
+    }
+    assert_eq!(
+        users,
+        ["daemon.rs"],
+        "modules that reach into web: {users:?}"
+    );
+    // lib.rs only declares the module
+    let lib = code_only(&read(&src.join("lib.rs")));
+    let lines: Vec<&str> = lib
+        .lines()
+        .filter(|l| has_word(l, "web"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(lines, ["pub mod web;"], "{lines:?}");
+}
+
+#[test]
+fn the_web_module_imports_only_what_it_needs_from_the_rest_of_the_crate() {
+    let dir = crate_dir("fleet-infra").join("src/web");
+    let allowed_modules = [
+        "web", "eventlog", "json", "statedir", "server", "protocol", "daemon",
+    ];
+    let allowed_paths = [
+        "crate::eventlog::VerifyReport",
+        "crate::server::PeerInfo",
+        "crate::protocol::MAX_RESPONSE_BYTES",
+        "crate::daemon::VERSION",
+    ];
+    let forbidden = [
+        "git",
+        "pty",
+        "jobs",
+        "undo",
+        "contract_fs",
+        "logs",
+        "config_file",
+        "client",
+        "doctor",
+        "fsx",
+        "procid",
+        "memory",
+        "clock",
+        "digest",
+    ];
+    let files = rust_files_in(&dir);
+    assert!(files.len() >= 6, "{files:?}");
+    let mut seen_paths: Vec<String> = Vec::new();
+    for file in &files {
+        let rel = relative(file);
+        let code = code_only(&read(file));
+        assert!(
+            !code.contains("crate::{"),
+            "{rel} uses a brace import of crate modules"
+        );
+        for (i, _) in code.match_indices("crate::") {
+            let rest = &code[i + "crate::".len()..];
+            let module: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                !forbidden.contains(&module.as_str()),
+                "{rel} imports crate::{module}"
+            );
+            assert!(
+                allowed_modules.contains(&module.as_str()),
+                "{rel} imports crate::{module}, which is not on the list"
+            );
+            let path: String = format!("crate::{rest}")
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            match module.as_str() {
+                "eventlog" | "server" | "protocol" | "daemon" => {
+                    assert!(
+                        allowed_paths.contains(&path.as_str()),
+                        "{rel} imports {path}"
+                    );
+                    seen_paths.push(path);
+                }
+                _ => {}
+            }
+        }
+        // the sibling adapters are not reachable through `super::super` or `fleet_infra::` either
+        assert!(!code.contains("fleet_infra::"), "{rel}");
+        assert!(!code.contains("super::super"), "{rel}");
+    }
+    // the check is not vacuous: the module does use the paths on the list
+    seen_paths.sort();
+    seen_paths.dedup();
+    assert_eq!(seen_paths.len(), allowed_paths.len(), "{seen_paths:?}");
+}
+
+#[test]
+fn the_cli_reaches_the_web_adapter_only_through_its_option_parser_and_options() {
+    let mut uses = Vec::new();
+    for file in rust_sources("fleet-cli") {
+        let rel = relative(&file);
+        let code = code_only(&read(&file));
+        for (i, _) in code.match_indices("fleet_infra::web") {
+            let rest = &code[i + "fleet_infra::web".len()..];
+            assert!(
+                rest.starts_with("::{parse_bind, WebOptions};"),
+                "{rel}: unexpected web import `{}`",
+                rest.lines().next().unwrap_or("")
+            );
+            uses.push(rel.clone());
+        }
+        for line in code.lines().filter(|l| l.contains("fleet_infra::{")) {
+            assert!(!has_word(line, "web"), "{rel}: {line}");
+        }
+        // no other path into the module, even through a re-import
+        for (i, _) in code.match_indices("web::") {
+            let before = &code[..i];
+            assert!(
+                before.ends_with("fleet_infra::"),
+                "{rel}: web:: used outside the single import"
+            );
+        }
+    }
+    assert_eq!(uses.len(), 1, "{uses:?}");
+    assert!(uses[0].ends_with("fleet-cli/src/commands.rs"), "{uses:?}");
+}
+
+#[test]
+fn the_web_module_has_no_unsafe_and_no_unwrap_or_expect_outside_its_tests() {
+    let files = rust_files_in(&crate_dir("fleet-infra").join("src/web"));
+    assert!(files.len() >= 6, "{files:?}");
+    for file in &files {
+        let rel = relative(file);
+        let text = read(file);
+        assert!(
+            !has_word(&code_only(&text), "unsafe"),
+            "{rel} contains the unsafe keyword"
+        );
+        // production code is everything above the file's top-level `#[cfg(test)]` module
+        let mut production = String::new();
+        for line in text.lines() {
+            if line == "#[cfg(test)]" {
+                break;
+            }
+            production.push_str(line);
+            production.push('\n');
+        }
+        let code = code_only(&production);
+        for needle in [
+            ".unwrap(",
+            ".expect(",
+            "unwrap_unchecked",
+            "panic!(",
+            "unreachable!(",
+            "todo!(",
+            "unimplemented!(",
+        ] {
+            assert!(
+                !code.contains(needle),
+                "{rel} uses {needle} outside its tests"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_http_async_or_tls_crate_is_a_dependency_of_any_crate() {
+    // everything the four crates may depend on besides each other
+    let allowed = [
+        "serde",
+        "serde_json",
+        "sha2",
+        "toml",
+        "portable-pty",
+        "nix",
+        "ratatui",
+        "crossterm",
+    ];
+    let mut checked = 0;
+    for (krate, deps) in all_manifests() {
+        for dep in deps {
+            checked += 1;
+            let is_path = dep.spec.contains("path");
+            assert!(
+                is_path || allowed.contains(&dep.name.as_str()),
+                "{krate} ({}) depends on {}, which is not on the list of {allowed:?}",
+                dep.section,
+                dep.name
+            );
+        }
+    }
+    assert!(checked >= 15, "only {checked} dependencies were checked");
+}
+
+/// Crates that serve or speak HTTP, run an async executor, or provide TLS. `mio` belongs here too:
+/// it is allowed only where the terminal library brings it in (see the lock file test).
+const NETWORK_CRATES: [&str; 31] = [
+    "hyper",
+    "hyper-util",
+    "tokio",
+    "tokio-util",
+    "axum",
+    "warp",
+    "tiny_http",
+    "tiny-http",
+    "rustls",
+    "openssl",
+    "native-tls",
+    "reqwest",
+    "ureq",
+    "actix",
+    "actix-web",
+    "actix-rt",
+    "rocket",
+    "async-std",
+    "smol",
+    "mio",
+    "h2",
+    "http",
+    "tower",
+    "tungstenite",
+    "tokio-tungstenite",
+    "isahc",
+    "surf",
+    "curl",
+    "futures",
+    "async-io",
+    "socket2",
+];
+
+struct LockPackage {
+    name: String,
+    dependencies: Vec<String>,
+}
+
+fn lock_packages() -> Vec<LockPackage> {
+    let text = read(&root().join("Cargo.lock"));
+    let mut out: Vec<LockPackage> = Vec::new();
+    let mut in_deps = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            out.push(LockPackage {
+                name: String::new(),
+                dependencies: Vec::new(),
+            });
+            in_deps = false;
+        } else if let Some(name) = line.strip_prefix("name = \"") {
+            if let Some(p) = out.last_mut() {
+                p.name = name.trim_end_matches('"').to_string();
+            }
+        } else if line == "dependencies = [" {
+            in_deps = true;
+        } else if line == "]" {
+            in_deps = false;
+        } else if in_deps {
+            if let (Some(p), Some(dep)) = (
+                out.last_mut(),
+                line.trim_matches(|c| c == ',' || c == '"')
+                    .split(' ')
+                    .next(),
+            ) {
+                p.dependencies.push(dep.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_lock_file_holds_no_http_async_or_tls_crate() {
+    let packages = lock_packages();
+    assert!(
+        packages.len() >= 60 && packages.iter().any(|p| p.name == "fleet-infra"),
+        "the lock file was not parsed: {} packages",
+        packages.len()
+    );
+    for p in &packages {
+        if p.name == "mio" {
+            continue;
+        }
+        let name = p.name.as_str();
+        assert!(
+            !NETWORK_CRATES.contains(&name),
+            "Cargo.lock contains the network crate {name}"
+        );
+        for prefix in [
+            "tokio-", "hyper-", "actix-", "rustls-", "openssl-", "async-", "axum-",
+        ] {
+            assert!(!name.starts_with(prefix), "Cargo.lock contains {name}");
+        }
+    }
+    // `mio` comes with the terminal library's event polling and nothing else may use it
+    let users: Vec<&str> = packages
+        .iter()
+        .filter(|p| p.dependencies.iter().any(|d| d == "mio"))
+        .map(|p| p.name.as_str())
+        .collect();
+    for user in &users {
+        assert!(
+            matches!(*user, "crossterm" | "signal-hook-mio"),
+            "{user} depends on mio"
+        );
+    }
+    // and the fleet crates themselves never name any of these crates
+    for p in packages.iter().filter(|p| p.name.starts_with("fleet-")) {
+        for d in &p.dependencies {
+            assert!(
+                !NETWORK_CRATES.contains(&d.as_str()),
+                "{} depends on {d}",
+                p.name
+            );
+        }
     }
 }
