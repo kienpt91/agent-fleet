@@ -356,6 +356,16 @@ impl World {
             .cloned()
             .unwrap_or_default()
     }
+    /// Changes the stored packs of a task behind the application's back, as someone who can write
+    /// the state directory could (for tamper tests).
+    pub fn tamper_packs(&self, run: &str, task: &str, change: impl FnOnce(&mut Vec<StoredPack>)) {
+        let mut g = self.lock();
+        let list = g
+            .packs
+            .entry((run.to_string(), task.to_string()))
+            .or_default();
+        change(list);
+    }
     pub fn saved_handoffs(&self, run: &str, task: &str) -> Vec<(String, Value)> {
         self.lock()
             .handoff_store
@@ -1042,7 +1052,7 @@ impl ContractFiles for FakeContract {
 
 pub struct MemoryContextStore(World);
 
-const KEPT_PER_TASK: usize = 8;
+const KEPT_PER_TASK: usize = CONTEXT_PACKS_KEPT;
 
 fn pick<'a, T>(
     items: &'a [T],

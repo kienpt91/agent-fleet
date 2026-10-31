@@ -4,12 +4,12 @@
 use super::data;
 use crate::api::Reply;
 use crate::orchestrator::{Key, Orchestrator};
-use fleet_domain::error::{FleetError, Result};
+use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::value::Value;
 use neo_context::handoff::HandoffTrigger;
 use neo_context::layer::LayerId;
 use neo_context::limits::LAYER_PERCENT;
-use neo_context::pack::{diff, read_document, Manifest, ManifestDiff};
+use neo_context::pack::{diff, read_document, verify_text, Manifest, ManifestDiff};
 
 fn no_pack(key: &Key, digest: Option<&str>) -> FleetError {
     match digest {
@@ -56,24 +56,113 @@ fn diff_layers(d: &ManifestDiff) -> Value {
     }))
 }
 
+fn tampered(key: &Key, digest: &str, why: &str) -> FleetError {
+    FleetError::new(
+        ErrorCode::Tampered,
+        format!(
+            "the stored context pack {} of {}/{} cannot be trusted: {why}; nothing is shown",
+            digest.get(..12).unwrap_or(digest),
+            key.0,
+            key.1
+        ),
+    )
+}
+
 impl Orchestrator {
+    /// A stored pack, checked against the hash-chained log before anything of it is used: the
+    /// digest must be one a `context_compiled` event recorded for this task (the newest one when
+    /// none is named; the file names and sequence numbers of the store decide nothing), the stored
+    /// manifest must be the event's, and the stored text must hash to the layer digests, the stable
+    /// digest and the pack digest that the event named. Any mismatch is a `Tampered` error, with no
+    /// content in it.
     fn stored_manifest(
         &self,
         key: &Key,
         digest: Option<&str>,
     ) -> Result<(String, String, Manifest)> {
-        let stored = self
-            .ports
-            .context
-            .load_pack(&key.0, &key.1, digest)?
-            .ok_or_else(|| no_pack(key, digest))?;
-        let (doc_digest, manifest) =
-            read_document(&stored.document).map_err(super::context::context_error)?;
-        if doc_digest != stored.digest {
-            return Err(FleetError::internal(
-                "a stored context pack does not match its own digest",
+        let records = self.context.compiled(key);
+        let record = match digest {
+            None => records.last(),
+            Some(prefix) => {
+                if prefix.len() < 8 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(FleetError::invalid(
+                        "a digest is given as at least 8 hexadecimal digits",
+                    ));
+                }
+                let mut seen: Vec<&str> = Vec::new();
+                for r in records.iter().filter(|r| r.digest.starts_with(prefix)) {
+                    if !seen.contains(&r.digest.as_str()) {
+                        seen.push(r.digest.as_str());
+                    }
+                }
+                if seen.len() > 1 {
+                    return Err(FleetError::invalid(format!(
+                        "the digest prefix {prefix} matches more than one pack of {}/{}",
+                        key.0, key.1
+                    )));
+                }
+                seen.first()
+                    .and_then(|d| records.iter().rev().find(|r| r.digest == *d))
+            }
+        };
+        let record = record.ok_or_else(|| no_pack(key, digest))?;
+        let wanted = record.digest.as_str();
+        let newest: Vec<&str> = {
+            let mut v: Vec<&str> = Vec::new();
+            for r in records.iter().rev() {
+                if !v.contains(&r.digest.as_str()) {
+                    v.push(r.digest.as_str());
+                }
+                if v.len() >= crate::ports::CONTEXT_PACKS_KEPT {
+                    break;
+                }
+            }
+            v
+        };
+        let stored = match self.ports.context.load_pack(&key.0, &key.1, Some(wanted)) {
+            Ok(Some(p)) => p,
+            Ok(None) if newest.contains(&wanted) => {
+                return Err(tampered(
+                    key,
+                    wanted,
+                    "the log recorded it, but the store does not have it",
+                ))
+            }
+            Ok(None) => {
+                return Err(FleetError::not_found(format!(
+                    "the pack {} of {}/{} is no longer kept (only the newest {} per task are)",
+                    wanted.get(..12).unwrap_or(wanted),
+                    key.0,
+                    key.1,
+                    crate::ports::CONTEXT_PACKS_KEPT
+                )))
+            }
+            Err(e) => {
+                return Err(tampered(
+                    key,
+                    wanted,
+                    &format!("it cannot be read ({})", e.code.as_str()),
+                ))
+            }
+        };
+        if stored.digest != wanted {
+            return Err(tampered(key, wanted, "the store returned another pack"));
+        }
+        let (doc_digest, manifest) = read_document(&stored.document)
+            .map_err(|_| tampered(key, wanted, "its manifest document is damaged"))?;
+        if doc_digest != wanted {
+            return Err(tampered(key, wanted, "its document names another digest"));
+        }
+        if manifest.canonical() != record.manifest || manifest.stable_digest != record.stable_digest
+        {
+            return Err(tampered(
+                key,
+                wanted,
+                "its manifest differs from the logged one",
             ));
         }
+        verify_text(&stored.text, &manifest, wanted, self.ports.digest.as_ref())
+            .map_err(|_| tampered(key, wanted, "its text does not match its digests"))?;
         Ok((stored.digest, stored.text, manifest))
     }
 

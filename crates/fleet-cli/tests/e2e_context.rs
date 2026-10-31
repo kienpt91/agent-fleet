@@ -417,3 +417,61 @@ printf '{{"version":1,"status":"done","summary":"ok"}}' > .fleet/result.json
     );
     assert!(!(1..=5u8).any(|n| layer(&after, n).contains("half done")));
 }
+
+#[test]
+fn a_tampered_stored_pack_is_refused_with_its_own_exit_code_and_shows_nothing() {
+    let mut f = Fleet::new();
+    let script = f.script(
+        "worker.sh",
+        "#!/bin/sh\nset -eu\nprintf '{\"version\":1,\"status\":\"done\",\"summary\":\"ok\"}' > .fleet/result.json\n",
+    );
+    f.write_cfg(&simple_cfg(&script, ""));
+    f.start();
+    plan_and_go(&f, None, &[t("a").spec("SECRET-SPEC-TEXT")]);
+    f.wait_task("r1", "a", &["completed"]);
+    assert!(f.cli(&["context", "show", "r1/a"]).code == 0);
+    let dir = f.state.join("context/r1/a");
+    let md: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    assert_eq!(md.len(), 1, "{md:?}");
+    let original = fs::read_to_string(&md[0]).unwrap();
+    // an edit of one layer
+    fs::write(
+        &md[0],
+        original.replace("SECRET-SPEC-TEXT", "EDITED-BY-AN-ATTACKER"),
+    )
+    .unwrap();
+    for args in [
+        vec!["context", "show", "r1/a"],
+        vec!["context", "verify", "r1/a"],
+        vec!["context", "show", "r1/a", "--json"],
+    ] {
+        let out = f.cli(&args);
+        assert_eq!(out.code, 11, "{args:?}: {out:?}");
+        assert!(
+            !out.stdout.contains("EDITED-BY-AN-ATTACKER")
+                && !out.stderr.contains("EDITED-BY-AN-ATTACKER")
+        );
+        assert!(
+            out.stdout.is_empty() || out.stdout.contains("tampered"),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("cannot be trusted") || out.stdout.contains("cannot be trusted"),
+            "{out:?}"
+        );
+    }
+    // truncated
+    fs::write(&md[0], &original[..original.len() / 2]).unwrap();
+    assert_eq!(f.cli(&["context", "show", "r1/a"]).code, 11);
+    // deleted: the log says the pack exists
+    fs::remove_file(&md[0]).unwrap();
+    assert_eq!(f.cli(&["context", "show", "r1/a"]).code, 11);
+    // restored: whole again
+    fs::write(&md[0], &original).unwrap();
+    assert_eq!(f.cli(&["context", "show", "r1/a"]).code, 0);
+}

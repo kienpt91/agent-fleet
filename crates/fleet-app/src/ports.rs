@@ -483,6 +483,9 @@ pub struct StoredPack {
     pub document: Value,
 }
 
+/// Packs kept per task by every [`ContextStore`]; older ones are forgotten.
+pub const CONTEXT_PACKS_KEPT: usize = 8;
+
 /// Where compiled packs and handoff packets are kept, for `fleet context show`, `diff` and
 /// `verify` and so that a worker that rewrites its own copy changes nothing. Bounded: an adapter
 /// keeps the newest few per task and forgets the rest.

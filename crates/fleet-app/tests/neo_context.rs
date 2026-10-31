@@ -496,3 +496,233 @@ fn a_summary_survives_a_crash_between_the_end_of_an_attempt_and_its_handoff() {
     h.restart(test_config()).unwrap();
     assert_eq!(handoff_events(&h).len(), 1);
 }
+
+// ---- the stored pack is checked against the log ---------------------------------------------
+
+use fleet_domain::error::ErrorCode;
+
+/// A run with two packs in the log (the first attempt failed and was retried).
+fn two_packs() -> Harness {
+    let mut h = Harness::new();
+    compiled_run(&mut h, Some("compiled"));
+    let session = h.world.session_for("a").unwrap();
+    h.world.exit(session, 1);
+    h.orch.tick();
+    assert_eq!(compiled_events(&h).len(), 2);
+    h
+}
+
+fn digests_in_log(h: &Harness) -> Vec<String> {
+    compiled_events(h)
+        .iter()
+        .map(|e| match e {
+            DomainEvent::ContextCompiled { pack_digest, .. } => pack_digest.clone(),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+/// Every read command refuses with `tampered`, and the error holds none of the pack.
+fn assert_all_refuse(h: &mut Harness, secret: &str) {
+    let log = digests_in_log(h);
+    let calls: Vec<(&str, Value)> = vec![
+        ("context.show", Value::object([("task", s("r1/a"))])),
+        (
+            "context.show",
+            Value::object([("task", s("r1/a")), ("digest", s(&log[1][..12]))]),
+        ),
+        ("context.verify", Value::object([("task", s("r1/a"))])),
+        (
+            "context.diff",
+            Value::object([
+                ("task", s("r1/a")),
+                ("a", s(&log[0][..12])),
+                ("b", s(&log[1][..12])),
+            ]),
+        ),
+    ];
+    for (cmd, args) in calls {
+        let err = h.call(cmd, args).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Tampered, "{cmd}: {}", err.message);
+        assert!(err.message.contains("nothing is shown"), "{}", err.message);
+        assert!(!err.message.contains(secret), "{}", err.message);
+    }
+}
+
+#[test]
+fn an_untouched_store_passes_every_check() {
+    let mut h = two_packs();
+    let log = digests_in_log(&h);
+    assert!(h
+        .call("context.show", Value::object([("task", s("r1/a"))]))
+        .is_ok());
+    for d in &log {
+        assert!(h
+            .call(
+                "context.show",
+                Value::object([("task", s("r1/a")), ("digest", s(&d[..12]))])
+            )
+            .is_ok());
+    }
+    let v = h
+        .call("context.verify", Value::object([("task", s("r1/a"))]))
+        .unwrap();
+    assert_eq!(
+        v.data().get("stored").and_then(Value::as_str),
+        Some(log[1].as_str())
+    );
+}
+
+#[test]
+fn an_edited_layer_of_the_stored_text_is_a_hard_error_not_a_display() {
+    let mut h = two_packs();
+    h.world.tamper_packs("r1", "a", |packs| {
+        let newest = packs.last_mut().unwrap();
+        newest.text = newest.text.replace("do the work", "EVIL-EDIT");
+        assert!(newest.text.contains("EVIL-EDIT"));
+    });
+    assert_all_refuse(&mut h, "EVIL-EDIT");
+}
+
+#[test]
+fn an_edited_manifest_is_a_hard_error() {
+    let mut h = two_packs();
+    h.world.tamper_packs("r1", "a", |packs| {
+        let newest = packs.last_mut().unwrap();
+        let mut doc = newest.document.as_object().unwrap().clone();
+        let mut manifest = doc.get("manifest").unwrap().as_object().unwrap().clone();
+        manifest.insert("total_tokens".to_string(), Value::int(1u64));
+        doc.insert("manifest".to_string(), Value::Object(manifest));
+        newest.document = Value::Object(doc);
+    });
+    assert_all_refuse(&mut h, "total_tokens");
+}
+
+#[test]
+fn a_truncated_stored_text_is_a_hard_error() {
+    let mut h = two_packs();
+    h.world.tamper_packs("r1", "a", |packs| {
+        let newest = packs.last_mut().unwrap();
+        let half = newest.text.len() / 2;
+        newest.text.truncate(half);
+    });
+    assert_all_refuse(&mut h, "@@neo-layer 4");
+}
+
+#[test]
+fn an_older_pack_swapped_in_under_the_newest_digest_is_a_hard_error() {
+    let mut h = two_packs();
+    h.world.tamper_packs("r1", "a", |packs| {
+        let older = packs[0].clone();
+        let newest = packs.last_mut().unwrap();
+        // the text and the manifest document of the older pack, under the newest pack's name
+        newest.text = older.text.clone();
+        newest.document = older.document.clone();
+    });
+    assert_all_refuse(&mut h, "Attempt");
+    // the same with the digest fields rewritten to the newest one: the text no longer hashes to it
+    let log = digests_in_log(&h);
+    h.world.tamper_packs("r1", "a", |packs| {
+        let newest = packs.last_mut().unwrap();
+        let mut doc = newest.document.as_object().unwrap().clone();
+        doc.insert("digest".to_string(), Value::str(log[1].clone()));
+        newest.document = Value::Object(doc);
+    });
+    assert_all_refuse(&mut h, "Attempt");
+}
+
+#[test]
+fn rolling_the_store_back_to_an_older_pack_is_not_a_quiet_success() {
+    let mut h = two_packs();
+    // the newest pack disappears from the store: the log says it exists, so this is an error and the
+    // older pack is not shown in its place
+    h.world.tamper_packs("r1", "a", |packs| {
+        packs.pop();
+    });
+    let err = h
+        .call("context.show", Value::object([("task", s("r1/a"))]))
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Tampered);
+    assert!(
+        err.message.contains("the store does not have it"),
+        "{}",
+        err.message
+    );
+    assert!(h
+        .call("context.verify", Value::object([("task", s("r1/a"))]))
+        .is_err());
+    // the older pack, asked for by its own digest, is still whole and is shown
+    let log = digests_in_log(&h);
+    assert!(h
+        .call(
+            "context.show",
+            Value::object([("task", s("r1/a")), ("digest", s(&log[0][..12]))])
+        )
+        .is_ok());
+}
+
+#[test]
+fn a_planted_pack_the_log_never_recorded_is_ignored_whatever_its_sequence() {
+    let mut h = two_packs();
+    let log = digests_in_log(&h);
+    // a perfectly well-formed pack of another state, saved last: newest by file order, absent from the log
+    let planted = {
+        let mut stored = h.world.saved_packs("r1", "a")[0].clone();
+        let forged = "f".repeat(64);
+        stored.digest = forged.clone();
+        let mut doc = stored.document.as_object().unwrap().clone();
+        doc.insert("digest".to_string(), Value::str(forged));
+        stored.document = Value::Object(doc);
+        stored
+    };
+    let mut ports = h.world.ports();
+    ports
+        .context
+        .save_pack(
+            &fleet_domain::ids::RunId::parse("r1").unwrap(),
+            &fleet_domain::ids::TaskId::parse("a").unwrap(),
+            &planted,
+        )
+        .unwrap();
+    let shown = h
+        .call("context.show", Value::object([("task", s("r1/a"))]))
+        .unwrap();
+    assert_eq!(
+        shown.data().get("digest").and_then(Value::as_str),
+        Some(log[1].as_str())
+    );
+    let err = h
+        .call(
+            "context.show",
+            Value::object([("task", s("r1/a")), ("digest", s("ffffffff"))]),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound, "{}", err.message);
+}
+
+#[test]
+fn a_pack_the_store_forgot_is_not_found_not_tampered() {
+    let mut cfg = test_config();
+    cfg.max_retries = 10;
+    let mut h = Harness::with_config(cfg);
+    compiled_run(&mut h, Some("compiled"));
+    // eleven attempts, each with a pack of its own; the store keeps the newest eight
+    for _ in 0..10 {
+        let session = h.world.session_for("a").unwrap();
+        h.world.exit(session, 1);
+        h.orch.tick();
+    }
+    let log = digests_in_log(&h);
+    assert!(log.len() >= 11, "{}", log.len());
+    let err = h
+        .call(
+            "context.show",
+            Value::object([("task", s("r1/a")), ("digest", s(&log[0][..12]))]),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound, "{}", err.message);
+    assert!(err.message.contains("no longer kept"), "{}", err.message);
+    assert!(h
+        .call("context.show", Value::object([("task", s("r1/a"))]))
+        .is_ok());
+}

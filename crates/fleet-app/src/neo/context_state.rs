@@ -32,14 +32,29 @@ impl HandoffClass {
     }
 }
 
+/// What the log says about one compiled pack: where it was recorded, its digests and its manifest.
+/// A stored pack is trusted only if it matches such a record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompiledRecord {
+    pub seq: u64,
+    pub digest: String,
+    pub stable_digest: String,
+    /// The canonical text of the manifest the event carried.
+    pub manifest: String,
+}
+
 #[derive(Default)]
 pub(crate) struct ContextState {
+    /// The packet the next brief continues from: the newest one made by the flow itself. An
+    /// on-demand packet (`fleet handoff`) is only the brief's source when there is none else, so an
+    /// operator looking at a task does not replace what a worker left for its next attempt.
     handoffs: BTreeMap<Key, HandoffPacket>,
+    /// The digest of the newest packet of any kind, to not record the same packet twice.
+    last_handoff: BTreeMap<Key, String>,
     made: BTreeSet<(Key, u32, HandoffClass)>,
     history: BTreeMap<Key, VecDeque<EventLine>>,
-    /// The sequence number of the `context_compiled` event of each pack: what the pack was made
-    /// from is the state before that event.
-    compiled: BTreeMap<(Key, String), u64>,
+    /// Every `context_compiled` event of each task, oldest first.
+    compiled: BTreeMap<Key, Vec<CompiledRecord>>,
 }
 
 impl ContextState {
@@ -62,16 +77,29 @@ impl ContextState {
                 if let Some(class) = HandoffTrigger::parse(trigger).and_then(HandoffClass::of) {
                     self.made.insert((key.clone(), *attempt, class));
                 }
-                self.handoffs.insert(key, packet);
+                self.last_handoff
+                    .insert(key.clone(), packet.digest().to_string());
+                if packet.trigger != HandoffTrigger::OnDemand || !self.handoffs.contains_key(&key) {
+                    self.handoffs.insert(key, packet);
+                }
             }
             DomainEvent::ContextCompiled {
                 run,
                 task,
                 pack_digest,
+                stable_digest,
+                manifest,
                 ..
             } => {
                 self.compiled
-                    .insert(((run.clone(), task.clone()), pack_digest.clone()), seq);
+                    .entry((run.clone(), task.clone()))
+                    .or_default()
+                    .push(CompiledRecord {
+                        seq,
+                        digest: pack_digest.clone(),
+                        stable_digest: stable_digest.clone(),
+                        manifest: manifest.0.canonical(),
+                    });
             }
             DomainEvent::Warning { .. } => {}
             other => {
@@ -93,6 +121,10 @@ impl ContextState {
         self.handoffs.get(key)
     }
 
+    pub(crate) fn last_handoff_digest(&self, key: &Key) -> Option<&str> {
+        self.last_handoff.get(key).map(String::as_str)
+    }
+
     pub(crate) fn was_made(&self, key: &Key, attempt: u32, class: HandoffClass) -> bool {
         self.made.contains(&(key.clone(), attempt, class))
     }
@@ -108,16 +140,27 @@ impl ContextState {
     /// Forgets a task (its worktree and records were cleaned up).
     pub(crate) fn forget(&mut self, key: &Key) {
         self.handoffs.remove(key);
+        self.last_handoff.remove(key);
         self.history.remove(key);
         self.made.retain(|(k, _, _)| k != key);
-        self.compiled.retain(|(k, _), _| k != key);
+        self.compiled.remove(key);
     }
 
-    /// Where in the log the pack with this digest was recorded.
-    pub(crate) fn compiled_at(&self, key: &Key, digest: &str) -> Option<u64> {
+    /// The packs the log recorded for a task, oldest first.
+    pub(crate) fn compiled(&self, key: &Key) -> &[CompiledRecord] {
         self.compiled
-            .get(&(key.clone(), digest.to_string()))
-            .copied()
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Where in the log the pack with this digest was recorded (the newest record of it).
+    pub(crate) fn compiled_at(&self, key: &Key, digest: &str) -> Option<u64> {
+        self.compiled(key)
+            .iter()
+            .rev()
+            .find(|r| r.digest == digest)
+            .map(|r| r.seq)
     }
 }
 

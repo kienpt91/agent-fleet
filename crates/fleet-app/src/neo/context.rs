@@ -642,11 +642,7 @@ impl Orchestrator {
             compiler.hygiene(),
             hasher,
         );
-        if self
-            .context
-            .handoff(key)
-            .is_some_and(|h| h.digest() == packet.digest())
-        {
+        if self.context.last_handoff_digest(key) == Some(packet.digest()) {
             self.handoff_summaries.remove(key);
             return Ok((packet, false));
         }
