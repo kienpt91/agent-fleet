@@ -5,6 +5,7 @@ use crate::api::{NewGoalArgs, Reply};
 use crate::orchestrator::Orchestrator;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::ids::GoalId;
+use fleet_domain::redact::Redactor;
 use fleet_domain::status::GoalStatus;
 use fleet_domain::value::{Document, Value};
 use neo_goals::goal::{AttachedContract, NewGoal, TaskRef};
@@ -15,6 +16,17 @@ impl Orchestrator {
     fn attached_contract(&self, doc: &Document) -> Result<AttachedContract> {
         let contract = VerificationContract::from_value(&doc.0)
             .map_err(|e| FleetError::invalid(format!("invalid verification contract: {e}")))?;
+        // The contract text is stored in the audit log and shown by `fleet goals show`: a secret
+        // in it would be kept forever. Anything the redaction rules would change (key shapes,
+        // tokens, the values of secret-looking variables of the daemon's environment) is refused.
+        let mut redactor = Redactor::builtin();
+        redactor.add_env_values(self.cfg.parent_env.iter().cloned());
+        let text = contract.canonical();
+        if text.lines().any(|l| redactor.redact(l) != l) {
+            return Err(FleetError::invalid(
+                "the verification contract contains something that looks like a secret (a key, a token or the value of a secret variable); contracts are stored in the audit log and shown to everyone who can run `fleet goals show`, so pass secrets through the environment of the command instead",
+            ));
+        }
         Ok(AttachedContract {
             id: contract.id(self.ports.digest.as_ref()),
             contract,

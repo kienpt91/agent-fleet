@@ -562,3 +562,55 @@ fn unknown_goals_are_not_found_by_the_read_commands() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn a_contract_that_contains_a_secret_is_refused_and_nothing_is_recorded() {
+    let mut h = Harness::new();
+    h.call("goal.add", obj(vec![("id", s("g")), ("title", s("G"))]))
+        .unwrap();
+    let before = h.world.stored_events().len();
+    let token = format!("ghp_{}", "a1B2".repeat(10));
+    let with = |arg: &str| {
+        obj(vec![
+            ("version", Value::int(1)),
+            (
+                "checks",
+                Value::array([obj(vec![
+                    ("id", s("c")),
+                    ("kind", s("command")),
+                    ("program", s("/usr/bin/make")),
+                    ("args", list(&[arg])),
+                ])]),
+            ),
+        ])
+    };
+    let cloud = format!("AK{}{}", "IA", "ABCDEFGHIJKLMNOP");
+    for secret in [token.as_str(), "--password=daemon-secret", cloud.as_str()] {
+        for call in ["goal.add", "goal.attach"] {
+            let args = if call == "goal.add" {
+                obj(vec![("title", s("t")), ("contract", with(secret))])
+            } else {
+                obj(vec![("goal", s("g")), ("contract", with(secret))])
+            };
+            let err = h.call(call, args).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Invalid, "{call} {secret}");
+            assert!(err.message.contains("secret"), "{}", err.message);
+            assert!(
+                !err.message.contains(secret),
+                "the error does not repeat it"
+            );
+        }
+    }
+    // an ordinary contract is fine, and so is a long hex digest (not a secret rule)
+    h.call(
+        "goal.attach",
+        obj(vec![("goal", s("g")), ("contract", with(&"ab".repeat(32)))]),
+    )
+    .unwrap();
+    assert!(h.world.stored_events().len() > before);
+    assert!(!h
+        .world
+        .stored_events()
+        .iter()
+        .any(|e| format!("{e:?}").contains(&token)));
+}
