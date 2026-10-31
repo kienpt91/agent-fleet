@@ -1,0 +1,4 @@
+[
+  {"number": 7, "title": "Crash on start", "state": "open", "labels": [{"name": "bug"}], "user": {"login": "octocat"}, "comments": 3, "updated_at": "2026-10-30T10:00:00Z", "html_url": "https://github.com/o/r/issues/7", "body": "It crashes."},
+  {"number": 8, "title": "Docs are out of date", "state": "open", "labels": [], "user": {"login": "hubot"}, "comments": 0, "updated_at": "2026-10-29T10:00:00Z", "html_url": "https://github.com/o/r/issues/8", "body": null}
+]
