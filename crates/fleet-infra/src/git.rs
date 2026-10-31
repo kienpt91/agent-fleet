@@ -401,6 +401,7 @@ impl GitVcs {
         let mut child = cmd
             .spawn()
             .map_err(|e| FleetError::io("cannot start git", &e))?;
+        let _group = crate::jobs::GroupGuard::register(child.id());
         let pgid = match i32::try_from(child.id()) {
             Ok(p) => Pid::from_raw(p),
             Err(_) => {

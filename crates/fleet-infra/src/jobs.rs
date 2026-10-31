@@ -243,6 +243,43 @@ fn status_kind(status: ExitStatus) -> ExitKind {
     }
 }
 
+/// Process groups of everything the daemon is running on behalf of workers right now (quality
+/// gates, approved commands, the undo tool, git). The origin check of the control socket and of
+/// the web dashboard refuses connections from these groups: a process that is adopted by init
+/// but still sits in the group of a gate is still the gate's. Process wide on purpose: the
+/// daemon's request handler, which does the checking, does not own the runners.
+static RUNNING_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Most groups remembered; more than this many concurrent children is not a normal daemon.
+const MAX_TRACKED_GROUPS: usize = 256;
+
+pub fn running_groups() -> Vec<u32> {
+    lock(&RUNNING_GROUPS).clone()
+}
+
+/// Keeps one process group in [`running_groups`] for as long as it lives.
+pub struct GroupGuard(u32);
+
+impl GroupGuard {
+    /// `pgid` is the pid of a child started with `process_group(0)`.
+    pub fn register(pgid: u32) -> GroupGuard {
+        let mut groups = lock(&RUNNING_GROUPS);
+        if groups.len() < MAX_TRACKED_GROUPS {
+            groups.push(pgid);
+        }
+        GroupGuard(pgid)
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        let mut groups = lock(&RUNNING_GROUPS);
+        if let Some(i) = groups.iter().position(|g| *g == self.0) {
+            groups.swap_remove(i);
+        }
+    }
+}
+
 /// Runs one program to completion within the limits of `spec`. Never panics, never uses a shell.
 pub fn run_bounded(spec: &RunSpec) -> RunResult {
     let Some(program) = resolve_program(&spec.program, &spec.cwd, &spec.env) else {
@@ -267,6 +304,8 @@ pub fn run_bounded(spec: &RunSpec) -> RunResult {
         Err(e) => return spawn_failed(e.to_string()),
     };
     let pid = child.id();
+    // Registered until this function returns, which is after the group was killed.
+    let _group = GroupGuard::register(pid);
 
     let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
         terminate(&mut child, pid);
@@ -607,6 +646,45 @@ mod tests {
             timeout_ms: 10_000,
             max_output: CAP,
         }
+    }
+
+    #[test]
+    fn a_running_job_group_is_listed_until_the_job_has_ended() {
+        let dir = TempDir::new("job-groups");
+        // the script publishes its own pid (the group leader) so the test knows what to look for
+        let script = dir.script(
+            "s.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > {}/pid\nsleep 1\n",
+                dir.path().display()
+            ),
+        );
+        let job = std::thread::spawn({
+            let s = spec(&script, &[], &dir);
+            move || run_bounded(&s)
+        });
+        assert!(
+            wait_until(10_000, || dir.exists("pid")),
+            "the script started"
+        );
+        let leader: u32 = dir.read("pid").trim().parse().unwrap();
+        assert!(running_groups().contains(&leader), "listed while it runs");
+        job.join().unwrap();
+        assert!(!running_groups().contains(&leader), "gone after it ended");
+    }
+
+    #[test]
+    fn the_group_list_is_bounded() {
+        let guards: Vec<GroupGuard> = (0..MAX_TRACKED_GROUPS + 20)
+            .map(|i| GroupGuard::register(4_000_000 + i as u32))
+            .collect();
+        let tracked = running_groups()
+            .into_iter()
+            .filter(|g| *g >= 4_000_000)
+            .count();
+        assert!(tracked <= MAX_TRACKED_GROUPS);
+        drop(guards);
+        assert!(running_groups().iter().all(|g| *g < 4_000_000));
     }
 
     fn run_script(body: &str) -> RunResult {

@@ -25,7 +25,7 @@ use fleet_app::orchestrator::Orchestrator;
 use fleet_app::ports::{EventPublisher, Ports, StoredEvent};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::MAX_CONCURRENT_JOBS;
-use fleet_domain::supervision::{is_worker_origin, LiveSession, ProcInfo};
+use fleet_domain::supervision::{is_started_by_daemon, is_worker_origin, LiveSession, ProcInfo};
 use fleet_domain::value::Value;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -366,8 +366,15 @@ impl DaemonHandler {
     /// the socket). It runs at accept (`admit`, binding the decision to the connection) and
     /// again per request.
     fn check_origin(&self, peer: &PeerInfo) -> Result<()> {
-        let live = self.ask(|reply| EngineMsg::Live { reply })?;
-        decide_origin(peer, &live, procid::ancestry)
+        let mut live = self.ask(|reply| EngineMsg::Live { reply })?;
+        // Gates, approved commands, the undo tool and git run code an agent influenced: their
+        // process groups count as worker origin too, even after a member was adopted by init.
+        live.extend(
+            crate::jobs::running_groups()
+                .into_iter()
+                .map(|g| LiveSession { pid: g, pgid: g }),
+        );
+        decide_origin(peer, &live, std::process::id(), procid::ancestry)
     }
 
     /// A repository that contains the state directory would let workers read the daemon's
@@ -458,6 +465,7 @@ impl DaemonHandler {
 fn decide_origin(
     peer: &PeerInfo,
     live: &[LiveSession],
+    daemon_pid: u32,
     ancestry: impl FnOnce(u32) -> Vec<ProcInfo>,
 ) -> Result<()> {
     let Some(pid) = peer.pid else {
@@ -471,7 +479,7 @@ fn decide_origin(
             "the connecting process has exited or cannot be inspected; refusing the connection",
         ));
     }
-    if is_worker_origin(&chain, live) {
+    if is_worker_origin(&chain, live) || is_started_by_daemon(&chain, daemon_pid) {
         return Err(FleetError::forbidden(
             "requests from worker processes are refused; approvals and decisions are made by a person",
         ));
@@ -612,6 +620,8 @@ mod tests {
         pid: 500,
         pgid: 500,
     };
+    /// The pid of the pretend daemon in the process table below.
+    const DAEMON: u32 = 100;
 
     /// The process table of a pretend machine: `fleet` (900) run by a shell (800), and `fleet`
     /// (901) started by the worker's own shell script (600) below the worker (500).
@@ -621,6 +631,17 @@ mod tests {
             901 => vec![info(901, 600, 500), info(600, 500, 500), info(500, 1, 500)],
             // a process that left its worker's tree and was adopted by init
             950 => vec![info(950, 1, 950)],
+            // a quality gate (700) started by the daemon (100) and the script it runs (701)
+            700 => vec![info(700, DAEMON, 700), info(DAEMON, 80, 80)],
+            701 => vec![
+                info(701, 700, 700),
+                info(700, DAEMON, 700),
+                info(DAEMON, 80, 80),
+            ],
+            // a member of the gate's process group that was adopted by init
+            702 => vec![info(702, 1, 700)],
+            // a client that is the daemon process itself (tests run the daemon in-process)
+            100 => vec![info(DAEMON, 80, 80)],
             500 => vec![info(500, 1, 500)],
             _ => Vec::new(),
         }
@@ -634,14 +655,34 @@ mod tests {
 
     #[test]
     fn an_operator_process_is_admitted_whether_or_not_workers_are_running() {
-        assert!(decide_origin(&peer(Some(900)), &[WORKER], table).is_ok());
-        assert!(decide_origin(&peer(Some(900)), &[], table).is_ok());
+        assert!(decide_origin(&peer(Some(900)), &[WORKER], DAEMON, table).is_ok());
+        assert!(decide_origin(&peer(Some(900)), &[], DAEMON, table).is_ok());
+    }
+
+    #[test]
+    fn everything_the_daemon_started_is_refused_even_with_no_worker_running() {
+        // a gate, the script a gate runs, and a leftover of a gate's group that init adopted
+        let gate_group = [LiveSession {
+            pid: 700,
+            pgid: 700,
+        }];
+        for pid in [700, 701] {
+            let message = refused(decide_origin(&peer(Some(pid)), &[], DAEMON, table));
+            assert!(message.contains("worker processes"), "{pid}: {message}");
+        }
+        let message = refused(decide_origin(&peer(Some(702)), &gate_group, DAEMON, table));
+        assert!(message.contains("worker processes"), "{message}");
+        // without the group registry the adopted leftover would pass: the registry is what stops it
+        assert!(decide_origin(&peer(Some(702)), &[], DAEMON, table).is_ok());
+        // the operator and the daemon process itself are not affected
+        assert!(decide_origin(&peer(Some(900)), &gate_group, DAEMON, table).is_ok());
+        assert!(decide_origin(&peer(Some(100)), &gate_group, DAEMON, table).is_ok());
     }
 
     #[test]
     fn a_worker_and_everything_it_started_is_refused() {
         for pid in [901, 500] {
-            let message = refused(decide_origin(&peer(Some(pid)), &[WORKER], table));
+            let message = refused(decide_origin(&peer(Some(pid)), &[WORKER], DAEMON, table));
             assert!(message.contains("worker processes"), "{message}");
         }
     }
@@ -651,30 +692,41 @@ mod tests {
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();
-        let message = refused(decide_origin(&peer(Some(pid)), &[], procid::ancestry));
+        let message = refused(decide_origin(
+            &peer(Some(pid)),
+            &[],
+            DAEMON,
+            procid::ancestry,
+        ));
         assert!(message.contains("exited"), "{message}");
-        assert!(decide_origin(&peer(Some(std::process::id())), &[], procid::ancestry).is_ok());
+        assert!(decide_origin(
+            &peer(Some(std::process::id())),
+            &[],
+            DAEMON,
+            procid::ancestry
+        )
+        .is_ok());
     }
 
     #[test]
     fn a_peer_that_cannot_be_identified_is_refused_even_with_no_worker_running() {
         // no pid from the kernel
-        let message = refused(decide_origin(&peer(None), &[], table));
+        let message = refused(decide_origin(&peer(None), &[], DAEMON, table));
         assert!(message.contains("identified"), "{message}");
         // the process is already gone: the original bypass (pipeline requests, then exit)
         for live in [&[][..], &[WORKER][..]] {
-            let message = refused(decide_origin(&peer(Some(777)), live, table));
+            let message = refused(decide_origin(&peer(Some(777)), live, DAEMON, table));
             assert!(message.contains("exited"), "{message}");
         }
         // a table that answers about some other process is not an answer about the peer
         let wrong = |_pid: u32| vec![info(123, 1, 123)];
-        refused(decide_origin(&peer(Some(777)), &[WORKER], wrong));
+        refused(decide_origin(&peer(Some(777)), &[WORKER], DAEMON, wrong));
     }
 
     #[test]
     fn the_ancestry_source_is_asked_exactly_once_about_the_peer() {
         let asked = std::cell::RefCell::new(Vec::new());
-        let result = decide_origin(&peer(Some(900)), &[WORKER], |pid| {
+        let result = decide_origin(&peer(Some(900)), &[WORKER], DAEMON, |pid| {
             asked.borrow_mut().push(pid);
             table(pid)
         });
@@ -687,6 +739,6 @@ mod tests {
         // Detaching completely (setsid and adoption by init) before connecting is not caught by
         // the origin check; the token and the per-worker state directory are what stand in
         // the way. This test pins the behaviour so a change to it is a decision, not an accident.
-        assert!(decide_origin(&peer(Some(950)), &[WORKER], table).is_ok());
+        assert!(decide_origin(&peer(Some(950)), &[WORKER], DAEMON, table).is_ok());
     }
 }
