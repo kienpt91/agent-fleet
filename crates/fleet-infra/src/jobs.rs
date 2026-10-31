@@ -65,7 +65,7 @@ pub struct RunResult {
 /// the code a job runs (a quality gate, an approved command, a verification check running
 /// `make test` or `sh script`) is made of files a worker wrote, so it is untrusted too.
 #[derive(Clone, Default)]
-pub struct JobTracker(Arc<Mutex<Vec<u32>>>);
+pub struct JobTracker(Arc<Mutex<Vec<(u32, u32)>>>);
 
 impl JobTracker {
     pub fn new() -> JobTracker {
@@ -76,18 +76,28 @@ impl JobTracker {
     pub fn live(&self) -> Vec<LiveSession> {
         lock(&self.0)
             .iter()
-            .map(|pid| LiveSession {
+            .map(|(pid, pgid)| LiveSession {
                 pid: *pid,
-                pgid: *pid,
+                pgid: *pgid,
             })
             .collect()
     }
 
+    /// A child that leads its own group.
     fn track(&self, pid: u32) -> Tracked {
-        lock(&self.0).push(pid);
+        self.track_entry(pid, pid)
+    }
+
+    /// A process of a job that is known only by its pid (a descendant that left the group).
+    fn track_loose(&self, pid: u32) -> Tracked {
+        self.track_entry(pid, 0)
+    }
+
+    fn track_entry(&self, pid: u32, pgid: u32) -> Tracked {
+        lock(&self.0).push((pid, pgid));
         Tracked {
             tracker: self.clone(),
-            pid,
+            entry: (pid, pgid),
         }
     }
 }
@@ -95,15 +105,71 @@ impl JobTracker {
 /// Keeps a child registered until the job has dealt with its whole process group.
 struct Tracked {
     tracker: JobTracker,
-    pid: u32,
+    entry: (u32, u32),
 }
 
 impl Drop for Tracked {
     fn drop(&mut self) {
         let mut all = lock(&self.tracker.0);
-        if let Some(i) = all.iter().position(|p| *p == self.pid) {
+        if let Some(i) = all.iter().position(|p| *p == self.entry) {
             all.swap_remove(i);
         }
+    }
+}
+
+/// How often the descendants of a running job child are looked up.
+const SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Follows the processes a job child starts, so that those that leave its process group
+/// (`setsid`, a double fork) can still be stopped when the check is over and are treated as
+/// untrusted origin meanwhile.
+///
+/// What this does and does not cover: a descendant is found when a sample (every 200 ms, and one
+/// at the very end) sees it below the child. A process that detaches *and* whose whole chain of
+/// parents is gone before the next sample is not found; neither is one that starts after the
+/// last sample. The group kill of the child still takes every process that stayed in the group.
+/// Without cgroups or a sandbox there is no complete answer; run checks in a container or as
+/// another user when that matters.
+struct Sweeper<'a> {
+    tracker: &'a JobTracker,
+    root: u32,
+    seen: Vec<(u32, String, Tracked)>,
+    last: Option<Instant>,
+}
+
+impl<'a> Sweeper<'a> {
+    fn new(tracker: &'a JobTracker, root: u32) -> Sweeper<'a> {
+        Sweeper {
+            tracker,
+            root,
+            seen: Vec::new(),
+            last: None,
+        }
+    }
+
+    /// Looks for new descendants if the last look is older than the interval (or `force`).
+    fn sample(&mut self, force: bool) {
+        if !force && self.last.is_some_and(|t| t.elapsed() < SWEEP_INTERVAL) {
+            return;
+        }
+        self.last = Some(Instant::now());
+        let table = crate::procid::process_table();
+        for pid in crate::procid::descendants_in(&table, self.root) {
+            if self.seen.iter().any(|(p, _, _)| *p == pid) {
+                continue;
+            }
+            if let Some(token) = crate::procid::start_token(pid) {
+                self.seen.push((pid, token, self.tracker.track_loose(pid)));
+            }
+        }
+    }
+
+    /// Kills every process seen that is still the same process, then forgets them.
+    fn kill_all(&mut self) {
+        for (pid, token, _) in &self.seen {
+            crate::procid::kill_if_same(*pid, token);
+        }
+        self.seen.clear();
     }
 }
 
@@ -112,6 +178,9 @@ impl Drop for Tracked {
 pub struct JobContext {
     pub redactor: Arc<Redactor>,
     pub tracker: JobTracker,
+    /// What verification jobs export commits with and where; `None` where there is none (such a
+    /// job then fails every check instead of running it in the worktree).
+    pub verify: Option<Arc<crate::verify::VerifyHost>>,
 }
 
 fn spawn_failed(why: impl Into<String>) -> RunResult {
@@ -329,6 +398,7 @@ pub fn run_bounded_tracked(spec: &RunSpec, tracker: &JobTracker) -> RunResult {
     };
     let pid = child.id();
     let _tracked = tracker.track(pid);
+    let mut sweeper = Sweeper::new(tracker, pid);
 
     let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
         terminate(&mut child, pid);
@@ -366,11 +436,15 @@ pub fn run_bounded_tracked(spec: &RunSpec, tracker: &JobTracker) -> RunResult {
             break ExitKind::OutputLimit;
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
+            sweeper.sample(true);
             stop_gracefully(&mut child, pid);
             break ExitKind::TimedOut;
         }
+        sweeper.sample(false);
         thread::sleep(POLL_INTERVAL);
     };
+    // Whatever left the group is stopped too; the group itself was killed above.
+    sweeper.kill_all();
 
     let reader_end = Instant::now() + READER_GRACE;
     while !(out.done.load(Ordering::SeqCst) && err.done.load(Ordering::SeqCst))
@@ -545,7 +619,7 @@ fn execute(job: &Job, ctx: &JobContext) -> JobDone {
 fn panic_result(job: &Job) -> JobDone {
     const WHY: &str = "internal error: the job panicked";
     match job {
-        Job::Verify(v) => JobDone::Verify(Box::new(crate::verify::panic_result(v, WHY))),
+        Job::Verify(v) => JobDone::Verify(Box::new(crate::verify::failed_run(v, WHY))),
         Job::Gates {
             run,
             task,
@@ -605,11 +679,18 @@ impl ThreadJobRunner {
             ctx: JobContext {
                 redactor,
                 tracker: JobTracker::new(),
+                verify: None,
             },
             running: Arc::new(AtomicUsize::new(0)),
             tx,
             rx,
         }
+    }
+
+    /// Lets this runner run verification jobs: commits are exported with `host`.
+    pub fn with_verification(mut self, host: crate::verify::VerifyHost) -> ThreadJobRunner {
+        self.ctx.verify = Some(Arc::new(host));
+        self
     }
 
     fn start_with(&mut self, job: Job, exec: JobFn) -> Result<()> {
@@ -756,6 +837,61 @@ mod tests {
             wait_until(5_000, || !process_alive(&pid)),
             "grandchild {pid} survived the timeout"
         );
+    }
+
+    #[test]
+    fn a_descendant_that_left_the_group_is_killed_when_the_check_is_over() {
+        if !Path::new("/usr/bin/setsid").exists() && !Path::new("/bin/setsid").exists() {
+            return;
+        }
+        let dir = TempDir::new("job-setsid");
+        // the grandchild starts a session of its own: the group kill cannot reach it
+        let script = dir.script(
+            "s.sh",
+            "#!/bin/sh\nsetsid sh -c 'echo $$ > \"$1\"; sleep 60' x \"$1\" &\nsleep 1\nexit 0\n",
+        );
+        let pidfile = dir.join("detached.pid");
+        let tracker = JobTracker::new();
+        let result =
+            run_bounded_tracked(&spec(&script, &[pidfile.to_str().unwrap()], &dir), &tracker);
+        assert_eq!(result.exit, ExitKind::Code(0));
+        let pid = read_pid(&dir, "detached.pid").expect("the detached process wrote its pid");
+        assert!(
+            wait_until(5_000, || !process_alive(&pid)),
+            "the detached descendant {pid} survived"
+        );
+        assert!(tracker.live().is_empty(), "nothing stays registered");
+    }
+
+    #[test]
+    fn a_detached_descendant_counts_as_worker_origin_while_it_runs() {
+        if !Path::new("/usr/bin/setsid").exists() && !Path::new("/bin/setsid").exists() {
+            return;
+        }
+        let dir = TempDir::new("job-setsid-live");
+        let script = dir.script(
+            "s.sh",
+            "#!/bin/sh\nsetsid sh -c 'echo $$ > \"$1\"; sleep 60' x \"$1\" &\ni=0; while [ ! -f go ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\nexit 0\n",
+        );
+        let pidfile = dir.join("detached.pid");
+        let tracker = JobTracker::new();
+        let t2 = tracker.clone();
+        let mut s = spec(&script, &[pidfile.to_str().unwrap()], &dir);
+        s.cwd = dir.path().to_path_buf();
+        let handle = thread::spawn(move || run_bounded_tracked(&s, &t2));
+        assert!(wait_until(10_000, || dir.exists("detached.pid")));
+        let pid: u32 = dir.read("detached.pid").trim().parse().unwrap();
+        assert!(
+            wait_until(5_000, || tracker
+                .live()
+                .iter()
+                .any(|l| l.pid == pid && l.pgid == 0)),
+            "{:?}",
+            tracker.live()
+        );
+        dir.write("go", "");
+        handle.join().unwrap();
+        assert!(tracker.live().is_empty());
     }
 
     #[test]
@@ -932,6 +1068,7 @@ mod tests {
         JobContext {
             redactor: rd(),
             tracker: JobTracker::new(),
+            verify: None,
         }
     }
 

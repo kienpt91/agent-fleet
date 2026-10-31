@@ -103,6 +103,75 @@ pub fn start_token(pid: u32) -> Option<String> {
     }
 }
 
+/// Every process as `(pid, ppid)`, as far as the platform lets this user see them.
+pub fn process_table() -> Vec<(u32, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
+            .filter_map(|pid| read_stat(pid).map(|s| (pid, s.ppid)))
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::process::{Command, Stdio};
+        let Ok(out) = Command::new("/bin/ps")
+            .args(["-A", "-o", "pid=,ppid="])
+            .env_clear()
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            })
+            .collect()
+    }
+}
+
+/// The pids below `root` in a process table (children, their children, ...), not `root` itself.
+pub fn descendants_in(table: &[(u32, u32)], root: u32) -> Vec<u32> {
+    let mut found: Vec<u32> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid) in table {
+            if *ppid == parent && *pid != root && !found.contains(pid) {
+                found.push(*pid);
+                frontier.push(*pid);
+            }
+        }
+        if found.len() > MAX_DESCENDANTS {
+            break;
+        }
+    }
+    found
+}
+
+/// Most descendants of one job child that are followed.
+const MAX_DESCENDANTS: usize = 4096;
+
+/// SIGKILLs one process, but only if it is still the process that was recorded under `token`.
+/// Returns true when a signal was sent.
+pub fn kill_if_same(pid: u32, token: &str) -> bool {
+    let id = ProcessIdentity::new(pid, token);
+    if !id.is_same_process(start_token(pid).as_deref()) {
+        return false;
+    }
+    match to_pid(pid) {
+        Some(p) => nix::sys::signal::kill(p, Signal::SIGKILL).is_ok(),
+        None => false,
+    }
+}
+
 /// Parent and process group of a process.
 pub fn proc_info(pid: u32) -> Option<ProcInfo> {
     if pid == 0 {
@@ -234,6 +303,53 @@ fn identity_alive(identity: &ProcessIdentity) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn descendants_follow_parent_links_and_skip_the_root_and_cycles() {
+        let table = [
+            (10, 1),
+            (11, 10),
+            (12, 11),
+            (13, 10),
+            (20, 1),
+            (21, 20),
+            (10, 10),
+        ];
+        let mut d = descendants_in(&table, 10);
+        d.sort_unstable();
+        assert_eq!(d, vec![11, 12, 13]);
+        assert!(descendants_in(&table, 12).is_empty());
+        assert!(descendants_in(&[], 10).is_empty());
+        // a cycle that does not include the root terminates
+        assert_eq!(descendants_in(&[(5, 6), (6, 5)], 7), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn the_process_table_lists_this_process_under_its_parent() {
+        let me = std::process::id();
+        let table = process_table();
+        let parent = table.iter().find(|(p, _)| *p == me).map(|(_, pp)| *pp);
+        assert!(parent.is_some_and(|pp| pp != 0), "{parent:?}");
+    }
+
+    #[test]
+    fn kill_if_same_needs_the_recorded_start_token() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let token = start_token(pid).unwrap();
+        assert!(!kill_if_same(pid, "not-the-token"));
+        assert!(child.try_wait().unwrap().is_none(), "still running");
+        assert!(!kill_if_same(pid, ""));
+        assert!(kill_if_same(pid, &token));
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        // the process is gone: nothing is signalled any more
+        assert!(!kill_if_same(pid, &token));
+        assert!(!kill_if_same(0, "x") && !kill_if_same(1, "x"));
+    }
+
     use super::*;
     use std::process::{Command, Stdio};
 

@@ -373,9 +373,24 @@ impl GitVcs {
         overrides: &[Override],
         args: &[&str],
     ) -> Result<Out> {
+        self.run_raw_env(cwd, ident, overrides, &[], args)
+    }
+
+    /// [`GitVcs::run_raw`] with extra environment variables for this one call.
+    fn run_raw_env(
+        &self,
+        cwd: &Path,
+        ident: Option<&Identity>,
+        overrides: &[Override],
+        extra_env: &[(&str, &OsStr)],
+        args: &[&str],
+    ) -> Result<Out> {
         let mut cmd = Command::new(self.find_git()?);
         cmd.env_clear();
         for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        for (k, v) in extra_env {
             cmd.env(k, v);
         }
         if !overrides.is_empty() {
@@ -495,13 +510,23 @@ impl GitVcs {
 
     /// Runs git with the config of `cwd` neutralized (see the module comment).
     fn run(&self, cwd: &Path, ident: Option<&Identity>, args: &[&str]) -> Result<Out> {
+        self.run_env(cwd, ident, &[], args)
+    }
+
+    fn run_env(
+        &self,
+        cwd: &Path,
+        ident: Option<&Identity>,
+        extra_env: &[(&str, &OsStr)],
+        args: &[&str],
+    ) -> Result<Out> {
         let listing = self.run_raw(cwd, None, &[], &["config", "--list", "-z"])?;
         let overrides = if listing.ok() {
             dynamic_overrides(&listing.stdout)?
         } else {
             Vec::new()
         };
-        self.run_raw(cwd, ident, &overrides, args)
+        self.run_raw_env(cwd, ident, &overrides, extra_env, args)
     }
 
     fn run_ok(&self, cwd: &Path, ident: Option<&Identity>, args: &[&str]) -> Result<Out> {
@@ -956,6 +981,159 @@ impl GitVcs {
         self.abort_merge(wt, ident)?;
         Ok(MergeOutcome::Conflict { files })
     }
+}
+
+/// What exporting a commit left behind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Export {
+    /// The tree object of the exported commit.
+    pub tree: Sha,
+    /// Symlinks of the commit that were removed because their target is not a plain descent
+    /// below their own directory (absolute, or containing `..`), so that nothing in the export
+    /// can point outside it.
+    pub removed_links: Vec<String>,
+}
+
+/// Most entries examined when an export is confined.
+const MAX_EXPORT_ENTRIES: usize = 500_000;
+
+impl GitVcs {
+    /// Writes the files of `commit` (a commit of the repository `worktree` belongs to) into the
+    /// empty directory `dest`, using the temporary index file `index`. Nothing of the worktree is
+    /// read: not its files, its index, its ignored or untracked files, nor its local state. Git
+    /// runs hardened like everywhere else (no hooks, no filters that are not neutralized, no
+    /// attributes file). The repository's own index and files are not touched.
+    ///
+    /// Symlinks whose target is absolute or contains `..` are removed from the export (and
+    /// reported): a link can only point further down than where it lies, so nothing can reach
+    /// the operator's files through the export.
+    pub fn export_commit(
+        &self,
+        worktree: &str,
+        commit: &Sha,
+        dest: &Path,
+        index: &Path,
+    ) -> Result<Export> {
+        let wt = self.check_worktree(worktree)?;
+        let spec_commit = format!("{}^{{commit}}", commit.as_str());
+        let resolved = self.run_ok(
+            &wt,
+            None,
+            &["rev-parse", "--verify", "--end-of-options", &spec_commit],
+        )?;
+        if resolved.text().trim() != commit.as_str() {
+            return Err(FleetError::not_found(format!(
+                "commit {} does not exist",
+                commit.as_str()
+            )));
+        }
+        let spec_tree = format!("{}^{{tree}}", commit.as_str());
+        let tree = self.run_ok(
+            &wt,
+            None,
+            &["rev-parse", "--verify", "--end-of-options", &spec_tree],
+        )?;
+        let tree = Sha::parse(tree.text().trim())?;
+        if !crate::fsx::is_real_dir(dest) {
+            return Err(FleetError::invalid("the export directory does not exist"));
+        }
+        if fs::read_dir(dest)
+            .map_err(|e| FleetError::io("cannot read the export directory", &e))?
+            .next()
+            .is_some()
+        {
+            return Err(FleetError::invalid("the export directory is not empty"));
+        }
+        let prefix = {
+            let mut p = dest.as_os_str().to_os_string();
+            p.push("/");
+            p
+        };
+        let prefix_text = prefix
+            .to_str()
+            .ok_or_else(|| FleetError::invalid("the export directory is not valid UTF-8"))?
+            .to_string();
+        let env = [("GIT_INDEX_FILE", index.as_os_str())];
+        self.run_env_ok(
+            &wt,
+            &env,
+            &[
+                "-c",
+                "core.sparseCheckout=false",
+                "read-tree",
+                "--end-of-options",
+                commit.as_str(),
+            ],
+        )?;
+        self.run_env_ok(
+            &wt,
+            &env,
+            &[
+                "-c",
+                "core.sparseCheckout=false",
+                "checkout-index",
+                "--all",
+                &format!("--prefix={prefix_text}"),
+            ],
+        )?;
+        let _ = fs::remove_file(index);
+        let removed_links = confine_links(dest)?;
+        Ok(Export {
+            tree,
+            removed_links,
+        })
+    }
+
+    fn run_env_ok(&self, cwd: &Path, env: &[(&str, &OsStr)], args: &[&str]) -> Result<Out> {
+        let out = self.run_env(cwd, None, env, args)?;
+        if out.ok() {
+            return Ok(out);
+        }
+        Err(self.failure(args, &out))
+    }
+}
+
+/// Removes every symlink below `root` whose target is not a plain descent (only normal path
+/// components) and returns their paths relative to `root`. Symlinks are never followed.
+fn confine_links(root: &Path) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let mut seen = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| FleetError::io("cannot read the exported directory", &e))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| FleetError::io("cannot read the exported directory", &e))?;
+            seen += 1;
+            if seen > MAX_EXPORT_ENTRIES {
+                return Err(FleetError::limit(format!(
+                    "the commit has more than {MAX_EXPORT_ENTRIES} files"
+                )));
+            }
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| FleetError::io("cannot examine an exported file", &e))?;
+            if ft.is_symlink() {
+                let target = fs::read_link(&path)
+                    .map_err(|e| FleetError::io("cannot read an exported symlink", &e))?;
+                let plain = target
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+                if !plain || target.as_os_str().is_empty() {
+                    fs::remove_file(&path)
+                        .map_err(|e| FleetError::io("cannot remove an exported symlink", &e))?;
+                    let rel = path.strip_prefix(root).unwrap_or(&path);
+                    removed.push(safe_text(&rel.to_string_lossy(), 200));
+                }
+            } else if ft.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    removed.sort();
+    Ok(removed)
 }
 
 impl Vcs for GitVcs {
@@ -1723,6 +1901,218 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Forbidden);
         let err = fx.vcs.worktree_state("/nonexistent/wt", &base).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    // ---- exporting a commit ----------------------------------------------------------------
+
+    struct Exp {
+        fx: Fx,
+        wt: String,
+        dest: PathBuf,
+        index: PathBuf,
+    }
+
+    fn exp() -> Exp {
+        let fx = Fx::new();
+        let wt = fx.prepare("r1", "t1");
+        let dest = fx.tmp.join("export/tree");
+        fs::create_dir_all(&dest).unwrap();
+        let index = fx.tmp.join("export/index");
+        Exp {
+            fx,
+            wt,
+            dest,
+            index,
+        }
+    }
+
+    impl Exp {
+        fn export(&self, commit: &Sha) -> Result<Export> {
+            self.fx
+                .vcs
+                .export_commit(&self.wt, commit, &self.dest, &self.index)
+        }
+
+        fn head(&self) -> Sha {
+            self.fx
+                .vcs
+                .worktree_state(&self.wt, &self.fx.base())
+                .unwrap()
+                .head
+        }
+    }
+
+    #[test]
+    fn an_export_holds_exactly_the_committed_files() {
+        need_git!();
+        let e = exp();
+        e.fx.edit_and_commit(&e.wt, "src/new.txt", "new\n");
+        let head = e.head();
+        // everything that is not in the commit: modified, untracked, ignored, staged
+        fs::write(
+            Path::new(&e.wt).join("README.md"),
+            "modified, not committed\n",
+        )
+        .unwrap();
+        fs::write(Path::new(&e.wt).join("untracked.txt"), "u\n").unwrap();
+        fs::write(
+            Path::new(&e.wt).join("Makefile"),
+            "test:\n\ttouch planted\n",
+        )
+        .unwrap();
+        fs::write(Path::new(&e.wt).join("staged.txt"), "s\n").unwrap();
+        git(Path::new(&e.wt), &["add", "staged.txt"]);
+        let before_index = git(Path::new(&e.wt), &["status", "--porcelain"]);
+        let out = e.export(&head).unwrap();
+        assert_eq!(
+            out.tree.as_str(),
+            git(Path::new(&e.wt), &["rev-parse", "HEAD^{tree}"])
+        );
+        assert!(out.removed_links.is_empty());
+        assert_eq!(
+            fs::read_to_string(e.dest.join("README.md")).unwrap(),
+            "# fixture\n"
+        );
+        assert_eq!(
+            fs::read_to_string(e.dest.join("src/new.txt")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            fs::read_to_string(e.dest.join("src/lib.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+        for absent in ["untracked.txt", "Makefile", "staged.txt", ".git", ".fleet"] {
+            assert!(
+                !e.dest.join(absent).exists(),
+                "{absent} is not part of the commit"
+            );
+        }
+        // the worktree and its index were not touched, and the temporary index is gone
+        assert_eq!(
+            git(Path::new(&e.wt), &["status", "--porcelain"]),
+            before_index
+        );
+        assert!(!e.index.exists());
+    }
+
+    #[test]
+    fn an_export_keeps_file_modes_and_an_older_commit_is_exported_as_it_was() {
+        need_git!();
+        let e = exp();
+        let first =
+            e.fx.edit_and_commit(&e.wt, "run.sh", "#!/bin/sh\necho first\n");
+        fs::write(Path::new(&e.wt).join("run.sh"), "#!/bin/sh\necho second\n").unwrap();
+        fs::set_permissions(
+            Path::new(&e.wt).join("run.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        git(Path::new(&e.wt), &["add", "-A"]);
+        git(Path::new(&e.wt), &["commit", "-q", "-m", "second"]);
+        let second = e.head();
+        e.export(&first).unwrap();
+        assert_eq!(
+            fs::read_to_string(e.dest.join("run.sh")).unwrap(),
+            "#!/bin/sh\necho first\n"
+        );
+        assert_eq!(
+            fs::metadata(e.dest.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        fs::remove_dir_all(&e.dest).unwrap();
+        fs::create_dir_all(&e.dest).unwrap();
+        e.export(&second).unwrap();
+        assert_eq!(
+            fs::read_to_string(e.dest.join("run.sh")).unwrap(),
+            "#!/bin/sh\necho second\n"
+        );
+        assert_ne!(
+            fs::metadata(e.dest.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o100,
+            0
+        );
+    }
+
+    #[test]
+    fn symlinks_that_could_leave_the_export_are_removed() {
+        need_git!();
+        let e = exp();
+        let wt = Path::new(&e.wt);
+        fs::create_dir_all(wt.join("sub")).unwrap();
+        fs::write(wt.join("sub/real.txt"), "r\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", wt.join("abs-link")).unwrap();
+        std::os::unix::fs::symlink("../outside", wt.join("sub/up-link")).unwrap();
+        std::os::unix::fs::symlink("sub/..", wt.join("dot-dot-link")).unwrap();
+        std::os::unix::fs::symlink("sub/real.txt", wt.join("down-link")).unwrap();
+        std::os::unix::fs::symlink("sub", wt.join("dir-link")).unwrap();
+        git(wt, &["add", "-A"]);
+        git(wt, &["commit", "-q", "-m", "links"]);
+        let out = e.export(&e.head()).unwrap();
+        assert_eq!(
+            out.removed_links,
+            ["abs-link", "dot-dot-link", "sub/up-link"]
+        );
+        for gone in ["abs-link", "dot-dot-link", "sub/up-link"] {
+            assert!(fs::symlink_metadata(e.dest.join(gone)).is_err(), "{gone}");
+        }
+        for kept in ["down-link", "dir-link"] {
+            assert!(
+                fs::symlink_metadata(e.dest.join(kept))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{kept}"
+            );
+        }
+        assert_eq!(fs::read_to_string(e.dest.join("down-link")).unwrap(), "r\n");
+    }
+
+    #[test]
+    fn export_refuses_unknown_commits_dirty_destinations_and_foreign_directories() {
+        need_git!();
+        let e = exp();
+        let missing = Sha::parse(&"1".repeat(40)).unwrap();
+        assert!(e.export(&missing).is_err());
+        fs::write(e.dest.join("already"), "x").unwrap();
+        let err = e.export(&e.head()).unwrap_err();
+        assert!(err.message.contains("not empty"), "{}", err.message);
+        fs::remove_file(e.dest.join("already")).unwrap();
+        let err =
+            e.fx.vcs
+                .export_commit(e.fx.repo_s(), &e.head(), &e.dest, &e.index)
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "only fleet worktrees");
+        let err =
+            e.fx.vcs
+                .export_commit(&e.wt, &e.head(), &e.fx.tmp.join("nope"), &e.index)
+                .unwrap_err();
+        assert!(err.message.contains("does not exist"), "{}", err.message);
+    }
+
+    #[test]
+    fn planted_hooks_filters_and_local_config_do_not_run_during_an_export() {
+        need_git!();
+        let fx = Fx::with_attributes(Some("* filter=planted\n"));
+        let script = fx.plant_script();
+        fx.append_config(&format!(
+            "[filter \"planted\"]\n\tsmudge = {script}\n\tclean = {script}\n\trequired = false\n[core]\n\tfsmonitor = {script}\n\thooksPath = /nonexistent\n"
+        ));
+        let wt = fx.prepare("r1", "t1");
+        let dest = fx.tmp.join("export/tree");
+        fs::create_dir_all(&dest).unwrap();
+        let head = fx.vcs.worktree_state(&wt, &fx.base()).unwrap().head;
+        fx.vcs
+            .export_commit(&wt, &head, &dest, &fx.tmp.join("export/index"))
+            .unwrap();
+        assert!(!fx.triggered(), "a planted filter or fsmonitor ran");
+        assert!(dest.join("README.md").exists());
     }
 
     // ---- isolation -----------------------------------------------------------------------

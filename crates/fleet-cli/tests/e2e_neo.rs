@@ -635,3 +635,101 @@ fn processes_started_by_contract_checks_and_gates_cannot_use_the_control_socket(
     assert_eq!(jarr(&goals, "goals").len(), 1, "{}", goals.canonical());
     assert_eq!(jstr(&jarr(&goals, "goals")[0], "id"), "feature");
 }
+
+// ---- checks run on a clean export of the commit --------------------------------------------------------
+
+#[test]
+fn a_check_never_sees_ignored_files_or_the_real_home_and_runs_in_a_private_export() {
+    let (f, files) = fleet_with(
+        r#"#!/bin/sh
+set -eu
+printf 'helper.sh\n' > .gitignore
+printf '#!/bin/sh\necho helper-ran\n' > helper.sh
+chmod +x helper.sh
+printf '#!/bin/sh\ndirname "$0" > where.txt 2>&1\n./helper.sh\n' > test.sh
+chmod +x test.sh
+printf '{"version":1,"status":"done","summary":"d"}\n' > .fleet/result.json
+"#,
+        "0",
+    );
+    load_plan(&f);
+    let real_home = f.home.display().to_string();
+    let show_tool = f.script(
+        "tools/show.sh",
+        "#!/bin/sh\necho \"cwd=$(pwd) home=$HOME tmp=$TMPDIR\"\nls -A\n",
+    );
+    let helper = f.script("tools/run-test.sh", "#!/bin/sh\nexec ./test.sh\n");
+    let contract = format!(
+        r#"{{"version":1,"checks":[
+  {{"id":"show","kind":"command","program":"{}","mandatory":false}},
+  {{"id":"test","kind":"command","program":"{}"}}
+]}}"#,
+        show_tool.display(),
+        helper.display()
+    );
+    add_goal(&f, &files, &contract);
+    f.ok(&["start", "--run", "r1"]);
+    f.wait_task("r1", "a", &["failed"]);
+    let goal = show(&f, "feature");
+    let history = jarr(&goal, "history");
+    let find = |check: &str| {
+        history
+            .iter()
+            .find(|e| jstr(e, "check") == check)
+            .unwrap()
+            .clone()
+    };
+    // the committed script ran, but the ignored helper it needs exists only in the worktree
+    let test = find("test");
+    assert_eq!(jstr(&test, "verdict"), "failed", "{}", test.canonical());
+    let shown = jstr(&find("show"), "output").to_string();
+    assert!(shown.contains("/verify/job-"), "{shown}");
+    assert!(
+        !shown.contains(&real_home),
+        "the operator's home leaked: {shown}"
+    );
+    assert!(
+        shown.contains("test.sh") && !shown.contains("helper.sh"),
+        "{shown}"
+    );
+    assert!(jstr(&find("show"), "commit").len() == 40);
+    assert_eq!(jstr(&find("show"), "tree").len(), 40);
+    assert_eq!(find("show").get("dirty"), Some(&Value::Bool(false)));
+    // the export directory is gone once the job is over
+    let leftovers: Vec<_> = fs::read_dir(f.state.join("verify"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn a_worker_that_commits_a_path_under_dot_fleet_is_caught_by_the_diff_constraint() {
+    let (f, files) = fleet_with(
+        r#"#!/bin/sh
+set -eu
+echo ready > answer.txt
+echo planted > .fleet/planted.txt
+git add -f .fleet/planted.txt answer.txt
+git -c user.name=w -c user.email=w@example.invalid commit -q -m "worker commit"
+printf '{"version":1,"status":"done","summary":"d"}\n' > .fleet/result.json
+"#,
+        "0",
+    );
+    load_plan(&f);
+    add_goal(
+        &f,
+        &files,
+        r#"{"version":1,"checks":[{"id":"scope","kind":"diff","allow":["answer.txt"]}]}"#,
+    );
+    f.ok(&["start", "--run", "r1"]);
+    f.wait_task("r1", "a", &["failed"]);
+    let goal = show(&f, "feature");
+    let e = &jarr(&goal, "history")[0];
+    assert_eq!(jstr(e, "verdict"), "failed", "{}", e.canonical());
+    assert!(
+        jstr(e, "output").contains(".fleet/planted.txt"),
+        "{}",
+        e.canonical()
+    );
+}

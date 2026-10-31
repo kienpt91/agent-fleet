@@ -18,6 +18,7 @@ use crate::pty::{PtySessionHost, SessionIo, SessionRegistry};
 use crate::server::{AttachSession, HandlerReply, PeerInfo, RequestHandler, Server};
 use crate::statedir::{DaemonLock, StateLayout};
 use crate::undo::AgentUndo;
+use crate::verify::VerifyHost;
 use fleet_app::api::{parse_command, Command, Reply};
 use fleet_app::config::AppConfig;
 use fleet_app::orchestrator::Orchestrator;
@@ -156,10 +157,14 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
             registry.clone(),
         )),
         contract: Box::new(FsContractFiles::new(Arc::clone(&redactor))),
-        jobs: Box::new(ThreadJobRunner::new(
-            MAX_CONCURRENT_JOBS,
-            Arc::clone(&redactor),
-        )),
+        jobs: Box::new(
+            ThreadJobRunner::new(MAX_CONCURRENT_JOBS, Arc::clone(&redactor)).with_verification(
+                VerifyHost::new(
+                    GitVcs::new(env.clone(), app.env.clone()),
+                    layout.verify_dir.clone(),
+                )?,
+            ),
+        ),
         logs: Box::new(FileOutputLogs::new(layout.logs_dir.clone())),
         undo: Box::new(AgentUndo::detect_with_env(path_env.as_deref(), undo_env)),
         digest: Box::new(Sha256Digest),

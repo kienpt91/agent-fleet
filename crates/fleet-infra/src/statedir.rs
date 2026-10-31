@@ -44,6 +44,8 @@ pub struct StateLayout {
     pub events: PathBuf,
     pub head: PathBuf,
     pub logs_dir: PathBuf,
+    /// Where verification jobs export commits and give their checks a home (emptied at start).
+    pub verify_dir: PathBuf,
     pub default_config: PathBuf,
     /// The control-socket capability token, next to the socket.
     pub token: PathBuf,
@@ -58,6 +60,7 @@ impl StateLayout {
             events: root.join("events.log"),
             head: root.join("events.head"),
             logs_dir: root.join("logs"),
+            verify_dir: root.join("verify"),
             default_config: root.join("fleet.toml"),
             token: control_dir.join(TOKEN_FILE),
             control_dir,

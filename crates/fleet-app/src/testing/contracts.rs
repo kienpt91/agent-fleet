@@ -923,6 +923,16 @@ impl VerifyHarness for MemoryVerifyHarness {
         "/work/wt".to_string()
     }
 
+    fn state(&self) -> WorktreeState {
+        WorktreeState {
+            head: sha(&"e".repeat(40)),
+            tree: sha(&"f".repeat(40)),
+            changed: Vec::new(),
+            truncated: false,
+            dirty: false,
+        }
+    }
+
     fn place(&mut self, present: &[&str]) {
         // The fake cannot look at files; it fails the first mandatory check when `first.txt` is
         // missing and passes otherwise, which is what the suite's scenarios call for.
@@ -1257,6 +1267,9 @@ pub trait VerifyHarness {
     fn runner(&mut self) -> Box<dyn JobRunner>;
     /// The worktree path given to the jobs.
     fn worktree(&self) -> String;
+    /// The state of that worktree the jobs are started with: the commit the files placed by
+    /// [`VerifyHarness::place`] are committed as, and its tree.
+    fn state(&self) -> WorktreeState;
     /// Makes exactly the files named in `present` (relative paths) exist in the worktree, so that
     /// the checks of the suite's contract pass or fail accordingly.
     fn place(&mut self, present: &[&str]);
@@ -1301,13 +1314,7 @@ fn verify_job(h: &dyn VerifyHarness, task: &str, goals: &[&str]) -> VerifyJob {
         attempt: 3,
         origin: VerifyOrigin::Manual,
         worktree: h.worktree(),
-        state: WorktreeState {
-            head: sha(&"e".repeat(40)),
-            tree: sha(&"f".repeat(40)),
-            changed: Vec::new(),
-            truncated: false,
-            dirty: false,
-        },
+        state: h.state(),
         env: vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
         targets: goals.iter().map(|g| verify_target(g)).collect(),
     }
@@ -1359,8 +1366,9 @@ pub fn verify_jobs_contract(h: &mut dyn VerifyHarness) {
         "verify jobs contract: the result must echo run, task, attempt and origin"
     );
     assert_eq!(
-        done.commit, job.state.head,
-        "verify jobs contract: the result must carry the commit the job was given"
+        (done.commit.clone(), done.tree.clone(), done.dirty),
+        (job.state.head.clone(), job.state.tree.clone(), job.state.dirty),
+        "verify jobs contract: the result must carry the commit, tree and dirtiness the job was given"
     );
     assert_eq!(
         done.results.len(),
