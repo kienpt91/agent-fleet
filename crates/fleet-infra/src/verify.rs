@@ -84,22 +84,76 @@ impl VerifyHost {
     }
 }
 
-/// Removes a directory tree that a check may have left read-only, never following a symlink.
+/// Removes a directory tree that a check may have left read-only, never following a symlink:
+/// every directory is opened with `O_NOFOLLOW | O_DIRECTORY` (relative to its parent's descriptor)
+/// and made writable through that descriptor, so a directory that is replaced by a link while
+/// this runs is not a path to chmod. A directory that is unreadable (mode 000) is made accessible
+/// by `fchmodat` without following links; where the platform cannot do that it is left, and
+/// `remove_dir_all` (which does not follow links either) reports nothing and removes what it can.
 fn remove_tree(path: &Path) {
-    fn relax(p: &Path, depth: usize) {
-        let Ok(meta) = fs::symlink_metadata(p) else {
-            return;
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::{fchmod, fchmodat, FchmodatFlags, Mode};
+    use std::os::fd::{AsFd, OwnedFd};
+
+    const FLAGS: OFlag = OFlag::from_bits_truncate(
+        OFlag::O_RDONLY.bits()
+            | OFlag::O_NOFOLLOW.bits()
+            | OFlag::O_DIRECTORY.bits()
+            | OFlag::O_CLOEXEC.bits(),
+    );
+    let private = Mode::from_bits_truncate(0o700);
+
+    fn open_dir(
+        parent: Option<&OwnedFd>,
+        path: &Path,
+        name: &std::ffi::OsStr,
+        flags: OFlag,
+        private: Mode,
+    ) -> Option<OwnedFd> {
+        let try_open = || match parent {
+            Some(p) => openat(p.as_fd(), name, flags, Mode::empty()),
+            None => open(path, flags, Mode::empty()),
         };
-        if meta.is_dir() && depth < 256 {
-            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
-            if let Ok(rd) = fs::read_dir(p) {
-                for e in rd.flatten() {
-                    relax(&e.path(), depth + 1);
-                }
+        match try_open() {
+            Ok(fd) => Some(fd),
+            Err(nix::errno::Errno::EACCES) => {
+                let chmod = match parent {
+                    Some(p) => fchmodat(
+                        p.as_fd(),
+                        Path::new(name),
+                        private,
+                        FchmodatFlags::NoFollowSymlink,
+                    ),
+                    None => fchmodat(
+                        nix::fcntl::AT_FDCWD,
+                        path,
+                        private,
+                        FchmodatFlags::NoFollowSymlink,
+                    ),
+                };
+                chmod.ok()?;
+                try_open().ok()
             }
+            Err(_) => None,
         }
     }
-    relax(path, 0);
+
+    fn relax(parent: Option<&OwnedFd>, path: &Path, flags: OFlag, private: Mode, depth: usize) {
+        let Some(name) = path.file_name() else { return };
+        let Some(fd) = open_dir(parent, path, name, flags, private) else {
+            return;
+        };
+        if fchmod(fd.as_fd(), private).is_err() || depth >= 256 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            relax(Some(&fd), &entry.path(), flags, private, depth + 1);
+        }
+    }
+    relax(None, path, FLAGS, private, 0);
     let _ = fs::remove_dir_all(path);
 }
 
@@ -1224,5 +1278,52 @@ mod tests {
             fs::metadata(&scratch).unwrap().permissions().mode() & 0o077,
             0
         );
+    }
+
+    #[test]
+    fn removing_a_tree_makes_read_only_directories_writable_and_never_follows_links() {
+        let t = TempDir::new("verify-remove");
+        let outside = t.join("outside");
+        fs::create_dir_all(outside.join("inner")).unwrap();
+        fs::write(outside.join("inner/keep.txt"), "keep").unwrap();
+        fs::set_permissions(&outside, PermissionsExt::from_mode(0o500)).unwrap();
+        fs::set_permissions(outside.join("inner"), PermissionsExt::from_mode(0o500)).unwrap();
+
+        let job = t.join("job-1");
+        fs::create_dir_all(job.join("tree/a/b/c")).unwrap();
+        fs::create_dir_all(job.join("tree/closed/deeper")).unwrap();
+        fs::write(job.join("tree/a/b/c/file"), "x").unwrap();
+        fs::write(job.join("tree/closed/deeper/file"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, job.join("tree/a/link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("inner"), job.join("tree/a/b/link")).unwrap();
+        // what a build tool leaves behind: read-only directories, one nobody can open
+        for d in ["tree/a/b/c", "tree/a/b", "tree/a", "tree/closed/deeper"] {
+            fs::set_permissions(job.join(d), PermissionsExt::from_mode(0o500)).unwrap();
+        }
+        fs::set_permissions(job.join("tree/closed"), PermissionsExt::from_mode(0o000)).unwrap();
+
+        remove_tree(&job);
+        assert!(!job.exists(), "the job directory is gone");
+        // nothing behind the links was touched or removed
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(outside.clone()), 0o500);
+        assert_eq!(mode(outside.join("inner")), 0o500);
+        assert_eq!(
+            fs::read_to_string(outside.join("inner/keep.txt")).unwrap(),
+            "keep"
+        );
+
+        // a link in place of the job directory is not followed and not removed through
+        let target = t.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, PermissionsExt::from_mode(0o500)).unwrap();
+        let link = t.join("job-2");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        remove_tree(&link);
+        assert_eq!(mode(target.clone()), 0o500, "the link target was chmodded");
+        assert!(target.exists());
+        fs::set_permissions(&outside, PermissionsExt::from_mode(0o700)).unwrap();
+        fs::set_permissions(outside.join("inner"), PermissionsExt::from_mode(0o700)).unwrap();
+        fs::set_permissions(&target, PermissionsExt::from_mode(0o700)).unwrap();
     }
 }
