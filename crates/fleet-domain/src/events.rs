@@ -41,7 +41,7 @@ fn field<T: Field>(v: &Value, name: &str) -> Result<T, DecodeError> {
 
 macro_rules! define_events {
     ($($(#[$meta:meta])* $name:ident = $tag:literal { $($field:ident : $ty:ty),* $(,)? }),+ $(,)?) => {
-        #[derive(Clone, Debug, PartialEq)]
+        #[derive(Clone, Debug, PartialEq, Eq)]
         pub enum DomainEvent {
             $($(#[$meta])* $name { $($field: $ty),* }),+
         }
