@@ -209,6 +209,7 @@ fn unlisted(peer: SocketAddr) -> PeerIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::net::{TcpListener, TcpStream};
 
     const TABLE: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 424242 1 0000000000000000 100 0 0 10 0\n   1: 0100007F:D431 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 535353 1 0000000000000000 100 0 0 10 0\n   2: 0100007F:D432 0100007F:1F90 06 00000000:00000000 03:00000000 00000000     0        0 0 3 0000000000000000\n";
