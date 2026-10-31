@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [features]
 # In-memory fakes and port contract suites, for tests of this crate and of the adapters.
-testing = []
+testing = ["neo-context/testing"]
 
 [dependencies]
 fleet-domain = { path = "../fleet-domain" }

@@ -456,3 +456,36 @@ fn unverified_text_stays_out_of_layers_one_to_five_even_when_the_worker_writes_a
     assert!(text[..layer7].find("FORGED-INSTRUCTION").is_none());
     assert!(text[layer7..].contains("FORGED-INSTRUCTION"));
 }
+
+#[test]
+fn a_summary_survives_a_crash_between_the_end_of_an_attempt_and_its_handoff() {
+    let mut h = Harness::new();
+    compiled_run(&mut h, Some("compiled"));
+    let wt = h.world.briefs()[0].0.clone();
+    h.world.write_handoff(
+        &wt,
+        ContractRead::Valid(WorkerHandoff {
+            summary: "SUMMARY-WRITTEN-BEFORE-THE-CRASH".to_string(),
+        }),
+    );
+    // the attempt's end is recorded (the retry is queued) but the handoff cannot be: the daemon
+    // dies, or the store refuses, between the two steps
+    h.world.fail_context_store(true);
+    let session = h.world.session_for("a").unwrap();
+    h.world.exit(session, 1);
+    h.orch.tick();
+    assert!(handoff_events(&h).is_empty(), "the handoff could not be recorded");
+    assert!(h.world.stored_events().iter().any(|e| matches!(e, DomainEvent::RetryQueued { .. })));
+    h.world.fail_context_store(false);
+    // the new daemon makes the missing handoff, from the summary still in the worker's file
+    h.restart(test_config()).unwrap();
+    assert_eq!(handoff_events(&h), vec![("retry".to_string(), 1)]);
+    let (_, packet) = h.world.saved_handoffs("r1", "a").pop().unwrap();
+    assert_eq!(
+        packet.get("summary").and_then(Value::as_str),
+        Some("SUMMARY-WRITTEN-BEFORE-THE-CRASH")
+    );
+    // and a further restart does not make it twice
+    h.restart(test_config()).unwrap();
+    assert_eq!(handoff_events(&h).len(), 1);
+}

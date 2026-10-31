@@ -120,6 +120,15 @@ impl Orchestrator {
                 }
             }
         }
+        if self.uses_compiled_context(&key) {
+            if let Err(e) = self.ensure_restart_handoff(&key, &worktree) {
+                self.warn(format!(
+                    "{run_id}/{task_id}: the handoff of the last attempt could not be recorded, so the next attempt waits: {}",
+                    e.message
+                ));
+                return;
+            }
+        }
         // A run that chose compiled context gets a pack compiled by NEO from fleet's own state
         // (and a short brief that points at it); every other run gets the plain brief it always did.
         let pack = if self.uses_compiled_context(&key) {

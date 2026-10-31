@@ -625,7 +625,9 @@ impl Orchestrator {
             .collect();
         evidence.sort();
         evidence.dedup();
-        let summary = self.handoff_summaries.remove(key);
+        // kept until the handoff is recorded: if recording fails (or the daemon dies first), the
+        // summary is still in the worker's `.fleet/handoff.json`, which start-up reads again
+        let summary = self.handoff_summaries.get(key).cloned();
         let packet = HandoffPacket::new(
             HandoffParts {
                 run: key.0.to_string(),
@@ -645,6 +647,7 @@ impl Orchestrator {
             .handoff(key)
             .is_some_and(|h| h.digest() == packet.digest())
         {
+            self.handoff_summaries.remove(key);
             return Ok((packet, false));
         }
         let document = packet.to_value();
@@ -659,7 +662,68 @@ impl Orchestrator {
             digest: packet.digest().to_string(),
             packet: Document(document),
         }])?;
+        self.handoff_summaries.remove(key);
         Ok((packet, true))
+    }
+
+    /// Before a task is briefed again, the handoff of the attempt that ended must exist: it is
+    /// made now if it is missing (the daemon died after recording the end of the attempt, or the
+    /// store refused it), from the summary still in the worker's `.fleet/handoff.json`. If it
+    /// cannot be recorded the next attempt does not start yet, so nothing the worker left is wiped.
+    pub(crate) fn ensure_restart_handoff(&mut self, key: &Key, worktree: &str) -> Result<()> {
+        let attempt = self
+            .state
+            .run(&key.0)
+            .ok()
+            .and_then(|r| r.task(&key.1))
+            .map_or(0, |t| t.attempt);
+        if attempt == 0
+            || self.context.was_made(key, attempt, HandoffClass::Restart)
+            || self.context.was_made(key, attempt, HandoffClass::TaskEnd)
+        {
+            return Ok(());
+        }
+        self.stash_worker_summary(key, worktree);
+        self.make_handoff(key, HandoffTrigger::Retry).map(|_| ())
+    }
+
+    /// After a restart: an attempt whose end was recorded but whose handoff was not (the daemon
+    /// died between the two steps, or the store refused it) gets it now. The worker's summary is
+    /// read again from `.fleet/handoff.json`, which stays in the worktree until the next attempt
+    /// starts, so nothing a worker left is lost by a crash in between.
+    pub(crate) fn reconcile_handoffs(&mut self) {
+        let mut wanted: Vec<(Key, HandoffTrigger, String)> = Vec::new();
+        for run in self.state.runs().filter(|r| r.context == ContextMode::Compiled) {
+            for t in run.tasks().iter().filter(|t| t.attempt >= 1) {
+                let trigger = match t.status {
+                    TaskStatus::Completed => HandoffTrigger::TaskCompleted,
+                    TaskStatus::Failed => HandoffTrigger::TaskFailed,
+                    TaskStatus::Ready => HandoffTrigger::Retry,
+                    _ => continue,
+                };
+                wanted.push((
+                    (run.id.clone(), t.id.clone()),
+                    trigger,
+                    t.worktree.clone().unwrap_or_default(),
+                ));
+            }
+        }
+        for (key, trigger, worktree) in wanted {
+            let attempt = self
+                .state
+                .run(&key.0)
+                .ok()
+                .and_then(|r| r.task(&key.1))
+                .map_or(0, |t| t.attempt);
+            let Some(class) = HandoffClass::of(trigger) else {
+                continue;
+            };
+            if self.context.was_made(&key, attempt, class) {
+                continue;
+            }
+            self.stash_worker_summary(&key, &worktree);
+            self.auto_handoff(&key, trigger);
+        }
     }
 
     /// The handoff made by the flow itself (an attempt ended; a task goes back in line; the daemon
