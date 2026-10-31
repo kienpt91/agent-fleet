@@ -10,6 +10,7 @@ use fleet_domain::value::Value;
 const MAX_FIELD: usize = 400;
 const MAX_ROWS: usize = 2048;
 const MAX_LIST: usize = 64;
+const MAX_FORGE_LINES: usize = 128;
 const MAX_TAIL_BYTES: usize = 64 * 1024;
 /// Order of `counts` in [`Model::visible_counts`] and the header.
 pub const STATUS_NAMES: [&str; 7] = [
@@ -157,6 +158,11 @@ pub struct Model {
     /// True once a status document has been applied.
     pub loaded: bool,
     pub connected: bool,
+    /// The GitHub integration is on in the daemon.
+    pub forge_enabled: bool,
+    /// Issue and pull request links, then the cached issues and pull requests, one clean line
+    /// each. Read only: nothing here causes a request to GitHub.
+    pub forge: Vec<String>,
 }
 
 impl Default for Model {
@@ -180,6 +186,8 @@ impl Default for Model {
             input: None,
             loaded: false,
             connected: true,
+            forge_enabled: false,
+            forge: Vec::new(),
         }
     }
 }
@@ -407,6 +415,47 @@ impl Model {
 
     pub fn set_message(&mut self, text: &str) {
         self.message = clean_line(text);
+    }
+
+    /// Replaces the GitHub lines with what `forge.snapshot` and `forge.links` report.
+    pub fn update_forge(&mut self, snapshot: &Value, links: &Value) {
+        let mut lines = Vec::new();
+        for l in list_of(links, "issues").iter().take(MAX_LIST) {
+            lines.push(format!(
+                "{}/{} <- issue #{}",
+                text_of(l, "run"),
+                text_of(l, "task"),
+                num_of(l, "number")
+            ));
+        }
+        for p in list_of(links, "pulls").iter().take(MAX_LIST) {
+            let task = format!("{}/{}", text_of(p, "run"), text_of(p, "task"));
+            lines.push(match text_of(p, "state").as_str() {
+                "opened" => format!("{task} -> PR #{} opened", num_of(p, "number")),
+                "failed" => format!("{task} -> PR failed: {}", text_of(p, "reason")),
+                _ => format!("{task} -> PR started"),
+            });
+        }
+        for (name, key) in [("issue", "issues"), ("PR", "pulls")] {
+            let items = snapshot
+                .get(key)
+                .and_then(|e| e.get("data"))
+                .map_or(&[][..], |d| list_of(d, "items"));
+            for i in items.iter().take(MAX_LIST) {
+                lines.push(format!(
+                    "cached {name} #{} {} {}",
+                    num_of(i, "number"),
+                    text_of(i, "state"),
+                    text_of(i, "title")
+                ));
+            }
+        }
+        lines.truncate(MAX_FORGE_LINES);
+        self.forge_enabled = snapshot
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.forge = lines;
     }
 
     /// Task counts by status, in [`STATUS_NAMES`] order.
@@ -690,6 +739,43 @@ mod tests {
         let mut m = Model::new();
         m.update_status(&status(many));
         assert_eq!(m.tasks.len(), MAX_ROWS);
+    }
+
+    #[test]
+    fn forge_lines_are_clean_bounded_and_tolerate_garbage() {
+        let mut m = Model::new();
+        let links = Value::object([
+            (
+                "pulls",
+                Value::array([Value::object([
+                    ("run", Value::str("r1")),
+                    ("task", Value::str("a")),
+                    ("state", Value::str("failed")),
+                    ("reason", Value::str("no\x1b[2J\u{202e}pe")),
+                ])]),
+            ),
+            ("issues", Value::int(3)),
+        ]);
+        m.update_forge(&Value::Null, &links);
+        assert!(!m.forge_enabled);
+        assert_eq!(m.forge.len(), 1);
+        assert!(
+            m.forge[0].starts_with("r1/a -> PR failed: no"),
+            "{:?}",
+            m.forge
+        );
+        assert!(!m.forge[0].contains('\x1b') && !m.forge[0].contains('\u{202e}'));
+        let many = Value::array((0..500).map(|i| {
+            Value::object([
+                ("run", Value::str("r")),
+                ("task", Value::str("t")),
+                ("number", Value::int(i)),
+            ])
+        }));
+        m.update_forge(&Value::Null, &Value::object([("issues", many)]));
+        assert_eq!(m.forge.len(), MAX_LIST);
+        m.update_forge(&Value::int(1), &Value::str("x"));
+        assert!(m.forge.is_empty());
     }
 
     #[test]
