@@ -105,6 +105,7 @@ struct Inner {
     jobs_started: Vec<Job>,
     jobs_done: VecDeque<JobDone>,
     jobs_running: usize,
+    job_groups: Vec<LiveSession>,
 
     logs: BTreeMap<(String, String), (u32, String)>,
 
@@ -322,6 +323,17 @@ impl World {
         let mut g = self.lock();
         g.worktree_changed = paths.iter().map(|p| p.to_string()).collect();
         g.worktree_truncated = truncated;
+    }
+    /// The process groups the fake job runner reports as running (what a gate or a verification
+    /// check started).
+    pub fn set_job_groups(&self, groups: &[(u32, u32)]) {
+        self.lock().job_groups = groups
+            .iter()
+            .map(|(pid, pgid)| LiveSession {
+                pid: *pid,
+                pgid: *pgid,
+            })
+            .collect();
     }
     /// Makes one job slot look taken (a job that never finishes).
     pub fn occupy_job_slot(&self) {
@@ -989,6 +1001,10 @@ impl JobRunner for FakeJobs {
 
     fn running(&self) -> usize {
         self.0.lock().jobs_running
+    }
+
+    fn live(&self) -> Vec<LiveSession> {
+        self.0.lock().job_groups.clone()
     }
 }
 

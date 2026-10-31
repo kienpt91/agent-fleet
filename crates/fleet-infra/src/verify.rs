@@ -10,19 +10,19 @@
 
 use crate::digest::Sha256Digest;
 use crate::fsx::{open_beneath, read_open, ReadError};
-use crate::jobs::{combined_text, redact_block, run_bounded, trusted_program, RunSpec};
+use crate::jobs::{
+    redact_block, redacted_tail, run_bounded_tracked, trusted_program, JobContext, RunSpec,
+};
 use crate::json;
 use fleet_app::ports::{VerifiedContract, VerifyDone, VerifyJob};
 use fleet_domain::approval::Digest;
 use fleet_domain::limits::MAX_GATE_OUTPUT;
 use fleet_domain::quality::ExitKind;
-use fleet_domain::redact::Redactor;
 use fleet_domain::status::Verdict;
 use neo_verify::contract::{Check, CheckKind, FileAssertion};
 use neo_verify::judge::{judge, CheckReport, FileObservation, Observation};
 use neo_verify::limits::MAX_FILE_BYTES;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// All checks of one job together may take this long; checks that would start after it are
@@ -31,15 +31,11 @@ const JOB_BUDGET: Duration = Duration::from_secs(60 * 60);
 
 /// Runs every check of every target of `job`, in order, and reports on all of them (also after a
 /// failure: the retry brief lists every failing check).
-pub fn run_verify(job: &VerifyJob, redactor: &Arc<Redactor>) -> VerifyDone {
-    run_verify_within(job, redactor, JOB_BUDGET)
+pub fn run_verify(job: &VerifyJob, ctx: &JobContext) -> VerifyDone {
+    run_verify_within(job, ctx, JOB_BUDGET)
 }
 
-pub(crate) fn run_verify_within(
-    job: &VerifyJob,
-    redactor: &Arc<Redactor>,
-    budget: Duration,
-) -> VerifyDone {
+pub(crate) fn run_verify_within(job: &VerifyJob, ctx: &JobContext, budget: Duration) -> VerifyDone {
     let started = Instant::now();
     let dir = Path::new(&job.worktree);
     let results = job
@@ -54,7 +50,7 @@ pub(crate) fn run_verify_within(
                 .iter()
                 .map(|check| {
                     let left = budget.saturating_sub(started.elapsed());
-                    run_check(check, job, dir, redactor, left)
+                    run_check(check, job, dir, ctx, left)
                 })
                 .collect(),
         })
@@ -104,18 +100,18 @@ fn run_check(
     check: &Check,
     job: &VerifyJob,
     dir: &Path,
-    redactor: &Arc<Redactor>,
+    ctx: &JobContext,
     left: Duration,
 ) -> CheckReport {
     let observed = if left.is_zero() {
         Observation::Failed("skipped: the time budget of this verification is spent".to_string())
     } else {
-        observe(check, job, dir, redactor, left)
+        observe(check, job, dir, ctx, left)
     };
     let mut report = judge(check, &observed);
     // Whatever was printed, and any text that quotes it, leaves this module redacted.
-    report.summary = redact_block(redactor, &report.summary);
-    report.output = redact_block(redactor, &report.output);
+    report.summary = redact_block(&ctx.redactor, &report.summary);
+    report.output = redact_block(&ctx.redactor, &report.output);
     report
 }
 
@@ -123,7 +119,7 @@ fn observe(
     check: &Check,
     job: &VerifyJob,
     dir: &Path,
-    redactor: &Arc<Redactor>,
+    ctx: &JobContext,
     left: Duration,
 ) -> Observation {
     match &check.kind {
@@ -132,12 +128,12 @@ fn observe(
             args,
             timeout_ms,
             ..
-        } => run_process(program, args, *timeout_ms, false, job, dir, redactor, left),
+        } => run_process(program, args, *timeout_ms, false, job, dir, ctx, left),
         CheckKind::RefcheckJson {
             program,
             args,
             timeout_ms,
-        } => run_process(program, args, *timeout_ms, true, job, dir, redactor, left),
+        } => run_process(program, args, *timeout_ms, true, job, dir, ctx, left),
         CheckKind::File { path, assertion } => {
             Observation::File(observe_file(dir, path, assertion))
         }
@@ -156,7 +152,7 @@ fn run_process(
     structured: bool,
     job: &VerifyJob,
     dir: &Path,
-    redactor: &Arc<Redactor>,
+    ctx: &JobContext,
     left: Duration,
 ) -> Observation {
     let program = match trusted_program(Path::new(program), dir) {
@@ -171,16 +167,19 @@ fn run_process(
         }
     };
     let allowed = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
-    let result = run_bounded(&RunSpec {
-        program: program.display().to_string(),
-        args: args.to_vec(),
-        cwd: dir.to_path_buf(),
-        env: job.env.clone(),
-        timeout_ms: timeout_ms.min(allowed),
-        max_output: MAX_GATE_OUTPUT,
-    });
-    // Redacted before it is judged, so a cut at the tail limit cannot leave half a secret behind.
-    let output = redact_block(redactor, &combined_text(&result));
+    let result = run_bounded_tracked(
+        &RunSpec {
+            program: program.display().to_string(),
+            args: args.to_vec(),
+            cwd: dir.to_path_buf(),
+            env: job.env.clone(),
+            timeout_ms: timeout_ms.min(allowed),
+            max_output: MAX_GATE_OUTPUT,
+        },
+        &ctx.tracker,
+    );
+    // The whole capture is redacted before it is cut to its tail and judged.
+    let output = redacted_tail(&result, &ctx.redactor);
     let stdout_json = structured.then(|| json::parse_value(&result.stdout, MAX_GATE_OUTPUT));
     Observation::Process {
         exit: result.exit,
@@ -226,15 +225,21 @@ fn file_error(e: &ReadError) -> FileObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobTracker;
     use crate::testutil::TempDir;
     use fleet_app::ports::{VerifyOrigin, VerifyTarget, WorktreeState};
     use fleet_domain::ids::{GoalId, RunId, Sha, TaskId};
+    use fleet_domain::redact::Redactor;
     use fleet_domain::value::Value;
     use neo_verify::contract::VerificationContract;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
-    fn rd() -> Arc<Redactor> {
-        Arc::new(Redactor::builtin())
+    fn rd() -> JobContext {
+        JobContext {
+            redactor: Arc::new(Redactor::builtin()),
+            tracker: JobTracker::new(),
+        }
     }
 
     fn token() -> String {

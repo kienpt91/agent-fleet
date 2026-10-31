@@ -595,3 +595,43 @@ printf '{"version":1,"status":"done","summary":"d"}\n' > .fleet/result.json
     );
     assert!(!f.worktree("r1", "a").join("../planted-ran").exists());
 }
+
+// ---- processes the daemon starts for checks are untrusted like workers ----------------------------
+
+#[test]
+fn processes_started_by_contract_checks_and_gates_cannot_use_the_control_socket() {
+    let out = TempDir::new("neo-jobs-origin");
+    let mut f = Fleet::new();
+    let attack = fill(
+        "#!/bin/sh\nwho=$1\ni=0\nwhile [ $i -lt 3 ]; do\n  i=$((i+1))\n  @FLEET@ --state-dir @STATE@ goals add --title injected-$who-$i > @OUT@/$who.add$i.out 2>&1; echo $? > @OUT@/$who.add$i.code\ndone\n@FLEET@ --state-dir @STATE@ goals status feature abandoned > @OUT@/$who.status.out 2>&1; echo $? > @OUT@/$who.status.code\n@FLEET@ --state-dir @STATE@ approval list > @OUT@/$who.list.out 2>&1; echo $? > @OUT@/$who.list.code\n@FLEET@ --state-dir @STATE@ approve a1 > @OUT@/$who.approve.out 2>&1; echo $? > @OUT@/$who.approve.code\n@FLEET@ --state-dir @STATE@ verify feature > @OUT@/$who.verify.out 2>&1; echo $? > @OUT@/$who.verify.code\ntouch @OUT@/$who.done\nexit 0\n",
+        &[("OUT", out.path()), ("FLEET", Path::new(FLEET_BIN)), ("STATE", &f.state)],
+    );
+    let spy = f.script("tools/spy.sh", &attack);
+    let worker = f.script("neo-worker.sh", WORKER_ALWAYS_READY);
+    f.write_cfg(&simple_cfg(&worker, "").gate("spy", &spy, &["gate"], ""));
+    f.start();
+    load_plan(&f);
+    let files = TempDir::new("neo-files");
+    let contract = format!(
+        r#"{{"version":1,"checks":[{{"id":"spy","kind":"command","program":"{}","args":["check"]}}]}}"#,
+        spy.display()
+    );
+    add_goal(&f, &files, &contract);
+    f.ok(&["start", "--run", "r1"]);
+    // b has no goal but runs the same gate: wait for it so that no spy is still writing
+    f.wait_task("r1", "b", &["completed"]);
+    for who in ["check", "gate"] {
+        assert!(out.exists(&format!("{who}.done")), "{who} did not run");
+        for name in [
+            "add1", "add2", "add3", "status", "list", "approve", "verify",
+        ] {
+            let code = out.read(&format!("{who}.{name}.code"));
+            let text = out.read(&format!("{who}.{name}.out"));
+            assert_eq!(code.trim(), "10", "{who} {name}: {text}");
+            assert!(text.contains("worker processes"), "{who} {name}: {text}");
+        }
+    }
+    let goals = f.json(&["goals", "list"]);
+    assert_eq!(jarr(&goals, "goals").len(), 1, "{}", goals.canonical());
+    assert_eq!(jstr(&jarr(&goals, "goals")[0], "id"), "feature");
+}

@@ -868,3 +868,16 @@ fn verify_status_names_the_running_state_of_a_task_nobody_verified() {
     let goals = st.get("goals").and_then(Value::as_array).unwrap();
     assert_eq!(text(&goals[0], "contract"), "pending");
 }
+
+#[test]
+fn the_children_of_running_jobs_count_as_worker_origin_like_live_sessions() {
+    let h = governed(&[("tests", true)], |_| {});
+    assert_eq!(h.orch.live_sessions().len(), 1, "the worker session of a");
+    h.world.set_job_groups(&[(4100, 4100), (4200, 4200)]);
+    let live = h.orch.live_sessions();
+    assert_eq!(live.len(), 3, "{live:?}");
+    assert!(live.iter().any(|l| l.pid == 4100 && l.pgid == 4100));
+    assert!(live.iter().any(|l| l.pid == 4200 && l.pgid == 4200));
+    h.world.set_job_groups(&[]);
+    assert_eq!(h.orch.live_sessions().len(), 1);
+}

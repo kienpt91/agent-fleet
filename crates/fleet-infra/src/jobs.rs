@@ -12,6 +12,7 @@ use fleet_domain::limits::MAX_GATE_OUTPUT;
 use fleet_domain::quality::{evaluate_exit, evaluate_refcheck, ExitKind, GateFormat, GateOutcome};
 use fleet_domain::redact::{Redactor, StreamRedactor};
 use fleet_domain::sanitize::{sanitize_text, tail_str};
+use fleet_domain::supervision::LiveSession;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use std::fs;
@@ -57,6 +58,60 @@ pub struct RunResult {
     pub exit: ExitKind,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+/// The process groups of the children jobs have started and not yet cleaned up. The daemon
+/// treats every process in one of them, and every process one of them started, like a worker:
+/// the code a job runs (a quality gate, an approved command, a verification check running
+/// `make test` or `sh script`) is made of files a worker wrote, so it is untrusted too.
+#[derive(Clone, Default)]
+pub struct JobTracker(Arc<Mutex<Vec<u32>>>);
+
+impl JobTracker {
+    pub fn new() -> JobTracker {
+        JobTracker::default()
+    }
+
+    /// The groups alive now (each child leads its own group, so pid and pgid are the same).
+    pub fn live(&self) -> Vec<LiveSession> {
+        lock(&self.0)
+            .iter()
+            .map(|pid| LiveSession {
+                pid: *pid,
+                pgid: *pid,
+            })
+            .collect()
+    }
+
+    fn track(&self, pid: u32) -> Tracked {
+        lock(&self.0).push(pid);
+        Tracked {
+            tracker: self.clone(),
+            pid,
+        }
+    }
+}
+
+/// Keeps a child registered until the job has dealt with its whole process group.
+struct Tracked {
+    tracker: JobTracker,
+    pid: u32,
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        let mut all = lock(&self.tracker.0);
+        if let Some(i) = all.iter().position(|p| *p == self.pid) {
+            all.swap_remove(i);
+        }
+    }
+}
+
+/// What a job needs from the adapter besides its own description.
+#[derive(Clone)]
+pub struct JobContext {
+    pub redactor: Arc<Redactor>,
+    pub tracker: JobTracker,
 }
 
 fn spawn_failed(why: impl Into<String>) -> RunResult {
@@ -245,6 +300,12 @@ fn status_kind(status: ExitStatus) -> ExitKind {
 
 /// Runs one program to completion within the limits of `spec`. Never panics, never uses a shell.
 pub fn run_bounded(spec: &RunSpec) -> RunResult {
+    run_bounded_tracked(spec, &JobTracker::new())
+}
+
+/// [`run_bounded`], with the child's process group registered in `tracker` from the moment the
+/// child exists until its group was killed and the output readers are done.
+pub fn run_bounded_tracked(spec: &RunSpec, tracker: &JobTracker) -> RunResult {
     let Some(program) = resolve_program(&spec.program, &spec.cwd, &spec.env) else {
         return spawn_failed(format!(
             "program {} not found or not executable",
@@ -267,6 +328,7 @@ pub fn run_bounded(spec: &RunSpec) -> RunResult {
         Err(e) => return spawn_failed(e.to_string()),
     };
     let pid = child.id();
+    let _tracked = tracker.track(pid);
 
     let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
         terminate(&mut child, pid);
@@ -354,32 +416,38 @@ fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<std::process::C
 }
 
 /// Last `max` bytes of `bytes`.
-fn last_bytes(bytes: &[u8], max: usize) -> &[u8] {
-    bytes.split_at(bytes.len().saturating_sub(max)).1
-}
-
-/// Lossy text of stdout (+ stderr under a separator), at most the last 64 KiB.
-pub(crate) fn combined_text(result: &RunResult) -> String {
-    let mut bytes = last_bytes(&result.stdout, OUTPUT_TEXT_BYTES).to_vec();
+/// Lossy text of stdout (+ stderr under a separator), redacted line by line over the *whole*
+/// capture (at most 4 MiB per stream) and only then cut to the last 64 KiB. Cutting first would
+/// let a token or a private-key block that spans the cut lose the part the redaction rules
+/// recognize.
+pub(crate) fn redacted_tail(result: &RunResult, redactor: &Arc<Redactor>) -> String {
+    let mut text = redact_block(redactor, &String::from_utf8_lossy(&result.stdout));
     if !result.stderr.is_empty() {
-        bytes.extend_from_slice(STDERR_SEPARATOR.as_bytes());
-        bytes.extend_from_slice(last_bytes(&result.stderr, OUTPUT_TEXT_BYTES));
+        text.push_str(STDERR_SEPARATOR);
+        text.push_str(&redact_block(
+            redactor,
+            &String::from_utf8_lossy(&result.stderr),
+        ));
     }
-    let text = String::from_utf8_lossy(&bytes);
     tail_str(&text, OUTPUT_TEXT_BYTES).to_string()
 }
 
-fn run_gate(worktree: &Path, gate: &GateSpec, redactor: &Arc<Redactor>) -> GateOutcome {
-    let result = run_bounded(&RunSpec {
-        program: gate.program.clone(),
-        args: gate.args.clone(),
-        cwd: worktree.to_path_buf(),
-        env: gate.env.clone(),
-        timeout_ms: gate.timeout_ms,
-        max_output: MAX_GATE_OUTPUT,
-    });
-    // Redacted before evaluation so a cut at the tail limit cannot leave half a secret behind.
-    let text = redact_block(redactor, &combined_text(&result));
+fn run_gate(worktree: &Path, gate: &GateSpec, ctx: &JobContext) -> GateOutcome {
+    let redactor = &ctx.redactor;
+    let result = run_bounded_tracked(
+        &RunSpec {
+            program: gate.program.clone(),
+            args: gate.args.clone(),
+            cwd: worktree.to_path_buf(),
+            env: gate.env.clone(),
+            timeout_ms: gate.timeout_ms,
+            max_output: MAX_GATE_OUTPUT,
+        },
+        &ctx.tracker,
+    );
+    // Redacted before evaluation, and the whole capture before it is cut to its tail, so a cut
+    // can neither leave half a secret behind nor hide the start of a key block.
+    let text = redacted_tail(&result, redactor);
     let mut outcome = match gate.format {
         GateFormat::Exit => evaluate_exit(&gate.name, &result.exit, &text),
         GateFormat::RefcheckJson => {
@@ -409,9 +477,9 @@ fn command_summary(exit: &ExitKind) -> String {
 }
 
 /// Runs a job to completion on the calling thread.
-fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
+fn execute(job: &Job, ctx: &JobContext) -> JobDone {
     match job {
-        Job::Verify(v) => JobDone::Verify(Box::new(crate::verify::run_verify(v, redactor))),
+        Job::Verify(v) => JobDone::Verify(Box::new(crate::verify::run_verify(v, ctx))),
         Job::Gates {
             run,
             task,
@@ -421,10 +489,7 @@ fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
         } => {
             let dir = PathBuf::from(worktree);
             // Every gate runs, also after a failure: the retry brief lists all of them.
-            let outcomes = gates
-                .iter()
-                .map(|gate| run_gate(&dir, gate, redactor))
-                .collect();
+            let outcomes = gates.iter().map(|gate| run_gate(&dir, gate, ctx)).collect();
             JobDone::Gates {
                 run: run.clone(),
                 task: task.clone(),
@@ -451,15 +516,18 @@ fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
                     };
                 }
             };
-            let result = run_bounded(&RunSpec {
-                program: program.display().to_string(),
-                args: args.clone(),
-                cwd: PathBuf::from(worktree),
-                env: env.clone(),
-                timeout_ms: *timeout_ms,
-                max_output: MAX_GATE_OUTPUT,
-            });
-            let text = redact_block(redactor, &sanitize_text(combined_text(&result).as_bytes()));
+            let result = run_bounded_tracked(
+                &RunSpec {
+                    program: program.display().to_string(),
+                    args: args.clone(),
+                    cwd: PathBuf::from(worktree),
+                    env: env.clone(),
+                    timeout_ms: *timeout_ms,
+                    max_output: MAX_GATE_OUTPUT,
+                },
+                &ctx.tracker,
+            );
+            let text = sanitize_text(redacted_tail(&result, &ctx.redactor).as_bytes());
             JobDone::Command {
                 approval: approval.clone(),
                 exit_code: match result.exit {
@@ -520,13 +588,13 @@ impl Drop for RunningGuard {
 /// channel and collected by [`JobRunner::poll`].
 pub struct ThreadJobRunner {
     max_concurrent: usize,
-    redactor: Arc<Redactor>,
+    ctx: JobContext,
     running: Arc<AtomicUsize>,
     tx: Sender<JobDone>,
     rx: Receiver<JobDone>,
 }
 
-type JobFn = fn(&Job, &Arc<Redactor>) -> JobDone;
+type JobFn = fn(&Job, &JobContext) -> JobDone;
 
 impl ThreadJobRunner {
     /// `redactor` is applied to everything gates and commands print before it is reported.
@@ -534,7 +602,10 @@ impl ThreadJobRunner {
         let (tx, rx) = channel();
         ThreadJobRunner {
             max_concurrent,
-            redactor,
+            ctx: JobContext {
+                redactor,
+                tracker: JobTracker::new(),
+            },
             running: Arc::new(AtomicUsize::new(0)),
             tx,
             rx,
@@ -552,12 +623,12 @@ impl ThreadJobRunner {
         self.running.fetch_add(1, Ordering::SeqCst);
         let counter = Arc::clone(&self.running);
         let tx = self.tx.clone();
-        let redactor = Arc::clone(&self.redactor);
+        let ctx = self.ctx.clone();
         let spawned = thread::Builder::new()
             .name("fleet-job".into())
             .spawn(move || {
                 let guard = RunningGuard(counter);
-                let done = catch_unwind(AssertUnwindSafe(|| exec(&job, &redactor)))
+                let done = catch_unwind(AssertUnwindSafe(|| exec(&job, &ctx)))
                     .unwrap_or_else(|_| panic_result(&job));
                 // The result is queued before the job stops counting as running.
                 let _ = tx.send(done);
@@ -583,6 +654,10 @@ impl JobRunner for ThreadJobRunner {
 
     fn running(&self) -> usize {
         self.running.load(Ordering::SeqCst)
+    }
+
+    fn live(&self) -> Vec<LiveSession> {
+        self.ctx.tracker.live()
     }
 }
 
@@ -853,6 +928,13 @@ mod tests {
         Arc::new(Redactor::builtin())
     }
 
+    fn ctx() -> JobContext {
+        JobContext {
+            redactor: rd(),
+            tracker: JobTracker::new(),
+        }
+    }
+
     fn gate(dir: &TempDir, name: &str, body: &str, format: GateFormat) -> GateSpec {
         let script = dir.script(&format!("{name}.sh"), &format!("#!/bin/sh\n{body}\n"));
         GateSpec {
@@ -868,7 +950,7 @@ mod tests {
     fn run_one(body: &str, format: GateFormat) -> GateOutcome {
         let dir = TempDir::new("job-gate");
         let g = gate(&dir, "g", body, format);
-        run_gate(dir.path(), &g, &rd())
+        run_gate(dir.path(), &g, &ctx())
     }
 
     #[test]
@@ -945,10 +1027,10 @@ mod tests {
         let dir = TempDir::new("job-gate-bad");
         let mut slow = gate(&dir, "slow", "sleep 30", GateFormat::Exit);
         slow.timeout_ms = 300;
-        assert_eq!(run_gate(dir.path(), &slow, &rd()).summary, "timed out");
+        assert_eq!(run_gate(dir.path(), &slow, &ctx()).summary, "timed out");
         let mut missing = gate(&dir, "missing", "", GateFormat::Exit);
         missing.program = "/nonexistent/prog".to_string();
-        let o = run_gate(dir.path(), &missing, &rd());
+        let o = run_gate(dir.path(), &missing, &ctx());
         assert!(!o.passed);
         assert!(o.summary.starts_with("could not start"), "{o:?}");
     }
@@ -979,7 +1061,7 @@ mod tests {
             task,
             attempt,
             outcomes,
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a gates result");
         };
@@ -1001,7 +1083,7 @@ mod tests {
         let work = dir.join("wt");
         std::fs::create_dir_all(&work).unwrap();
         let g = gate(&dir, "pwd", "echo here > marker", GateFormat::Exit);
-        let o = run_gate(&work, &g, &rd());
+        let o = run_gate(&work, &g, &ctx());
         assert!(o.passed);
         assert!(work.join("marker").exists());
     }
@@ -1035,7 +1117,7 @@ mod tests {
             exit_code,
             summary,
             output,
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1050,7 +1132,7 @@ mod tests {
     fn command_job_output_is_a_bounded_tail() {
         let dir = TempDir::new("job-cmd-tail");
         let job = command_job(&dir, "i=0; while [ $i -lt 2000 ]; do echo line-$i-padding-padding-padding; i=$((i+1)); done; echo THE-END", 20_000);
-        let JobDone::Command { output, .. } = execute(&job, &rd()) else {
+        let JobDone::Command { output, .. } = execute(&job, &ctx()) else {
             panic!("expected a command result");
         };
         assert!(output.len() <= COMMAND_OUTPUT_BYTES);
@@ -1062,7 +1144,7 @@ mod tests {
         let dir = TempDir::new("job-cmd-fail");
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&command_job(&dir, "sleep 30", 300), &rd())
+        } = execute(&command_job(&dir, "sleep 30", 300), &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1070,7 +1152,7 @@ mod tests {
 
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&command_job(&dir, "kill -9 $$", 10_000), &rd())
+        } = execute(&command_job(&dir, "kill -9 $$", 10_000), &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1086,7 +1168,7 @@ mod tests {
         };
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1132,6 +1214,126 @@ mod tests {
             got.len()
         );
         got
+    }
+
+    // ---- process groups of running jobs count as worker origin ------------------------------
+
+    fn live_pids(runner: &ThreadJobRunner) -> Vec<(u32, u32)> {
+        runner.live().iter().map(|l| (l.pid, l.pgid)).collect()
+    }
+
+    #[test]
+    fn the_children_of_running_jobs_are_listed_until_their_group_is_gone() {
+        let dir = TempDir::new("job-live");
+        let mut runner = ThreadJobRunner::new(4, rd());
+        assert!(runner.live().is_empty());
+        // a command job whose child leaves a grandchild behind in the group, then waits
+        let job = command_job(
+            &dir,
+            "echo $$ > pid; (sleep 5 &) ; i=0; while [ ! -f go ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done",
+            20_000,
+        );
+        let Job::Command { worktree, .. } = &job else {
+            panic!("a command job")
+        };
+        let wt = PathBuf::from(worktree);
+        runner.start(job).unwrap();
+        assert!(wait_until(10_000, || wt.join("pid").exists()));
+        let pid: u32 = std::fs::read_to_string(wt.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let live = live_pids(&runner);
+        assert_eq!(live, vec![(pid, pid)], "the group leader is registered");
+        std::fs::write(wt.join("go"), "").unwrap();
+        collect(&mut runner, 1);
+        // the result is queued before the guard of the child is dropped; both happen right away
+        assert!(wait_until(5_000, || runner.live().is_empty()));
+        assert!(
+            !crate::procid::group_exists(pid),
+            "the group was killed before it was forgotten"
+        );
+    }
+
+    #[test]
+    fn gates_and_several_jobs_at_once_are_all_listed() {
+        let dir = TempDir::new("job-live-gates");
+        let mut runner = ThreadJobRunner::new(4, rd());
+        let slow = gate(
+            &dir,
+            "slow",
+            "echo $$ > pid-slow; i=0; while [ ! -f go ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done",
+            GateFormat::Exit,
+        );
+        runner.start(gates_job(&dir, vec![slow])).unwrap();
+        assert!(wait_until(10_000, || dir.exists("pid-slow")));
+        let pid: u32 = dir.read("pid-slow").trim().parse().unwrap();
+        assert_eq!(live_pids(&runner), vec![(pid, pid)]);
+        dir.write("go", "");
+        collect(&mut runner, 1);
+        assert!(wait_until(5_000, || runner.live().is_empty()));
+    }
+
+    #[test]
+    fn a_child_that_cannot_start_is_never_listed() {
+        let tracker = JobTracker::new();
+        let dir = TempDir::new("job-live-none");
+        let r = run_bounded_tracked(&spec(Path::new("/nonexistent/prog"), &[], &dir), &tracker);
+        assert!(matches!(r.exit, ExitKind::SpawnFailed(_)));
+        assert!(tracker.live().is_empty());
+    }
+
+    // ---- redaction happens on the whole capture, before the tail is cut ---------------------------
+
+    /// What the code did before: cut the last 64 KiB, then redact.
+    fn legacy_cut_then_redact(result: &RunResult) -> String {
+        let text = String::from_utf8_lossy(&result.stdout);
+        redact_block(&rd(), tail_str(&text, OUTPUT_TEXT_BYTES))
+    }
+
+    #[test]
+    fn a_token_that_spans_the_start_of_the_kept_tail_is_still_redacted() {
+        let token = token();
+        // the kept window starts 12 bytes into the token
+        let keep_after_token = OUTPUT_TEXT_BYTES - (token.len() - 12) - 1;
+        let result = RunResult {
+            exit: ExitKind::Code(0),
+            stdout: format!(
+                "{}\n{token}{}\n",
+                "x".repeat(1000),
+                "y".repeat(keep_after_token)
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+        };
+        let fragment = &token[12..];
+        assert!(
+            legacy_cut_then_redact(&result).contains(fragment),
+            "the scenario must leak with the old order (it is the finding)"
+        );
+        let text = redacted_tail(&result, &rd());
+        assert!(!text.contains(fragment), "{}", &text[..80.min(text.len())]);
+        assert!(!text.contains(&token));
+        assert!(text.len() <= OUTPUT_TEXT_BYTES);
+    }
+
+    #[test]
+    fn a_private_key_block_that_starts_before_the_kept_tail_is_dropped_whole() {
+        let body = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\n".repeat(40);
+        let block = format!(
+            "-----BEGIN {} KEY-----\n{body}-----END {} KEY-----\n",
+            "PRIVATE", "PRIVATE"
+        );
+        let filler = "z".repeat(OUTPUT_TEXT_BYTES);
+        let result = RunResult {
+            exit: ExitKind::Code(0),
+            stdout: format!("{filler}\n{block}after\n").into_bytes(),
+            stderr: format!("{filler}\n{block}err-after\n").into_bytes(),
+        };
+        let text = redacted_tail(&result, &rd());
+        assert!(!text.contains("QUJDREVG"), "{text}");
+        assert!(text.contains("err-after"));
     }
 
     #[test]
@@ -1199,7 +1401,7 @@ mod tests {
         assert_eq!(runner.running(), 0);
     }
 
-    fn exploding(_: &Job, _: &Arc<Redactor>) -> JobDone {
+    fn exploding(_: &Job, _: &JobContext) -> JobDone {
         panic!("simulated failure inside a job");
     }
 
@@ -1349,7 +1551,7 @@ mod tests {
             summary,
             output,
             ..
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1374,7 +1576,7 @@ mod tests {
         };
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1426,7 +1628,7 @@ mod tests {
             GateFormat::Exit,
         );
         g.args = vec![token()];
-        let o = run_gate(dir.path(), &g, &rd());
+        let o = run_gate(dir.path(), &g, &ctx());
         assert!(!o.passed);
         assert!(
             !o.output.contains(&token()) && !o.summary.contains(&token()),
@@ -1445,7 +1647,7 @@ mod tests {
         let body = r#"printf '{"version":1,"summary":{"errors":1},"findings":[{"severity":"error","file":"a.rs","line":3,"message":"leaked %s"}]}\n' "$1"; exit 1"#;
         let mut g = gate(&dir, "refcheck", body, GateFormat::RefcheckJson);
         g.args = vec![token()];
-        let o = run_gate(dir.path(), &g, &rd());
+        let o = run_gate(dir.path(), &g, &ctx());
         assert!(!o.passed);
         assert!(
             !o.output.contains(&token()) && !o.summary.contains(&token()),
@@ -1461,7 +1663,7 @@ mod tests {
         if let Job::Command { args, .. } = &mut job {
             args.push(token());
         }
-        let JobDone::Command { output, .. } = execute(&job, &rd()) else {
+        let JobDone::Command { output, .. } = execute(&job, &ctx()) else {
             panic!("expected a command result");
         };
         assert!(!output.contains(&token()), "{output}");

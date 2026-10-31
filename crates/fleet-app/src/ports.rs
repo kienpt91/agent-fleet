@@ -355,6 +355,10 @@ pub trait JobRunner: Send {
     /// Results that arrived since the last call.
     fn poll(&mut self) -> Vec<JobDone>;
     fn running(&self) -> usize;
+    /// The process groups of the children running jobs have started. They run code a worker
+    /// wrote (gates, approved commands, verification checks): the origin check of the control
+    /// socket treats them, and what they start, like workers.
+    fn live(&self) -> Vec<LiveSession>;
 }
 
 // ---- stored output ------------------------------------------------------------------------------

@@ -139,9 +139,13 @@ impl Orchestrator {
         self.live.len()
     }
 
-    /// Live sessions for the control socket's worker-origin check.
+    /// The process groups that count as worker origin for the control socket: live worker
+    /// sessions and the children of running jobs (gates, approved commands, verification checks),
+    /// which execute files a worker wrote.
     pub fn live_sessions(&self) -> Vec<fleet_domain::supervision::LiveSession> {
-        self.ports.sessions.live()
+        let mut live = self.ports.sessions.live();
+        live.extend(self.ports.jobs.live());
+        live
     }
 
     /// The session of a live task, for the transport's attach and send paths.
