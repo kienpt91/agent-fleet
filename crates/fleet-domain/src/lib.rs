@@ -11,9 +11,12 @@
 )]
 
 pub mod approval;
+pub mod brief;
+pub mod chain;
 pub mod contract;
 pub mod dag;
 pub mod decision;
+pub mod env;
 pub mod error;
 pub mod events;
 pub mod fleet;
