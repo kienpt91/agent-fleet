@@ -10,7 +10,7 @@
 
 use super::context_state::HandoffClass;
 use crate::orchestrator::{Key, Orchestrator};
-use crate::ports::{StoredPack, TreeListing};
+use crate::ports::{StoredPack, TreeFile, TreeListing};
 use fleet_domain::contract::ContractRead;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
@@ -26,6 +26,7 @@ use neo_context::pack::Pack;
 use neo_goals::goal::Goal;
 use neo_verify::contract::{Check, CheckKind, FileAssertion};
 use neo_verify::glob::Glob;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Files listed per commit when selecting the working set.
@@ -94,6 +95,13 @@ pub(crate) fn describe_check(check: &Check) -> (String, String) {
     (check.kind.name().to_string(), what)
 }
 
+/// Goals in the order of their ids. The ledger lists them in the order they were added; a pack
+/// must not depend on that, only on which goals there are.
+fn by_id(mut goals: Vec<&Goal>) -> Vec<&Goal> {
+    goals.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    goals
+}
+
 fn short(s: &str) -> String {
     s.get(..12).unwrap_or(s).to_string()
 }
@@ -142,7 +150,7 @@ impl Orchestrator {
     /// every contract that governs it.
     pub(crate) fn verification_lines(&self, key: &Key) -> Vec<VerificationLine> {
         let mut lines = Vec::new();
-        for goal in self.ledger.governing(&key.0, &key.1) {
+        for goal in by_id(self.ledger.governing(&key.0, &key.1)) {
             let Some(attached) = &goal.contract else {
                 continue;
             };
@@ -240,9 +248,14 @@ impl Orchestrator {
     }
 
     /// The files layer 6 shows (as the repository had them at the run's base commit), the paths
-    /// and committed files of the worker's own work (layer 7, UNVERIFIED), and every path that was
-    /// a candidate (for scoping facts).
-    fn repository_inputs(&self, key: &Key) -> Result<RepositoryInputs> {
+    /// and committed files of the worker's own work (layer 7, UNVERIFIED), and, when asked, the
+    /// files of the base commit that are in the task's scope (for scoping facts).
+    ///
+    /// The scope is made of operator inputs only: the base commit's tree and the paths the task's
+    /// contracts allow (every file when no contract limits the paths). Which paths the worker's
+    /// commits changed steers which files layer 6 shows first, and nothing else: it never decides
+    /// what layers 1 to 5 hold.
+    fn repository_inputs(&self, key: &Key, need_scope: bool) -> Result<RepositoryInputs> {
         let run = self.state.run(&key.0)?;
         let task = run
             .task(&key.1)
@@ -270,68 +283,75 @@ impl Orchestrator {
             }
             None => (Vec::new(), 0),
         };
-        let base: TreeListing = if changed.is_empty() && allowed.is_empty() {
+        let base: TreeListing = if changed.is_empty() && allowed.is_empty() && !need_scope {
             TreeListing::default()
         } else {
             self.ports
                 .vcs
                 .tree_files(repo, &run.base_sha, MAX_TREE_FILES)?
         };
-        let readable = |f: &&crate::ports::TreeFile| f.size <= MAX_FILE_READ;
-        let mut chosen: Vec<(&crate::ports::TreeFile, Selection)> = Vec::new();
+        // looked up by path, not searched for: the paths a worker changed are many and its choice
+        let by_path: BTreeMap<&str, &TreeFile> =
+            base.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        let readable = |f: &TreeFile| f.size <= MAX_FILE_READ;
+        let mut chosen: Vec<(&TreeFile, Selection)> = Vec::new();
+        let mut chosen_paths: BTreeSet<&str> = BTreeSet::new();
         for path in &changed {
-            if let Some(f) = base.files.iter().filter(readable).find(|f| &f.path == path) {
-                chosen.push((f, Selection::Changed));
+            if chosen.len() >= neo_context::limits::MAX_EXCERPTS {
+                break;
+            }
+            if let Some(f) = by_path.get(path.as_str()).filter(|f| readable(f)) {
+                if chosen_paths.insert(f.path.as_str()) {
+                    chosen.push((f, Selection::Changed));
+                }
             }
         }
-        for f in base.files.iter().filter(readable) {
-            if chosen.iter().any(|(c, _)| c.path == f.path) {
-                continue;
+        for f in base.files.iter().filter(|f| readable(f)) {
+            if chosen.len() >= neo_context::limits::MAX_EXCERPTS {
+                break;
             }
-            if allowed.iter().any(|g| g.matches(&f.path)) {
+            if !chosen_paths.contains(f.path.as_str()) && allowed.iter().any(|g| g.matches(&f.path))
+            {
+                chosen_paths.insert(f.path.as_str());
                 chosen.push((f, Selection::Allowed));
             }
         }
-        chosen.truncate(neo_context::limits::MAX_EXCERPTS);
         let mut files = Vec::with_capacity(chosen.len());
-        let mut candidates: Vec<String> = changed.clone();
         for (f, selection) in &chosen {
             files.push(self.read_excerpt(repo, f, *selection)?);
-            candidates.push(f.path.clone());
         }
+        let scope: Vec<String> = if need_scope {
+            base.files
+                .iter()
+                .filter(|f| allowed.is_empty() || allowed.iter().any(|g| g.matches(&f.path)))
+                .map(|f| f.path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let mut work = Vec::new();
         if let Some(head) = &task.head {
             if !changed.is_empty() {
                 let at_head = self.ports.vcs.tree_files(repo, head, MAX_TREE_FILES)?;
+                let head_by_path: BTreeMap<&str, &TreeFile> =
+                    at_head.files.iter().map(|f| (f.path.as_str(), f)).collect();
                 for path in changed.iter() {
                     if work.len() >= WORK_FILES {
                         break;
                     }
-                    if let Some(f) = at_head
-                        .files
-                        .iter()
-                        .find(|f| &f.path == path && f.size <= MAX_FILE_READ)
-                    {
+                    if let Some(f) = head_by_path.get(path.as_str()).filter(|f| readable(f)) {
                         work.push(self.read_excerpt(repo, f, Selection::Changed)?);
                     }
                 }
             }
         }
-        candidates.sort();
-        candidates.dedup();
         let paths = changed
             .into_iter()
             .take(neo_context::limits::MAX_STAT_PATHS)
             .map(|path| ChangedPath { path })
             .collect();
-        Ok((
-            WorkingSetInput { files },
-            paths,
-            changed_total,
-            work,
-            candidates,
-        ))
+        Ok((WorkingSetInput { files }, paths, changed_total, work, scope))
     }
 
     /// Everything one compile of the pack of `key` needs.
@@ -365,9 +385,7 @@ impl Orchestrator {
             title: t.title.clone(),
         };
         let plan = PlanInput {
-            goals: self
-                .ledger
-                .owners_of(&key.0, &key.1)
+            goals: by_id(self.ledger.owners_of(&key.0, &key.1))
                 .into_iter()
                 .map(|g| GoalLine {
                     id: g.id.to_string(),
@@ -401,9 +419,7 @@ impl Orchestrator {
                 .collect(),
         };
 
-        let contracts = self
-            .ledger
-            .governing(&key.0, &key.1)
+        let contracts = by_id(self.ledger.governing(&key.0, &key.1))
             .into_iter()
             .filter_map(|g| {
                 g.contract.as_ref().map(|c| ContractLines {
@@ -434,19 +450,30 @@ impl Orchestrator {
             verification: self.verification_lines(key),
         };
 
-        let (working_set, changed, changed_total, work, candidates) =
-            self.repository_inputs(key)?;
+        // Layer 5 is operator-written. A knowledge file inside the run's repository (or one of its
+        // worktrees, which live below it) is a file a worker can write, so it is not used.
+        if let Some(file) = &self.cfg.context.knowledge {
+            let repo = run.repo.trim_end_matches('/');
+            if file == repo || file.starts_with(&format!("{repo}/")) {
+                return Err(FleetError::invalid(format!(
+                    "the knowledge file {} is inside the repository of run {}, where a worker can write; keep it outside",
+                    fleet_domain::ids::show(file),
+                    key.0
+                )));
+            }
+        }
+        let entries = self.ports.knowledge.entries()?;
+        let need_scope = entries.iter().any(|e| !e.paths.is_empty());
+        let (working_set, changed, changed_total, work, scope) =
+            self.repository_inputs(key, need_scope)?;
 
         let globs_match = |paths: &[String]| -> bool {
             paths.iter().any(|p| match Glob::new(p) {
-                Ok(g) => candidates.iter().any(|c| g.matches(c)),
+                Ok(g) => scope.iter().any(|c| g.matches(c)),
                 Err(_) => false,
             })
         };
-        let knowledge = self
-            .ports
-            .knowledge
-            .entries()?
+        let knowledge = entries
             .into_iter()
             .filter(|e| e.paths.is_empty() || globs_match(&e.paths))
             .map(|e| e.fact)

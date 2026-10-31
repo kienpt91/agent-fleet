@@ -58,6 +58,8 @@ pub struct Orchestrator {
     /// Summaries workers left in `.fleet/handoff.json`, kept (UNVERIFIED) until the handoff of
     /// their attempt is made.
     pub(crate) handoff_summaries: BTreeMap<Key, String>,
+    /// Ticks a task's next attempt has waited for the handoff of the last one.
+    pub(crate) handoff_waits: BTreeMap<Key, u32>,
     pub(crate) policy: Policy,
     pub(crate) live: BTreeMap<Key, Live>,
     /// Quality-gate jobs in flight: (run, task, attempt).
@@ -116,6 +118,7 @@ impl Orchestrator {
             ledger,
             context,
             handoff_summaries: BTreeMap::new(),
+            handoff_waits: BTreeMap::new(),
             policy,
             live: BTreeMap::new(),
             gate_jobs: BTreeSet::new(),

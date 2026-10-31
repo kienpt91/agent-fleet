@@ -726,3 +726,257 @@ fn a_pack_the_store_forgot_is_not_found_not_tampered() {
         .call("context.show", Value::object([("task", s("r1/a"))]))
         .is_ok());
 }
+
+// ---- what decides layers 1 to 5 -------------------------------------------------------------
+
+use fleet_app::ports::KnowledgeEntry;
+use neo_context::input::Fact;
+
+fn entry(id: &str, paths: &[&str]) -> KnowledgeEntry {
+    KnowledgeEntry {
+        fact: Fact {
+            id: id.to_string(),
+            claim: format!("claim of {id}"),
+            source: "docs/x.md at commit 0123456".to_string(),
+            freshness: String::new(),
+        },
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+    }
+}
+
+/// The text of one layer of a rendered pack.
+fn layer_text(text: &str, n: u8) -> String {
+    let from = text.find(&format!("@@neo-layer {n} ")).unwrap();
+    let rest = &text[from..];
+    rest[..rest.find(&format!("\n@@neo-end {n} ")).unwrap()].to_string()
+}
+
+#[test]
+fn facts_are_scoped_by_the_repository_and_the_contract_never_by_what_the_worker_changed() {
+    let mut h = Harness::new();
+    h.world.set_repo_files(None, &[("src/a.rs", b"fn a() {}")]);
+    h.world.set_knowledge(vec![
+        entry("in-scope", &["src/**"]),
+        entry("elsewhere", &["docs/**"]),
+        entry("always", &[]),
+    ]);
+    compiled_run(&mut h, Some("compiled"));
+    let shown = h
+        .call("context.show", Value::object([("task", s("r1/a"))]))
+        .unwrap();
+    let l5 = layer_text(shown.data().get("text").and_then(Value::as_str).unwrap(), 5);
+    assert!(l5.contains("[in-scope]") && l5.contains("[always]"), "{l5}");
+    assert!(!l5.contains("[elsewhere]"), "{l5}");
+
+    // the worker commits a change under docs/ and the task completes
+    let wt = h.world.briefs()[0].0.clone();
+    h.world.set_worktree_changes(&["docs/other.md"], false);
+    h.world.write_result(
+        &wt,
+        ContractRead::Valid(WorkerResult {
+            status: ResultStatus::Done,
+            summary: "done".to_string(),
+        }),
+    );
+    let session = h.world.session_for("a").unwrap();
+    h.world.exit(session, 0);
+    h.orch.tick();
+    h.orch.tick();
+    // compiled again from the state as it is now: layer 5 is the same, whatever the worker named
+    let v = h
+        .call("context.verify", Value::object([("task", s("r1/a"))]))
+        .unwrap();
+    let l5_changed = v
+        .data()
+        .get("layers")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .find(|l| l.get("id").and_then(Value::as_u64) == Some(5))
+        .and_then(|l| l.get("changed").and_then(Value::as_bool))
+        .unwrap();
+    assert!(!l5_changed, "layer 5 followed the worker's committed paths");
+}
+
+/// A run whose task is governed by goals added in the given order, started afterwards.
+fn run_with_goals(order: &[&str]) -> Harness {
+    let mut h = Harness::new();
+    h.call(
+        "run.create",
+        Value::object([
+            ("objective", s("o")),
+            ("repo", s("/repo")),
+            ("context", s("compiled")),
+        ]),
+    )
+    .unwrap();
+    h.call(
+        "task.add",
+        Value::object([
+            ("run", s("r1")),
+            ("id", s("a")),
+            ("title", s("task a")),
+            ("spec", s("do it")),
+        ]),
+    )
+    .unwrap();
+    for id in order {
+        let contract = Value::object([
+            ("version", Value::int(1u64)),
+            (
+                "checks",
+                Value::array([Value::object([
+                    ("id", s(&format!("check-{id}"))),
+                    ("kind", s("file")),
+                    ("path", s(&format!("{id}.txt"))),
+                    ("assert", s("exists")),
+                ])]),
+            ),
+        ]);
+        h.call(
+            "goal.add",
+            Value::object([
+                ("id", s(id)),
+                ("title", s(&format!("goal {id}"))),
+                ("tasks", Value::array([s("r1/a")])),
+                ("contract", contract),
+            ]),
+        )
+        .unwrap();
+    }
+    h.call("run.start", Value::object([("run", s("r1"))]))
+        .unwrap();
+    h
+}
+
+#[test]
+fn the_pack_does_not_depend_on_the_order_goals_were_added_in() {
+    let stable_of = |order: &[&str]| -> (String, Vec<String>) {
+        let mut h = run_with_goals(order);
+        let shown = h
+            .call("context.show", Value::object([("task", s("r1/a"))]))
+            .unwrap();
+        let d = shown.data();
+        let layers = d
+            .get("layers")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .take(5)
+            .map(|l| l.get("digest").and_then(Value::as_str).unwrap().to_string())
+            .collect();
+        (
+            d.get("stable_digest")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string(),
+            layers,
+        )
+    };
+    let first = stable_of(&["alpha", "beta", "gamma"]);
+    for order in [
+        ["gamma", "alpha", "beta"],
+        ["beta", "gamma", "alpha"],
+        ["gamma", "beta", "alpha"],
+        ["beta", "alpha", "gamma"],
+        ["alpha", "gamma", "beta"],
+    ] {
+        assert_eq!(stable_of(&order), first, "{order:?}");
+    }
+}
+
+#[test]
+fn a_task_whose_handoff_cannot_be_recorded_fails_with_the_reason_instead_of_waiting_for_ever() {
+    let mut h = Harness::new();
+    compiled_run(&mut h, Some("compiled"));
+    h.world.fail_context_store(true);
+    let session = h.world.session_for("a").unwrap();
+    h.world.exit(session, 1);
+    for _ in 0..12 {
+        h.orch.tick();
+    }
+    let reason = h
+        .world
+        .stored_events()
+        .into_iter()
+        .find_map(|e| match e {
+            DomainEvent::TaskFailed { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("the task is failed");
+    assert!(
+        reason.contains("could not be recorded after 5 tries"),
+        "{reason}"
+    );
+    // and it stopped trying
+    let ticks_before = h.world.stored_events().len();
+    for _ in 0..5 {
+        h.orch.tick();
+    }
+    assert_eq!(h.world.stored_events().len(), ticks_before);
+}
+
+#[test]
+fn a_knowledge_file_inside_the_runs_repository_is_not_used() {
+    let mut cfg = test_config();
+    cfg.context.knowledge = Some("/repo/docs/knowledge.toml".to_string());
+    let mut h = Harness::with_config(cfg);
+    h.call(
+        "run.create",
+        Value::object([
+            ("objective", s("o")),
+            ("repo", s("/repo")),
+            ("context", s("compiled")),
+        ]),
+    )
+    .unwrap();
+    h.call(
+        "task.add",
+        Value::object([("run", s("r1")), ("id", s("a")), ("title", s("t"))]),
+    )
+    .unwrap();
+    h.call("run.start", Value::object([("run", s("r1"))]))
+        .unwrap();
+    let said = h.world.stored_events().into_iter().any(|e| {
+        matches!(&e, DomainEvent::SessionEnded { output_tail, .. } if output_tail.contains("inside the repository"))
+    });
+    assert!(said, "{:?}", h.world.event_kinds());
+    // a file outside it is fine, whatever its name resembles
+    let mut cfg = test_config();
+    cfg.context.knowledge = Some("/repository-notes/knowledge.toml".to_string());
+    let mut h = Harness::with_config(cfg);
+    compiled_run(&mut h, Some("compiled"));
+    assert_eq!(compiled_events(&h).len(), 1);
+}
+
+#[test]
+fn thousands_of_changed_paths_do_not_make_a_pack_slow() {
+    let mut h = Harness::new();
+    let names: Vec<String> = (0..20_000)
+        .map(|n| format!("dir{}/file{n}.rs", n % 50))
+        .collect();
+    let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+    h.world.set_repo_files(None, &files);
+    h.world.set_knowledge(vec![entry("scoped", &["dir7/**"])]);
+    compiled_run(&mut h, Some("compiled"));
+    let wt = h.world.briefs()[0].0.clone();
+    let changed: Vec<&str> = names.iter().take(10_000).map(String::as_str).collect();
+    h.world.set_worktree_changes(&changed, false);
+    h.world.write_result(
+        &wt,
+        ContractRead::Valid(WorkerResult {
+            status: ResultStatus::Done,
+            summary: "done".to_string(),
+        }),
+    );
+    let started = std::time::Instant::now();
+    let session = h.world.session_for("a").unwrap();
+    h.world.exit(session, 0);
+    h.orch.tick();
+    h.orch.tick();
+    let v = h
+        .call("context.verify", Value::object([("task", s("r1/a"))]))
+        .unwrap();
+    assert!(v.data().get("layers").is_some());
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+}

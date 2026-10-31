@@ -13,6 +13,9 @@ use fleet_domain::status::{EndKind, TaskStatus};
 use fleet_domain::supervision::SupervisionPolicy;
 use neo_verify::limits::MAX_CONCURRENT_VERIFICATIONS;
 
+/// Ticks the next attempt of a task waits for the handoff of the last one before the task fails.
+const MAX_HANDOFF_WAITS: u32 = 5;
+
 impl Orchestrator {
     /// Starts workers for ready tasks while capacity allows.
     pub(crate) fn schedule(&mut self) -> Result<()> {
@@ -122,12 +125,34 @@ impl Orchestrator {
         }
         if self.uses_compiled_context(&key) {
             if let Err(e) = self.ensure_restart_handoff(&key, &worktree) {
-                self.warn(format!(
-                    "{run_id}/{task_id}: the handoff of the last attempt could not be recorded, so the next attempt waits: {}",
-                    e.message
-                ));
+                // The next attempt waits for the handoff of the one before it, but not for ever:
+                // after a few ticks the task is failed with the reason, instead of being tried
+                // again by every tick.
+                let tries = {
+                    let n = self.handoff_waits.entry(key.clone()).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if tries >= MAX_HANDOFF_WAITS {
+                    self.handoff_waits.remove(&key);
+                    self.fail_task(
+                        &key,
+                        format!(
+                            "the handoff of the last attempt could not be recorded after {tries} tries: {}",
+                            e.message
+                        ),
+                    );
+                } else {
+                    self.warn(format!(
+                        "{run_id}/{task_id}: the handoff of the last attempt could not be recorded, so the next attempt waits: {}",
+                        e.message
+                    ));
+                }
                 return;
             }
+            self.handoff_waits.remove(&key);
+            // a summary left from an earlier attempt must not be attached to a later handoff
+            self.handoff_summaries.remove(&key);
         }
         // A run that chose compiled context gets a pack compiled by NEO from fleet's own state
         // (and a short brief that points at it); every other run gets the plain brief it always did.
