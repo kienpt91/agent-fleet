@@ -29,7 +29,12 @@ line and the README. When a word is used in one of those places with another mea
 | **Audit log** | The append-only, hash-chained file of events (`events.log`) plus its head file. Tamper-evident, not tamper-proof. |
 | **Orphan** | A session recorded as running by an earlier daemon process. After a restart it is checked (pid *and* start time) and stopped, and its task is queued again. |
 | **Port** | A trait the application layer needs from the outside world (`fleet-app::ports`). **Adapter**: its implementation in `fleet-infra`. |
-| **Origin check** | Control requests from a worker, or from a process a worker started, are refused. |
+| **Origin check** | Control requests from a worker, or from a process a worker started, are refused. The web dashboard applies the same rule to the process at the other end of each TCP connection (*admission*). |
+| **Dashboard** | The local web UI served by `fleet daemon --web <addr>` (`fleet-infra::web`): a thin adapter over a handful of the daemon's own commands, never a second implementation of them. Off by default. |
+| **Web token** | 256 random bits generated at daemon start, held in memory, printed once on the operator's terminal as a login URL (token in the fragment). Opens the dashboard as `Authorization: Bearer` or, exchanged by `POST /api/login`, as a session. Never stored, logged or passed to a worker. Not the control token. |
+| **Web session** | A browser's login: a random id in an `HttpOnly; SameSite=Strict` cookie, with its own **CSRF token** that the page sends in `X-CSRF-Token` with every state-changing request. Bounded in number and lifetime, forgotten at daemon restart. |
+| **Admission** | The check at accept that decides whether a connecting process may talk to the daemon at all: not a worker, not started by one, identifiable (control socket: `SO_PEERCRED`; dashboard: the process holding the client's end of the TCP connection). Fails closed. |
+| **Event stream** | The dashboard's server-sent events for one task's output: sanitized text in bounded chunks, ended after a lifetime or byte budget (the browser reconnects with the last offset). |
 
 ## Layers and the dependency rule
 
@@ -38,8 +43,8 @@ fleet-domain   pure rules: entities, value objects, aggregates, domain services,
                std only. No I/O, clock, randomness, processes, files, network.
 fleet-app      use cases (Orchestrator), commands/replies, read models, port traits,
                in-memory fakes and port contract suites (feature `testing`). Depends on fleet-domain only.
-fleet-infra    adapters: git, ptys, files, hash-chained log, job runner, sockets, TOML config, daemon wiring.
-               Depends on fleet-app and fleet-domain.
+fleet-infra    adapters: git, ptys, files, hash-chained log, job runner, sockets, TOML config, the web dashboard
+               (hand-written HTTP on std::net), daemon wiring. Depends on fleet-app and fleet-domain.
 fleet-cli      the `fleet` binary: argument parsing, terminal output, dashboard, attach. Depends on all of the above.
 ```
 

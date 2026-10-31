@@ -14,8 +14,9 @@ public issue for a vulnerability. This is a hobby-scale project; expect a reply 
 
 Linux and macOS. Windows is not supported (ptys, process groups, unix sockets and `/proc` assumptions).
 The test suite and all numbers in the README were produced on Linux in a container. The macOS code paths
-(`LOCAL_PEERCRED`/`LOCAL_PEERPID` peer checks, `ps`-based process identity, pty behaviour) type-check
-(`cargo check --target aarch64-apple-darwin`) but have **not been run**.
+(`LOCAL_PEERCRED`/`LOCAL_PEERPID` peer checks, `ps`-based process identity, pty behaviour, and the `lsof`-based lookup of
+the process behind a dashboard connection) type-check (`cargo check --target aarch64-apple-darwin`) but have **not been
+run**.
 
 ## Threat model
 
@@ -29,6 +30,8 @@ Who and what is trusted:
 | Repositories handed to a run | Untrusted for execution: hooks, config, filters and attributes inside them are treated as attacker-controlled. |
 | Other users on the machine | Untrusted. The state directory is 0700, the socket 0600 and the peer's uid is checked. |
 | Same-user processes that are not workers | Not defended against (they can do what the operator can). |
+| Web pages in the operator's browser (other origins, other tabs) | **Untrusted.** They can send requests to `127.0.0.1` but have neither the token nor the CSRF token, and Host, Origin and fetch-metadata checks refuse them. |
+| Clients of the web dashboard (`--web`) | The operator (a browser tab or a script that holds the web token) is trusted like the operator on the control socket. Everything else on the network path is untrusted: there is no TLS. |
 
 What the design tries to guarantee, and where it is tested:
 
@@ -44,6 +47,7 @@ What the design tries to guarantee, and where it is tested:
 | Tamper-evident audit log | Hash chain over canonical event text plus a head file created together with the log; truncation, edits, deletions and reordering are detected at start and by `fleet verify-log`; a log with records but no head file is refused. Deleting *both* files starts a fresh history and is not detected | `fleet-domain::chain`, `fleet-infra::eventlog`, `e2e_recovery.rs` |
 | No signal reaches the wrong process | Pid plus process start time (on Linux scoped by the boot id) must match before any signal; only a process group leader is signalled as a group; orphans of an earlier daemon run are checked the same way | `fleet-domain::supervision`, `fleet-infra::procid`, `fleet-infra::pty` |
 | Control socket hygiene | 0700 directory (owner checked, symlinks refused), 0600 socket, `SO_PEERCRED`/`LOCAL_PEERCRED` uid check, flock-based single daemon, stale socket detection, bounded JSON lines, bounded frames, connection cap | `fleet-infra::server`, `statedir`, `client`, `e2e_security.rs` |
+| The web dashboard serves the operator only | Off unless `fleet daemon --web`; loopback unless `--web-allow-remote` (then a warning is printed). Per request: admission (the process holding the client end of the TCP connection must not be a worker or a descendant of one, and must be identifiable: same rule as the control socket, answered 403 before the request is read), strict `Host` check against rebinding, 256-bit per-start token (memory only, printed once on the daemon's terminal, constant-time compare, failed attempts rate limited) as bearer or as an `HttpOnly; SameSite=Strict` session cookie, and for every state-changing request `Origin`, `Sec-Fetch-Site`, a per-session CSRF token and a JSON content type. The UI offers only `status`, `events`, `task.tail`, `task.send`, `gate.resolve`, `approval.decide` and `merge`; approvals still need the displayed digest and a merge still needs its approval. Hand-written HTTP/1.1 with bounded line, head, header count, body, one deadline per request, connection and stream caps. CSP `default-src 'none'; script-src 'self'; ...`, no inline code, `textContent` only, JSON with `<>&`, controls and bidi escaped | `fleet-infra::web::{http,auth,peer,assets}`, `fleet-infra/tests/web_http.rs`, `fleet-cli/tests/e2e_web.rs`, `fleet-app/tests/hostile_text.rs`, `architecture.rs`, soak with a connected stream, `scripts/web-smoke.mjs` |
 
 ## Known limitations (read these)
 
@@ -71,6 +75,30 @@ What the design tries to guarantee, and where it is tested:
 - **The audit log is tamper evident, not tamper proof.** Whoever can rewrite both `events.log` and `events.head`, or delete
   both, can forge or erase history. The head file lives next to the log, so it cannot anchor the log against an attacker
   with write access to the state directory.
+- **The web dashboard does not protect against a same-user hostile process.** The token exists only in the daemon's memory
+  and on the terminal that started it, but a process of yours can read process memory (where `ptrace` is allowed), the
+  terminal's scrollback, the browser's cookie store or its memory, and then act as the operator. Workers are kept off by
+  the admission check (they are refused before the token is even looked at, and they never receive the token), but a
+  worker that detaches from its process tree first, or that reads the operator's terminal or browser, is outside what
+  fleet can see. Run workers as another user, in a container or in a VM for a real boundary.
+- **No TLS.** The dashboard speaks plain HTTP, so it is meant for the loopback interface. The token, the session cookie
+  (which is not `Secure`) and every page cross a non-loopback network in clear text; `--web-allow-remote` exists for
+  trusted networks and prints a warning. For remote use put an SSH tunnel (`ssh -L 7878:127.0.0.1:7878 host`) in front
+  of a loopback dashboard instead. Remote peers cannot be identified (they are not processes of this machine), so for
+  them only the token protects.
+- **The web token lives until the daemon stops.** It is not rotated, and a login URL scrolled back in a terminal stays
+  valid. A session cookie is valid for 12 hours (2 hours idle) and sessions are forgotten when the daemon restarts.
+- **Failed logins lock everyone out for a minute.** Five wrong credentials within a minute lock web authentication for a
+  minute (the limiter is global because every client is a local process), so any local process that can reach the port
+  and pass admission can keep the operator out of the dashboard; the control socket is unaffected.
+- **Admission looks at processes, not at intent.** On Linux it needs `/proc/net/tcp*` and the readable `/proc/<pid>/fd` of
+  the client (same user: readable); where that is hidden every loopback client is refused. On macOS it runs `lsof` and has
+  not been run there. A client that exits before the lookup is refused (fail closed).
+- **The page shows what workers wrote.** Text is sanitized by the domain and rendered as text, so it cannot run or break
+  the layout, but an operator reading a summary or a question can still be misled by its content (prompt injection
+  reaches people too). The exact action and digest of an approval are shown as the daemon holds them.
+- **`merge` and the health panel run on the daemon.** A merge from the web runs git synchronously on the engine thread like
+  `fleet merge`; the health panel re-verifies the whole event log (up to 64 MiB) at most every five seconds when it is open.
 - **Quality gates run on the tree the worker edited.** A worker can influence a gate (for example by editing the
   gate's script if it lives in the repository). Keep gate commands outside the repository.
 - **A path-planted git driver can race.** A merge driver or filter planted by a *concurrently running* worker
@@ -111,7 +139,8 @@ What the design tries to guarantee, and where it is tested:
 - Dependabot (cargo and github-actions, weekly) has a 7 day cooldown so new releases age before they are proposed.
 - GitHub Actions are pinned to a commit SHA; the workflow has `permissions: contents: read` and
   `persist-credentials: false`; it uses the runner's preinstalled rustup and no third-party actions.
-- There is no async runtime, no web framework, no CLI framework and no regex engine.
+- There is no async runtime, no web or HTTP framework (the dashboard's server is hand-written on `std::net`, see ADR 10),
+  no TLS stack, no CLI framework and no regex engine. An architecture test fails if one appears.
 
 Direct dependencies and why they are there:
 
