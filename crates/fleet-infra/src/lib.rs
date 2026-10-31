@@ -19,6 +19,9 @@ pub mod contract_fs;
 pub mod git;
 pub mod jobs;
 pub mod undo;
+pub mod protocol;
+pub mod server;
+pub mod client;
 
 #[doc(hidden)]
 pub mod testutil;
