@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "fleet-app"
+version = "0.1.0"
+dependencies = [
+ "fleet-domain",
+]
+
+[[package]]
 name = "fleet-domain"
 version = "0.1.0"

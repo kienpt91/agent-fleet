@@ -1,0 +1,23 @@
+[package]
+name = "fleet-app"
+description = "Application layer of agent-fleet: use cases that orchestrate the domain through ports. Depends on fleet-domain only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "fleet_app"
+path = "src/lib.rs"
+
+[features]
+# In-memory fakes and port contract suites, for tests of this crate and of the adapters.
+testing = []
+
+[dependencies]
+fleet-domain = { path = "../fleet-domain" }
+
+[lints]
+workspace = true

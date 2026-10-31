@@ -1,0 +1,326 @@
+//! Ports: everything the application layer needs from the outside world.
+//!
+//! The application layer calls these traits and never touches a file, a process, git or a clock
+//! directly. Adapters (fleet-infra) implement them for real; `fleet_app::testing` has in-memory
+//! fakes for tests. Every port is `Send` so the orchestrator can live on its own thread.
+
+use fleet_domain::approval::Digest;
+use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
+use fleet_domain::error::Result;
+use fleet_domain::events::DomainEvent;
+use fleet_domain::ids::{ApprovalId, RunId, Sha, TaskId};
+use fleet_domain::output::Chunk;
+use fleet_domain::quality::{GateFormat, GateOutcome};
+use fleet_domain::supervision::{LiveSession, ProcessIdentity};
+
+// ---- time -------------------------------------------------------------------------------
+
+pub trait Clock: Send {
+    /// Milliseconds since the Unix epoch.
+    fn now_ms(&self) -> u64;
+}
+
+// ---- event store ------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub event: DomainEvent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ReplayInfo {
+    pub records: u64,
+}
+
+/// Append-only, ordered, durable record of domain events.
+pub trait EventStore: Send {
+    /// Appends `events` as one atomic batch: either all are recorded or none.
+    fn append(&mut self, ts_ms: u64, events: &[DomainEvent]) -> Result<()>;
+    /// Visits every stored event in order. A damaged store is an error (`Tampered`).
+    fn replay(&self, visit: &mut dyn FnMut(StoredEvent) -> Result<()>) -> Result<ReplayInfo>;
+}
+
+// ---- version control ----------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub name: String,
+    pub email: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseCommit {
+    /// The name the user gave (`HEAD`, `main`, ...).
+    pub ref_name: String,
+    pub sha: Sha,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Merged {
+        sha: Sha,
+    },
+    /// The merge was attempted, found conflicts and was aborted; the target is unchanged.
+    Conflict {
+        files: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegrationMerge {
+    pub repo: String,
+    pub run: RunId,
+    pub task: TaskId,
+    pub base: Sha,
+    pub integration_branch: String,
+    pub task_branch: String,
+    pub message: String,
+    pub identity: Identity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegrationResult {
+    pub outcome: MergeOutcome,
+    /// The integration branch did not exist before this call.
+    pub created: bool,
+}
+
+/// Version control. Every operation happens on fleet's own branches and worktrees; the user's
+/// checked-out branch and working tree are never touched.
+pub trait Vcs: Send {
+    /// Resolves a ref (`HEAD` or a branch name) of `repo` to a commit.
+    fn resolve_base(&self, repo: &str, base_ref: &str) -> Result<BaseCommit>;
+    /// Creates (or reuses) the worktree and branch of a task, starting at `base`. Returns the
+    /// worktree path. Idempotent.
+    fn prepare_worktree(
+        &self,
+        repo: &str,
+        run: &RunId,
+        task: &TaskId,
+        branch: &str,
+        base: &Sha,
+    ) -> Result<String>;
+    /// Merges `branches` into the branch checked out in `worktree` (dependency work).
+    fn merge_into_worktree(
+        &self,
+        worktree: &str,
+        branches: &[String],
+        identity: &Identity,
+    ) -> Result<MergeOutcome>;
+    /// Commits everything in the worktree (except fleet's own `.fleet` directory). `None` when
+    /// there was nothing to commit.
+    fn commit_all(&self, worktree: &str, message: &str, identity: &Identity)
+        -> Result<Option<Sha>>;
+    /// The commit a branch points at.
+    fn branch_head(&self, repo: &str, branch: &str) -> Result<Sha>;
+    /// Merges a task branch into the run's integration branch, creating that branch first when
+    /// needed. A conflict aborts the merge and leaves the integration branch as it was.
+    fn merge_into_integration(&self, req: &IntegrationMerge) -> Result<IntegrationResult>;
+    /// Removes a worktree (and its branch when `delete_branch`).
+    fn remove_worktree(
+        &self,
+        repo: &str,
+        worktree: &str,
+        branch: &str,
+        delete_branch: bool,
+    ) -> Result<()>;
+    /// True when `branch` is contained in `into`.
+    fn is_merged(&self, repo: &str, branch: &str, into: &str) -> Result<bool>;
+}
+
+// ---- sessions -----------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSpec {
+    pub run: RunId,
+    pub task: TaskId,
+    pub attempt: u32,
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    /// The complete environment of the process; nothing else is inherited.
+    pub env: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spawned {
+    pub id: SessionId,
+    pub identity: ProcessIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionState {
+    Running,
+    Exited {
+        code: Option<i64>,
+        signal: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionReading {
+    pub elapsed_ms: u64,
+    /// Time since the session last produced output.
+    pub idle_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Term,
+    Kill,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignalOutcome {
+    Sent,
+    /// Nothing is running there any more.
+    Gone,
+    /// The process behind the pid is not the one that was started; nothing was signalled.
+    Refused(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionOutput {
+    /// Everything retained in the output ring (sanitized, redacted).
+    pub text: String,
+    pub stripped: u64,
+}
+
+/// Pty sessions with their own process group and a bounded output buffer.
+pub trait SessionHost: Send {
+    fn spawn(&mut self, spec: &SessionSpec) -> Result<Spawned>;
+    /// Non-blocking. Reaps the child once it ended; keeps answering `Exited` afterwards.
+    fn poll(&mut self, id: SessionId) -> SessionState;
+    fn reading(&self, id: SessionId) -> Option<SessionReading>;
+    /// Signals the whole process group after verifying the process is still the one started.
+    fn signal(&mut self, id: SessionId, signal: Signal) -> SignalOutcome;
+    /// Last `max` bytes of output, including an unterminated line.
+    fn snapshot(&self, id: SessionId, max: usize) -> Option<String>;
+    /// Complete lines after `offset`.
+    fn read_since(&self, id: SessionId, offset: u64, max: usize) -> Option<Chunk>;
+    /// After the leader exited: stop stragglers in its group, finish the output, free resources.
+    fn release(&mut self, id: SessionId) -> SessionOutput;
+    /// Live sessions, for the worker-origin check of the control socket.
+    fn live(&self) -> Vec<LiveSession>;
+    /// Start token of whatever currently runs under `pid` (`None` when nothing does).
+    fn start_token(&self, pid: u32) -> Option<String>;
+    /// Terminates the process group of a process recorded by an earlier daemon run. Verifies
+    /// `identity` first; waits up to `grace_ms` between TERM and KILL.
+    fn terminate_orphan(&mut self, identity: &ProcessIdentity, grace_ms: u64) -> SignalOutcome;
+}
+
+// ---- worker contract files ------------------------------------------------------------------
+
+pub trait ContractFiles: Send {
+    /// Creates `.fleet/` in the worktree, writes the brief and removes stale contract files.
+    fn prepare(&self, worktree: &str, brief: &str) -> Result<()>;
+    fn read_question(&self, worktree: &str) -> ContractRead<WorkerQuestion>;
+    fn read_result(&self, worktree: &str) -> ContractRead<WorkerResult>;
+    /// Cheap check used while the worker runs: does a question file exist?
+    fn question_present(&self, worktree: &str) -> bool;
+}
+
+// ---- background jobs ------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GateSpec {
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub format: GateFormat,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Job {
+    Gates {
+        run: RunId,
+        task: TaskId,
+        attempt: u32,
+        worktree: String,
+        gates: Vec<GateSpec>,
+    },
+    /// A command a human approved on behalf of a worker.
+    Command {
+        approval: ApprovalId,
+        worktree: String,
+        program: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobDone {
+    Gates {
+        run: RunId,
+        task: TaskId,
+        attempt: u32,
+        outcomes: Vec<GateOutcome>,
+    },
+    Command {
+        approval: ApprovalId,
+        exit_code: Option<i64>,
+        summary: String,
+        output: String,
+    },
+}
+
+/// Runs long commands off the orchestrator's thread.
+pub trait JobRunner: Send {
+    fn start(&mut self, job: Job) -> Result<()>;
+    /// Results that arrived since the last call.
+    fn poll(&mut self) -> Vec<JobDone>;
+    fn running(&self) -> usize;
+}
+
+// ---- stored output ------------------------------------------------------------------------------
+
+pub trait OutputLogs: Send {
+    fn save(&mut self, run: &RunId, task: &TaskId, attempt: u32, text: &str) -> Result<()>;
+    /// Last `max` bytes of the most recent attempt's output.
+    fn tail(&self, run: &RunId, task: &TaskId, max: usize) -> Option<String>;
+    fn remove(&mut self, run: &RunId, task: &TaskId);
+}
+
+// ---- optional undo tool --------------------------------------------------------------------------
+
+pub trait UndoTool: Send {
+    fn available(&self) -> bool;
+    /// Records a checkpoint of the worktree; returns a short description.
+    fn checkpoint(&self, worktree: &str, label: &str) -> Result<String>;
+    /// Reverts the worktree to the last checkpoint; returns the tool's report.
+    fn undo(&self, worktree: &str) -> Result<String>;
+}
+
+// ---- event publication --------------------------------------------------------------------------
+
+/// Receives events after they were stored and applied.
+pub trait EventPublisher: Send {
+    fn publish(&mut self, events: &[StoredEvent]);
+}
+
+/// Hashing for approval digests and the audit chain; `Send` version of the domain port.
+pub trait SendDigest: Digest + Send {}
+impl<T: Digest + Send> SendDigest for T {}
+
+/// All ports of the orchestrator.
+pub struct Ports {
+    pub clock: Box<dyn Clock>,
+    pub store: Box<dyn EventStore>,
+    pub vcs: Box<dyn Vcs>,
+    pub sessions: Box<dyn SessionHost>,
+    pub contract: Box<dyn ContractFiles>,
+    pub jobs: Box<dyn JobRunner>,
+    pub logs: Box<dyn OutputLogs>,
+    pub undo: Box<dyn UndoTool>,
+    pub digest: Box<dyn SendDigest>,
+    pub publisher: Box<dyn EventPublisher>,
+}
