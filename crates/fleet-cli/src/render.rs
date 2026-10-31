@@ -483,17 +483,21 @@ pub fn render_plan(v: &Value) -> String {
 /// `fleet merge`.
 pub fn render_merge(v: &Value) -> String {
     let task = text(v, "task");
-    let sha = prefix(&text(v, "merged"), 12);
+    let sha = prefix(&text(v, "merge_sha"), 12);
     let mut line = String::from("merged");
     if !task.is_empty() {
         let _ = write!(line, " {task}");
     }
+    let from = text(v, "branch");
+    if !from.is_empty() {
+        let _ = write!(line, " ({from})");
+    }
+    let into = text(v, "integration_branch");
+    if !into.is_empty() {
+        let _ = write!(line, " into {into}");
+    }
     if !sha.is_empty() {
         let _ = write!(line, " at {sha}");
-    }
-    let branch = text(v, "branch");
-    if !branch.is_empty() {
-        let _ = write!(line, " into {branch}");
     }
     with_note(line, v)
 }
@@ -501,7 +505,7 @@ pub fn render_merge(v: &Value) -> String {
 /// `fleet cleanup`.
 pub fn render_cleanup(v: &Value) -> String {
     let mut line = String::from("cleanup finished");
-    for key in ["removed", "worktrees", "branches"] {
+    for key in ["removed", "branches_deleted"] {
         let n = match v.get(key) {
             Some(Value::Array(a)) => Some(a.len() as u64),
             Some(other) => other.as_u64(),
@@ -874,21 +878,22 @@ recent
         assert_eq!(render_plan(&plan), "plan loaded into run r1 (2 tasks)\n");
         let merge = Value::object([
             ("task", s("r1/t1")),
-            ("merged", s("0123456789abcdef0123456789")),
-            ("branch", s("fleet/r1/integration")),
+            ("merge_sha", s("0123456789abcdef0123456789")),
+            ("branch", s("fleet/r1/t1")),
+            ("integration_branch", s("fleet/r1/integration")),
             ("message", s("fast-forward\nclean")),
         ]);
         assert_eq!(
             render_merge(&merge),
-            "merged r1/t1 at 0123456789ab into fleet/r1/integration\nfast-forward\nclean\n"
+            "merged r1/t1 (fleet/r1/t1) into fleet/r1/integration at 0123456789ab\nfast-forward\nclean\n"
         );
         let cleanup = Value::object([
             ("removed", Value::array([s("w1")])),
-            ("branches", Value::int(2u64)),
+            ("branches_deleted", Value::array([s("b1"), s("b2")])),
         ]);
         assert_eq!(
             render_cleanup(&cleanup),
-            "cleanup finished, removed 1, branches 2\n"
+            "cleanup finished, removed 1, branches_deleted 2\n"
         );
         assert!(render_undo(&Value::object([("report", s("1 file"))]), true).ends_with("1 file\n"));
         assert_eq!(render_ack("stopped", &Value::Null), "stopped\n");
