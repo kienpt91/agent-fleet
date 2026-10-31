@@ -145,8 +145,11 @@ fn http(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: Opt
     let mut chunk = [0u8; 8192];
     loop {
         match s.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            // a signal (a child process ended) interrupts the read: not the end of the response
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
         }
     }
     parse_response(&raw)
@@ -318,7 +321,9 @@ impl Sse {
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
                 ) =>
             {
                 Fill::Idle
