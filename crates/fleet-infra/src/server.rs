@@ -42,6 +42,8 @@ const REFUSAL_DRAIN_BYTES: usize = 64 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Consecutive accept failures (about five seconds) after which the server gives up.
 const MAX_ACCEPT_FAILURES: u32 = 250;
+/// How long `serve` lets open connections finish writing a reply before it closes them.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
 /// How long `serve` waits for connection threads after asking them to stop.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The attach forwarder looks at its stop flag this often while the session is quiet.
@@ -433,6 +435,13 @@ impl Server {
     }
 
     fn close_connections(&self) {
+        // A connection whose request was already answered by the engine may still be writing the
+        // reply: the `shutdown` command itself is the case (the engine stops right after it
+        // answers). Give those a moment to finish before the rest is closed.
+        let grace = Instant::now() + SHUTDOWN_GRACE;
+        while self.shared.active.load(Ordering::Acquire) > 0 && Instant::now() < grace {
+            thread::sleep(Duration::from_millis(5));
+        }
         for stream in lock(&self.shared.streams).values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
@@ -858,6 +867,14 @@ pub(crate) mod test_support {
                 ]))),
                 "fail" => Err(FleetError::conflict("not allowed now").with_subject("a1")),
                 "forbid" => Err(FleetError::forbidden("go away")),
+                // an answer that takes a while, as the engine's does around a shutdown
+                "slow" => {
+                    thread::sleep(Duration::from_millis(120));
+                    Ok(HandlerReply::Data(obj(&[(
+                        "schema",
+                        Value::str("fleet.slow/1"),
+                    )])))
+                }
                 "boom" => panic!("handler exploded"),
                 "attach" | "task.attach" => {
                     let Some(rx) = lock(&self.attach_rx).take() else {
@@ -1006,6 +1023,23 @@ mod tests {
 
     fn start() -> TestServer {
         TestServer::start(Fake::new().0)
+    }
+
+    #[test]
+    fn a_reply_that_is_being_produced_when_the_server_stops_is_still_delivered() {
+        // `fleet shutdown` is answered by an engine that stops right afterwards; the daemon sets the
+        // server's stop flag at that moment, and the reply must not be cut off
+        let mut s = start();
+        let mut c = Raw::connect(&s.path);
+        c.send_line(&encode_request("slow", &Value::Null, c.token.as_deref()));
+        thread::sleep(Duration::from_millis(30));
+        s.stop.store(true, Ordering::Release);
+        let reply = c.read_reply().expect("the reply arrives");
+        assert_eq!(
+            reply.get("schema").and_then(Value::as_str),
+            Some("fleet.slow/1")
+        );
+        s.shut_down();
     }
 
     #[test]
