@@ -9,7 +9,8 @@ use crate::dag::{self, Node};
 use crate::error::{FleetError, Result};
 use crate::events::DomainEvent;
 use crate::ids::{
-    integration_branch, task_branch, validate_line, validate_text, RunId, Sha, TaskId, WorkerName,
+    integration_branch, task_branch, validate_line, validate_text, HostName, RunId, Sha, TaskId,
+    WorkerName,
 };
 use crate::limits::{
     MAX_NOTE, MAX_NOTES_PER_TASK, MAX_QUESTIONS_PER_TASK, MAX_SESSIONS_HARD, MAX_SPEC,
@@ -49,6 +50,7 @@ pub struct Task {
     pub spec: String,
     pub deps: Vec<TaskId>,
     pub worker: Option<WorkerName>,
+    pub host: Option<HostName>,
     pub status: TaskStatus,
     pub block: Option<Block>,
     /// Number of dispatches so far.
@@ -78,6 +80,7 @@ pub struct NewTask {
     pub spec: String,
     pub deps: Vec<TaskId>,
     pub worker: Option<WorkerName>,
+    pub host: Option<HostName>,
 }
 
 /// What the supervisor observed when a worker session ended.
@@ -226,6 +229,7 @@ impl Run {
                 spec: n.spec.clone(),
                 deps: n.deps.clone(),
                 worker: n.worker.clone(),
+                host: n.host.clone(),
             });
         }
         Ok((ids, events))
@@ -613,6 +617,7 @@ impl Run {
                 spec,
                 deps,
                 worker,
+                host,
             } if *run == self.id => {
                 self.tasks.push(Task {
                     id: task.clone(),
@@ -620,6 +625,7 @@ impl Run {
                     spec: spec.clone(),
                     deps: deps.clone(),
                     worker: worker.clone(),
+                    host: host.clone(),
                     status: TaskStatus::Pending,
                     block: None,
                     attempt: 0,
@@ -910,6 +916,7 @@ pub(crate) mod test_support {
             spec: "do it".into(),
             deps: deps.iter().map(|d| tid(d)).collect(),
             worker: None,
+            host: None,
         }
     }
 
@@ -989,6 +996,7 @@ mod tests {
                     spec: String::new(),
                     deps: vec![],
                     worker: None,
+                    host: None,
                 },
                 NewTask {
                     id: None,
@@ -996,6 +1004,7 @@ mod tests {
                     spec: String::new(),
                     deps: vec![],
                     worker: None,
+                    host: None,
                 },
             ])
             .unwrap();

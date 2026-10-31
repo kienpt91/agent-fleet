@@ -502,9 +502,9 @@ fn check_task(index: usize, task: &Value) -> Result<()> {
     let obj = task
         .as_object()
         .ok_or_else(|| invalid(format!("{what} must be a table")))?;
-    check_keys(&what, obj, &["id", "title", "spec", "after", "worker"])?;
+    check_keys(&what, obj, &["id", "title", "spec", "after", "worker", "host"])?;
     check_string(&what, obj, "title", true)?;
-    for key in ["id", "spec", "worker"] {
+    for key in ["id", "spec", "worker", "host"] {
         check_string(&what, obj, key, false)?;
     }
     match obj.get("after") {
@@ -1072,6 +1072,20 @@ after = ["a"]
             from_toml.get("run").is_none(),
             "the run table is renamed to new_run"
         );
+    }
+
+    #[test]
+    fn a_task_host_is_carried_through_the_plan() {
+        let dir = TempDir::new("cf");
+        let v = plan(
+            &dir,
+            "h.toml",
+            "[[tasks]]\ntitle = \"A\"\nhost = \"build1\"\n",
+        )
+        .unwrap();
+        let tasks = v.get("tasks").and_then(Value::as_array).unwrap();
+        assert_eq!(tasks[0].get("host").and_then(Value::as_str), Some("build1"));
+        assert!(plan(&dir, "h2.toml", "[[tasks]]\ntitle = \"A\"\nhost = 3\n").is_err());
     }
 
     #[test]

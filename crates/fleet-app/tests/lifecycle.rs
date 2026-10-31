@@ -82,6 +82,26 @@ fn finish_ok(h: &mut Harness, task: &str) {
 }
 
 #[test]
+fn a_task_naming_an_undefined_host_is_rejected_and_nothing_is_recorded() {
+    let mut h = Harness::new();
+    new_run(&mut h);
+    let err = h
+        .call(
+            "task.add",
+            obj(vec![
+                ("run", s("r1")),
+                ("id", s("a")),
+                ("title", s("task a")),
+                ("host", s("build1")),
+            ]),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err:?}");
+    assert!(err.message.contains("is not defined in the configuration"), "{err:?}");
+    assert!(!h.world.event_kinds().contains(&"task_added"));
+}
+
+#[test]
 fn a_single_task_runs_to_completion() {
     let mut h = Harness::new();
     new_run(&mut h);

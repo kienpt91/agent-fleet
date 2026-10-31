@@ -5,7 +5,7 @@
 
 use crate::ports::SessionId;
 use fleet_domain::error::{FleetError, Result};
-use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, RunId, TaskId, WorkerName};
+use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, HostName, RunId, TaskId, WorkerName};
 use fleet_domain::limits::MAX_SEND_BYTES;
 use fleet_domain::run::NewTask;
 use fleet_domain::status::GoalStatus;
@@ -238,6 +238,7 @@ fn parse_new_task(v: &Value) -> Result<NewTask> {
             .map(TaskId::parse)
             .collect::<Result<Vec<_>>>()?,
         worker: a.opt_str("worker")?.map(WorkerName::parse).transpose()?,
+        host: a.opt_str("host")?.map(HostName::parse).transpose()?,
     })
 }
 
@@ -476,6 +477,7 @@ mod tests {
                 ("spec", Value::str("s")),
                 ("after", Value::array([Value::str("a"), Value::str("b")])),
                 ("worker", Value::str("agent")),
+                ("host", Value::str("build1")),
             ],
         )
         .unwrap();
@@ -485,6 +487,7 @@ mod tests {
         assert_eq!(run.as_str(), "r1");
         assert_eq!(task.deps.len(), 2);
         assert_eq!(task.worker.unwrap().as_str(), "agent");
+        assert_eq!(task.host.unwrap().as_str(), "build1");
         assert!(task.id.is_none());
     }
 

@@ -65,6 +65,15 @@ pub(crate) fn text_or_dash(v: &Value, key: &str) -> String {
     }
 }
 
+/// The worker of a task, followed by `host:<name>` when it runs on a remote host.
+fn worker_cell(t: &Value) -> String {
+    let worker = text_or_dash(t, "worker");
+    match text(t, "host") {
+        h if h.is_empty() => worker,
+        h => format!("{worker} host:{h}"),
+    }
+}
+
 pub(crate) fn num(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
@@ -228,7 +237,7 @@ fn render_run(run: &Value, out: &mut String) {
                 text_or_dash(t, "status"),
                 deps_text(t),
                 num(t, "attempt").to_string(),
-                text_or_dash(t, "worker"),
+                worker_cell(t),
                 task_note(t),
             ]
         })
@@ -238,7 +247,7 @@ fn render_run(run: &Value, out: &mut String) {
     } else {
         out.push_str(&table(
             &["ID", "STATUS", "DEPS", "TRY", "WORKER", "NOTE"],
-            &[20, 12, 24, 4, 16, 60],
+            &[20, 12, 24, 4, 28, 60],
             &rows,
             "  ",
         ));
@@ -659,6 +668,17 @@ mod tests {
                 ])]),
             ),
         ])
+    }
+
+    #[test]
+    fn a_remote_host_is_shown_after_the_worker() {
+        let mut t = task("t1", "running", &[]);
+        if let Value::Object(m) = &mut t {
+            m.insert("worker".into(), s("coder"));
+            m.insert("host".into(), s("build1"));
+        }
+        assert_eq!(worker_cell(&t), "coder host:build1");
+        assert_eq!(worker_cell(&task("t2", "running", &[])), "-");
     }
 
     #[test]

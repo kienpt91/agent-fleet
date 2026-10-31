@@ -217,6 +217,9 @@ fn detail_lines(t: &TaskRow, width: usize) -> Vec<Line<'static>> {
     if let Some(w) = &t.worker {
         head.push_str(&format!(" worker {w}"));
     }
+    if let Some(h) = &t.host {
+        head.push_str(&format!(" host:{h}"));
+    }
     lines.push(Line::from(Span::styled(
         fit(&head, width),
         Style::new().add_modifier(Modifier::BOLD),

@@ -91,6 +91,7 @@ pub struct TaskRow {
     pub status: String,
     pub deps: Vec<String>,
     pub worker: Option<String>,
+    pub host: Option<String>,
     pub attempt: u64,
     pub retries_used: u64,
     pub summary: Option<String>,
@@ -231,6 +232,7 @@ fn parse_task(run: &str, t: &Value) -> TaskRow {
         status: text_of(t, "status"),
         deps: strings_of(t, "deps"),
         worker: opt_text(t, "worker"),
+        host: opt_text(t, "host"),
         attempt: num_of(t, "attempt"),
         retries_used: num_of(t, "retries_used"),
         summary: opt_text(t, "summary"),
@@ -690,6 +692,18 @@ mod tests {
         let mut m = Model::new();
         m.update_status(&status(many));
         assert_eq!(m.tasks.len(), MAX_ROWS);
+    }
+
+    #[test]
+    fn a_task_host_is_parsed_when_present() {
+        let mut t = task("t1", "x", "pending", &[]);
+        if let Value::Object(mp) = &mut t {
+            mp.insert("host".into(), Value::str("build1"));
+        }
+        let mut m = Model::new();
+        m.update_status(&status(vec![t, task("t2", "x", "pending", &[])]));
+        assert_eq!(m.tasks[0].host.as_deref(), Some("build1"));
+        assert_eq!(m.tasks[1].host, None);
     }
 
     #[test]

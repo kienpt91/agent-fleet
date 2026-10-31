@@ -83,7 +83,7 @@ daemon:
 
 runs and tasks:
   run create --objective <text> --repo <path> [--base <ref>] [--id <id>] [--max-parallel N]
-  task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--id <id>]
+  task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--host <name>] [--id <id>]
                                      (--spec - reads the spec from stdin, at most 16 KiB)
   plan <file.toml|file.json> [--run <run>]
                                      load a whole task graph (with --run: into an existing run)
@@ -448,6 +448,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                     let spec = p.opt("--spec")?.map(|s| read_spec(s, stdin)).transpose()?;
                     let after = p.multi("--after")?;
                     let worker = p.opt("--worker")?;
+                    let host = p.opt("--host")?;
                     let id = p.opt("--id")?;
                     no_args(p)?;
                     let view = View::TaskAdded(run.clone());
@@ -462,6 +463,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                                 Some(Value::array(after.into_iter().map(Value::Str))),
                             ),
                             ("worker", worker.and_then(st)),
+                            ("host", host.and_then(st)),
                             ("id", id.and_then(st)),
                         ]),
                         view,
@@ -1403,7 +1405,7 @@ mod tests {
             (
                 vec![
                     "task", "add", "--run", "r1", "--title", "T", "--spec", "do x", "--after", "a",
-                    "--after", "b", "--worker", "coder", "--id", "t9",
+                    "--after", "b", "--worker", "coder", "--host", "build1", "--id", "t9",
                 ],
                 req(
                     "task.add",
@@ -1413,6 +1415,7 @@ mod tests {
                         ("spec", s("do x")),
                         ("after", Value::array([s("a"), s("b")])),
                         ("worker", s("coder")),
+                        ("host", s("build1")),
                         ("id", s("t9")),
                     ],
                     View::TaskAdded("r1".into()),
@@ -2639,6 +2642,7 @@ mod tests {
             "--spec",
             "--after",
             "--worker",
+            "--host",
             "--no-newline",
             "--follow",
             "--lines",

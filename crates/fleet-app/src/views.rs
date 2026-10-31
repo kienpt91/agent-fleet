@@ -44,6 +44,7 @@ fn task_value(t: &Task, live: bool) -> Value {
             Value::array(t.deps.iter().map(|d| Value::str(d.as_str()))),
         ),
         ("worker", opt_str(t.worker.as_ref().map(|w| w.as_str()))),
+        ("host", opt_str(t.host.as_ref().map(|h| h.as_str()))),
         ("attempt", Value::int(t.attempt)),
         ("retries_used", Value::int(t.retries_used)),
         ("branch", Value::str(&t.branch)),
@@ -233,6 +234,7 @@ mod tests {
                     spec: String::new(),
                     deps: vec![],
                     worker: None,
+                    host: None,
                 }],
             )
             .unwrap();
@@ -339,6 +341,7 @@ mod tests {
                 "failure",
                 "gates",
                 "head",
+                "host",
                 "id",
                 "live",
                 "merged",
