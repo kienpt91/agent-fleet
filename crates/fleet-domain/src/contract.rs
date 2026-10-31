@@ -6,6 +6,8 @@
 //! `result.json`:   `{"version":1,"status":"done"|"failed","summary":"..."}`
 //! `question.json`: `{"version":1,"kind":"question"|"approval","text":"...","choices":["..."],
 //!                    "action":{"command":"/absolute/path","args":["..."]}}`
+//! `handoff.json`:  `{"version":1,"summary":"..."}`: a summary of the state of the work for whoever
+//!                    continues it. Stored and shown as UNVERIFIED; never a source of truth.
 
 use crate::ids::is_invisible;
 use crate::limits::{MAX_ACTION_ARGS, MAX_ACTION_ARG_LEN, MAX_CHOICES, MAX_SUMMARY};
@@ -65,6 +67,33 @@ impl WorkerResult {
             Some(_) => return Err("summary must be a string".to_string()),
         };
         Ok(WorkerResult { status, summary })
+    }
+}
+
+/// The summary a worker may leave for the next attempt (`.fleet/handoff.json`). Worker-written, so
+/// it is only ever shown labelled UNVERIFIED and quoted; it decides nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerHandoff {
+    pub summary: String,
+}
+
+impl WorkerHandoff {
+    pub fn from_value(v: &Value) -> Result<WorkerHandoff, String> {
+        if v.as_object().is_none() {
+            return Err("not a JSON object".to_string());
+        }
+        check_version(v)?;
+        match v.get("summary") {
+            Some(Value::Str(s)) => {
+                let summary = clip_text(s, MAX_SUMMARY);
+                if summary.is_empty() {
+                    Err("summary is empty".to_string())
+                } else {
+                    Ok(WorkerHandoff { summary })
+                }
+            }
+            _ => Err("summary must be a string".to_string()),
+        }
     }
 }
 
@@ -437,5 +466,40 @@ mod tests {
         let t = WorkerQuestion::from_value(&v).unwrap().text;
         assert!(!t.contains('\u{1b}') && !t.contains('\u{202e}'));
         assert!(t.starts_with("go"));
+    }
+
+    #[test]
+    fn handoff_summary_parses_and_is_cleaned() {
+        let v = Value::object([
+            ("version", Value::int(1)),
+            (
+                "summary",
+                Value::str("did \u{1b}[31mthe\u{1b}[0m work\u{202e}"),
+            ),
+        ]);
+        let h = WorkerHandoff::from_value(&v).unwrap();
+        assert!(h.summary.starts_with("did "));
+        assert!(!h.summary.contains('\u{1b}') && !h.summary.contains('\u{202e}'));
+        let long = Value::object([
+            ("version", Value::int(1)),
+            ("summary", Value::str("x".repeat(10_000))),
+        ]);
+        assert!(WorkerHandoff::from_value(&long).unwrap().summary.len() <= MAX_SUMMARY);
+    }
+
+    #[test]
+    fn handoff_rejects_bad_shapes() {
+        let bad = [
+            Value::Null,
+            Value::str("x"),
+            Value::object([("summary", Value::str("s"))]),
+            Value::object([("version", Value::int(2)), ("summary", Value::str("s"))]),
+            Value::object([("version", Value::int(1))]),
+            Value::object([("version", Value::int(1)), ("summary", Value::int(3))]),
+            Value::object([("version", Value::int(1)), ("summary", Value::str("  \n "))]),
+        ];
+        for v in bad {
+            assert!(WorkerHandoff::from_value(&v).is_err(), "{v:?}");
+        }
     }
 }
