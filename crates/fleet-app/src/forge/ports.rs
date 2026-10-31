@@ -144,8 +144,10 @@ pub struct ForgeStatus {
 /// `poll` collects what finished. A call that cannot even start (the queue is full) is an error
 /// of `start`; one that fails is an error in the answer.
 pub trait ForgeJobs: Send {
-    fn status(&self) -> ForgeStatus;
-    fn start(&mut self, ticket: u64, req: ForgeRequest) -> Result<()>;
+    /// `repos` are the local repositories of every run: the adapter refuses to run a program that
+    /// lies inside one of them.
+    fn status(&self, repos: &[String]) -> ForgeStatus;
+    fn start(&mut self, ticket: u64, req: ForgeRequest, repos: &[String]) -> Result<()>;
     fn poll(&mut self) -> Vec<(u64, Result<ForgeAnswer>)>;
     /// Calls in flight.
     fn running(&self) -> usize;

@@ -336,7 +336,7 @@ impl FakeForgeJobs {
 }
 
 impl ForgeJobs for FakeForgeJobs {
-    fn status(&self) -> ForgeStatus {
+    fn status(&self, _repos: &[String]) -> ForgeStatus {
         let g = self.world.lock();
         ForgeStatus {
             ready: g.ready,
@@ -345,7 +345,7 @@ impl ForgeJobs for FakeForgeJobs {
         }
     }
 
-    fn start(&mut self, ticket: u64, req: ForgeRequest) -> Result<()> {
+    fn start(&mut self, ticket: u64, req: ForgeRequest, _repos: &[String]) -> Result<()> {
         if let Some(e) = self.world.lock().fail_start.clone() {
             return Err(e);
         }

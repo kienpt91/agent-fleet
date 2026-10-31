@@ -188,9 +188,10 @@ impl Orchestrator {
 
     fn forge_status(&self) -> Reply {
         let cfg = &self.cfg.forge;
+        let repos = self.repo_paths();
         let (ready, detail, rate) = match &self.forge.jobs {
             Some(j) => {
-                let s = j.status();
+                let s = j.status(&repos);
                 (s.ready, s.detail, s.rate)
             }
             None => (
@@ -314,7 +315,7 @@ impl Orchestrator {
                 "the GitHub integration has no adapter in this daemon",
             ));
         };
-        let status = jobs.status();
+        let status = jobs.status(&self.repo_paths());
         if !status.ready {
             return Err(FleetError::unavailable(format!(
                 "the GitHub integration cannot run: {}. Nothing was changed.",
@@ -335,13 +336,20 @@ impl Orchestrator {
         })
     }
 
+    /// The repositories of every run: `gh` must not be a program inside one of them.
+    fn repo_paths(&self) -> Vec<String> {
+        let all: BTreeSet<String> = self.state.runs().map(|r| r.repo.clone()).collect();
+        all.into_iter().collect()
+    }
+
     /// Hands `req` to the adapter and remembers what the answer is for.
     fn forge_start(&mut self, req: ForgeRequest, pending: Pending) -> Result<u64> {
         let ticket = self.forge.seq.saturating_add(1);
+        let repos = self.repo_paths();
         let jobs = self.forge.jobs.as_mut().ok_or_else(|| {
             FleetError::unavailable("the GitHub integration has no adapter in this daemon")
         })?;
-        jobs.start(ticket, req)?;
+        jobs.start(ticket, req, &repos)?;
         self.forge.seq = ticket;
         self.forge.pending.insert(ticket, pending);
         self.forge.slots.insert(ticket, Slot::Running);
@@ -810,6 +818,7 @@ impl Orchestrator {
             head: plan.draft.head_sha.clone(),
         });
         self.commit(events)?;
+        let repos = self.repo_paths();
         let started = match self.forge.jobs.as_mut() {
             Some(jobs) => jobs.start(
                 ticket,
@@ -817,6 +826,7 @@ impl Orchestrator {
                     push: plan.push.clone(),
                     draft: plan.draft.clone(),
                 })),
+                &repos,
             ),
             None => Err(FleetError::unavailable(
                 "the GitHub integration has no adapter in this daemon",
