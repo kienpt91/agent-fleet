@@ -203,6 +203,7 @@ function buildEnv(opts) {
     calls: [],
     streams: [],
     goalFetches: [],
+    forgeFetches: 0,
     unauth: [],
     storageKeys: new Set(),
     created: [],
@@ -224,7 +225,9 @@ function buildEnv(opts) {
         streamStatus: 200,
         streamThrow: 0,
         goalsStatus: 200,
-        goalCount: 4
+        goalCount: 4,
+        forgeStatus: 200,
+        forgeEmpty: false
       },
       opts.server || {}
     )
@@ -520,6 +523,10 @@ function buildEnv(opts) {
       const gid = query.get('id');
       env.goalFetches.push(gid);
       body = goalShowDoc(gid);
+    } else if (path === '/api/forge') {
+      env.forgeFetches += 1;
+      if (S.forgeStatus !== 200) err(S.forgeStatus, { code: 'forge', message: 'forge unavailable' });
+      else body = forgeDoc(S.forgeEmpty);
     } else {
       err(404, { code: 'not_found', message: 'no such endpoint' });
     }
@@ -598,6 +605,32 @@ async function boot(opts) {
 const COMMIT = 'a1'.repeat(20);
 const TREE = 'b2'.repeat(20);
 const CONTRACT_ID = 'c3'.repeat(20);
+
+function forgeDoc(empty) {
+  if (empty) {
+    return { schema: 'fleet.web.forge/1', snapshot: { schema: 'fleet.forge.snapshot/1', enabled: false, issues: null, pulls: null, details: [] }, links: { schema: 'fleet.forge.links/1', issues: [], pulls: [] } };
+  }
+  const page = (items) => ({ page: 1, has_more: false, items });
+  return {
+    schema: 'fleet.web.forge/1',
+    snapshot: {
+      schema: 'fleet.forge.snapshot/1',
+      enabled: true,
+      issues: { fetched_ms: 1700000000000, repo: 'o/r', data: page([{ number: 12, title: 'Fix ' + IMG, state: 'open', labels: ['bug ' + IMG, ESC], author: BIDI, comments: 3, updated: '2026-01-01T00:00:00Z', url: 'https://github.com/o/r/issues/12' }]) },
+      pulls: { fetched_ms: 1700000001000, repo: 'o/r', data: page([{ number: 34, title: 'PR ' + SCRIPT, state: 'open', draft: true, labels: [], author: 'alice', head_branch: 'fleet/r1/api', base_branch: 'main', head_sha: 'a'.repeat(40), comments: 0, updated: '2026-01-02T00:00:00Z', url: 'https://github.com/o/r/pull/34' }]) },
+      details: []
+    },
+    links: {
+      schema: 'fleet.forge.links/1',
+      issues: [{ run: 'r1', task: 'api', repo: 'o/r', number: 12 }],
+      pulls: [
+        { approval: 'a1', run: 'r1', task: 'api', repo: 'o/r', base: 'main', branch: 'fleet/r1/api', head: 'a'.repeat(40), state: 'opened', number: 34, url: 'https://github.com/o/r/pull/34', reason: null },
+        { approval: 'a2', run: 'r1', task: 'web', repo: 'o/r', base: 'main', branch: 'fleet/r1/web', head: 'b'.repeat(40), state: 'started', number: null, url: null, reason: null },
+        { approval: 'a3', run: 'r1', task: 'bad', repo: 'o/r', base: 'main', branch: 'fleet/r1/bad', head: 'c'.repeat(40), state: 'failed', number: null, url: null, reason: 'push refused ' + IMG }
+      ]
+    }
+  };
+}
 
 function goalsDoc(count) {
   const base = [
@@ -797,7 +830,7 @@ function staticChecks() {
   check(!/<style/i.test(HTML), 'no style element');
   check(!/@import/.test(CSS) && !/url\(/i.test(CSS), 'css has no @import or url()');
   check(CSS.includes('prefers-color-scheme: dark'), 'css supports dark mode');
-  ['view', 'statusline', 'hdr-version', 'hdr-sessions', 'hdr-rss', 'hdr-approvals', 'hdr-goals', 'logout', 'nav-runs', 'nav-goals', 'nav-decisions', 'nav-events', 'nav-health'].forEach(
+  ['view', 'statusline', 'hdr-version', 'hdr-sessions', 'hdr-rss', 'hdr-approvals', 'hdr-goals', 'logout', 'nav-runs', 'nav-goals', 'nav-github', 'nav-decisions', 'nav-events', 'nav-health'].forEach(
     (id) => check(HTML.includes('id="' + id + '"'), 'index.html has #' + id)
   );
 }
@@ -1322,6 +1355,37 @@ async function goalsUnavailable() {
   check(allText(env2) === NOT_LOGGED_IN && env2.storage.data.size === 0, 'a 401 on the goals request logs out and clears the session');
 }
 
+async function githubFlow() {
+  const env = await boot({ hash: '#/github', stored: true });
+  await env.advance(300);
+  check(env.registry.get('nav-github').hasClass('active'), 'github nav active');
+  check(env.forgeFetches >= 1, 'the github page asks the daemon for /api/forge');
+  const text = allText(env);
+  check(text.includes('Fetched by the operator at') && text.includes('the dashboard never contacts GitHub'), 'the page says who fetched what');
+  check(hasTextNode(env, 'Fix ' + IMG) && hasTextNode(env, 'PR ' + SCRIPT), 'issue and pull request titles are text nodes');
+  check(hasTextNode(env, 'bug ' + IMG), 'labels are text nodes');
+  check(text.includes('[U+001B]') && text.includes('[U+202E]') && !/[\u001b\u202e]/.test(text), 'ESC and bidi controls are made visible');
+  check(text.includes('\u2190 issue #12') && text.includes('\u2192 PR #34') && text.includes('\u2192 PR (not opened)'), 'links read as task <- issue and task -> PR');
+  check(text.includes('started') && text.includes('opened') && text.includes('failed') && text.includes('push refused'), 'publication states and the reason are shown');
+  check(text.includes('Issues (1)') && text.includes('Pull requests (1)'), 'cached issues and pull requests are listed');
+  assertSafe(env, 'github');
+  // nothing made by the view acts: no form, input, button or image; the only anchors are validated task routes
+  const acting = find(env, (n) => ['form', 'input', 'button', 'textarea', 'select', 'img', 'iframe'].includes(n.tagName));
+  check(acting.length === 0, 'the github page has no form, input or button');
+  const anchors = find(env, (n) => n.tagName === 'a');
+  check(anchors.length > 0 && anchors.every((a) => HREF_OK.test(String(a.attrs.get('href')))), 'every anchor is a validated hash route');
+  check(find(env, (n) => n.listeners.size > 0).length === 0, 'no element of the github page has an event listener');
+  check(!find(env, (n) => /^https?:/i.test(String(n.attrs.get('href') || ''))).length, 'a url is never a link');
+  const calls = env.calls.filter((c) => !/^\/api\/(status|goals|session)/.test(c.url));
+  check(calls.length > 0 && calls.every((c) => c.url === '/api/forge' && c.method === 'GET' && c.body === null), 'only GET /api/forge is requested for GitHub');
+  const out = await boot({ hash: '#/github', stored: true, server: { forgeStatus: 401 } });
+  await out.advance(300);
+  check(allText(out) === NOT_LOGGED_IN && out.storage.data.size === 0, 'a 401 on /api/forge logs out');
+  const off = await boot({ hash: '#/github', stored: true, server: { forgeEmpty: true } });
+  await off.advance(300);
+  check(allText(off).includes('The GitHub integration is off') && allText(off).includes('No issues have been fetched'), 'an integration that is off is explained');
+}
+
 async function streamRetries() {
   const env = await boot({ hash: '#/task/r1/web', stored: true, server: { streamThrow: 1000 } });
   await env.advance(40000);
@@ -1363,6 +1427,7 @@ await nextRoute();
 await goalsFlow();
 await goalsBounds();
 await goalsUnavailable();
+await githubFlow();
 await streamRetries();
 await streamOverflow();
 await streamAuth();
