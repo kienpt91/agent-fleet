@@ -173,6 +173,31 @@ impl RepoPath {
         }
         RepoPath::parse(&stack.join("/")).ok()
     }
+
+    /// Where a symbolic link that lives in directory `self` points, when the target is a plain
+    /// relative path that stays inside the repository (`a/b`, `../c`). The text is taken
+    /// literally (no query, fragment or percent escapes: they are ordinary characters in a link
+    /// target). An absolute target, one that leaves the repository, or one that is not a valid
+    /// path gives `None`. Nothing is looked up and the link is never followed.
+    pub fn resolve_literal(&self, target: &str) -> Option<RepoPath> {
+        if target.is_empty() || target.len() > MAX_PATH_BYTES * 3 || target.starts_with('/') {
+            return None;
+        }
+        let mut stack: Vec<&str> = self.components().collect();
+        for part in target.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    stack.pop()?;
+                }
+                other => stack.push(other),
+            }
+        }
+        if stack.is_empty() {
+            return None;
+        }
+        RepoPath::parse(&stack.join("/")).ok()
+    }
 }
 
 impl fmt::Display for RepoPath {
@@ -310,6 +335,34 @@ mod tests {
         }
         let deep = vec!["d"; MAX_PATH_DEPTH].join("/");
         assert!(ok(&deep).join("x").is_err());
+    }
+
+    #[test]
+    fn a_symlink_target_is_taken_literally_and_must_stay_inside() {
+        let dir = ok("a/b");
+        let r = |t: &str| dir.resolve_literal(t).map(|p| p.as_str().to_string());
+        assert_eq!(r("c").as_deref(), Some("a/b/c"));
+        assert_eq!(r("../c").as_deref(), Some("a/c"));
+        assert_eq!(r("../../c").as_deref(), Some("c"));
+        assert_eq!(r("./c/./d").as_deref(), Some("a/b/c/d"));
+        // `?`, `#` and `%` are ordinary characters in a link target
+        assert_eq!(r("c?d#e").as_deref(), Some("a/b/c?d#e"));
+        assert_eq!(r("%2e%2e/x").as_deref(), Some("a/b/%2e%2e/x"));
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../../..",
+            "../../../x",
+            "../..",
+            "a\\b",
+            "x\0y",
+            ".git/config",
+            "../.git",
+        ] {
+            assert_eq!(r(bad), None, "{bad:?}");
+        }
+        let long = "x/".repeat(MAX_PATH_BYTES);
+        assert_eq!(dir.resolve_literal(&long), None);
     }
 
     #[test]

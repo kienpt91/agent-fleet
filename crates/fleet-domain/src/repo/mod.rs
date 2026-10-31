@@ -4,8 +4,11 @@
 //! about a worktree. Names, contents and diffs come from agents and are untrusted: they are
 //! validated, bounded and escaped here, and shown as text by every front end.
 
+pub mod diff;
 pub mod limits;
 pub mod markdown;
 pub mod path;
+pub mod tree;
+pub mod view;
 
 pub use path::RepoPath;
