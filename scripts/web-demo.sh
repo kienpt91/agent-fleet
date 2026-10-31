@@ -133,7 +133,7 @@ if command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null
     # every run is a fresh page, so each one logs in with the fragment and lands on its route
     url="$BASE/#token=$TOKEN&next=$route"
     extra=""
-    [ -z "${WEB_DEMO_SHOTS:-}" ] || extra="--screenshot=$WEB_DEMO_SHOTS/$name.png --window-size=1200,800"
+    [ -z "${WEB_DEMO_SHOTS:-}" ] || extra="--screenshot=$WEB_DEMO_SHOTS/$name.png --window-size=1200,${SHOT_HEIGHT:-800}"
     # shellcheck disable=SC2086
     "$BROWSER" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir="$PROFILE" \
       --virtual-time-budget=12000 --dump-dom $extra "$url" > "$WORK/dom-$name.html" 2> "$WORK/chromium-$name.err" || true
@@ -146,7 +146,9 @@ if command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null
   shoot dag "/run/r1" 'Build the users API' 'st-blocked'
   shoot decisions "/decisions" 'Which HTTP framework' 'Decisions'
   say "# the live output of a running task in the page: the stream is read with fetch and the session header"
+  SHOT_HEIGHT=1400
   shoot live "/task/r2/slow" 'slow agent: starting slow' 'tick 1' 'tick 2' 'Streaming live output'
+  SHOT_HEIGHT=800
   grep -c "$TOKEN" "$WORK/dom-login.html" | sed 's/^/  occurrences of the token in the rendered page (must be 0): /' || true
 fi
 
