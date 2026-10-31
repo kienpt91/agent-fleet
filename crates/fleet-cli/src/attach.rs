@@ -72,7 +72,10 @@ fn stdin_pump(writer: SharedWriter, stop: Arc<AtomicBool>, detached: Arc<AtomicB
     while !stop.load(Ordering::Relaxed) {
         // Poll with a timeout so the thread notices `stop` instead of blocking in read forever
         // and stealing a keystroke from whatever owns the terminal next.
-        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN | PollFlags::POLLHUP)];
+        let mut fds = [PollFd::new(
+            stdin.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP,
+        )];
         match poll(&mut fds, PollTimeout::from(100u16)) {
             Ok(0) => continue,
             Ok(_) => {}

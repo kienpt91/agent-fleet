@@ -43,7 +43,10 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Action {
         };
     }
     // Other modifiers (Alt, Ctrl) are not bindings; do not let Ctrl-D act as `d`.
-    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
         return Action::None;
     }
     match key.code {
@@ -150,9 +153,11 @@ fn handle_input(model: &mut Model, key: KeyEvent) -> Action {
             }
             Action::None
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !c.is_control()
-            && !fleet_domain::ids::is_invisible(c) => {
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !c.is_control()
+                && !fleet_domain::ids::is_invisible(c) =>
+        {
             if let Some(s) = model.input.as_mut() {
                 if s.len() + c.len_utf8() <= MAX_ANSWER {
                     s.push(c);
@@ -182,7 +187,11 @@ mod tests {
             task("t1", "one", "running", &[]),
             task("t2", "two", "pending", &[]),
         ]);
-        let s = with(s, "approvals", vec![approval("a1", "dig1"), approval("a2", "dig2")]);
+        let s = with(
+            s,
+            "approvals",
+            vec![approval("a1", "dig1"), approval("a2", "dig2")],
+        );
         let s = with(s, "gates", vec![gate("g1", "which db?", true)]);
         let mut m = Model::new();
         m.update_status(&s);
@@ -195,7 +204,10 @@ mod tests {
         assert_eq!(handle_key(&mut m, ch('q')), Action::Quit);
         assert_eq!(handle_key(&mut m, press(KeyCode::Esc)), Action::Quit);
         assert_eq!(
-            handle_key(&mut m, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            handle_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
             Action::Quit
         );
         // Esc closes help first, the next Esc quits.
@@ -245,11 +257,17 @@ mod tests {
         handle_key(&mut m, ch('j'));
         assert_eq!(
             handle_key(&mut m, ch('a')),
-            Action::Approve { id: "a2".into(), digest: "dig2".into() }
+            Action::Approve {
+                id: "a2".into(),
+                digest: "dig2".into()
+            }
         );
         assert_eq!(
             handle_key(&mut m, ch('d')),
-            Action::Deny { id: "a2".into(), digest: "dig2".into() }
+            Action::Deny {
+                id: "a2".into(),
+                digest: "dig2".into()
+            }
         );
     }
 
@@ -282,7 +300,10 @@ mod tests {
     #[test]
     fn enter_attaches_only_to_live_tasks() {
         let mut m = model();
-        assert_eq!(handle_key(&mut m, press(KeyCode::Enter)), Action::OpenAttach("r1/t1".into()));
+        assert_eq!(
+            handle_key(&mut m, press(KeyCode::Enter)),
+            Action::OpenAttach("r1/t1".into())
+        );
         handle_key(&mut m, ch('j'));
         assert_eq!(handle_key(&mut m, press(KeyCode::Enter)), Action::None);
         assert!(m.message.contains("no live session"));
@@ -294,7 +315,11 @@ mod tests {
         m.focus = Focus::Approvals;
         let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert_eq!(handle_key(&mut m, ctrl_d), Action::None);
-        let release = KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
         assert_eq!(handle_key(&mut m, release), Action::None);
     }
 
@@ -312,7 +337,10 @@ mod tests {
         assert_eq!(m.input.as_deref(), Some("sql"));
         assert_eq!(
             handle_key(&mut m, press(KeyCode::Enter)),
-            Action::ResolveGate { id: "g1".into(), answer: "sql".into() }
+            Action::ResolveGate {
+                id: "g1".into(),
+                answer: "sql".into()
+            }
         );
         assert!(m.input.is_none());
     }
@@ -350,7 +378,11 @@ mod tests {
         m.focus = Focus::Gates;
         handle_key(&mut m, press(KeyCode::Enter));
         handle_key(&mut m, ch('x'));
-        m.update_status(&with(status(vec![task("t1", "one", "running", &[])]), "gates", vec![]));
+        m.update_status(&with(
+            status(vec![task("t1", "one", "running", &[])]),
+            "gates",
+            vec![],
+        ));
         assert_eq!(handle_key(&mut m, press(KeyCode::Enter)), Action::None);
         assert!(m.input.is_none());
     }

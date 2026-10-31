@@ -18,7 +18,13 @@ const RECENT_SHOWN: usize = 10;
 pub fn clean(s: &str) -> String {
     sanitize_text(s.as_bytes())
         .chars()
-        .map(|c| if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -181,7 +187,11 @@ fn render_run(run: &Value, out: &mut String) {
         text_or_dash(run, "status"),
         num(run, "max_parallel")
     );
-    let _ = writeln!(out, "  objective  {}", truncate(&text(run, "objective"), 100));
+    let _ = writeln!(
+        out,
+        "  objective  {}",
+        truncate(&text(run, "objective"), 100)
+    );
     let sha = prefix(&text(run, "base_sha"), 8);
     let _ = writeln!(
         out,
@@ -190,7 +200,11 @@ fn render_run(run: &Value, out: &mut String) {
         text_or_dash(run, "base_ref"),
         if sha.is_empty() { "-" } else { &sha }
     );
-    let _ = writeln!(out, "  branch     {}", text_or_dash(run, "integration_branch"));
+    let _ = writeln!(
+        out,
+        "  branch     {}",
+        text_or_dash(run, "integration_branch")
+    );
     if let Some(c) = run.get("counts") {
         let parts: Vec<String> = [
             "pending",
@@ -281,7 +295,11 @@ fn render_approval_lines(approvals: &[Value], only_pending: bool, out: &mut Stri
             let _ = writeln!(out, "  {}", truncate(&display, 200));
         }
         if status == "pending" {
-            let _ = writeln!(out, "  decide: fleet approve {0} | fleet deny {0}", text(a, "id"));
+            let _ = writeln!(
+                out,
+                "  decide: fleet approve {0} | fleet deny {0}",
+                text(a, "id")
+            );
         }
     }
 }
@@ -293,7 +311,12 @@ fn render_recent(recent: &[Value], out: &mut String) {
     out.push_str("recent\n");
     let skip = recent.len().saturating_sub(RECENT_SHOWN);
     for e in recent.iter().skip(skip) {
-        let _ = writeln!(out, "  #{} {}", num(e, "seq"), truncate(&text(e, "line"), 200));
+        let _ = writeln!(
+            out,
+            "  #{} {}",
+            num(e, "seq"),
+            truncate(&text(e, "line"), 200)
+        );
     }
 }
 
@@ -380,7 +403,12 @@ pub fn render_events(v: &Value) -> String {
     }
     let mut out = String::new();
     for e in events {
-        let _ = writeln!(out, "#{} {}", num(e, "seq"), truncate(&text(e, "line"), 300));
+        let _ = writeln!(
+            out,
+            "#{} {}",
+            num(e, "seq"),
+            truncate(&text(e, "line"), 300)
+        );
     }
     out
 }
@@ -666,7 +694,14 @@ recent
     #[test]
     fn status_survives_missing_and_mistyped_fields() {
         let v = Value::object([
-            ("runs", Value::array([Value::Int(3), Value::Null, Value::object([("tasks", s("x"))])])),
+            (
+                "runs",
+                Value::array([
+                    Value::Int(3),
+                    Value::Null,
+                    Value::object([("tasks", s("x"))]),
+                ]),
+            ),
             ("gates", Value::Bool(true)),
         ]);
         let out = render_status(&v);
@@ -711,10 +746,7 @@ recent
                     ("digest", s(evil)),
                 ])]),
             ),
-            (
-                "recent",
-                Value::array([Value::object([("line", s(evil))])]),
-            ),
+            ("recent", Value::array([Value::object([("line", s(evil))])])),
         ]);
         for out in [
             render_status(&v),
@@ -788,7 +820,10 @@ recent
         assert!(out.contains("gate g1 [conflict] r1/t1: which side?"));
         assert!(out.contains("choices: ours | theirs"));
         assert!(out.contains("answered: yes"));
-        assert_eq!(render_gates(&Value::Object(Default::default())), "no decision gates\n");
+        assert_eq!(
+            render_gates(&Value::Object(Default::default())),
+            "no decision gates\n"
+        );
     }
 
     #[test]
@@ -805,7 +840,10 @@ recent
     fn events_fall_back_to_recent() {
         let e = Value::object([(
             "events",
-            Value::array([Value::object([("seq", Value::int(3u64)), ("line", s("hi"))])]),
+            Value::array([Value::object([
+                ("seq", Value::int(3u64)),
+                ("line", s("hi")),
+            ])]),
         )]);
         assert_eq!(render_events(&e), "#3 hi\n");
         assert_eq!(render_events(&status_fixture()), "#7 t2 started\n");
@@ -827,7 +865,10 @@ recent
     fn small_renderers() {
         let created = Value::object([("run", s("r9"))]);
         assert_eq!(render_run_created(&created, None), "run r9 created\n");
-        assert_eq!(render_run_created(&Value::Null, Some("mine")), "run mine created\n");
+        assert_eq!(
+            render_run_created(&Value::Null, Some("mine")),
+            "run mine created\n"
+        );
         assert_eq!(render_run_created(&Value::Null, None), "run created\n");
         let plan = Value::object([("run", s("r1")), ("tasks", Value::array([s("a"), s("b")]))]);
         assert_eq!(render_plan(&plan), "plan loaded into run r1 (2 tasks)\n");
@@ -841,8 +882,14 @@ recent
             render_merge(&merge),
             "merged r1/t1 at 0123456789ab into fleet/r1/integration\nfast-forward\nclean\n"
         );
-        let cleanup = Value::object([("removed", Value::array([s("w1")])), ("branches", Value::int(2u64))]);
-        assert_eq!(render_cleanup(&cleanup), "cleanup finished, removed 1, branches 2\n");
+        let cleanup = Value::object([
+            ("removed", Value::array([s("w1")])),
+            ("branches", Value::int(2u64)),
+        ]);
+        assert_eq!(
+            render_cleanup(&cleanup),
+            "cleanup finished, removed 1, branches 2\n"
+        );
         assert!(render_undo(&Value::object([("report", s("1 file"))]), true).ends_with("1 file\n"));
         assert_eq!(render_ack("stopped", &Value::Null), "stopped\n");
     }

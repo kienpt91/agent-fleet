@@ -235,11 +235,14 @@ fn parse_task(run: &str, t: &Value) -> TaskRow {
         retries_used: num_of(t, "retries_used"),
         summary: opt_text(t, "summary"),
         failure: opt_text(t, "failure"),
-        block: t.get("block").filter(|b| b.as_object().is_some()).map(|b| BlockInfo {
-            kind: text_of(b, "kind"),
-            subject: text_of(b, "subject"),
-            detail: text_of(b, "detail"),
-        }),
+        block: t
+            .get("block")
+            .filter(|b| b.as_object().is_some())
+            .map(|b| BlockInfo {
+                kind: text_of(b, "kind"),
+                subject: text_of(b, "subject"),
+                detail: text_of(b, "detail"),
+            }),
         gates: list_of(t, "gates")
             .iter()
             .take(MAX_LIST)
@@ -267,7 +270,10 @@ impl Model {
     pub fn update_status(&mut self, status: &Value) {
         let previous = self.selected_key();
         let previous_gate = self.gates.get(self.gate_selected).map(|g| g.id.clone());
-        let previous_approval = self.approvals.get(self.approval_selected).map(|a| a.id.clone());
+        let previous_approval = self
+            .approvals
+            .get(self.approval_selected)
+            .map(|a| a.id.clone());
 
         let d = status.get("daemon").cloned().unwrap_or(Value::Null);
         self.daemon = DaemonInfo {
@@ -523,12 +529,19 @@ mod tests {
         assert_eq!(m.selected_key().as_deref(), Some("r1/t1"));
         assert_eq!(m.visible_counts(), [1, 0, 1, 0, 1, 0, 0]);
         assert_eq!(m.daemon.max_sessions, 8);
-        assert_eq!(m.tasks.get(1).map(|t| t.deps.clone()), Some(vec!["t1".to_string()]));
+        assert_eq!(
+            m.tasks.get(1).map(|t| t.deps.clone()),
+            Some(vec!["t1".to_string()])
+        );
     }
 
     #[test]
     fn only_open_gates_and_pending_approvals_are_kept() {
-        let s = with(three(), "gates", vec![gate("g1", "q?", true), gate("g2", "old", false)]);
+        let s = with(
+            three(),
+            "gates",
+            vec![gate("g1", "q?", true), gate("g2", "old", false)],
+        );
         let mut denied = approval("a2", "x");
         if let Value::Object(m) = &mut denied {
             m.insert("status".into(), Value::str("denied"));
@@ -598,9 +611,15 @@ mod tests {
         let mut m = Model::new();
         m.update_status(&status(vec![task("t1", evil, "running", &[])]));
         let title = m.tasks.first().map(|t| t.title.clone()).unwrap_or_default();
-        assert!(!title.chars().any(|c| c.is_control() || c == '\u{202e}'), "{title:?}");
+        assert!(
+            !title.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{title:?}"
+        );
         m.set_tail("r1/t1", "x\x1b[31m\x07\u{202e}y");
-        assert!(!m.tail.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'));
+        assert!(!m
+            .tail
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'));
     }
 
     #[test]
@@ -612,8 +631,15 @@ mod tests {
             Value::int(7),
             Value::str("x"),
             Value::array([Value::Null, Value::int(1)]),
-            Value::object([("runs", Value::int(1)), ("gates", Value::str("g")), ("daemon", Value::array([]))]),
-            Value::object([("runs", Value::array([Value::Null, Value::object([("tasks", Value::str("t"))])]))]),
+            Value::object([
+                ("runs", Value::int(1)),
+                ("gates", Value::str("g")),
+                ("daemon", Value::array([])),
+            ]),
+            Value::object([(
+                "runs",
+                Value::array([Value::Null, Value::object([("tasks", Value::str("t"))])]),
+            )]),
             Value::object([(
                 "runs",
                 Value::array([Value::object([(
@@ -642,7 +668,10 @@ mod tests {
             "runs",
             Value::array([Value::object([
                 ("id", Value::str("r9")),
-                ("tasks", Value::array([Value::object([("id", Value::str("tx"))])])),
+                (
+                    "tasks",
+                    Value::array([Value::object([("id", Value::str("tx"))])]),
+                ),
             ])]),
         )]));
         let t = m.selected_task().cloned().unwrap_or_default();
@@ -671,6 +700,9 @@ mod tests {
             f = f.next();
             seen.push(f);
         }
-        assert_eq!(seen, vec![Focus::Gates, Focus::Approvals, Focus::Output, Focus::Tasks]);
+        assert_eq!(
+            seen,
+            vec![Focus::Gates, Focus::Approvals, Focus::Output, Focus::Tasks]
+        );
     }
 }

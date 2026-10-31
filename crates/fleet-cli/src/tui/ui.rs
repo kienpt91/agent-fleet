@@ -52,7 +52,11 @@ pub fn header_text(model: &Model) -> String {
     } else {
         format!("fleet {}", model.daemon.version)
     };
-    let undo = if model.daemon.undo == "available" { "on" } else { "off" };
+    let undo = if model.daemon.undo == "available" {
+        "on"
+    } else {
+        "off"
+    };
     let rss = model
         .daemon
         .rss_kb
@@ -137,7 +141,10 @@ fn render_header(frame: &mut Frame, model: &Model, area: Rect) {
     } else {
         Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
     };
-    frame.render_widget(Paragraph::new(Span::styled(header_text(model), style)), area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(header_text(model), style)),
+        area,
+    );
 }
 
 fn render_tasks(frame: &mut Frame, model: &Model, area: Rect) {
@@ -216,7 +223,10 @@ fn detail_lines(t: &TaskRow, width: usize) -> Vec<Line<'static>> {
     )));
     if let Some(b) = &t.block {
         lines.push(Line::from(Span::styled(
-            fit(&format!("blocked: {} {} {}", b.kind, b.subject, b.detail), width),
+            fit(
+                &format!("blocked: {} {} {}", b.kind, b.subject, b.detail),
+                width,
+            ),
             status_style("blocked"),
         )));
     }
@@ -271,7 +281,12 @@ fn render_output(frame: &mut Frame, model: &Model, area: Rect) {
         .lines()
         .rev()
         .take(rows)
-        .map(|l| Line::from(fit(&sanitize_text(l.replace('\t', "    ").as_bytes()), width)))
+        .map(|l| {
+            Line::from(fit(
+                &sanitize_text(l.replace('\t', "    ").as_bytes()),
+                width,
+            ))
+        })
         .collect();
     lines.reverse();
     if lines.is_empty() {
@@ -290,7 +305,10 @@ fn render_approvals(frame: &mut Frame, model: &Model, area: Rect) {
     frame.render_widget(block, area);
     if model.approvals.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled("none pending", Style::new().fg(Color::DarkGray))),
+            Paragraph::new(Span::styled(
+                "none pending",
+                Style::new().fg(Color::DarkGray),
+            )),
             inner,
         );
         return;
@@ -413,7 +431,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let height = area.height.saturating_sub(2).min(16);
     let rect = Rect::new(
         area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y.saturating_add(area.height.saturating_sub(height) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
         width,
         height,
     );
@@ -475,7 +494,11 @@ mod tests {
         ]);
         let digest = "0123456789abcdef0123";
         let s = with(s, "approvals", vec![approval("a1", digest)]);
-        let s = with(s, "gates", vec![gate("g1", "which database should I use?", true)]);
+        let s = with(
+            s,
+            "gates",
+            vec![gate("g1", "which database should I use?", true)],
+        );
         let mut m = Model::new();
         m.update_status(&s);
         m.set_tail("r1/t1", "compiling\nlinking\n");
@@ -549,7 +572,11 @@ mod tests {
             m.insert("worker".into(), Value::str(evil));
             m.insert(
                 "block".into(),
-                Value::object([("kind", Value::str(evil)), ("subject", Value::str(evil)), ("detail", Value::str(evil))]),
+                Value::object([
+                    ("kind", Value::str(evil)),
+                    ("subject", Value::str(evil)),
+                    ("detail", Value::str(evil)),
+                ]),
             );
         }
         let s = with(status(vec![t]), "approvals", vec![denied_digest]);
@@ -592,7 +619,16 @@ mod tests {
     #[test]
     fn tiny_terminals_do_not_panic() {
         let m = sample();
-        for (w, h) in [(0, 0), (1, 1), (10, 3), (39, 9), (39, 30), (100, 9), (40, 10), (41, 11)] {
+        for (w, h) in [
+            (0, 0),
+            (1, 1),
+            (10, 3),
+            (39, 9),
+            (39, 30),
+            (100, 9),
+            (40, 10),
+            (41, 11),
+        ] {
             let text = screen(&m, w, h);
             if w < MIN_WIDTH || h < MIN_HEIGHT {
                 if w >= 18 && h >= 1 {

@@ -45,7 +45,9 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Result<TerminalGuard> {
         if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-            return Err(FleetError::usage("the dashboard needs an interactive terminal"));
+            return Err(FleetError::usage(
+                "the dashboard needs an interactive terminal",
+            ));
         }
         enable_raw_mode().map_err(|e| FleetError::io("cannot enable raw terminal mode", &e))?;
         let mut out = std::io::stdout();
@@ -235,7 +237,10 @@ impl App {
         let Some(key) = self.model.selected_key() else {
             return;
         };
-        let args = Value::object([("task", Value::str(key.as_str())), ("max", Value::Int(TAIL_MAX))]);
+        let args = Value::object([
+            ("task", Value::str(key.as_str())),
+            ("max", Value::Int(TAIL_MAX)),
+        ]);
         // A failed tail poll is not worth a message; the status poll reports connection loss.
         if let Ok(v) = self.link.call("task.tail", args) {
             if let Some(text) = v.get("text").and_then(Value::as_str) {
@@ -264,7 +269,9 @@ impl App {
                 }
                 match outcome {
                     Ok(_) => self.model.set_message(&format!("detached from {task}")),
-                    Err(e) => self.model.set_message(&describe_error(&format!("attach {task}"), &e)),
+                    Err(e) => self
+                        .model
+                        .set_message(&describe_error(&format!("attach {task}"), &e)),
                 }
                 self.refresh_now();
             }
@@ -294,8 +301,8 @@ impl App {
             let ready = event::poll(EVENT_POLL)
                 .map_err(|e| FleetError::io("cannot read terminal events", &e))?;
             if ready {
-                let event = event::read()
-                    .map_err(|e| FleetError::io("cannot read terminal events", &e))?;
+                let event =
+                    event::read().map_err(|e| FleetError::io("cannot read terminal events", &e))?;
                 // Resizes need no handling: the next draw picks up the new size.
                 if let Event::Key(key) = event {
                     let action = handle_key(&mut self.model, key);
@@ -402,8 +409,8 @@ mod tests {
 
     #[test]
     fn error_text_includes_code_and_subject() {
-        let e = FleetError::new(ErrorCode::ApprovalRequired, "merge needs approval")
-            .with_subject("a7");
+        let e =
+            FleetError::new(ErrorCode::ApprovalRequired, "merge needs approval").with_subject("a7");
         assert_eq!(
             describe_error("merge r1/t1", &e),
             "merge r1/t1: merge needs approval (approval_required) [a7]"
@@ -414,11 +421,17 @@ mod tests {
 
     #[test]
     fn only_connection_failures_trigger_a_reconnect() {
-        assert!(is_transport_error(&FleetError::new(ErrorCode::DaemonDown, "x")));
+        assert!(is_transport_error(&FleetError::new(
+            ErrorCode::DaemonDown,
+            "x"
+        )));
         assert!(is_transport_error(&FleetError::internal("broken pipe")));
         assert!(!is_transport_error(&FleetError::conflict("x")));
         assert!(!is_transport_error(&FleetError::not_found("x")));
-        assert!(!is_transport_error(&FleetError::new(ErrorCode::ApprovalRequired, "x")));
+        assert!(!is_transport_error(&FleetError::new(
+            ErrorCode::ApprovalRequired,
+            "x"
+        )));
     }
 
     #[test]

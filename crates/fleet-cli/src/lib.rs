@@ -10,6 +10,10 @@
 )]
 
 pub mod args;
-pub mod render;
 pub mod attach;
+pub mod commands;
+pub mod doctor;
+pub mod render;
 pub mod tui;
+
+pub use commands::run;
