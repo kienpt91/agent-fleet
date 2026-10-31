@@ -875,7 +875,7 @@ fn bodies_are_validated_strictly_and_rejected_before_the_daemon_sees_them() {
         ("/api/gate/resolve", "{\"id\":7,\"answer\":\"x\"}".into()),
         (
             "/api/approval/decide",
-            format!("{{\"id\":\"a1\",\"approve\":true}}"),
+            "{\"id\":\"a1\",\"approve\":true}".to_string(),
         ),
         (
             "/api/approval/decide",
