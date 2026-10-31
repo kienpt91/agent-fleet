@@ -157,26 +157,27 @@ pub fn identify(peer: SocketAddr, local: SocketAddr) -> PeerIdentity {
     }
 }
 
-/// On macOS the socket table is read with `lsof` (a fixed absolute path, an empty environment).
+/// On macOS the socket table is read with `lsof` (a fixed absolute path, an empty environment, two
+/// seconds at most; a missing or hung `lsof` leaves the peer unidentified, which is refused).
 /// This code type-checks for macOS but has not been run there.
 #[cfg(target_os = "macos")]
 pub fn identify(peer: SocketAddr, local: SocketAddr) -> PeerIdentity {
-    use std::process::{Command, Stdio};
-    let out = Command::new("/usr/sbin/lsof")
-        .args([
-            "-nP",
-            "-w",
-            "-a",
-            "-F",
-            "pn",
-            &format!("-iTCP:{}", peer.port()),
-        ])
-        .env_clear()
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    let Ok(out) = out else {
+    use std::process::Command;
+    let out = crate::procid::output_within(
+        Command::new("/usr/sbin/lsof")
+            .args([
+                "-nP",
+                "-w",
+                "-a",
+                "-F",
+                "pn",
+                &format!("-iTCP:{}", peer.port()),
+            ])
+            .env_clear()
+            .env("LC_ALL", "C"),
+        crate::procid::TOOL_TIMEOUT,
+    );
+    let Some(out) = out else {
         return PeerIdentity::Unknown;
     };
     let Ok(text) = String::from_utf8(out.stdout) else {

@@ -136,17 +136,24 @@ const SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 /// (`setsid`, a double fork) can still be stopped when the check is over and are treated as
 /// untrusted origin meanwhile.
 ///
-/// What this does and does not cover: a descendant is found when a sample (every 200 ms, and one
-/// at the very end) sees it below the child. A process that detaches *and* whose whole chain of
-/// parents is gone before the next sample is not found; neither is one that starts after the
-/// last sample. The group kill of the child still takes every process that stayed in the group.
-/// Without cgroups or a sandbox there is no complete answer; run checks in a container or as
-/// another user when that matters.
+/// What this does and does not cover: a descendant is found when a sample sees it below the child.
+/// Samples are taken every 200 ms while the child runs (the first one 200 ms after it started)
+/// and once more just before a child that ran out of time is stopped. There is none after a
+/// normal exit: the child is gone by then, and so is the parent link that would lead to its
+/// descendants. A process that detaches *and* whose whole chain of parents is gone before the next
+/// sample is not found (`setsid` plus a parent that exits within the first 200 ms); neither is
+/// one that starts after the last sample. The group kill of the child still takes every process
+/// that stayed in the group. When the process table cannot be read (an unreadable `/proc`, a
+/// `ps` that fails or hangs) the sweeper finds nothing: it says so once on stderr and carries on
+/// with the group kill. Without cgroups or a sandbox there is no complete answer; run checks in a
+/// container or as another user when that matters.
 pub(crate) struct Sweeper<'a> {
     tracker: &'a JobTracker,
     root: u32,
     seen: Vec<(u32, String, Tracked)>,
     last: Option<Instant>,
+    /// The process table could not be read at some sample (reported once).
+    blind: bool,
 }
 
 impl<'a> Sweeper<'a> {
@@ -158,16 +165,36 @@ impl<'a> Sweeper<'a> {
             root,
             seen: Vec::new(),
             last: Some(Instant::now()),
+            blind: false,
         }
+    }
+
+    /// True once a sample could not read the process table: what escaped the group since then
+    /// has not been seen.
+    #[cfg(test)]
+    pub(crate) fn is_blind(&self) -> bool {
+        self.blind
     }
 
     /// Looks for new descendants if the last look is older than the interval (or `force`).
     pub(crate) fn sample(&mut self, force: bool) {
+        self.sample_from(force, crate::procid::process_table);
+    }
+
+    fn sample_from(&mut self, force: bool, table: impl FnOnce() -> Option<Vec<(u32, u32)>>) {
         if !force && self.last.is_some_and(|t| t.elapsed() < SWEEP_INTERVAL) {
             return;
         }
         self.last = Some(Instant::now());
-        let table = crate::procid::process_table();
+        let Some(table) = table() else {
+            if !self.blind {
+                self.blind = true;
+                eprintln!(
+                    "fleet: the process table could not be read; processes that leave the process group of a check or a gate are not followed (the group is still killed)"
+                );
+            }
+            return;
+        };
         for pid in crate::procid::descendants_in(&table, self.root) {
             if self.seen.iter().any(|(p, _, _)| *p == pid) {
                 continue;
@@ -771,6 +798,22 @@ mod tests {
 
     const SAFE_PATH: &str = "/usr/bin:/bin";
     const CAP: usize = 64 * 1024;
+
+    #[test]
+    fn a_sweeper_that_cannot_read_the_process_table_is_blind_and_still_works_afterwards() {
+        let tracker = JobTracker::default();
+        let mut sweeper = Sweeper::new(&tracker, std::process::id());
+        assert!(!sweeper.is_blind());
+        sweeper.sample_from(true, || None);
+        assert!(sweeper.is_blind(), "an unreadable table must be noticed");
+        // it does not stop following: a later readable sample finds a child of the root
+        let mut child = StdCommand::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        sweeper.sample_from(true, || Some(vec![(pid, std::process::id())]));
+        assert_eq!(sweeper.seen.len(), 1);
+        sweeper.kill_all();
+        let _ = child.wait();
+    }
 
     fn env_path() -> Vec<(String, String)> {
         vec![("PATH".to_string(), SAFE_PATH.to_string())]
