@@ -132,14 +132,37 @@ const NETWORK_MARKERS: [&str; 11] = [
     "connection reset",
 ];
 
+fn status_digits(digits: &str) -> Option<u16> {
+    if digits.len() == 3 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        digits.parse::<u16>().ok()
+    } else {
+        None
+    }
+}
+
+/// The status that `gh` reports on stderr when the output has no header block: `gh: <message>
+/// (HTTP 404)`, or `gh: HTTP 404` when the answer had no message. Only a line of that shape
+/// counts, the last such line: a message of the server that has `(HTTP 200)` in the middle of its
+/// text does not decide anything.
 fn http_status_in(stderr: &str) -> Option<u16> {
-    let at = stderr.rfind("(HTTP ")?;
-    let rest = stderr.get(at + 6..)?;
-    rest.split(')').next()?.trim().parse::<u16>().ok()
+    stderr.lines().rev().find_map(|line| {
+        let line = line.trim_end();
+        if let Some(digits) = line.strip_prefix("gh: HTTP ") {
+            return status_digits(digits);
+        }
+        let rest = line.strip_suffix(')')?;
+        status_digits(rest.get(rest.rfind("(HTTP ")? + 6..)?)
+    })
 }
 
 /// Reads a failed call. `message` is the `message` field of an error body, already cleaned (it
 /// may be empty); `stderr` is what `gh` printed; `exit_code` is its exit status.
+///
+/// What decides is structure: the HTTP status (from the header block or the end of a `gh` line),
+/// the exit status (4 is `gh`'s "needs authentication") and the rate-limit headers. The words of
+/// `gh` and of the server are read only where nothing structural exists: the words of `gh` when
+/// there was no HTTP answer at all, and "rate limit" in the message of a 403. Text that arrives
+/// with an answer (a validation message, a name) never makes it a sign-in problem.
 pub fn classify(
     exit_code: Option<i32>,
     status: Option<u16>,
@@ -152,14 +175,20 @@ pub fn classify(
     let status = status.or_else(|| http_status_in(stderr));
     let not_signed_in = status == Some(401)
         || exit_code == Some(4)
-        || low_err.contains("gh auth login")
-        || low_err.contains("not logged in")
-        || low_err.contains("authentication token")
-        || low_msg.contains("bad credentials");
+        || (status.is_none()
+            && (low_err.contains("gh auth login")
+                || low_err.contains("not logged in")
+                || low_err.contains("authentication token")
+                || low_msg.contains("bad credentials")));
     if not_signed_in {
         return Failure::NotAuthenticated;
     }
-    let limited_text = low_msg.contains("rate limit") || low_err.contains("rate limit");
+    // the server's message, and `gh`'s rendering of it only when there is no message
+    let limited_text = if message.is_empty() {
+        low_err.contains("rate limit")
+    } else {
+        low_msg.contains("rate limit")
+    };
     let limited = status == Some(429)
         || (status == Some(403)
             && (limited_text || rate.remaining == Some(0) || rate.retry_after_s.is_some()));
@@ -374,6 +403,80 @@ mod tests {
             classify(Some(1), None, none(), "", "something odd"),
             Failure::Other(_)
         ));
+    }
+
+    #[test]
+    fn words_that_come_with_an_answer_do_not_make_it_a_sign_in_problem() {
+        // a server's message can repeat text that somebody else wrote; with a status in hand, the
+        // status decides and the words of the sign-in problem mean nothing
+        let words = "Validation Failed: gh auth login, Bad credentials, not logged in, authentication token, rate limit";
+        let stderr = format!("gh: {words} (HTTP 422)\nTry authenticating with:  gh auth login\n");
+        for status in [None, Some(422)] {
+            let f = classify(Some(1), status, none(), words, &stderr);
+            assert!(matches!(f, Failure::Rejected(_)), "{status:?}: {f:?}");
+        }
+        assert_eq!(
+            classify(
+                Some(1),
+                Some(404),
+                none(),
+                "Not Found",
+                "gh: Not Found (HTTP 404)\nTo get started with GitHub CLI, please run:  gh auth login\n"
+            ),
+            Failure::NotFound
+        );
+        assert_eq!(
+            classify(Some(1), Some(502), none(), "not logged in", ""),
+            Failure::Server(502)
+        );
+        // a 403 is a rate limit by its headers or by the server's own message, not by words that
+        // only `gh` repeats on stderr next to a different message
+        let f = classify(
+            Some(1),
+            Some(403),
+            none(),
+            "Resource not accessible by integration",
+            "gh: Resource not accessible by integration (HTTP 403)\nrate limit rate limit\n",
+        );
+        assert!(matches!(f, Failure::Forbidden(_)), "{f:?}");
+    }
+
+    #[test]
+    fn the_status_on_stderr_is_the_one_that_ends_a_line_of_gh() {
+        let at = |stderr: &str| classify(Some(1), None, none(), "", stderr);
+        assert_eq!(at("gh: Bad Gateway (HTTP 502)\n"), Failure::Server(502));
+        // an answer without a message: gh says only `gh: HTTP 502`
+        assert_eq!(at("gh: HTTP 502\n"), Failure::Server(502));
+        assert!(matches!(at("gh: HTTP 5020\n"), Failure::Other(_)));
+        // (HTTP 404) in the middle of the text of a server is not gh's status
+        assert_eq!(
+            at("gh: it says (HTTP 404) here (HTTP 502)\n"),
+            Failure::Server(502)
+        );
+        assert!(matches!(
+            at("gh: it says (HTTP 404) in the middle of a line\n"),
+            Failure::Other(_)
+        ));
+        // not three digits: no status
+        assert!(matches!(at("gh: odd (HTTP 4040)\n"), Failure::Other(_)));
+        assert!(matches!(at("gh: odd (HTTP x)\n"), Failure::Other(_)));
+        // an earlier line that ends like a status does not outrank the last one
+        assert_eq!(
+            at("gh: first (HTTP 404)\nSSO required (HTTP 503)\n"),
+            Failure::Server(503)
+        );
+    }
+
+    #[test]
+    fn a_name_in_the_endpoint_does_not_change_a_network_failure() {
+        // gh repeats the URL it called, with the owner and the name of the repository in it
+        for name in ["403", "401", "rate-limit", "not-logged-in", "gh-auth-login"] {
+            let stderr = format!(
+                "Get \"https://api.github.com/repos/o/{name}/issues\": dial tcp: lookup api.github.com: no such host"
+            );
+            let f = classify(Some(1), None, none(), "", &stderr);
+            assert!(matches!(f, Failure::NetworkDown(_)), "{name}: {f:?}");
+        }
     }
 
     #[test]
