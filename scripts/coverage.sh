@@ -24,7 +24,10 @@ export CARGO_TARGET_DIR="$COV/build"
 export LLVM_PROFILE_FILE="$COV/raw/p-%p-%m.profraw"
 export FLEET_SOAK_SECS=${FLEET_SOAK_SECS:-8}
 
-cargo test --workspace --locked --offline --no-fail-fast
+# With an OpenSSH server in the image (docker/Dockerfile.ssh) the remote tests are part of the numbers.
+RUN=""
+if [ -x /usr/sbin/sshd ]; then RUN="sh scripts/ssh-env.sh"; fi
+$RUN cargo test --workspace --locked --offline --no-fail-fast
 objects=$(cargo test --workspace --locked --offline --no-run --message-format=json 2>/dev/null \
   | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | sort -u)
 [ -x "$CARGO_TARGET_DIR/debug/fleet" ] && objects="$objects $CARGO_TARGET_DIR/debug/fleet"

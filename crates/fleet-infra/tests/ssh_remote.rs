@@ -587,7 +587,7 @@ fn hostile_arguments_reach_the_remote_program_unchanged() {
         expected.extend_from_slice(a.as_bytes());
         expected.push(0);
     }
-    expected.extend_from_slice(b"Linux\n");
+    expected.extend_from_slice(format!("Linux\n{}\n", nix::unistd::geteuid().as_raw()).as_bytes());
     assert_eq!(done.stdout, expected);
     assert!(!std::path::Path::new("/tmp/fleet-pwned").exists());
 }
@@ -634,7 +634,10 @@ fn random_hostile_arguments_survive_the_real_shell() {
         for (i, a) in args.iter().enumerate() {
             assert_eq!(parts[i], a.as_bytes(), "round {round} argument {i}");
         }
-        assert_eq!(parts[args.len()], b"Linux\n");
+        assert_eq!(
+            parts[args.len()],
+            format!("Linux\n{}\n", nix::unistd::geteuid().as_raw()).as_bytes()
+        );
     }
 }
 
@@ -1056,4 +1059,249 @@ fn an_oversized_bundle_is_refused_before_anything_is_sent() {
     assert!(err.message.contains("bundle"), "{}", err.message);
     assert_eq!(connections(&fx), before);
     assert!(!fx.remote_dir(&host, "r1", "t1").exists());
+}
+
+// ---- the whole path: terminal session, sanitizer, bounds, supervision -------------------------------
+
+mod sessions {
+    use super::*;
+    use fleet_app::ports::{SessionHost, SessionId, SessionSpec, SessionState, SignalOutcome};
+    use fleet_app::remote::RemoteSessions;
+    use fleet_infra::pty::{PtySessionHost, SessionRegistry};
+
+    pub struct Rig {
+        pub sessions: RemoteSessions,
+        pub registry: SessionRegistry,
+        pub host: HostDef,
+    }
+
+    pub fn rig(fx: &Fx, workers: &[&str], ring: usize, redactor: Redactor) -> Rig {
+        let mut host = fx.host(workers);
+        host.env = vec![("API_BASE".to_string(), "https://api.invalid".to_string())];
+        let remote = fx.remote(vec![host.clone()]);
+        fx.trust(&remote, &host);
+        let registry = SessionRegistry::default();
+        let pty = PtySessionHost::new(ring, Arc::new(redactor), registry.clone());
+        let hosts: BTreeMap<HostName, HostDef> =
+            std::iter::once((host.name.clone(), host.clone())).collect();
+        Rig {
+            sessions: RemoteSessions::new(Box::new(pty), Arc::new(remote), hosts),
+            registry,
+            host,
+        }
+    }
+
+    pub fn spec(fx: &Fx, rig: &Rig, program: &str, args: &[&str]) -> SessionSpec {
+        let wt = fx.worktree("r1", "t1");
+        let dir = rig.host.layout().unwrap().worktree(&rid("r1"), &tid("t1"));
+        SessionSpec {
+            run: rid("r1"),
+            task: tid("t1"),
+            attempt: 1,
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            cwd: wt,
+            env: worker_env(&rig.host.env, &rid("r1"), &tid("t1"), &dir),
+            host: Some(rig.host.name.clone()),
+        }
+    }
+
+    pub fn wait_exit(rig: &mut Rig, id: SessionId, secs: u64) -> SessionState {
+        let mut last = SessionState::Running;
+        wait_until(secs * 1000, || {
+            last = rig.sessions.poll(id);
+            last != SessionState::Running
+        });
+        last
+    }
+
+    #[test]
+    fn a_remote_worker_runs_in_a_local_terminal_with_sanitized_bounded_redacted_output() {
+        let Some(fx) = Fx::new() else { return };
+        let mut redactor = Redactor::builtin();
+        redactor.add_env_values(vec![(
+            "DEPLOY_TOKEN".to_string(),
+            "remote-secret-value-1234".to_string(),
+        )]);
+        let mut rig = rig(&fx, &["sh"], 64 * 1024, redactor);
+        // Hostile terminal text, a secret, then far more output than the ring keeps.
+        let script =
+            "printf 'start\\033]52;c;ZXZpbA==\\a\\033]0;owned\\a\\033[2J\\033[31mred\\033[0m\\n'; \
+                      echo 'token remote-secret-value-1234'; \
+                      head -c 40000000 /dev/zero | tr '\\0' 'x'; echo; echo finished-marker";
+        let spec = spec(&fx, &rig, "sh", &["-c", script]);
+        let spawned = rig.sessions.spawn(&spec).unwrap();
+        let state = wait_exit(&mut rig, spawned.id, 90);
+        assert!(
+            matches!(state, SessionState::Exited { code: Some(0), .. }),
+            "{state:?}"
+        );
+        let snapshot = rig.sessions.snapshot(spawned.id, 10 * 1024 * 1024).unwrap();
+        assert!(
+            snapshot.len() <= 80 * 1024,
+            "ring is bounded: {} bytes",
+            snapshot.len()
+        );
+        assert!(
+            snapshot.contains("finished-marker"),
+            "the end of the output is kept"
+        );
+        let all = rig.sessions.release(spawned.id);
+        assert!(all.text.len() <= 80 * 1024 + 4096, "{}", all.text.len());
+        for hostile in ["\u{1b}", "ZXZpbA", "owned"] {
+            assert!(
+                !all.text.contains(hostile),
+                "{hostile:?} reached the stored output"
+            );
+        }
+        assert!(
+            !all.text.contains("remote-secret-value-1234"),
+            "the secret is redacted"
+        );
+        assert!(
+            all.text.contains("brought back") || all.text.contains("no change"),
+            "{}",
+            &all.text[all.text.len().saturating_sub(400)..]
+        );
+        assert!(rig.registry.output_bytes() < 200 * 1024 * 1024);
+        assert!(!fx.remote_dir(&rig.host, "r1", "t1").exists(), "cleaned up");
+    }
+
+    #[test]
+    fn stopping_a_remote_worker_that_ignores_term_and_hangup_kills_it_on_the_host_too() {
+        let Some(fx) = Fx::new() else { return };
+        let mut rig = rig(&fx, &["sh"], 64 * 1024, Redactor::builtin());
+        let spec = spec(
+            &fx,
+            &rig,
+            "sh",
+            &[
+                "-c",
+                "trap '' TERM HUP INT; echo up; while :; do sleep 1; done",
+            ],
+        );
+        let spawned = rig.sessions.spawn(&spec).unwrap();
+        let pidfile = fx.remote_dir(&rig.host, "r1", "t1").with_extension("pid");
+        assert!(wait_until(20_000, || std::fs::read_to_string(&pidfile)
+            .is_ok_and(|t| t.split_whitespace().count() == 2)));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let alive = |p: i32| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok();
+        assert!(alive(pid));
+        // The supervisor's sequence: TERM, a grace period, KILL.
+        assert_eq!(
+            rig.sessions.signal(spawned.id, Signal::Term),
+            SignalOutcome::Sent
+        );
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            alive(pid) || rig.sessions.poll(spawned.id) != SessionState::Running,
+            "TERM alone does not stop it on the host"
+        );
+        let _ = rig.sessions.signal(spawned.id, Signal::Kill);
+        let state = wait_exit(&mut rig, spawned.id, 60);
+        assert!(matches!(state, SessionState::Exited { .. }), "{state:?}");
+        assert!(
+            wait_until(10_000, || !alive(pid)),
+            "the worker on the host is gone"
+        );
+        let out = rig.sessions.release(spawned.id);
+        assert!(out.text.contains("was removed"), "{}", out.text);
+        assert!(!fx.remote_dir(&rig.host, "r1", "t1").exists());
+    }
+
+    #[test]
+    fn the_worker_environment_in_the_terminal_holds_no_local_secret() {
+        let Some(fx) = Fx::new() else { return };
+        let mut rig = rig(&fx, &["sh"], 64 * 1024, Redactor::builtin());
+        let mut spec = spec(&fx, &rig, "sh", &["-c", "env | sort"]);
+        // Whatever a careless caller put into the spec's environment is exactly what is sent: the
+        // orchestrator builds it from the host's explicit values only (tested in fleet-app).
+        spec.env.retain(|(k, _)| k != "SENTINEL_LOCAL");
+        let spawned = rig.sessions.spawn(&spec).unwrap();
+        let state = wait_exit(&mut rig, spawned.id, 60);
+        assert!(
+            matches!(state, SessionState::Exited { code: Some(0), .. }),
+            "{state:?}"
+        );
+        let text = rig.sessions.release(spawned.id).text;
+        assert!(text.contains("API_BASE=https://api.invalid"), "{text}");
+        assert!(text.contains("FLEET_TASK=t1"));
+        for leaked in ["HOME=", "USER=", "SSH_", "SENTINEL", "LANG=", "XDG_"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+
+    #[test]
+    fn a_frozen_server_ends_the_attempt_through_the_keepalive_not_a_hang() {
+        let Some(fx) = Fx::new() else { return };
+        let mut rig = rig(&fx, &["sh"], 64 * 1024, Redactor::builtin());
+        rig.host.server_alive_secs = 1;
+        rig.host.server_alive_count = 2;
+        // Rebuild the rig's remote with short keepalives (the host entry is part of the client).
+        let remote = fx.remote(vec![rig.host.clone()]);
+        let registry = SessionRegistry::default();
+        let pty = PtySessionHost::new(64 * 1024, Arc::new(Redactor::builtin()), registry.clone());
+        let hosts: BTreeMap<HostName, HostDef> =
+            std::iter::once((rig.host.name.clone(), rig.host.clone())).collect();
+        rig.sessions = RemoteSessions::new(Box::new(pty), Arc::new(remote), hosts);
+        let spec = spec(&fx, &rig, "sh", &["-c", "echo connected; sleep 600"]);
+        let spawned = rig.sessions.spawn(&spec).unwrap();
+        assert!(wait_until(20_000, || rig
+            .sessions
+            .snapshot(spawned.id, 4096)
+            .is_some_and(|t| t.contains("connected"))));
+        // Freeze the whole server: it answers nothing, including keepalives.
+        let sshd_pid = std::fs::read_to_string(fx.sshd.dir.join("sshd.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let children: Vec<i32> = {
+            let table = fleet_infra::procid::process_table().unwrap_or_default();
+            fleet_infra::procid::descendants_in(&table, sshd_pid as u32)
+                .into_iter()
+                .map(|p| p as i32)
+                .collect()
+        };
+        for p in std::iter::once(sshd_pid).chain(children.iter().copied()) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(p),
+                nix::sys::signal::Signal::SIGSTOP,
+            );
+        }
+        let started = std::time::Instant::now();
+        let state = wait_exit(&mut rig, spawned.id, 90);
+        for p in std::iter::once(sshd_pid).chain(children.iter().copied()) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(p),
+                nix::sys::signal::Signal::SIGCONT,
+            );
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(p),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(
+            matches!(state, SessionState::Exited { code: Some(c), .. } if c != 0),
+            "{state:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+        let out = rig.sessions.release(spawned.id);
+        assert!(
+            out.text.contains("could not be brought back")
+                || out.text.contains("could not be collected"),
+            "{}",
+            out.text
+        );
+    }
 }

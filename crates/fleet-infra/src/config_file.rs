@@ -8,10 +8,11 @@
 use crate::fsx::{read_regular, ReadError};
 use crate::json;
 use fleet_app::config::{AppConfig, GateDef, WorkerDef};
+use fleet_app::hosts::HostDef;
 use fleet_app::ports::Identity;
 use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
-use fleet_domain::ids::{show, WorkerName};
+use fleet_domain::ids::{show, HostName, WorkerName};
 use fleet_domain::limits::{
     DEFAULT_RING_BYTES, MAX_CONFIG_FILE, MAX_PLAN_FILE, MAX_REDACT_RULES, MAX_RING_BYTES,
     MAX_TOTAL_TASKS,
@@ -31,6 +32,15 @@ pub struct LoadedConfig {
     pub redactor: Redactor,
     /// Bytes of recent output kept in memory per session.
     pub ring_bytes: usize,
+    /// Settings of the remote (SSH) support that are not about one host.
+    pub remote: RemoteSettings,
+}
+
+/// The `[remote]` table.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteSettings {
+    /// The `ssh` program, as an absolute path. When absent it is found once in `PATH`.
+    pub ssh_binary: Option<String>,
 }
 
 const MAX_TOML_MESSAGE: usize = 512;
@@ -48,6 +58,34 @@ struct FileConfig {
     redact: RedactSection,
     workers: BTreeMap<String, WorkerSection>,
     gates: Vec<GateSection>,
+    remote: RemoteSection,
+    hosts: BTreeMap<String, HostSection>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct RemoteSection {
+    ssh: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostSection {
+    address: String,
+    port: Option<u32>,
+    user: String,
+    identity_file: String,
+    base_dir: String,
+    #[serde(default)]
+    allowed_workers: Vec<String>,
+    max_sessions: Option<u32>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    proxy_jump: Option<String>,
+    connect_timeout_secs: Option<u64>,
+    server_alive_secs: Option<u64>,
+    server_alive_count: Option<u32>,
+    max_bundle_mib: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -195,7 +233,13 @@ pub fn default_config(parent_env: Vec<(String, String)>) -> LoadedConfig {
         app: AppConfig::new(parent_env),
         redactor,
         ring_bytes: DEFAULT_RING_BYTES,
+        remote: RemoteSettings::default(),
     }
+}
+
+/// Reads configuration text with an empty environment (for tools that edit the file).
+pub fn parse_config_text(text: &str) -> Result<LoadedConfig> {
+    parse_config(text, Vec::new())
 }
 
 fn parse_config(text: &str, parent_env: Vec<(String, String)>) -> Result<LoadedConfig> {
@@ -314,6 +358,57 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
         });
     }
 
+    for (key, h) in file.hosts {
+        let name = HostName::parse(&key)
+            .map_err(|e| invalid(format!("host {}: {}", show(&key), e.message)))?;
+        let mut def = HostDef::new(
+            name.clone(),
+            &h.address,
+            &h.user,
+            &h.identity_file,
+            &h.base_dir,
+        );
+        if let Some(p) = h.port {
+            def.port = fleet_domain::remote::validate_port(p)
+                .map_err(|e| invalid(format!("host {name}: {}", e.message)))?;
+        }
+        def.allowed_workers = h.allowed_workers;
+        if let Some(n) = h.max_sessions {
+            def.max_sessions = usize::try_from(n)
+                .map_err(|_| invalid(format!("host {name}: max_sessions is too large")))?;
+        }
+        def.env = env_pairs(h.env);
+        def.proxy_jump = h
+            .proxy_jump
+            .as_deref()
+            .map(HostName::parse)
+            .transpose()
+            .map_err(|e| invalid(format!("host {name}: proxy_jump: {}", e.message)))?;
+        if let Some(n) = h.connect_timeout_secs {
+            def.connect_timeout_secs = n;
+        }
+        if let Some(n) = h.server_alive_secs {
+            def.server_alive_secs = n;
+        }
+        if let Some(n) = h.server_alive_count {
+            def.server_alive_count = n;
+        }
+        if let Some(mib) = h.max_bundle_mib {
+            def.max_bundle_bytes = mib
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| invalid(format!("host {name}: max_bundle_mib is too large")))?;
+        }
+        app.hosts.insert(name, def);
+    }
+    if let Some(ssh) = &file.remote.ssh {
+        if !Path::new(ssh).is_absolute() {
+            return Err(invalid("remote: ssh must be an absolute path"));
+        }
+    }
+    let remote = RemoteSettings {
+        ssh_binary: file.remote.ssh,
+    };
+
     app.validate()?;
 
     if file.redact.rules.len() > MAX_REDACT_RULES {
@@ -351,6 +446,7 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
         app,
         redactor,
         ring_bytes,
+        remote,
     })
 }
 
@@ -889,6 +985,94 @@ format = "refcheck-json"
         assert!(!child
             .iter()
             .any(|(k, _)| k == "MY_VAR" || k == "SOME_TOKEN"));
+    }
+
+    const HOSTS: &str = r#"
+[remote]
+ssh = "/usr/bin/ssh"
+
+[hosts.bastion]
+address = "203.0.113.7"
+user = "jump"
+identity_file = "/home/me/.ssh/bastion_ed25519"
+base_dir = "/home/jump/fleet"
+allowed_workers = ["agent"]
+
+[hosts.build]
+address = "build.example.org"
+port = 2222
+user = "fleet"
+identity_file = "/home/me/.ssh/build_ed25519"
+base_dir = "/srv/fleet"
+allowed_workers = ["agent", "/opt/agent/bin/agent"]
+max_sessions = 3
+proxy_jump = "bastion"
+connect_timeout_secs = 5
+server_alive_secs = 10
+server_alive_count = 2
+max_bundle_mib = 64
+
+[hosts.build.env]
+API_BASE = "https://api.invalid"
+"#;
+
+    #[test]
+    fn hosts_are_read_validated_and_default_to_nothing() {
+        assert!(parse("").unwrap().app.hosts.is_empty());
+        assert_eq!(parse("").unwrap().remote, RemoteSettings::default());
+        let cfg = parse(HOSTS).unwrap();
+        assert_eq!(cfg.remote.ssh_binary.as_deref(), Some("/usr/bin/ssh"));
+        let build = &cfg.app.hosts[&HostName::parse("build").unwrap()];
+        assert_eq!(build.address, "build.example.org");
+        assert_eq!(build.port, 2222);
+        assert_eq!(build.max_sessions, 3);
+        assert_eq!(build.proxy_jump, Some(HostName::parse("bastion").unwrap()));
+        assert_eq!(build.max_bundle_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            build.env,
+            vec![("API_BASE".to_string(), "https://api.invalid".to_string())]
+        );
+        assert_eq!(build.allowed_workers, ["agent", "/opt/agent/bin/agent"]);
+        let bastion = &cfg.app.hosts[&HostName::parse("bastion").unwrap()];
+        assert_eq!(bastion.port, 22);
+        assert_eq!(bastion.proxy_jump, None);
+    }
+
+    #[test]
+    fn a_bad_host_table_is_refused_naming_the_host() {
+        let base = |extra: &str| {
+            format!(
+                "[hosts.h]\naddress = \"h.example\"\nuser = \"u\"\nidentity_file = \"/k\"\nbase_dir = \"/srv/f\"\n{extra}\n"
+            )
+        };
+        assert!(parse(&base("")).is_ok());
+        for (extra, needle) in [
+            ("port = 0", "port"),
+            ("port = 70000", "port"),
+            ("proxy_jump = \"nobody\"", "proxy_jump"),
+            ("proxy_jump = \"h\"", "itself"),
+            ("allowed_workers = [\"a b\"]", "worker command"),
+            ("max_sessions = 0", "max_sessions"),
+            ("connect_timeout_secs = 0", "connect_timeout_secs"),
+            ("max_bundle_mib = 0", "max_bundle_bytes"),
+            ("colour = \"red\"", "colour"),
+            ("[hosts.h.env]\nFLEET_X = \"1\"", "FLEET_"),
+            ("[hosts.h.env]\nA = \"x\\u0000\"", "NUL"),
+        ] {
+            let err = parse(&base(extra)).unwrap_err();
+            assert!(err.message.contains(needle), "{extra}: {}", err.message);
+        }
+        for text in [
+            "[hosts.\"Bad Name\"]\naddress = \"a\"\nuser = \"u\"\nidentity_file = \"/k\"\nbase_dir = \"/b\"",
+            "[hosts.h]\naddress = \"-oProxyCommand=x\"\nuser = \"u\"\nidentity_file = \"/k\"\nbase_dir = \"/b\"",
+            "[hosts.h]\naddress = \"a\"\nuser = \"u\"\nidentity_file = \"relative\"\nbase_dir = \"/b\"",
+            "[hosts.h]\naddress = \"a\"\nuser = \"u\"\nidentity_file = \"/k\"\nbase_dir = \"../b\"",
+            "[hosts.h]\naddress = \"a\"\nuser = \"u\"\nidentity_file = \"/k\"",
+            "[remote]\nssh = \"ssh\"",
+            "[remote]\nother = 1",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
     }
 
     #[test]

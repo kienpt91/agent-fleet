@@ -149,3 +149,81 @@ pub fn wait_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+/// Runs a program on a real pseudo-terminal (so that it sees a terminal on stdin and stdout), types
+/// `send` whenever the output so far contains the paired `expect`, and returns the exit code and
+/// everything it printed. The environment is exactly `env`. Panics after `timeout`.
+pub fn run_in_pty(
+    program: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    script: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> (i32, String) {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::sync::{Arc, Mutex};
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open a pty");
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
+    cmd.env_clear();
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn on the pty");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("pty reader");
+    let mut writer = pair.master.take_writer().expect("pty writer");
+    let seen = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&seen);
+    let reader_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    let start = std::time::Instant::now();
+    let mut consumed = 0usize;
+    for (expect, send) in script {
+        loop {
+            let text = seen.lock().unwrap().clone();
+            if let Some(at) = text[consumed..].find(expect) {
+                consumed += at + expect.len();
+                break;
+            }
+            if start.elapsed() > timeout {
+                let _ = child.kill();
+                panic!("waiting for {expect:?} on the terminal; saw: {text}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        writer.write_all(send.as_bytes()).expect("type");
+        writer.flush().expect("flush");
+    }
+    let code = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status.exit_code() as i32;
+        }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            panic!("the program did not finish; saw: {}", seen.lock().unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    drop(writer);
+    let _ = reader_thread.join();
+    let out = seen.lock().unwrap().clone();
+    (code, out)
+}

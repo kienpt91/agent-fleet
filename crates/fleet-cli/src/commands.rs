@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Every subcommand, as typed. The help text must mention each (a test enforces it).
-pub const SUBCOMMANDS: [&str; 32] = [
+pub const SUBCOMMANDS: [&str; 37] = [
     "daemon",
     "run create",
     "task add",
@@ -58,6 +58,11 @@ pub const SUBCOMMANDS: [&str; 32] = [
     "goals show",
     "goals remaining",
     "verify",
+    "host add",
+    "host list",
+    "host trust",
+    "host remove",
+    "host doctor",
 ];
 
 pub const HELP: &str = "\
@@ -126,6 +131,16 @@ goals and verification (NEO):
   verify <goal|task> [--task <run>/<task>] [--timeout <secs>]
                                      run the contracts independently of the worker and record
                                      evidence; exit 6 when a mandatory check did not pass
+
+remote hosts (SSH; tasks name one with `task add --host <name>`; never talk to the daemon):
+  host add <name> --address <host> --user <user> --identity <key file> --base-dir <dir on the host>
+           [--port N] [--worker <command>]... [--max-sessions N] [--proxy-jump <host>] [--env NAME=VALUE]...
+           [--config <fleet.toml>]   write a [hosts.<name>] table (the key is not trusted yet)
+  host list [--config <fleet.toml>]  hosts and the key pinned for each
+  host trust <name>                  show the host's key fingerprint and pin it after you type yes
+                                     at a terminal (the only way a key becomes trusted)
+  host remove <name>                 remove the table and forget the pinned key
+  host doctor <name>                 connect once and check key, login, quoting, git and directory
 
 dashboard:
   tui                                terminal dashboard
@@ -211,6 +226,7 @@ pub enum Command {
     Doctor {
         config: Option<PathBuf>,
     },
+    Host(crate::host_cmd::HostCommand),
     VerifyLog,
     Plan {
         file: PathBuf,
@@ -656,6 +672,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                     .transpose()?,
             }
         }
+        "host" => Command::Host(crate::host_cmd::parse(p)?),
         "verify-log" => {
             no_args(p)?;
             Command::VerifyLog
@@ -1126,7 +1143,12 @@ fn run_doctor(
     })
 }
 
-fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> {
+fn execute(
+    command: Command,
+    ctx: &Context,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<i32> {
     let layout = StateLayout::new(ctx.state_dir.clone());
     match command {
         Command::Help => write_out(out, HELP)?,
@@ -1157,6 +1179,18 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
             crate::tui::run_tui(&ctx.socket)?;
         }
         Command::Doctor { config } => return run_doctor(ctx, layout, config, out),
+        Command::Host(cmd) => {
+            return crate::host_cmd::run(
+                cmd,
+                &crate::host_cmd::HostContext {
+                    state_dir: &ctx.state_dir,
+                    json: ctx.json,
+                    env: &ctx.env,
+                },
+                input,
+                out,
+            )
+        }
         Command::VerifyLog => run_verify_log(&layout, ctx.json, out)?,
         Command::Plan { file, run } => {
             let plan = load_plan(&file)?;
@@ -1273,7 +1307,7 @@ pub fn run_with(
             json: cli.json,
             env,
         };
-        execute(cli.command, &ctx, out)
+        execute(cli.command, &ctx, stdin, out)
     })();
     match result {
         Ok(code) => {

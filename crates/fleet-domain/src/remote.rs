@@ -337,8 +337,9 @@ rm -rf -- \"$dir\" \"$pidfile\"";
 const CHECK_BASE: &str =
     "umask 077; mkdir -p -- \"$1\" && [ -d \"$1\" ] && [ ! -L \"$1\" ] && [ -w \"$1\" ] && echo ok";
 
-/// Script of [`RemoteCall::RoundTrip`]: prints every argument followed by a NUL, then `uname -s`.
-const ROUND_TRIP: &str = "printf '%s\\0' \"$@\"; uname -s";
+/// Script of [`RemoteCall::RoundTrip`]: prints every argument followed by a NUL, then `uname -s`
+/// and the user id the command runs as, one per line.
+const ROUND_TRIP: &str = "printf '%s\\0' \"$@\"; uname -s; id -u";
 
 /// Every constant script, for tests and for the documentation of what runs on a remote host.
 pub const SCRIPTS: [(&str, &str); 9] = [

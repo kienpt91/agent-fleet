@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod eventlog;
 pub mod fsx;
 pub mod git;
+pub mod hosts_file;
 pub mod jobs;
 pub mod json;
 pub mod logs;

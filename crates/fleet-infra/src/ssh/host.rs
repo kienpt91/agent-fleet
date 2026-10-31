@@ -331,6 +331,12 @@ impl Shared {
         let mut reachable = true;
         let out = self.temp(t, "out.bundle")?;
 
+        // 0. The session is over: nothing of the worker's process group may run on while its
+        // work is committed and its directory removed (a worker can ignore the hang-up that the
+        // end of the terminal causes). Best effort; a host that cannot be reached is found out
+        // by the next call.
+        let _ = self.signal_remote(host, t, RemoteSignal::Kill);
+
         // 1. Commit what the worker left on the host and bring the commits back.
         let finalize = RemoteCall::Finalize {
             layout: &layout,
