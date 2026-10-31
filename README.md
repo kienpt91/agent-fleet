@@ -559,6 +559,26 @@ gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 6
 
 The full list, the threat model and the dependency policy are in [SECURITY.md](SECURITY.md).
 
+## Secrets and hooks
+
+Never commit `.env` files, keys or tokens: `.gitignore` blocks the usual secret file names (`.env`, `.env.*` except
+`.env.example`/`.env.sample`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `credentials.json`, `*.tfstate`, ...). A dependency-free
+scanner, [`scripts/secret-scan.sh`](scripts/secret-scan.sh), backs this up:
+
+- `--staged` scans the lines about to be committed (the pre-commit hook), `--tree` scans every tracked file (pre-push and
+  CI), `--history` scans the added lines of every reachable commit (CI).
+- It flags private-key blocks, cloud and Git hosting tokens, JWTs, passwords in URLs, quoted secret assignments and forbidden
+  file names. A finding prints the file, line number and rule name, never the value.
+- A reviewed, known-safe fixture goes into [`.secret-scan-allow`](.secret-scan-allow) as `<path> <rule>  # reason` (one entry
+  each), or carries the marker `secret-scan: allow` on its line. This repository has two entries: the PEM marker lines that
+  the redactor's tests use (placeholder bodies, no key material).
+
+Install the hooks once per clone with [lefthook](https://github.com/evilmartians/lefthook): `lefthook install`
+(configuration in [`lefthook.yml`](lefthook.yml)). CI runs the same scanner in a separate `secret-scan` job.
+
+If a secret is ever committed, **rotate it first** (treat it as compromised, whether or not the commit was pushed), then
+remove it from the tree and rewrite the history if it was not published.
+
 ## Verification
 
 What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
