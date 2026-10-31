@@ -1,6 +1,6 @@
 # 14. Checks run on an export of the commit, and the processes of jobs are untrusted
 
-Status: accepted. Amends ADR 13 (where a check runs and how evidence counts) and ADR 5 (a decision names its digest). The
+Status: accepted (the commit is chosen as ADR 16 says). Amends ADR 13 (where a check runs and how evidence counts) and ADR 5 (a decision names its digest). The
 registry of job processes described below is shared by all child-starting adapters and used by the web port too: see ADR 15.
 
 ## Context
@@ -17,12 +17,16 @@ commit, task or run it came from.
   (gates, approved commands, verification checks) for as long as the child and its group exist; the orchestrator adds
   them to the live sessions the control socket's origin check uses (`Ports.jobs.live()`), so a peer that is one of them or
   descends from one is refused, failing closed like workers. Descendants that leave the group are sampled from the process
-  table every 200 ms (and at the end), registered by pid, and killed with start-token verification when the check ends.
+  table every 200 ms while the child runs (and once more before a child that ran out of time is stopped; there is no sample after a normal exit, the child's descendants cannot be found from a parent that is gone), registered by pid, and killed with start-token verification when the check ends.
   This is a sample, not a guarantee (see SECURITY.md); without cgroups or a sandbox there is none.
 - **Decisions name their digest.** `approval.decide` requires the digest (>= 12 hex digits) of the action; `fleet approve`
   fills it from `approval list` unless `--digest` is given. A call without one is invalid and records nothing.
+  **What this is and is not:** the CLI fills the digest in itself from the list the daemon returns, so the digest guards
+  against a *stale* decision (the action changed since the person looked), not against an admitted caller, who can read the
+  list as well. The caller is kept out by the origin rule (ADR 15), not by the digest.
 - **Checks run on an export.** A verification job exports the reviewed commit with `git checkout-index` from a temporary
-  index into a fresh 0700 directory under `<state>/verify/`, after checking the tree id; commands run there with a home,
+  index into a fresh 0700 directory outside the state directory (`<temp>/fleet-verify-<uid>/<hash>/`, so that nothing above a check's
+  working directory leads to the control token), after checking the tree id; commands run there with a home,
   temporary and XDG directories of their own, a `PATH` of trusted directories only and git pinned to no configuration;
   the directory is removed afterwards and swept at start. Links that could leave the export are removed. The adapter
   never runs a check without a host that can export (it fails every check instead of falling back to the worktree).

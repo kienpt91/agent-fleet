@@ -1,7 +1,7 @@
 #!/bin/sh
 # Scripted demo of the web dashboard: a daemon started with --web in a throwaway HOME and repository,
 # the same four-task DAG and scripted agents as scripts/demo.sh, driven over HTTP with curl (login by
-# token, session cookie, CSRF header, a decision gate, a merge that needs an approval bound to its
+# token, session header, CSRF header, a decision gate, a merge that needs an approval bound to its
 # digest), and, when a headless Chromium is installed, the real page loaded in that browser.
 # The token and the session id are passed to curl through header files (`-H @file`), not on the command
 # line; Chromium gets the login URL as an argument (this runs in a throwaway container).

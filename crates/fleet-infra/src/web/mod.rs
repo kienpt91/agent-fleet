@@ -11,8 +11,8 @@
 //!    socket), or cannot be identified;
 //! 2. bounded, deadline-limited parsing of one request;
 //! 3. strict **Host** check (DNS rebinding);
-//! 4. for `/api`: `Sec-Fetch-Site`, then **authentication** (bearer token or session cookie,
-//!    constant-time, failed attempts rate limited), then for state-changing requests **Origin**,
+//! 4. for `/api`: `Sec-Fetch-Site`, then **authentication** (bearer token or the session id in the
+//!    `X-Fleet-Session` header, constant-time, failed attempts rate limited), then for state-changing requests **Origin**,
 //!    **CSRF token** and a JSON content type;
 //! 5. strictly validated JSON bodies, mapped onto the daemon's own commands.
 
@@ -168,7 +168,7 @@ pub fn check_bind(addr: SocketAddr, allow_remote: bool) -> Result<()> {
 /// The text printed when remote access is on.
 pub fn remote_warning(addr: SocketAddr) -> String {
     format!(
-        "WARNING: the web dashboard listens on {addr}, which is not loopback. There is no TLS: the token, the session cookie and every page travel in clear text, and anyone who can reach this port can try to guess the token or read what passes. Prefer `ssh -L` to a loopback address."
+        "WARNING: the web dashboard listens on {addr}, which is not loopback. There is no TLS: the token, the session id and every page travel in clear text, and anyone who can reach this port can try to guess the token or read what passes. Prefer `ssh -L` to a loopback address."
     )
 }
 
@@ -322,7 +322,8 @@ impl WebServer {
     }
 
     /// The URL an operator opens once: the token travels in the fragment, which browsers never
-    /// send to a server, and the page exchanges it for a cookie.
+    /// send to a server, and the page exchanges it for a session id that it keeps in `sessionStorage`
+    /// and sends in a header (never a cookie).
     pub fn login_url(&self) -> String {
         format!(
             "http://{}/#token={}",

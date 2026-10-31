@@ -114,8 +114,15 @@ pass, whatever older evidence says).
 
 ### How checks run
 
-**Where.** Not in the worktree. The commit the review recorded is exported into a fresh directory below the state
-directory (`<state>/verify/job-*/tree`, mode 0700; `git checkout-index` from a temporary index, so the worktree's files,
+**Which commit.** The head and the tree of a task are read from the real repository, never through the worktree's own git
+directory, which the worker owns: the worktree's `.git` pointer is validated before every use (a plain file naming exactly
+`<repo>/.git/worktrees/<name>`, whose back-pointer and `commondir` agree), git runs with that directory pinned, replace refs
+are disabled and a repository with alternates, `http-alternates` or grafts is refused. Evidence names (commit, tree) and a
+merge compares the tree the repository has for the commit it merges with the proven one (ADR 16).
+
+**Where.** Not in the worktree. The commit the review recorded is exported into a fresh directory outside the state
+directory (`<temp>/fleet-verify-<uid>/<hash of the state path>/job-*/tree`, mode 0700, so nothing above a check's working
+directory is the state directory; `git checkout-index` from a temporary index, so the worktree's files,
 ignored and untracked files, index and local git state are never read) and the checks run there; the directory is removed
 when the job ends and anything an earlier daemon left is removed at start. Symlinks of the commit that are absolute or
 contain `..` are removed from the export. A Makefile, script or helper that exists only in the worktree, in an ignored
@@ -133,7 +140,7 @@ scratch area; no stdin; its own process group, killed on timeout and when the le
 2 min, at most 30 min) and 30 min per job; at most 2 verification jobs at a time (8 jobs of any kind); at most 4 MiB of
 output per stream, **redacted over the whole capture before it is cut to its tail** and again before it is stored.
 Descendants that leave the process group (`setsid`, a double fork) are found by sampling the process table every 200 ms
-and once more at the end, tracked, and killed with start-token verification when the check is over. File assertions open
+while the check runs (and once more before a check that timed out is stopped), tracked, and killed with start-token verification when the check is over. File assertions open
 the file below the export root without following any symlink and read at most 1 MiB. The diff is `git diff base..HEAD`
 of the commit: paths under `.fleet/` that the worker committed are changes like any other.
 
@@ -141,9 +148,9 @@ of the commit: paths under `.fleet/` that the worker committed are changes like 
 tool and git) are registered in one tracker shared by all those adapters, and so are the detached descendants found above.
 The origin check refuses a peer that is one of them, sits in one of their groups, descends from one, or has the daemon
 itself among its ancestors, exactly like a worker (fail closed), on the control socket **and** on the web dashboard's
-port (one rule, see ADR 15). `approval.decide` requires the digest of the action it covers (at least 12 hex
+port (one rule, see ADR 15). An ancestry that could not be read to the root of the process tree is refused as well. `approval.decide` requires the digest of the action it covers (at least 12 hex
 digits; `fleet approve <id>` takes it from `fleet approval list` unless `--digest` is given), so a decision always names
-what it decides.
+what it decides. The digest guards against a stale decision; it does not keep out an admitted caller, since the CLI takes it from the list the daemon returns (the origin rule does that).
 
 Events appended to the audit log: `goal_added`, `goal_status_changed`, `criteria_attached`, `evidence_recorded`.
 `fleet verify-log` covers them like all others. There is no other file: the ledger is rebuilt by replay at start, so

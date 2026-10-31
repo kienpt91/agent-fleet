@@ -37,7 +37,8 @@ fleet plan plan.toml  ->  fleet start  ->  one worker per ready task, in .fleet-
   unparseable output, the wrong shape or death by signal.
 - **Goals and proof of work (NEO N1).** A goal ledger records what the objective is and what is left; a goal can carry
   a *verification contract* (commands, `refcheck-json`, file assertions, a diff constraint) that fleet runs itself,
-  independently of the worker, in the task's worktree. A task such a goal names completes only after that run passed;
+  independently of the worker, on an export of the task's recorded commit (a fresh directory outside the
+  state directory; the worktree itself is never run). A task such a goal names completes only after that run passed;
   what an agent reports is shown as `unverified` until there is evidence. See [NEO N1](#neo-n1-goals-and-verification).
 - **Supervised and recoverable.** Idle and total timeouts, TERM then KILL of the whole process group, pid-reuse
   protection (pid *and* start time are verified before any signal), and an append-only hash-chained event log:
@@ -949,8 +950,8 @@ scanner, [`scripts/secret-scan.sh`](scripts/secret-scan.sh), backs this up:
 - It flags private-key blocks, cloud and Git hosting tokens, JWTs, passwords in URLs, quoted secret assignments and forbidden
   file names. A finding prints the file, line number and rule name, never the value.
 - A reviewed, known-safe fixture goes into [`.secret-scan-allow`](.secret-scan-allow) as `<path> <rule>  # reason` (one entry
-  each), or carries the marker `secret-scan: allow` on its line. This repository has two entries: the PEM marker lines that
-  the redactor's tests use (placeholder bodies, no key material).
+  each), or carries the marker `secret-scan: allow` on its line. This repository has three entries: the PEM marker lines that
+  the redactor's tests use in `fleet-domain/src/{output,redact}.rs` and `fleet-infra/src/jobs.rs` (placeholder bodies, no key material).
 
 Install the hooks once per clone with [lefthook](https://github.com/evilmartians/lefthook): `lefthook install`
 (configuration in [`lefthook.yml`](lefthook.yml)). CI runs the same scanner in a separate `secret-scan` job.

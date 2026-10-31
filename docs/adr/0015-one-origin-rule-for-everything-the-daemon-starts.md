@@ -17,12 +17,16 @@ descendants that leave their group.
 - `jobs::JobTracker` is the only registry. The daemon creates one and hands a clone to every adapter that starts a child:
   `ThreadJobRunner` (gates, approved commands, verification checks), `GitVcs` (both instances) and `AgentUndo`. Each
   registers the process group of the child it starts for as long as the child and its group exist, and follows the
-  child's descendants with the `Sweeper` (sampled every 200 ms, registered by pid, killed with start-token verification
-  when the child ends). `JobRunner::live` and `Orchestrator::live_sessions` return the registry together with the live
+  child's descendants with the `Sweeper` (sampled every 200 ms while the child runs, the first sample 200 ms after it
+  started, and once more before a timed-out child is stopped; registered by pid, killed with start-token verification when
+  the child ends). `JobRunner::live` and `Orchestrator::live_sessions` return the registry together with the live
   worker sessions.
 - `decide_origin` (daemon) refuses a peer that (1) cannot be identified, (2) is a live session, a registered process or in a
   registered group (`is_worker_origin`), or (3) has the daemon among its ancestors (`is_started_by_daemon`: the generic
-  fail-closed catch-all for anything the daemon started that is still attached, whether or not anybody listed it).
+  fail-closed catch-all for anything the daemon started that is still attached, whether or not anybody listed it). A walk
+  of the ancestry that did not reach the root of the process tree (it is longer than 64 entries, or an ancestor could not
+  be read) is refused too: only a complete walk can say that the daemon is *not* among the ancestors. A daemon that is pid 1
+  of its namespace (a container entrypoint) is covered: every process inside is below it.
 - The control socket calls it at accept and per request. The web port calls the same function through `WebBackend::admit`
   for every holder of the client's end of a connection, after the request was read and before anything is acted on
   (fail closed for a loopback peer that cannot be identified).
@@ -30,6 +34,11 @@ descendants that leave their group.
   must send the digest it displayed.
 
 ## Consequences
+**What protects git.** Verification-host git runs on job threads and is registered in the tracker like any child. Most
+`GitVcs` calls (committing a worker's output at review, merging, brought-in dependency branches) run synchronously on the
+engine thread, which is also the thread that answers the registry's `live` query, so a process started by those calls is
+refused only by the ancestry rule (3), not by being listed. Both are enforced; the second is the one that matters for those calls.
+
 A process that left the daemon's process tree and the group of every job and was not seen by a sample (`setsid` plus a
 parent that exits within 200 ms, a unit started with `systemd-run --user`) is indistinguishable from the operator's own
 client. That is the documented limit of a same-user defence; real isolation is another user, a container or a VM.
