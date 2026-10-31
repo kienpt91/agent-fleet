@@ -77,6 +77,64 @@ pub fn describe(key: &HostKey) -> String {
     format!("{} {}", key.key_type, key.fingerprint())
 }
 
+/// `OpenSSH_9.2p1 Debian-2, OpenSSL ...` into (9, 2).
+pub fn parse_openssh_version(text: &str) -> Option<(u32, u32)> {
+    let rest = text.split("OpenSSH_").nth(1)?;
+    let mut numbers = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u32>());
+    Some((numbers.next()?.ok()?, numbers.next()?.ok()?))
+}
+
+/// The oldest OpenSSH whose options this adapter relies on (`StrictHostKeyChecking=accept-new`
+/// came with 7.6).
+pub const MIN_OPENSSH: (u32, u32) = (7, 6);
+
+/// The `ssh` program: found, and new enough.
+pub fn program_check(client: &SshClient) -> Check {
+    let done = super::exec::run(
+        &super::exec::Spec {
+            program: client.ssh.clone(),
+            args: vec!["-V".to_string()],
+            env: super::argv::client_env(&client.ssh, false),
+            input: Input::None,
+            output: Output::Capture { max: 4096 },
+            limits: super::exec::Limits {
+                total: Duration::from_secs(10),
+                stall: Duration::from_secs(10),
+            },
+        },
+        &client.tracker,
+    );
+    let text =
+        String::from_utf8_lossy(&done.stderr).into_owned() + &String::from_utf8_lossy(&done.stdout);
+    let path = client.ssh.display().to_string();
+    match parse_openssh_version(&text) {
+        Some(v) if v >= MIN_OPENSSH => Check::new(
+            "ssh program",
+            Status::Ok,
+            format!("{path} (OpenSSH {}.{})", v.0, v.1),
+        ),
+        Some(v) => Check::new(
+            "ssh program",
+            Status::Fail,
+            format!(
+                "{path} is OpenSSH {}.{}; {}.{} or newer is required",
+                v.0, v.1, MIN_OPENSSH.0, MIN_OPENSSH.1
+            ),
+        ),
+        None => Check::new(
+            "ssh program",
+            Status::Fail,
+            format!(
+                "{path} did not say which OpenSSH it is ({})",
+                super::client::clean(text.as_bytes(), 80)
+            ),
+        ),
+    }
+}
+
 /// What can be checked without a connection.
 pub fn offline_checks(client: &SshClient, host: &HostDef, pin_required: bool) -> Vec<Check> {
     let mut out = vec![identity_check(host), pin_check(client, host, pin_required)];
@@ -111,7 +169,8 @@ pub fn offline_checks(client: &SshClient, host: &HostDef, pin_required: bool) ->
 
 /// Everything, with one connection per check that needs one.
 pub fn full_checks(client: &SshClient, host: &HostDef) -> Vec<Check> {
-    let mut out = offline_checks(client, host, true);
+    let mut out = vec![program_check(client)];
+    out.extend(offline_checks(client, host, true));
     if out.iter().any(|c| c.status == Status::Fail) {
         out.push(Check::new(
             name(host, "connection"),
@@ -297,4 +356,26 @@ pub fn config_checks(
         out.extend(offline_checks(&client, host, false));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openssh_versions_are_read_from_the_banner() {
+        assert_eq!(
+            parse_openssh_version("OpenSSH_9.2p1 Debian-2+deb12u10, OpenSSL 3.0.20"),
+            Some((9, 2))
+        );
+        assert_eq!(
+            parse_openssh_version("OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"),
+            Some((8, 9))
+        );
+        assert_eq!(parse_openssh_version("OpenSSH_for_Windows_8.1p1"), Some((8, 1)));
+        assert_eq!(parse_openssh_version("OpenSSH_9"), None);
+        assert_eq!(parse_openssh_version("dropbear v2022.83"), None);
+        assert_eq!(parse_openssh_version(""), None);
+        assert!((7, 5) < MIN_OPENSSH && (7, 6) >= MIN_OPENSSH && (8, 0) >= MIN_OPENSSH);
+    }
 }

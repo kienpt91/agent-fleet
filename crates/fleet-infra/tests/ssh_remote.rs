@@ -1181,6 +1181,15 @@ mod sessions {
             ],
         );
         let spawned = rig.sessions.spawn(&spec).unwrap();
+        // The local ssh client is a live session: the origin checks refuse it and what it starts.
+        assert!(
+            rig.sessions
+                .live()
+                .iter()
+                .any(|l| l.pid == spawned.identity.pid),
+            "{:?}",
+            rig.sessions.live()
+        );
         let pidfile = fx.remote_dir(&rig.host, "r1", "t1").with_extension("pid");
         assert!(wait_until(20_000, || std::fs::read_to_string(&pidfile)
             .is_ok_and(|t| t.split_whitespace().count() == 2)));

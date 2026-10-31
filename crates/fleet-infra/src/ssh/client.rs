@@ -8,11 +8,12 @@ use crate::jobs::JobTracker;
 use fleet_app::hosts::HostDef;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::ids::{show, HostName};
+use fleet_domain::redact::Redactor;
 use fleet_domain::remote::{RemoteCall, DEFAULT_REMOTE_PATH};
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long a host that could not be reached is not tried again.
@@ -87,6 +88,8 @@ pub struct SshClient {
     pub state: PathBuf,
     pub tracker: JobTracker,
     pub timeouts: Timeouts,
+    /// Applied to what ssh and the remote programs print before it is shown or stored.
+    redactor: Option<Arc<Redactor>>,
     down: Mutex<BTreeMap<HostName, Instant>>,
 }
 
@@ -110,7 +113,21 @@ impl SshClient {
             state,
             tracker,
             timeouts: Timeouts::default(),
+            redactor: None,
             down: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Redacts secrets from the text of errors (what a remote program printed).
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> SshClient {
+        self.redactor = Some(redactor);
+        self
+    }
+
+    fn scrub(&self, text: String) -> String {
+        match &self.redactor {
+            Some(r) => crate::jobs::redact_block(r, &text),
+            None => text,
         }
     }
 
@@ -298,7 +315,7 @@ impl SshClient {
     /// An error for a call that did not succeed, with the reason in operator terms. `what` names
     /// the step ("sending the code").
     pub fn explain(&self, host: &HostDef, what: &str, done: &Done) -> FleetError {
-        let detail = clean(&done.stderr, 300);
+        let detail = self.scrub(clean(&done.stderr, 300));
         let host_name = &host.name;
         match self.classify(done) {
             Some(Failure::HostKeyChanged) => FleetError::forbidden(format!(

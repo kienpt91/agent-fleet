@@ -251,6 +251,8 @@ fn adding_listing_trusting_checking_and_removing_a_host() {
     ]);
     assert_eq!(doctor.code, 0, "{doctor:?}");
     for want in [
+        "ssh program",
+        "OpenSSH",
         "connection",
         "quoting",
         "git",

@@ -27,6 +27,7 @@ use fleet_app::ports::{EventPublisher, Ports, SessionHost, StoredEvent};
 use fleet_app::remote::RemoteSessions;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::MAX_CONCURRENT_JOBS;
+use fleet_domain::redact::Redactor;
 use fleet_domain::supervision::{is_started_by_daemon, is_worker_origin, Lineage, LiveSession};
 use fleet_domain::value::Value;
 use std::io::IsTerminal;
@@ -167,6 +168,7 @@ fn session_host(
     env: &[(String, String)],
     layout: &StateLayout,
     tracker: &JobTracker,
+    redactor: &Arc<Redactor>,
     pty: PtySessionHost,
 ) -> Box<dyn SessionHost> {
     if app.hosts.is_empty() {
@@ -183,7 +185,8 @@ fn session_host(
                 app.hosts.clone(),
                 layout.root.clone(),
                 tracker.clone(),
-            );
+            )
+            .with_redactor(Arc::clone(redactor));
             let vcs = GitVcs::new(env.to_vec(), app.env.clone()).with_tracker(tracker.clone());
             let host = crate::ssh::host::SshRemoteHost::new(client, vcs, app.author.clone());
             Box::new(RemoteSessions::new(
@@ -257,6 +260,7 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         &env,
         &layout,
         &tracker,
+        &redactor,
         PtySessionHost::new(loaded.ring_bytes, Arc::clone(&redactor), registry.clone()),
     );
     let ports = Ports {
