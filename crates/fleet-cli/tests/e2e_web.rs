@@ -2442,6 +2442,10 @@ if [ "$FLEET_TASK" = a ]; then
   printf '# Guide\n' > docs/guide.md
   echo 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' | base64 -d > img/logo.png
   printf 'a\r\nb\r\n' > crlf.txt
+  printf '\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x9c\x40\0\0\x9c\x40\x08\x02\0\0\0\0\0\0\0' > img/huge.png
+  printf 'GIF89a\xff\xff\xff\xff\0\0\0' > img/huge.gif
+  printf 'bare\rcr\n' > lone-cr.txt
+  printf 'back\\slash\\u{202e}\n' > 'lit\u{202e}eral\\name.txt'
   printf 'caf\xe9\n' > latin1.txt
   printf '\0\1\2\0' > bin.dat
   printf '<svg xmlns="x" onload="alert(1)"><script>alert(2)</script></svg>\n' > evil.svg
@@ -2589,7 +2593,7 @@ fn the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository() 
     // hostile names are listed, escaped, and cannot be requested back
     let evil = jarr(&root, "entries")
         .iter()
-        .find(|e| jstr(e, "name").contains("name.txt"))
+        .find(|e| jstr(e, "name").contains("\\u{1b}"))
         .expect("the name with an escape sequence is listed");
     assert!(
         jstr(evil, "name").contains("\\u{1b}") && jstr(evil, "name").contains("\\u{a}"),
@@ -2731,6 +2735,39 @@ fn the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository() 
     assert_eq!(img.header("content-disposition"), Some("inline"));
     assert!(img.body.starts_with(b"\x89PNG\r\n\x1a\n"));
     assert_eq!(img.body.len(), 70);
+    assert_eq!(img.header("x-image-width"), Some("1"));
+    assert_eq!(img.header("x-image-height"), Some("1"));
+    // an image that declares a canvas of 40000 x 40000 pixels (a 33 byte file) is never served,
+    // and its file document is a placeholder with the size and the limits
+    for huge in ["img/huge.png", "img/huge.gif"] {
+        let r = web.get(&repo_url("blob", "r1/a", "head", huge));
+        assert_eq!(r.status, 413, "{huge}: {}", r.text());
+        assert_workbench_response(&r, huge);
+        assert!(r
+            .header("content-type")
+            .unwrap()
+            .starts_with("application/json"));
+        assert!(r.header("x-image-width").is_none());
+        let d = get_ok(&web, &repo_url("file", "r1/a", "head", huge));
+        assert_eq!(jstr(&d, "view"), "image_too_large", "{huge}");
+        assert_eq!(jnum(&d, "max_side"), 8192);
+        assert_eq!(jnum(&d, "max_pixels"), 32_000_000);
+        assert!(jnum(&d, "width") >= 40_000 || huge.ends_with("gif"));
+    }
+    // a bare carriage return stays in the text for the page to make visible; a literal
+    // backslash is doubled in names so it cannot pass for an escape
+    let cr = get_ok(&web, &repo_url("file", "r1/a", "head", "lone-cr.txt"));
+    assert_eq!(jarr(&cr, "lines")[0].as_str(), Some("bare\rcr"));
+    let root_names: Vec<String> = jarr(&root, "entries")
+        .iter()
+        .map(|e| jstr(e, "name").to_string())
+        .collect();
+    assert!(
+        root_names
+            .iter()
+            .any(|n| n.contains("\\\\u{202e}eral\\\\\\\\name")),
+        "{root_names:?}"
+    );
     for (path, status) in [
         ("evil.svg", 415),
         ("README.md", 415),
@@ -2812,7 +2849,7 @@ fn the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository() 
     // hostile file names are shown escaped and are not offered to the viewer
     let weird = jarr(&d, "files")
         .iter()
-        .find(|f| jstr(f, "path").contains("name.txt"))
+        .find(|f| jstr(f, "path").contains("\\u{1b}"))
         .unwrap();
     assert!(!jbool(weird, "path_ok") && jstr(weird, "path").contains("\\u{1b}"));
     let stats = d.get("stats").unwrap();

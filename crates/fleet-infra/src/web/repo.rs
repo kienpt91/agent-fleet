@@ -112,13 +112,16 @@ const NOT_AN_IMAGE: &str = "not_an_image";
 
 /// What the backend sent as an image, checked once more here: the type must be one of the four and
 /// the size within the limit, whatever the backend says.
-fn image_response(content_type: &'static str, bytes: Vec<u8>) -> Response {
+fn image_response(content_type: &'static str, bytes: Vec<u8>, width: u32, height: u32) -> Response {
     if !IMAGE_TYPES.contains(&content_type) || bytes.len() > MAX_IMAGE_BYTES {
         return error_response(500, ErrorCode::Internal, "the image could not be served");
     }
+    // the declared size, so the page can budget how much it asks a browser to decode
     Response::new(200, content_type, bytes)
         .with_csp(IMAGE_CSP)
         .with_header("Content-Disposition", "inline")
+        .with_header("X-Image-Width", &width.to_string())
+        .with_header("X-Image-Height", &height.to_string())
 }
 
 pub(crate) fn handle(
@@ -130,7 +133,12 @@ pub(crate) fn handle(
     let _slot = claim(shared)?;
     if route == RepoRoute::Blob {
         return match shared.backend.image(args) {
-            Ok(image) => Ok(image_response(image.content_type, image.bytes)),
+            Ok(image) => Ok(image_response(
+                image.content_type,
+                image.bytes,
+                image.width,
+                image.height,
+            )),
             // a file that is not an image is "unsupported media"; a malformed request is a 400
             Err(e)
                 if e.code == ErrorCode::Invalid && e.subject.as_deref() == Some(NOT_AN_IMAGE) =>
@@ -212,7 +220,7 @@ mod tests {
 
     #[test]
     fn an_image_response_has_a_fixed_type_nosniff_a_closed_policy_and_no_filename() {
-        let r = image_response("image/png", vec![1, 2, 3]);
+        let r = image_response("image/png", vec![1, 2, 3], 3, 2);
         assert_eq!(r.status, 200);
         let mut wire = Vec::new();
         r.write_to(&mut wire).unwrap();
@@ -222,6 +230,7 @@ mod tests {
         assert!(text.contains("Content-Security-Policy: default-src 'none'; sandbox\r\n"));
         assert_eq!(text.matches("Content-Security-Policy:").count(), 1);
         assert!(text.contains("Content-Disposition: inline\r\n"));
+        assert!(text.contains("X-Image-Width: 3\r\n") && text.contains("X-Image-Height: 2\r\n"));
         assert!(!text.to_ascii_lowercase().contains("filename"));
         assert!(text.contains("Cache-Control: no-store\r\n"));
         assert!(text.contains("Cross-Origin-Resource-Policy: same-origin\r\n"));
@@ -233,14 +242,14 @@ mod tests {
             "image/png; x=y",
             "",
         ] {
-            assert_eq!(image_response(bad, vec![1]).status, 500, "{bad}");
+            assert_eq!(image_response(bad, vec![1], 1, 1).status, 500, "{bad}");
         }
         assert_eq!(
-            image_response("image/gif", vec![0; MAX_IMAGE_BYTES + 1]).status,
+            image_response("image/gif", vec![0; MAX_IMAGE_BYTES + 1], 1, 1).status,
             500
         );
         assert_eq!(
-            image_response("image/webp", vec![0; MAX_IMAGE_BYTES]).status,
+            image_response("image/webp", vec![0; MAX_IMAGE_BYTES], 1, 1).status,
             200
         );
     }

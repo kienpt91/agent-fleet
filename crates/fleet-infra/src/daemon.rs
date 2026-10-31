@@ -663,6 +663,8 @@ impl WebBackend for DaemonWeb {
         Ok(WebImage {
             content_type: image.kind.content_type(),
             bytes: image.bytes,
+            width: image.width,
+            height: image.height,
         })
     }
 

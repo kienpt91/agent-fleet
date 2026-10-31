@@ -19,7 +19,7 @@ use fleet_domain::repo::limits::{
 };
 use fleet_domain::repo::markdown;
 use fleet_domain::repo::tree::{sort_entries, EntryKind};
-use fleet_domain::repo::view::{image_kind, FileContent, FileView, ImageKind};
+use fleet_domain::repo::view::{image_info, FileContent, FileView, ImageKind, ImageLimits};
 use fleet_domain::repo::RepoPath;
 use fleet_domain::value::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -169,6 +169,9 @@ pub struct RepoRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoImage {
     pub kind: ImageKind,
+    /// The size the file's header declares (within the browser's limits, see `ImageLimits`).
+    pub width: u32,
+    pub height: u32,
     pub bytes: Vec<u8>,
 }
 
@@ -249,6 +252,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct RepoBrowser {
     reader: Arc<dyn RepoReader>,
+    images: ImageLimits,
     cache: Mutex<Cache>,
 }
 
@@ -270,8 +274,15 @@ impl RepoBrowser {
     pub fn new(reader: Arc<dyn RepoReader>) -> RepoBrowser {
         RepoBrowser {
             reader,
+            images: ImageLimits::default(),
             cache: Mutex::new(Cache::new()),
         }
+    }
+
+    /// Another limit on the size of the images that are shown (clamped to the hard caps).
+    pub fn with_image_limits(mut self, limits: ImageLimits) -> RepoBrowser {
+        self.images = limits;
+        self
     }
 
     /// Documents currently cached and their approximate size (for tests and diagnostics).
@@ -285,17 +296,27 @@ impl RepoBrowser {
         match query {
             RepoQuery::Tree { at, path, .. } => {
                 let commit = target.resolve(at)?;
+                // the selector is part of the key: the document says which one it was asked with
                 let key = format!(
-                    "tree\0{}\0{}\0{}\0{}",
-                    target.repo, target.task, commit, path
+                    "tree\0{}\0{}\0{}\0{}\0{}",
+                    target.repo,
+                    target.task,
+                    at.text(),
+                    commit,
+                    path
                 );
                 self.cached_doc(key, || self.tree(target, at, &commit, path))
             }
             RepoQuery::File { at, path, .. } => {
                 let commit = target.resolve(at)?;
+                // the selector is part of the key: the document says which one it was asked with
                 let key = format!(
-                    "file\0{}\0{}\0{}\0{}",
-                    target.repo, target.task, commit, path
+                    "file\0{}\0{}\0{}\0{}\0{}",
+                    target.repo,
+                    target.task,
+                    at.text(),
+                    commit,
+                    path
                 );
                 self.cached_doc(key, || self.file(target, at, &commit, path))
             }
@@ -319,9 +340,14 @@ impl RepoBrowser {
             }
             RepoQuery::Markdown { at, path, .. } => {
                 let commit = target.resolve(at)?;
+                // the selector is part of the key: the document says which one it was asked with
                 let key = format!(
-                    "markdown\0{}\0{}\0{}\0{}",
-                    target.repo, target.task, commit, path
+                    "markdown\0{}\0{}\0{}\0{}\0{}",
+                    target.repo,
+                    target.task,
+                    at.text(),
+                    commit,
+                    path
                 );
                 self.cached_doc(key, || self.markdown(target, at, &commit, path))
             }
@@ -411,6 +437,7 @@ impl RepoBrowser {
             read.stat.size,
             &read.stat.oid,
             read.content.as_deref(),
+            &self.images,
         );
         Ok(file_doc(target, at, commit, &view))
     }
@@ -430,6 +457,7 @@ impl RepoBrowser {
             read.stat.size,
             &read.stat.oid,
             read.content.as_deref(),
+            &self.images,
         );
         let bytes = match (&read.content, view.markdown) {
             (Some(b), true) => b,
@@ -483,8 +511,22 @@ impl RepoBrowser {
                 "the file is larger than the {MAX_IMAGE_BYTES} bytes the image viewer shows"
             )));
         }
-        match image_kind(&bytes) {
-            Some(kind) => Ok(RepoImage { kind, bytes }),
+        match image_info(&bytes) {
+            // a few bytes can declare a canvas that makes a browser allocate gigabytes: the file
+            // is not served at all when its declared size is above the limits
+            Some(i) if !self.images.allows(i.width, i.height) => Err(FleetError::limit(format!(
+                "the image declares {} x {} pixels, above the limits of {} per side and {} pixels",
+                i.width,
+                i.height,
+                self.images.max_side(),
+                self.images.max_pixels()
+            ))),
+            Some(i) => Ok(RepoImage {
+                kind: i.kind,
+                width: i.width,
+                height: i.height,
+                bytes,
+            }),
             None => Err(FleetError::invalid(
                 "only png, jpeg, gif and webp images are served (decided by the file's first bytes)",
             )
@@ -519,6 +561,7 @@ fn file_doc(target: &RepoTarget, at: &CommitSel, commit: &Sha, view: &FileView) 
         FileContent::Binary => ("binary", Vec::new(), 0, false, 0, false, false),
         FileContent::TooLarge => ("too_large", Vec::new(), 0, false, 0, false, false),
         FileContent::Image(_) => ("image", Vec::new(), 0, false, 0, false, false),
+        FileContent::ImageTooBig(..) => ("image_too_large", Vec::new(), 0, false, 0, false, false),
         FileContent::Symlink { .. } => ("symlink", Vec::new(), 0, false, 0, false, false),
         FileContent::Submodule { .. } => ("submodule", Vec::new(), 0, false, 0, false, false),
     };
@@ -533,8 +576,18 @@ fn file_doc(target: &RepoTarget, at: &CommitSel, commit: &Sha, view: &FileView) 
         _ => (Value::Null, Value::Null),
     };
     let image = match &view.content {
-        FileContent::Image(k) => Value::str(k.as_str()),
+        FileContent::Image(i) | FileContent::ImageTooBig(i, _) => Value::str(i.kind.as_str()),
         _ => Value::Null,
+    };
+    let (width, height) = match &view.content {
+        FileContent::Image(i) | FileContent::ImageTooBig(i, _) => {
+            (Value::int(i.width), Value::int(i.height))
+        }
+        _ => (Value::Null, Value::Null),
+    };
+    let (max_side, max_pixels) = match &view.content {
+        FileContent::ImageTooBig(_, l) => (Value::int(l.max_side()), Value::int(l.max_pixels())),
+        _ => (Value::Null, Value::Null),
     };
     let submodule_commit = match &view.content {
         FileContent::Submodule { commit: Some(c) } => Value::str(c.as_str()),
@@ -553,6 +606,10 @@ fn file_doc(target: &RepoTarget, at: &CommitSel, commit: &Sha, view: &FileView) 
             ("view", Value::str(kind_view)),
             ("class", Value::str(view.class())),
             ("image", image),
+            ("width", width),
+            ("height", height),
+            ("max_side", max_side),
+            ("max_pixels", max_pixels),
             ("lines", Value::array(lines)),
             ("line_count", Value::int(line_count as u64)),
             ("truncated", Value::Bool(truncated)),

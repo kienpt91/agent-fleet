@@ -63,6 +63,9 @@ pub trait WebBackend: Send + Sync {
 pub struct WebImage {
     pub content_type: &'static str,
     pub bytes: Vec<u8>,
+    /// The size the file's header declares; the daemon has checked it against its limits.
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Copy, Debug)]

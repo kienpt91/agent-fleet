@@ -2108,6 +2108,8 @@ fn png_image() -> WebImage {
     WebImage {
         content_type: "image/png",
         bytes: PNG.to_vec(),
+        width: 640,
+        height: 480,
     }
 }
 
@@ -2302,6 +2304,8 @@ fn an_image_is_sent_with_a_closed_policy_nosniff_and_one_of_four_types() {
         Some("default-src 'none'; sandbox")
     );
     assert_eq!(resp.header("content-disposition"), Some("inline"));
+    assert_eq!(resp.header("x-image-width"), Some("640"));
+    assert_eq!(resp.header("x-image-height"), Some("480"));
     assert_eq!(resp.header("cache-control"), Some("no-store"));
     assert_eq!(
         resp.header("cross-origin-resource-policy"),
@@ -2326,6 +2330,8 @@ fn an_image_is_sent_with_a_closed_policy_nosniff_and_one_of_four_types() {
             Ok(WebImage {
                 content_type: ct,
                 bytes: vec![1, 2, 3],
+                width: 1,
+                height: 1,
             })
         });
         let resp = r.get_bearer("/api/repo/blob?task=r1%2Fa&path=x");
@@ -2342,6 +2348,8 @@ fn an_image_is_sent_with_a_closed_policy_nosniff_and_one_of_four_types() {
             Ok(WebImage {
                 content_type: ct,
                 bytes: vec![1],
+                width: 1,
+                height: 1,
             })
         });
         let resp = r.get_bearer("/api/repo/blob?task=r1%2Fa&path=x");
@@ -2356,6 +2364,8 @@ fn an_image_is_sent_with_a_closed_policy_nosniff_and_one_of_four_types() {
         Ok(WebImage {
             content_type: "image/png",
             bytes: vec![0; 4 * 1024 * 1024 + 1],
+            width: 1,
+            height: 1,
         })
     });
     assert_eq!(

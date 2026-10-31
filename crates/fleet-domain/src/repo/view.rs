@@ -45,7 +45,7 @@ impl ImageKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TypeClass {
     Text,
-    Image(ImageKind),
+    Image(ImageInfo),
     Binary,
 }
 
@@ -63,42 +63,196 @@ fn starts(bytes: &[u8], magic: &[u8]) -> bool {
     bytes.get(..magic.len()) == Some(magic)
 }
 
-/// The image format of `bytes` by magic number and a minimal structural check, or `None`. A
-/// truncated or inconsistent header is not an image (the browser is never handed it), and so
-/// neither is anything that merely contains a magic number later on. SVG is text and is never an
-/// image here: it can carry script.
-pub fn image_kind(bytes: &[u8]) -> Option<ImageKind> {
-    if starts(bytes, b"\x89PNG\r\n\x1a\n") {
-        // the first chunk must be IHDR with its 13 bytes of data
-        let ok = bytes.len() >= 33
-            && bytes.get(8..12) == Some(&[0, 0, 0, 13][..])
-            && bytes.get(12..16) == Some(&b"IHDR"[..]);
-        return ok.then_some(ImageKind::Png);
+/// The format and the declared size of an image. The size is what the file's own header says; it
+/// is read here, before anything is handed to a browser, because a few kilobytes can declare
+/// a canvas of billions of pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub kind: ImageKind,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// What size of image the viewer shows. Always within the hard caps, whatever is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageLimits {
+    max_side: u32,
+    max_pixels: u64,
+}
+
+impl ImageLimits {
+    /// Most pixels along one side, whatever the operator configures.
+    pub const HARD_MAX_SIDE: u32 = 16_384;
+    /// Most pixels in all, whatever the operator configures.
+    pub const HARD_MAX_PIXELS: u64 = 64_000_000;
+    pub const DEFAULT_MAX_SIDE: u32 = 8192;
+    pub const DEFAULT_MAX_PIXELS: u64 = 32_000_000;
+
+    /// Limits clamped to `1..=HARD_MAX_*`.
+    pub fn new(max_side: u32, max_pixels: u64) -> ImageLimits {
+        ImageLimits {
+            max_side: max_side.clamp(1, Self::HARD_MAX_SIDE),
+            max_pixels: max_pixels.clamp(1, Self::HARD_MAX_PIXELS),
+        }
     }
-    if starts(bytes, b"\xff\xd8\xff") {
-        // SOI, then a marker that starts a segment: APPn, DQT, SOFn, DHT, COM, DRI...
-        let marker = bytes.get(3).copied().unwrap_or(0);
-        let plausible = matches!(marker, 0xe0..=0xef | 0xdb | 0xc0..=0xc2 | 0xc4 | 0xfe | 0xdd);
-        return (bytes.len() >= 12 && plausible).then_some(ImageKind::Jpeg);
+
+    pub fn max_side(&self) -> u32 {
+        self.max_side
     }
-    if starts(bytes, b"GIF87a") || starts(bytes, b"GIF89a") {
-        // header, then the 7-byte logical screen descriptor
-        return (bytes.len() >= 13).then_some(ImageKind::Gif);
+
+    pub fn max_pixels(&self) -> u64 {
+        self.max_pixels
     }
-    if starts(bytes, b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) {
-        let chunk = bytes.get(12..16);
-        let ok =
-            bytes.len() >= 20 && matches!(chunk, Some(b"VP8 ") | Some(b"VP8L") | Some(b"VP8X"));
-        return ok.then_some(ImageKind::Webp);
+
+    /// Whether an image of this size may be shown.
+    pub fn allows(&self, width: u32, height: u32) -> bool {
+        width > 0
+            && height > 0
+            && width <= self.max_side
+            && height <= self.max_side
+            && u64::from(width)
+                .checked_mul(u64::from(height))
+                .is_some_and(|p| p <= self.max_pixels)
+    }
+}
+
+impl Default for ImageLimits {
+    fn default() -> ImageLimits {
+        ImageLimits::new(Self::DEFAULT_MAX_SIDE, Self::DEFAULT_MAX_PIXELS)
+    }
+}
+
+fn be16(b: &[u8], at: usize) -> Option<u32> {
+    let h = b.get(at..at + 2)?;
+    Some(u32::from(*h.first()?) << 8 | u32::from(*h.get(1)?))
+}
+
+fn be32(b: &[u8], at: usize) -> Option<u32> {
+    Some(be16(b, at)? << 16 | be16(b, at + 2)?)
+}
+
+fn le16(b: &[u8], at: usize) -> Option<u32> {
+    let h = b.get(at..at + 2)?;
+    Some(u32::from(*h.get(1)?) << 8 | u32::from(*h.first()?))
+}
+
+fn le24(b: &[u8], at: usize) -> Option<u32> {
+    let h = b.get(at..at + 3)?;
+    Some(u32::from(*h.get(2)?) << 16 | u32::from(*h.get(1)?) << 8 | u32::from(*h.first()?))
+}
+
+/// Segments of a JPEG that are looked at before giving up on finding the frame header.
+const MAX_JPEG_SEGMENTS: usize = 4096;
+
+/// The size a JPEG declares in its first frame header (SOF), found by walking the segments.
+fn jpeg_size(b: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2usize;
+    for _ in 0..MAX_JPEG_SEGMENTS {
+        // markers are 0xFF, optional fill 0xFF bytes, then the marker code
+        while *b.get(i)? != 0xff {
+            i += 1;
+            if i > b.len() {
+                return None;
+            }
+        }
+        while *b.get(i + 1)? == 0xff {
+            i += 1;
+        }
+        let m = *b.get(i + 1)?;
+        match m {
+            // not a marker at all (an escaped 0xFF is only valid inside scan data)
+            0x00 => return None,
+            // markers without a length
+            0x01 | 0xd0..=0xd7 => i += 2,
+            // end of image, or the scan starts before any frame header: there is none
+            0xd9 | 0xda => return None,
+            // start of frame (not DHT, JPG, DAC)
+            0xc0..=0xcf if !matches!(m, 0xc4 | 0xc8 | 0xcc) => {
+                let len = be16(b, i + 2)?;
+                if len < 8 {
+                    return None;
+                }
+                return Some((be16(b, i + 7)?, be16(b, i + 5)?));
+            }
+            _ => {
+                let len = usize::try_from(be16(b, i + 2)?).ok()?;
+                if len < 2 {
+                    return None;
+                }
+                i = i.checked_add(2)?.checked_add(len)?;
+            }
+        }
     }
     None
+}
+
+/// The format and declared size of `bytes` by magic number and a structural check of the header,
+/// or `None`. A truncated or inconsistent header, a size of zero and anything that merely contains
+/// a magic number later on are not images (the browser is never handed them). SVG is text and is
+/// never an image here: it can carry script. The size is not limited here, see [`ImageLimits`].
+pub fn image_info(bytes: &[u8]) -> Option<ImageInfo> {
+    let (kind, width, height) = if starts(bytes, b"\x89PNG\r\n\x1a\n") {
+        // the first chunk must be IHDR with its 13 bytes of data; size at 16..24
+        if bytes.len() < 33
+            || bytes.get(8..12) != Some(&[0, 0, 0, 13][..])
+            || bytes.get(12..16) != Some(&b"IHDR"[..])
+        {
+            return None;
+        }
+        (ImageKind::Png, be32(bytes, 16)?, be32(bytes, 20)?)
+    } else if starts(bytes, b"\xff\xd8\xff") {
+        let (w, h) = jpeg_size(bytes)?;
+        (ImageKind::Jpeg, w, h)
+    } else if starts(bytes, b"GIF87a") || starts(bytes, b"GIF89a") {
+        // header, then the 7-byte logical screen descriptor (little endian size)
+        if bytes.len() < 13 {
+            return None;
+        }
+        (ImageKind::Gif, le16(bytes, 6)?, le16(bytes, 8)?)
+    } else if starts(bytes, b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) {
+        let (w, h) = match bytes.get(12..16)? {
+            b"VP8 " => {
+                // frame tag (3 bytes), start code 9d 01 2a, then 14-bit width and height
+                if bytes.get(23..26) != Some(&[0x9d, 0x01, 0x2a][..]) {
+                    return None;
+                }
+                (le16(bytes, 26)? & 0x3fff, le16(bytes, 28)? & 0x3fff)
+            }
+            b"VP8L" => {
+                // signature 0x2f, then width-1 and height-1 in 14 bits each
+                if *bytes.get(20)? != 0x2f {
+                    return None;
+                }
+                let bits = le16(bytes, 21)? | le16(bytes, 23)? << 16;
+                ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+            }
+            b"VP8X" => {
+                // flags and reserved bytes, then the canvas size minus one in 24 bits each
+                (le24(bytes, 24)? + 1, le24(bytes, 27)? + 1)
+            }
+            _ => return None,
+        };
+        (ImageKind::Webp, w, h)
+    } else {
+        return None;
+    };
+    (width > 0 && height > 0).then_some(ImageInfo {
+        kind,
+        width,
+        height,
+    })
+}
+
+/// The image format of `bytes`, see [`image_info`].
+pub fn image_kind(bytes: &[u8]) -> Option<ImageKind> {
+    image_info(bytes).map(|i| i.kind)
 }
 
 /// Text, an image or binary, from the first [`SNIFF_BYTES`] bytes: an image by [`image_kind`],
 /// binary when a NUL byte is there (as git decides), text otherwise.
 pub fn sniff(bytes: &[u8]) -> TypeClass {
-    if let Some(kind) = image_kind(bytes) {
-        return TypeClass::Image(kind);
+    if let Some(info) = image_info(bytes) {
+        return TypeClass::Image(info);
     }
     let prefix = bytes.get(..SNIFF_BYTES).unwrap_or(bytes);
     if prefix.contains(&0) {
@@ -228,8 +382,10 @@ pub enum FileContent {
     Text(TextView),
     /// Binary data: only its size and class are shown.
     Binary,
-    /// An image of a kind the viewer may show; the bytes come from the blob API.
-    Image(ImageKind),
+    /// An image of a kind and size the viewer may show; the bytes come from the blob API.
+    Image(ImageInfo),
+    /// An image whose declared size is above the limits: a placeholder, the bytes are never served.
+    ImageTooBig(ImageInfo, ImageLimits),
     /// Larger than the viewer shows.
     TooLarge,
     /// A symbolic link: its target as text.
@@ -267,6 +423,7 @@ impl FileView {
         size: Option<u64>,
         oid: &str,
         bytes: Option<&[u8]>,
+        images: &ImageLimits,
     ) -> FileView {
         let content = match kind {
             EntryKind::Submodule => FileContent::Submodule {
@@ -286,8 +443,15 @@ impl FileView {
             EntryKind::File => match bytes {
                 None => FileContent::TooLarge,
                 Some(b) => match sniff(b) {
-                    TypeClass::Image(k) if b.len() <= MAX_IMAGE_BYTES => FileContent::Image(k),
-                    TypeClass::Image(_) | TypeClass::Binary => FileContent::Binary,
+                    TypeClass::Image(i) if b.len() > MAX_IMAGE_BYTES => {
+                        let _ = i;
+                        FileContent::Binary
+                    }
+                    TypeClass::Image(i) if images.allows(i.width, i.height) => {
+                        FileContent::Image(i)
+                    }
+                    TypeClass::Image(i) => FileContent::ImageTooBig(i, *images),
+                    TypeClass::Binary => FileContent::Binary,
                     TypeClass::Text if b.len() > MAX_FILE_VIEW_BYTES => FileContent::TooLarge,
                     TypeClass::Text => FileContent::Text(TextView::from_bytes(b)),
                 },
@@ -310,7 +474,7 @@ impl FileView {
     pub fn class(&self) -> &'static str {
         match &self.content {
             FileContent::Text(_) => "text",
-            FileContent::Image(_) => "image",
+            FileContent::Image(_) | FileContent::ImageTooBig(..) => "image",
             FileContent::Binary => "binary",
             FileContent::TooLarge | FileContent::Symlink { .. } | FileContent::Submodule { .. } => {
                 "unknown"
@@ -323,28 +487,236 @@ impl FileView {
 mod tests {
     use super::*;
 
-    fn png() -> Vec<u8> {
+    pub(super) fn png_sized(w: u32, h: u32) -> Vec<u8> {
         let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
-        v.extend_from_slice(&[0u8; 25]);
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        v
+    }
+
+    fn png() -> Vec<u8> {
+        png_sized(1, 1)
+    }
+
+    /// A JPEG with a few segments before the frame header, which declares `w` by `h`.
+    fn jpeg_sized(w: u16, h: u16) -> Vec<u8> {
+        let mut v = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0".to_vec();
+        v.extend_from_slice(b"\xff\xfe\0\x05abc");
+        v.extend_from_slice(&[0xff, 0xc0, 0, 17, 8]);
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
         v
     }
 
     fn jpeg() -> Vec<u8> {
-        let mut v = b"\xff\xd8\xff\xe0\0\x10JFIF\0".to_vec();
-        v.extend_from_slice(&[0u8; 8]);
+        jpeg_sized(1, 1)
+    }
+
+    fn gif_sized(w: u16, h: u16) -> Vec<u8> {
+        let mut v = b"GIF89a".to_vec();
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.extend_from_slice(&[0, 0, 0]);
         v
     }
 
     fn gif() -> Vec<u8> {
-        let mut v = b"GIF89a".to_vec();
-        v.extend_from_slice(&[1, 0, 1, 0, 0, 0, 0, 0]);
+        gif_sized(1, 1)
+    }
+
+    fn webp_lossy(w: u16, h: u16) -> Vec<u8> {
+        let mut v = b"RIFF\x1a\0\0\0WEBPVP8 \x0e\0\0\0\x10\0\0\x9d\x01\x2a".to_vec();
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.extend_from_slice(&[0; 4]);
+        v
+    }
+
+    fn webp_lossless(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"RIFF\x1a\0\0\0WEBPVP8L\x05\0\0\0\x2f".to_vec();
+        let bits = (w - 1) | ((h - 1) << 14);
+        v.extend_from_slice(&bits.to_le_bytes());
+        v.extend_from_slice(&[0; 4]);
+        v
+    }
+
+    fn webp_extended(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"RIFF\x1a\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
+        v.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        v.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        v.extend_from_slice(&[0; 4]);
         v
     }
 
     fn webp() -> Vec<u8> {
-        let mut v = b"RIFF\x1a\0\0\0WEBPVP8 ".to_vec();
-        v.extend_from_slice(&[0u8; 8]);
-        v
+        webp_lossy(1, 1)
+    }
+
+    #[test]
+    fn declared_sizes_are_read_from_every_format() {
+        let size = |b: &[u8]| image_info(b).map(|i| (i.kind, i.width, i.height));
+        assert_eq!(size(&png_sized(640, 480)), Some((ImageKind::Png, 640, 480)));
+        assert_eq!(
+            size(&jpeg_sized(1920, 1080)),
+            Some((ImageKind::Jpeg, 1920, 1080))
+        );
+        assert_eq!(size(&gif_sized(300, 200)), Some((ImageKind::Gif, 300, 200)));
+        assert_eq!(
+            size(&webp_lossy(800, 600)),
+            Some((ImageKind::Webp, 800, 600))
+        );
+        assert_eq!(
+            size(&webp_lossless(4000, 3000)),
+            Some((ImageKind::Webp, 4000, 3000))
+        );
+        assert_eq!(
+            size(&webp_extended(16384, 16384)),
+            Some((ImageKind::Webp, 16384, 16384))
+        );
+        // the largest values each header can hold are read exactly, without overflow
+        assert_eq!(
+            size(&png_sized(u32::MAX, u32::MAX)),
+            Some((ImageKind::Png, u32::MAX, u32::MAX))
+        );
+        assert_eq!(
+            size(&gif_sized(u16::MAX, u16::MAX)),
+            Some((ImageKind::Gif, 65535, 65535))
+        );
+        assert_eq!(
+            size(&jpeg_sized(u16::MAX, u16::MAX)),
+            Some((ImageKind::Jpeg, 65535, 65535))
+        );
+        assert_eq!(
+            size(&webp_extended(1 << 24, 1 << 24)),
+            Some((ImageKind::Webp, 1 << 24, 1 << 24))
+        );
+    }
+
+    #[test]
+    fn a_size_of_zero_or_a_header_without_one_is_not_an_image() {
+        assert_eq!(image_info(&png_sized(0, 5)), None);
+        assert_eq!(image_info(&png_sized(5, 0)), None);
+        assert_eq!(image_info(&gif_sized(0, 1)), None);
+        assert_eq!(image_info(&gif_sized(1, 0)), None);
+        assert_eq!(image_info(&jpeg_sized(0, 1)), None);
+        assert_eq!(image_info(&webp_lossy(0, 3)), None);
+        // a JPEG whose scan starts before any frame header, or that ends first
+        let mut no_frame = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0".to_vec();
+        no_frame.extend_from_slice(&[0xff, 0xda, 0, 8, 1, 1, 0, 0, 0x3f, 0]);
+        assert_eq!(image_info(&no_frame), None);
+        assert_eq!(image_info(&no_frame[..20]), None);
+        // a frame header that is too short to hold a size, or cut in the middle of it
+        let short = [0xff, 0xd8, 0xff, 0xc0, 0, 4, 8, 0];
+        assert_eq!(image_info(&short), None);
+        let cut = jpeg_sized(10, 10);
+        assert_eq!(image_info(&cut[..cut.len() - 14]), None);
+        // a segment length that points past the end, or backwards
+        let far = [0xff, 0xd8, 0xff, 0xe0, 0xff, 0xff, 1, 2, 3];
+        assert_eq!(image_info(&far), None);
+        let back = [0xff, 0xd8, 0xff, 0xe0, 0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(image_info(&back), None);
+        // WebP whose chunk is too short for its canvas, or has the wrong signature
+        assert_eq!(image_info(&webp_extended(10, 10)[..28]), None);
+        assert_eq!(image_info(&webp_lossless(10, 10)[..24]), None);
+        let mut bad_start = webp_lossy(10, 10);
+        bad_start[24] = 0;
+        assert_eq!(image_info(&bad_start), None);
+        let mut bad_sig = webp_lossless(10, 10);
+        bad_sig[20] = 0x2e;
+        assert_eq!(image_info(&bad_sig), None);
+        // a PNG whose first chunk claims another length, or is not IHDR
+        let mut long = png_sized(10, 10);
+        long[11] = 14;
+        assert_eq!(image_info(&long), None);
+    }
+
+    #[test]
+    fn many_fill_bytes_and_segments_cannot_make_the_jpeg_walk_long() {
+        // thousands of tiny segments before the frame header: given up on, not walked to the end
+        let mut v = vec![0xff, 0xd8];
+        for _ in 0..10_000 {
+            v.extend_from_slice(&[0xff, 0xfe, 0, 2]);
+        }
+        v.extend_from_slice(&[
+            0xff, 0xc0, 0, 17, 8, 0, 1, 0, 1, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1,
+        ]);
+        assert_eq!(image_info(&v), None);
+        // endless fill bytes
+        let fill = [vec![0xff, 0xd8, 0xff], vec![0xff; 100_000]].concat();
+        let start = std::time::Instant::now();
+        assert_eq!(image_info(&fill), None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn limits_are_clamped_and_checked_with_exact_arithmetic() {
+        let l = ImageLimits::default();
+        assert_eq!((l.max_side(), l.max_pixels()), (8192, 32_000_000));
+        assert!(
+            l.allows(8192, 3906) && !l.allows(8192, 3907),
+            "32 megapixels"
+        );
+        assert!(!l.allows(8193, 1) && !l.allows(1, 8193));
+        assert!(!l.allows(0, 5) && !l.allows(5, 0));
+        assert!(!l.allows(u32::MAX, u32::MAX), "no overflow");
+        let big = ImageLimits::new(u32::MAX, u64::MAX);
+        assert_eq!(
+            (big.max_side(), big.max_pixels()),
+            (ImageLimits::HARD_MAX_SIDE, ImageLimits::HARD_MAX_PIXELS),
+            "configuration cannot lift the hard caps"
+        );
+        let small = ImageLimits::new(0, 0);
+        assert_eq!((small.max_side(), small.max_pixels()), (1, 1));
+        assert!(small.allows(1, 1) && !small.allows(2, 1));
+    }
+
+    #[test]
+    fn an_image_above_the_limits_is_a_placeholder_never_an_image() {
+        let build = |bytes: &[u8], limits: &ImageLimits| {
+            FileView::build(
+                &RepoPath::parse("x.png").unwrap(),
+                EntryKind::File,
+                ModeClass::Regular,
+                Some(bytes.len() as u64),
+                &"a".repeat(40),
+                Some(bytes),
+                limits,
+            )
+        };
+        let l = ImageLimits::default();
+        // a few dozen bytes that declare a 40000 x 40000 canvas, in every format
+        for b in [
+            png_sized(40_000, 40_000),
+            gif_sized(60_000, 60_000),
+            jpeg_sized(60_000, 60_000),
+            webp_extended(40_000, 40_000),
+            webp_lossless(16_384, 16_384),
+            png_sized(8193, 1),
+            png_sized(6000, 6000),
+        ] {
+            let v = build(&b, &l);
+            assert!(
+                matches!(v.content, FileContent::ImageTooBig(..)),
+                "{:?}",
+                image_info(&b)
+            );
+            assert_eq!(v.class(), "image");
+        }
+        let ok = build(&png_sized(4000, 4000), &l);
+        assert!(matches!(ok.content, FileContent::Image(i) if i.width == 4000));
+        // a size that is fine under one limit and refused under another
+        assert!(matches!(
+            build(&png_sized(5000, 5000), &ImageLimits::new(8192, 64_000_000)).content,
+            FileContent::Image(_)
+        ));
+        assert!(matches!(
+            build(&png_sized(5000, 5000), &ImageLimits::new(4096, 64_000_000)).content,
+            FileContent::ImageTooBig(..)
+        ));
+        // a header that does not parse is no image at all
+        assert_eq!(build(&png_sized(0, 0), &l).content, FileContent::Binary);
     }
 
     #[test]
@@ -407,7 +779,14 @@ mod tests {
         // sandbox) and its text is never interpreted
         let mut p = gif();
         p.extend_from_slice(b"<script>alert(1)</script>");
-        assert_eq!(sniff(&p), TypeClass::Image(ImageKind::Gif));
+        assert_eq!(
+            sniff(&p),
+            TypeClass::Image(ImageInfo {
+                kind: ImageKind::Gif,
+                width: 1,
+                height: 1
+            })
+        );
         // html that starts like text and ends like a gif is text
         let mut q = b"<script>alert(1)</script>".to_vec();
         q.extend_from_slice(&gif());
@@ -429,7 +808,15 @@ mod tests {
         );
         assert_eq!(TypeClass::Text.as_str(), "text");
         assert_eq!(TypeClass::Binary.as_str(), "binary");
-        assert_eq!(TypeClass::Image(ImageKind::Png).as_str(), "image");
+        assert_eq!(
+            TypeClass::Image(ImageInfo {
+                kind: ImageKind::Png,
+                width: 1,
+                height: 1
+            })
+            .as_str(),
+            "image"
+        );
     }
 
     #[test]
@@ -506,6 +893,7 @@ mod tests {
             Some(size),
             &"a".repeat(40),
             bytes,
+            &ImageLimits::default(),
         )
     }
 
@@ -518,7 +906,7 @@ mod tests {
         let v = view("a.bin", EntryKind::File, Some(b"a\0b"), 3);
         assert_eq!((&v.content, v.class()), (&FileContent::Binary, "binary"));
         let v = view("a.png", EntryKind::File, Some(&png()), 33);
-        assert_eq!(v.content, FileContent::Image(ImageKind::Png));
+        assert!(matches!(v.content, FileContent::Image(i) if i.kind == ImageKind::Png));
         assert_eq!(v.class(), "image");
         let v = view("a.rs", EntryKind::File, None, 99_999_999);
         assert_eq!((&v.content, v.class()), (&FileContent::TooLarge, "unknown"));
@@ -599,6 +987,7 @@ mod tests {
             None,
             &sha,
             None,
+            &ImageLimits::default(),
         );
         assert_eq!(
             v.content,
@@ -613,6 +1002,7 @@ mod tests {
             None,
             "not a sha",
             None,
+            &ImageLimits::default(),
         );
         assert_eq!(v.content, FileContent::Submodule { commit: None });
         assert_eq!(v.class(), "unknown");
@@ -645,6 +1035,45 @@ mod tests {
             assert!(t.lines().all(|l| l.chars().count() <= MAX_LINE_CHARS + 40));
             assert!(t.line_count >= t.shown());
             assert_eq!(t.lines().count(), t.shown());
+        }
+    }
+
+    /// Random damage to valid headers: never a panic, never a size of zero, and a size that comes
+    /// out is what a clean parse of the same bytes gives.
+    #[test]
+    fn damaged_headers_never_panic_or_yield_a_zero_size() {
+        let seeds = [
+            png_sized(300, 200),
+            jpeg_sized(300, 200),
+            gif_sized(300, 200),
+            webp_lossy(300, 200),
+            webp_lossless(300, 200),
+            webp_extended(300, 200),
+        ];
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let mut b = seeds[usize::try_from(next() % seeds.len() as u64).unwrap()].clone();
+            for _ in 0..(1 + next() % 4) {
+                let at = usize::try_from(next() % b.len() as u64).unwrap();
+                match next() % 3 {
+                    0 => b[at] = u8::try_from(next() % 256).unwrap(),
+                    1 => b.truncate(at),
+                    _ => b.insert(at, u8::try_from(next() % 256).unwrap()),
+                }
+                if b.is_empty() {
+                    break;
+                }
+            }
+            if let Some(i) = image_info(&b) {
+                assert!(i.width > 0 && i.height > 0);
+                let _ = ImageLimits::default().allows(i.width, i.height);
+            }
         }
     }
 }

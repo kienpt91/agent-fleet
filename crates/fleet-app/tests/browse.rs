@@ -16,6 +16,7 @@ use fleet_domain::contract::{ContractRead, ResultStatus, WorkerResult};
 use fleet_domain::error::{ErrorCode, Result};
 use fleet_domain::ids::Sha;
 use fleet_domain::repo::diff::DiffSet;
+use fleet_domain::repo::view::ImageLimits;
 use fleet_domain::repo::RepoPath;
 use fleet_domain::value::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -341,10 +342,16 @@ impl RepoReader for Spy {
     }
 }
 
-fn png() -> Vec<u8> {
+fn png_sized(w: u32, h: u32) -> Vec<u8> {
     let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
-    v.extend_from_slice(&[0u8; 25]);
+    v.extend_from_slice(&w.to_be_bytes());
+    v.extend_from_slice(&h.to_be_bytes());
+    v.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
     v
+}
+
+fn png() -> Vec<u8> {
+    png_sized(1, 1)
 }
 
 fn browser() -> (Arc<Spy>, RepoBrowser, RepoTarget) {
@@ -373,6 +380,11 @@ fn browser() -> (Arc<Spy>, RepoBrowser, RepoTarget) {
                 "big.bin".to_string(),
                 Item::File(vec![b'a'; 5 * 1024 * 1024]),
             ),
+            (
+                "huge.png".to_string(),
+                Item::File(png_sized(40_000, 40_000)),
+            ),
+            ("wide.png".to_string(), Item::File(png_sized(9000, 10))),
             ("big.png".to_string(), {
                 let mut v = png();
                 v.resize(4 * 1024 * 1024 + 10, 0);
@@ -587,13 +599,18 @@ fn the_blob_api_serves_images_and_nothing_else() {
         ("mod", ErrorCode::Invalid),
         ("src", ErrorCode::Invalid),
         ("big.png", ErrorCode::Limit),
+        ("huge.png", ErrorCode::Limit),
+        ("wide.png", ErrorCode::Limit),
         ("big.bin", ErrorCode::Limit),
         ("nope.png", ErrorCode::NotFound),
     ] {
         let e = ask(&b, &t, "repo.blob", vec![("path", s(path))]).unwrap_err();
         assert_eq!(e.code, code, "{path}: {}", e.message);
         // the dashboard answers "not an image" with 415 by this subject, a directory with 400
-        let not_image = !matches!(path, "src" | "big.png" | "big.bin" | "nope.png");
+        let not_image = !matches!(
+            path,
+            "src" | "big.png" | "huge.png" | "wide.png" | "big.bin" | "nope.png"
+        );
         assert_eq!(
             e.subject.as_deref() == Some(fleet_app::browse::NOT_AN_IMAGE),
             not_image,
@@ -855,4 +872,116 @@ fn only_small_markdown_text_is_rendered() {
     let d = doc(ask(&b, &t, "repo.markdown", vec![("path", s("lossy.md"))]));
     assert_eq!(text(&d, "notice"), "Invalid UTF-8 was replaced.");
     assert!(d.canonical().contains("caf\u{fffd}"));
+}
+
+// ---- image dimensions ------------------------------------------------------------------------------
+
+#[test]
+fn an_image_that_declares_a_huge_canvas_is_never_served_and_is_a_placeholder_in_its_file_document()
+{
+    let (_, b, t) = browser();
+    // 40000 x 40000 pixels declared by a 33 byte file
+    let e = ask(&b, &t, "repo.blob", vec![("path", s("huge.png"))]).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Limit, "{}", e.message);
+    assert!(e.message.contains("40000 x 40000"), "{}", e.message);
+    assert!(e.subject.is_none(), "it is a limit, not a media-type error");
+    let wide = ask(&b, &t, "repo.blob", vec![("path", s("wide.png"))]).unwrap_err();
+    assert_eq!(wide.code, ErrorCode::Limit);
+    let d = doc(ask(&b, &t, "repo.file", vec![("path", s("huge.png"))]));
+    assert_eq!(text(&d, "view"), "image_too_large");
+    assert_eq!(text(&d, "class"), "image");
+    assert_eq!(text(&d, "image"), "png");
+    assert_eq!(
+        (
+            d.get("width").and_then(Value::as_u64),
+            d.get("height").and_then(Value::as_u64)
+        ),
+        (Some(40_000), Some(40_000))
+    );
+    assert_eq!(d.get("max_side").and_then(Value::as_u64), Some(8192));
+    assert_eq!(
+        d.get("max_pixels").and_then(Value::as_u64),
+        Some(32_000_000)
+    );
+    // an ordinary image says its size and is served with it
+    let ok = doc(ask(&b, &t, "repo.file", vec![("path", s("pic.png"))]));
+    assert_eq!(text(&ok, "view"), "image");
+    assert_eq!(
+        (
+            ok.get("width").and_then(Value::as_u64),
+            ok.get("max_side").map(Value::is_null)
+        ),
+        (Some(1), Some(true))
+    );
+    match ask(&b, &t, "repo.blob", vec![("path", s("pic.png"))]).unwrap() {
+        RepoReply::Image(i) => assert_eq!((i.width, i.height), (1, 1)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_image_limits_can_be_changed_but_never_past_the_hard_caps() {
+    let (spy, _, t) = browser();
+    let strict = RepoBrowser::new(spy.clone()).with_image_limits(ImageLimits::new(0, 0));
+    // zero is clamped up to one: a 1 x 1 image still passes, anything bigger does not
+    assert!(ask(&strict, &t, "repo.blob", vec![("path", s("pic.png"))]).is_ok());
+    assert_eq!(
+        ask(&strict, &t, "repo.blob", vec![("path", s("wide.png"))])
+            .unwrap_err()
+            .code,
+        ErrorCode::Limit
+    );
+    let tiny = RepoBrowser::new(spy.clone()).with_image_limits(ImageLimits::new(1, 1));
+    assert!(ask(&tiny, &t, "repo.blob", vec![("path", s("pic.png"))]).is_ok());
+    let generous = RepoBrowser::new(spy).with_image_limits(ImageLimits::new(u32::MAX, u64::MAX));
+    // 40000 per side is above the hard cap of 16384 whatever is asked for
+    assert_eq!(
+        ask(&generous, &t, "repo.blob", vec![("path", s("huge.png"))])
+            .unwrap_err()
+            .code,
+        ErrorCode::Limit
+    );
+}
+
+#[test]
+fn a_cached_document_names_the_selector_of_the_request_it_answers() {
+    let (_, b, t) = browser();
+    let head = "2".repeat(40);
+    let first = doc(ask(
+        &b,
+        &t,
+        "repo.file",
+        vec![("path", s("src/a.rs")), ("commit", s("head"))],
+    ));
+    let second = doc(ask(
+        &b,
+        &t,
+        "repo.file",
+        vec![("path", s("src/a.rs")), ("commit", s(&head))],
+    ));
+    assert_eq!(text(&first, "at"), "head");
+    assert_eq!(text(&second, "at"), head, "the same commit asked for by id");
+    assert_eq!(text(&first, "commit"), text(&second, "commit"));
+    let tree_head = doc(ask(&b, &t, "repo.tree", vec![("commit", s("head"))]));
+    let tree_id = doc(ask(&b, &t, "repo.tree", vec![("commit", s(&head))]));
+    assert_eq!(
+        (text(&tree_head, "at"), text(&tree_id, "at")),
+        ("head", head.as_str())
+    );
+    let md = doc(ask(
+        &b,
+        &t,
+        "repo.markdown",
+        vec![("path", s("README.md")), ("commit", s("head"))],
+    ));
+    let md_id = doc(ask(
+        &b,
+        &t,
+        "repo.markdown",
+        vec![("path", s("README.md")), ("commit", s(&head))],
+    ));
+    assert_eq!(
+        (text(&md, "at"), text(&md_id, "at")),
+        ("head", head.as_str())
+    );
 }
