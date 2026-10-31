@@ -946,7 +946,7 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1385 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1558 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`; 372 domain, 335 application, 569 adapters, 1 soak, 281 end to end):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
@@ -969,11 +969,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               4852     4726    97.4%
-application          2634     2485    94.3%
-infrastructure       5420     4998    92.2%
-cli                  2705     2433    89.9%
-overall             15611    14642    93.8%
+domain               6078     5935    97.6%
+application          3496     3285    94.0%
+infrastructure       6171     5699    92.4%
+cli                  3223     2936    91.1%
+overall             18968    17855    94.1%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard

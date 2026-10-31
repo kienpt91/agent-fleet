@@ -28,7 +28,7 @@ phases that are still to be built.
 | not planned | Deliberately out of scope. Section 5 gives reasons. |
 
 agent-fleet is a headless daemon plus a CLI, a terminal dashboard and (phase 2) a local web dashboard. It has no
-desktop GUI application, no editor, no embedded browser, no GitHub or Linear integration, no SSH worktrees and no
+desktop GUI application, no editor, no embedded browser, no Linear integration, no SSH worktrees and no
 mobile app.
 
 ## 3. Matrix
