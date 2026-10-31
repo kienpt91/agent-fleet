@@ -415,7 +415,9 @@ task whose worker finished is shown as `unverified` while the contract runs; the
 cannot use any of the commands; **processes started by a contract check, a quality gate or an approved command are refused on
 the control socket and on the web port like workers**; a check never sees ignored or uncommitted files, runs in a private export with a home of its own
 and not the operator's; a contract command planted in the worktree is never run; a `.fleet/` path a worker committed
-fails the diff constraint; secrets in check output are redacted before they reach the audit log.
+fails the diff constraint; secrets in check output are redacted before they reach the audit log; **a worker that rewrites the `.git`
+file of its worktree to point at a repository of its own (alternates, a replace ref) gets a failed review, no evidence and no merge**
+(the commit and tree come from the real repository, ADR 16); nothing above a check's working directory is the state directory.
 
 ## Concepts
 
@@ -845,15 +847,15 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1369 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1385 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
 | Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 317 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 297 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | 496 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 298 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | 509 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | 258 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | 260 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -868,11 +870,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               4836     4710    97.4%
-application          2633     2484    94.3%
-infrastructure       5703     5271    92.4%
+domain               4852     4726    97.4%
+application          2634     2485    94.3%
+infrastructure       5420     4998    92.2%
 cli                  2705     2433    89.9%
-overall             15877    14898    93.8%
+overall             15611    14642    93.8%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -890,18 +892,18 @@ run on every byte) and samples the process's resident memory from `/proc/self/st
 buffer is capped (64 KiB in the test). A 120 second run in release mode, in the Linux container:
 
 ```text
-soak: 8 workers x 120s, 15211 MiB of terminal output (127 MiB/s), rss start 5140 kB, steady min 7136 kB / max 7984 kB / first 7144 kB, growth after warm-up 840 kB, 237 samples
-soak web: sse client 340257414 bytes, 20240 output events (per third [7986, 7135, 5119]), 81 reconnects, 0 refused, max 1 open stream(s); 226 status polls (0 failed); rss start 5140 kB, steady min 7136 kB / max 7984 kB, growth after warm-up 840 kB
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.81s
+soak: 8 workers x 120s, 31720 MiB of terminal output (264 MiB/s), rss start 5136 kB, steady min 7228 kB / max 7832 kB / first 7756 kB, growth after warm-up 76 kB, 240 samples
+soak web: sse client 647210898 bytes, 38402 output events (per third [12626, 13229, 12547]), 156 reconnects, 0 refused, max 1 open stream(s); 230 status polls (0 failed); rss start 5136 kB, steady min 7228 kB / max 7832 kB, growth after warm-up 76 kB
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 121.00s
 ```
 
 Since phase 2 the soak runs the daemon **with the web dashboard on**: one client holds an event stream (`/api/stream`) of a
 flooding task for the whole run (reconnecting with `Last-Event-ID` when the server ends the stream at its limits and
 counting bytes only, so the client keeps no buffer), and a second polls `/api/status` every 500 ms. Memory is flat after
-the buffers fill: it did not grow with the volume of output (about 15 GiB went through the daemon, 340 MB of it through the
-event stream), and the growth after warm-up (840 kB) is within the 4 MiB the test allows. Across all 120 second runs with the
-dashboard on made since the dashboard exists (seven, before and after the later changes, the last one on the merged tree)
-the growth was 428 to 840 kB; the throughput ranged from 26 to 184 MiB/s on a machine that was shared with other containers, so
+the buffers fill: it did not grow with the volume of output (about 31 GiB went through the daemon, 647 MB of it through the
+event stream), and the growth after warm-up (76 kB) is within the 4 MiB the test allows. Across all 120 second runs with the
+dashboard on made since the dashboard exists (eight, before and after the later changes, the last one after the security fixes of the merged tree)
+the growth was 76 to 840 kB; the throughput ranged from 26 to 184 MiB/s on a machine that was shared with other containers, so
 no throughput comparison is claimed (the earlier run without the dashboard measured 271 MiB/s). By default the test runs 20 seconds;
 `FLEET_SOAK_SECS=120 cargo test --release -p fleet-infra --test soak -- --nocapture` reproduces the numbers above
 (your throughput will differ). Bounds elsewhere: messages 64 KiB, frames 32 KiB, files read from workers 64 KiB,
