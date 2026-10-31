@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "id": "no-change-at-all",
+      "kind": "diff",
+      "deny": ["**"]
+    },
+    {
+      "id": "never-exists",
+      "kind": "file",
+      "path": "dogfood/.human-only-this-file-never-exists",
+      "assert": "exists"
+    }
+  ]
+}
