@@ -225,3 +225,14 @@ allowlist, and fleet's own variables never include the socket path or the state 
 redacted and sanitized. No tokens are logged. A final scan of the working tree and the full git history (key
 shapes, private-key headers, long hex/base64 strings, absolute home-directory paths) is part of the release
 checklist in the README.
+
+## NEO N2: compiled context
+
+| What | Rule | Where it is enforced and tested |
+| --- | --- | --- |
+| Agent-written text in a pack | Only in layer 7, labelled `UNVERIFIED (...)`, every line quoted with `> `; optionally excluded (`[context] unverified = "exclude"`). Layers 1-6 are built from fleet's state and the repository at a recorded commit. | `neo-context/tests/compiler.rs`, `properties.rs`; `fleet-cli/tests/e2e_context.rs` (forged `.fleet/context.*` and `handoff.json`) |
+| Framing forgery | Length-prefixed headers, a digest in each header, and a backslash in front of every content line that starts with `@@` or `\`. | `neo-context` pack and compiler tests (hostile bodies, a whole pack inside a note) |
+| Secrets | Every string is redacted; files whose name or content match the secret scanner's rules (reimplemented from `scripts/secret-scan.sh` without a regex engine, `secret-scan: allow` not honoured) are named, never shown. | `neo-context/src/secret.rs` tests with run-time-built key shapes |
+| Files read for layer 6 | From the real repository at the recorded commit, through the hardened git adapter (ADR 16); regular files only, at most 12 files, 64 KiB scanned and 4 KiB shown per file. | `fleet-infra` git tests |
+| Worker-written context files | `.fleet/context.md`, `context.json` and `handoff.json` are never trusted: fleet keeps its own copy in the state directory (0700/0600, bounded retention) and recompiles from state; `handoff.json` is read with the `result.json` rules and shown as UNVERIFIED. | `contract_fs` tests, `e2e_context.rs` |
+| Digests | The audit log records the pack digest and manifest (`context_compiled`), and handoffs (`handoff_created`) under the hash chain. | `fleet-app/tests/neo_context.rs` |

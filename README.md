@@ -1000,3 +1000,82 @@ Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/
 ## License
 
 MIT, see [LICENSE](LICENSE). Copyright (c) 2026 Kien Phan.
+
+## NEO N2: compiled context packs and handoffs
+
+A run created with `context = "compiled"` (in the plan's `[run]` table, or `fleet run create --context compiled`) does not get
+the plain brief. Fleet compiles a **context pack** from its own state, in eight layers in a fixed order (invariants, charter,
+plan position, task and acceptance contract, verified knowledge, working set, recent events, scratch), each with a hard token
+budget, and writes it to `.fleet/context.md` (+ `.fleet/context.json`, the manifest). The pack is deterministic: the same inputs
+give the same bytes and the same SHA-256 digest. Text that agents wrote is only ever in layer 7, labelled `UNVERIFIED` and
+quoted. A **handoff packet** is made when a task ends, when it is retried, when the daemon finds it running after a crash, and on
+demand; the next pack is compiled from it. Design: [docs/neo.md](docs/neo.md), [ADR 17](docs/adr/0017-the-context-compiler-is-a-pure-deterministic-function.md),
+[ADR 18](docs/adr/0018-handoffs-are-made-before-the-next-attempt-and-rebuilt-after-a-crash.md).
+
+```
+fleet context show <task> [--digest <hex>] [--json]      fleet context diff <task> <digest1> <digest2> [--json]
+fleet context verify <task> [--json]  (exit 6 if it differs)   fleet context explain [<task>] [--profile <name>] [--json]
+fleet handoff <task> [--json]
+```
+
+What is tested: determinism (golden digests, two SHA-256 implementations), layer order, budgets and the shrink order,
+layers 1-6 free of agent-written text, labelled UNVERIFIED text in layer 7, delimiter and control-character attacks, secret
+rules, crash re-briefing with identical layers 1-5. What is not claimed: that a pack makes a model correct or reduces
+hallucination; token counts are estimates. Not built yet: the knowledge store (N3), the token governor (N4), the credential broker (N5).
+
+Output of [`scripts/neo-n2-demo.sh`](scripts/neo-n2-demo.sh), run in a throwaway container with a fake HOME, a fake repository and the
+fake agent `examples/agents/n2-agent.sh` (its first attempt is wrong, its second reads layer 4 of its pack; abridged only by the
+script's own `sed`/`awk` filters, digests differ per run):
+
+```
+$ fleet context explain r1/answer
+profile default: 32000 tokens at most, 4 characters per token, 125% safety margin
+estimator: tokens = ceil(bytes x 125% / (4 x 100)), counted over UTF-8 bytes
+policy: label
+  #  LAYER        SHARE  BUDGET  WHEN TOO LARGE
+  1  invariants   12%    3840    never cut
+  2  charter      15%    4800    never cut
+  3  plan         35%    11200   never cut
+  4  task         50%    16000   never cut
+  5  knowledge    15%    4800    dropped when the pack is too large
+  6  working-set  35%    11200   dropped when the pack is too large
+  7  events       15%    4800    dropped when the pack is too large
+  8  scratch      5%     1600    never cut
+when the pack is too large, layers are shrunk in this order: 7, 6, 5, 2 (the first goes first)
+
+$ fleet context show r1/answer --digest 73f03c52f434   # the retry's pack
+digest:  73f03c52f434a7985e0435d79f7f41e4c67d89003815aa6cec59f1f3b30f3d1c
+tokens 2436 of 32000
+  1  invariants   725/3840   ccd7c687028af53a  trusted
+  4  task         337/16000  81d3cb23b4a36e56  trusted
+  7  events       610/4800   01bf0016d13caeae  contains-unveri…
+  ...
+### State of those checks now (fleet's own runs)
+- goal feature check answer (mandatory): failed on commit 1cfde475577b (evidence e1)
+- goal feature check tests (mandatory): passed on commit 1cfde475577b (evidence e2)
+## Handoff
+Handoff b49377235251 from attempt 1 (retry): fleet recorded this state when that attempt ended.
+  evidence pointers: e1, e2, e3
+UNVERIFIED (summary the worker attached to the handoff; fleet did not check it):
+> wrote a first answer, not sure it is right
+
+$ fleet context diff r1/answer d3748d1fdb89 73f03c52f434
+  1  invariants   same     725 -> 725       ccd7c687028af53a
+  2  charter      same     352 -> 352       c0307217af848b85
+  3  plan         same     139 -> 139       838819fe960de432
+  4  task         CHANGED  307 -> 337       8709d613a2b319d2 -> 81d3cb23b4a36e56
+  5  knowledge    same     69 -> 69         cb09c64623bfba17
+  7  events       CHANGED  82 -> 610        1e72b3a0d857c9b3 -> 01bf0016d13caeae
+3 of 8 layers changed: 4 task, 7 events, 8 scratch
+
+$ fleet context verify r1/answer   # the plan has moved since: exit status 6
+DIFFERS: the pack compiled now has the digest 4a8a0a53..., the stored pack 73f03c52...
+4 of 8 layers changed: 3 plan, 4 task, 7 events, 8 scratch
+exit status 6
+
+$ fleet handoff r1/answer
+Handoff of r1/answer, attempt 2, trigger on-demand
+open verification state (fleet's own runs):
+  goal feature check answer (mandatory): passed on ab876092fbe3 (evidence e4)
+evidence pointers: e4, e5, e6
+```

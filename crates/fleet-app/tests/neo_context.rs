@@ -474,8 +474,15 @@ fn a_summary_survives_a_crash_between_the_end_of_an_attempt_and_its_handoff() {
     let session = h.world.session_for("a").unwrap();
     h.world.exit(session, 1);
     h.orch.tick();
-    assert!(handoff_events(&h).is_empty(), "the handoff could not be recorded");
-    assert!(h.world.stored_events().iter().any(|e| matches!(e, DomainEvent::RetryQueued { .. })));
+    assert!(
+        handoff_events(&h).is_empty(),
+        "the handoff could not be recorded"
+    );
+    assert!(h
+        .world
+        .stored_events()
+        .iter()
+        .any(|e| matches!(e, DomainEvent::RetryQueued { .. })));
     h.world.fail_context_store(false);
     // the new daemon makes the missing handoff, from the summary still in the worker's file
     h.restart(test_config()).unwrap();

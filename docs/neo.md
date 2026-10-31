@@ -239,3 +239,10 @@ This section states what exists after the N2 work so far, and what does not. It 
   hallucination. What is tested: determinism, layer order, budgets, verified-only layers 1-6 and labelled UNVERIFIED text.
 - Not yet written up or exercised end to end with the real binary: ADRs, glossary entries, SECURITY.md and README
   sections, an N2 demo script and the coverage numbers.
+
+## N2 status
+
+N2 as built: everything in the section above, plus the crash-safe handoff described in ADR 18, the end-to-end tests in
+`crates/fleet-cli/tests/e2e_context.rs` and `scripts/neo-n2-demo.sh`. Layer 5 is only the static knowledge file
+(`[context] knowledge`, TOML or JSON, every fact with an explicit source). There is no token governor, no credential broker,
+no knowledge store with proposals and verification (N3), no claim checking, and no evidence that a pack changes what a model does.

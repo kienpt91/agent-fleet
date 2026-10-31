@@ -258,7 +258,7 @@ impl HandoffPacket {
     /// The packet for people: plain text, with the worker's summary quoted and labelled.
     pub fn render(&self) -> String {
         let mut out = format!(
-            "Handoff of {}/{}, attempt {}, made on {}\ndigest: {}\npack: {} (profile {})\nlayers 1-5 digest: {}\n",
+            "Handoff of {}/{}, attempt {}, trigger {}\ndigest: {}\npack: {} (profile {})\nlayers 1-5 digest: {}\n",
             self.run,
             self.task,
             self.attempt,

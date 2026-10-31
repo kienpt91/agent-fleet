@@ -693,7 +693,11 @@ impl Orchestrator {
     /// starts, so nothing a worker left is lost by a crash in between.
     pub(crate) fn reconcile_handoffs(&mut self) {
         let mut wanted: Vec<(Key, HandoffTrigger, String)> = Vec::new();
-        for run in self.state.runs().filter(|r| r.context == ContextMode::Compiled) {
+        for run in self
+            .state
+            .runs()
+            .filter(|r| r.context == ContextMode::Compiled)
+        {
             for t in run.tasks().iter().filter(|t| t.attempt >= 1) {
                 let trigger = match t.status {
                     TaskStatus::Completed => HandoffTrigger::TaskCompleted,

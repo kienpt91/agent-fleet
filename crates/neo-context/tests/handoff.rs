@@ -110,7 +110,7 @@ fn the_workers_summary_is_cleaned_and_always_marked_unverified() {
 fn rendering_lists_layers_state_and_pointers() {
     let c = c();
     let text = sample_handoff(&c, HandoffTrigger::Recovery, None).render();
-    assert!(text.starts_with("Handoff of r1/api, attempt 1, made on recovery\n"));
+    assert!(text.starts_with("Handoff of r1/api, attempt 1, trigger recovery\n"));
     for needle in [
         "digest: ",
         "pack: ",
