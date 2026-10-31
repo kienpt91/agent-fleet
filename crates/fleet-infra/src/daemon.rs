@@ -24,7 +24,7 @@ use fleet_app::orchestrator::Orchestrator;
 use fleet_app::ports::{EventPublisher, Ports, StoredEvent};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::MAX_CONCURRENT_JOBS;
-use fleet_domain::supervision::{is_worker_origin, LiveSession};
+use fleet_domain::supervision::{is_worker_origin, LiveSession, ProcInfo};
 use fleet_domain::value::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,6 +91,7 @@ impl DaemonHandle {
             let _ = s.join();
         }
         crate::server::remove_socket(&self.socket);
+        crate::statedir::remove_token_file(&crate::statedir::token_path(&self.socket));
     }
 }
 
@@ -138,6 +139,9 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         .cloned()
         .collect();
 
+    // One redactor for everything that is stored or shown: terminal output, gate and command
+    // output, and what workers write into their result and question files.
+    let redactor = Arc::new(loaded.redactor);
     let registry = SessionRegistry::default();
     let ports = Ports {
         clock: Box::new(SystemClock),
@@ -148,11 +152,14 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         vcs: Box::new(GitVcs::new(env.clone(), app.env.clone())),
         sessions: Box::new(PtySessionHost::new(
             loaded.ring_bytes,
-            Arc::new(loaded.redactor),
+            Arc::clone(&redactor),
             registry.clone(),
         )),
-        contract: Box::new(FsContractFiles),
-        jobs: Box::new(ThreadJobRunner::new(MAX_CONCURRENT_JOBS)),
+        contract: Box::new(FsContractFiles::new(Arc::clone(&redactor))),
+        jobs: Box::new(ThreadJobRunner::new(
+            MAX_CONCURRENT_JOBS,
+            Arc::clone(&redactor),
+        )),
         logs: Box::new(FileOutputLogs::new(layout.logs_dir.clone())),
         undo: Box::new(AgentUndo::detect_with_env(path_env.as_deref(), undo_env)),
         digest: Box::new(Sha256Digest),
@@ -266,21 +273,14 @@ impl DaemonHandler {
         })
     }
 
-    /// Refuses requests from a worker or from anything it started. Workers run as the same user
-    /// as the operator, so the socket's file mode cannot keep them out; this check covers the
-    /// direct path (a worker, or a child of a worker, connecting to the socket).
-    fn reject_worker_origin(&self, peer: &PeerInfo) -> Result<()> {
-        let Some(pid) = peer.pid else { return Ok(()) };
+    /// Refuses a peer that is, or was started by, a worker, and one that cannot be inspected.
+    /// Workers run as the same user as the operator, so the socket's file mode cannot keep them
+    /// out; this check covers the direct path (a worker, or a child of a worker, connecting to
+    /// the socket). It runs at accept (`admit`, binding the decision to the connection) and
+    /// again per request.
+    fn check_origin(&self, peer: &PeerInfo) -> Result<()> {
         let live = self.ask(|reply| EngineMsg::Live { reply })?;
-        if live.is_empty() {
-            return Ok(());
-        }
-        if is_worker_origin(&procid::ancestry(pid), &live) {
-            return Err(FleetError::forbidden(
-                "requests from worker processes are refused; approvals and decisions are made by a person",
-            ));
-        }
-        Ok(())
+        decide_origin(peer, &live, procid::ancestry)
     }
 
     /// A repository that contains the state directory would let workers read the daemon's
@@ -311,8 +311,12 @@ impl DaemonHandler {
                 let io = self.registry.get(session).ok_or_else(|| {
                     FleetError::conflict("the session ended before the input could be delivered")
                 })?;
-                io.write_input(&bytes).map_err(|e| {
-                    FleetError::internal(format!("could not write to the session: {e}"))
+                io.write_input(&bytes).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::WouldBlock => FleetError::unavailable(e.to_string()),
+                    std::io::ErrorKind::BrokenPipe => FleetError::conflict(
+                        "the session ended before the input could be delivered",
+                    ),
+                    _ => FleetError::internal(format!("could not write to the session: {e}")),
                 })?;
                 Ok(HandlerReply::Data(data))
             }
@@ -358,6 +362,36 @@ impl DaemonHandler {
     }
 }
 
+/// Decides whether the process behind a connection may talk to the daemon. It fails closed: a
+/// peer whose pid the kernel did not report, or that cannot be found in the process table any
+/// more (it exited after connecting, which is how a worker's child could pipeline requests and
+/// vanish before they were judged), is refused like a worker or a process one of them started.
+/// `ancestry` lists a process and its ancestors, nearest first, and is empty when the process
+/// cannot be inspected.
+fn decide_origin(
+    peer: &PeerInfo,
+    live: &[LiveSession],
+    ancestry: impl FnOnce(u32) -> Vec<ProcInfo>,
+) -> Result<()> {
+    let Some(pid) = peer.pid else {
+        return Err(FleetError::forbidden(
+            "the connecting process could not be identified; refusing the connection",
+        ));
+    };
+    let chain = ancestry(pid);
+    if chain.first().map(|p| p.pid) != Some(pid) {
+        return Err(FleetError::forbidden(
+            "the connecting process has exited or cannot be inspected; refusing the connection",
+        ));
+    }
+    if is_worker_origin(&chain, live) {
+        return Err(FleetError::forbidden(
+            "requests from worker processes are refused; approvals and decisions are made by a person",
+        ));
+    }
+    Ok(())
+}
+
 fn term_size(args: &Value) -> Option<(u16, u16)> {
     let cols = u16::try_from(args.get("cols")?.as_u64()?).ok()?;
     let rows = u16::try_from(args.get("rows")?.as_u64()?).ok()?;
@@ -365,8 +399,15 @@ fn term_size(args: &Value) -> Option<(u16, u16)> {
 }
 
 impl RequestHandler for DaemonHandler {
+    fn admit(&self, peer: &PeerInfo) -> Result<()> {
+        self.check_origin(peer)
+    }
+
     fn call(&self, peer: &PeerInfo, cmd: &str, args: Value) -> Result<HandlerReply> {
-        self.reject_worker_origin(peer)?;
+        // Admission already ran when the connection was accepted; this is the cheap re-check
+        // that a peer which has since turned out to be (or to be started by) a worker, or has
+        // vanished, gets nothing more.
+        self.check_origin(peer)?;
         let command = parse_command(cmd, &args)?;
         self.check_repo(&command)?;
         let size = if matches!(command, Command::Attach { .. }) {
@@ -398,5 +439,101 @@ impl AttachSession for PtyAttach {
 
     fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         self.io.resize(cols, rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fleet_domain::error::ErrorCode;
+
+    fn peer(pid: Option<u32>) -> PeerInfo {
+        PeerInfo { uid: Some(0), pid }
+    }
+
+    fn info(pid: u32, ppid: u32, pgid: u32) -> ProcInfo {
+        ProcInfo { pid, ppid, pgid }
+    }
+
+    const WORKER: LiveSession = LiveSession {
+        pid: 500,
+        pgid: 500,
+    };
+
+    /// The process table of a pretend machine: `fleet` (900) run by a shell (800), and `fleet`
+    /// (901) started by the worker's own shell script (600) below the worker (500).
+    fn table(pid: u32) -> Vec<ProcInfo> {
+        match pid {
+            900 => vec![info(900, 800, 800), info(800, 100, 800)],
+            901 => vec![info(901, 600, 500), info(600, 500, 500), info(500, 1, 500)],
+            // a process that left its worker's tree and was adopted by init
+            950 => vec![info(950, 1, 950)],
+            500 => vec![info(500, 1, 500)],
+            _ => Vec::new(),
+        }
+    }
+
+    fn refused(result: Result<()>) -> String {
+        let err = result.expect_err("the connection must be refused");
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        err.message
+    }
+
+    #[test]
+    fn an_operator_process_is_admitted_whether_or_not_workers_are_running() {
+        assert!(decide_origin(&peer(Some(900)), &[WORKER], table).is_ok());
+        assert!(decide_origin(&peer(Some(900)), &[], table).is_ok());
+    }
+
+    #[test]
+    fn a_worker_and_everything_it_started_is_refused() {
+        for pid in [901, 500] {
+            let message = refused(decide_origin(&peer(Some(pid)), &[WORKER], table));
+            assert!(message.contains("worker processes"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_real_process_that_already_exited_is_refused_and_a_live_one_is_not() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let message = refused(decide_origin(&peer(Some(pid)), &[], procid::ancestry));
+        assert!(message.contains("exited"), "{message}");
+        assert!(decide_origin(&peer(Some(std::process::id())), &[], procid::ancestry).is_ok());
+    }
+
+    #[test]
+    fn a_peer_that_cannot_be_identified_is_refused_even_with_no_worker_running() {
+        // no pid from the kernel
+        let message = refused(decide_origin(&peer(None), &[], table));
+        assert!(message.contains("identified"), "{message}");
+        // the process is already gone: the original bypass (pipeline requests, then exit)
+        for live in [&[][..], &[WORKER][..]] {
+            let message = refused(decide_origin(&peer(Some(777)), live, table));
+            assert!(message.contains("exited"), "{message}");
+        }
+        // a table that answers about some other process is not an answer about the peer
+        let wrong = |_pid: u32| vec![info(123, 1, 123)];
+        refused(decide_origin(&peer(Some(777)), &[WORKER], wrong));
+    }
+
+    #[test]
+    fn the_ancestry_source_is_asked_exactly_once_about_the_peer() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let result = decide_origin(&peer(Some(900)), &[WORKER], |pid| {
+            asked.borrow_mut().push(pid);
+            table(pid)
+        });
+        assert!(result.is_ok());
+        assert_eq!(*asked.borrow(), vec![900]);
+    }
+
+    #[test]
+    fn a_process_that_left_the_workers_tree_is_the_documented_gap() {
+        // Detaching completely (setsid and adoption by init) before connecting is not caught by
+        // the origin check; the token and the per-worker state directory are what stand in
+        // the way. This test pins the behaviour so a change to it is a decision, not an accident.
+        assert!(decide_origin(&peer(Some(950)), &[WORKER], table).is_ok());
     }
 }

@@ -10,6 +10,7 @@ use fleet_domain::error::{FleetError, Result};
 use fleet_domain::ids::show;
 use fleet_domain::limits::MAX_GATE_OUTPUT;
 use fleet_domain::quality::{evaluate_exit, evaluate_refcheck, ExitKind, GateFormat, GateOutcome};
+use fleet_domain::redact::{Redactor, StreamRedactor};
 use fleet_domain::sanitize::{sanitize_text, tail_str};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
@@ -78,8 +79,8 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// Finds the executable for `program`. A name with a '/' is used as given (relative to `cwd`);
 /// a bare name is searched only in the `PATH` entry of `env`, never in the daemon's own `PATH`.
-/// Empty `PATH` entries are skipped; relative ones resolve against `cwd`, the directory the child
-/// runs in.
+/// Empty and relative `PATH` entries are skipped: a relative entry would resolve inside the
+/// directory the child runs in, which a worker controls.
 pub fn resolve_program(program: &str, cwd: &Path, env: &[(String, String)]) -> Option<PathBuf> {
     if program.is_empty() {
         return None;
@@ -100,16 +101,63 @@ pub fn resolve_program(program: &str, cwd: &Path, env: &[(String, String)]) -> O
         .find(|(k, _)| k == "PATH")
         .map(|(_, v)| v)?;
     path.split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| {
-            let dir = Path::new(dir);
-            if dir.is_absolute() {
-                dir.join(program)
-            } else {
-                cwd.join(dir).join(program)
-            }
-        })
+        .map(Path::new)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
         .find(|candidate| is_executable_file(candidate))
+}
+
+/// Name of the directory below a repository that holds the worktrees fleet creates.
+const WORKTREES_DIR: &str = ".fleet-worktrees";
+
+/// The repository root of a fleet worktree: the parent of its `.fleet-worktrees` ancestor.
+fn repo_root_of(worktree: &Path) -> Option<PathBuf> {
+    worktree
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == WORKTREES_DIR))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+/// Checks that `program` is not something a worker could have planted: its canonical path must
+/// lie neither inside `worktree` nor inside the repository the worktree belongs to (the parent
+/// of the `.fleet-worktrees` ancestor). Returns the canonical path to run, or the reason it was
+/// refused.
+pub fn trusted_program(program: &Path, worktree: &Path) -> std::result::Result<PathBuf, String> {
+    if !program.is_absolute() {
+        return Err("could not start: the program path must be absolute".to_string());
+    }
+    let canonical = fs::canonicalize(program).map_err(|e| {
+        format!(
+            "could not start: the program cannot be resolved ({})",
+            e.kind()
+        )
+    })?;
+    let mut roots: Vec<PathBuf> = vec![worktree.to_path_buf()];
+    roots.extend(repo_root_of(worktree));
+    if let Ok(real) = fs::canonicalize(worktree) {
+        roots.extend(repo_root_of(&real));
+        roots.push(real);
+    }
+    let inside = roots.into_iter().any(|root| {
+        let root = fs::canonicalize(&root).unwrap_or(root);
+        canonical.starts_with(root)
+    });
+    if inside {
+        return Err(
+            "refused: the program lies inside the task's worktree or its repository, where the \
+             worker controls its contents; the command was not run"
+                .to_string(),
+        );
+    }
+    Ok(canonical)
+}
+
+/// Redacts a multi-line text line by line; lines of a private-key block are dropped.
+pub fn redact_block(redactor: &Arc<Redactor>, text: &str) -> String {
+    let mut stream = StreamRedactor::new(Arc::clone(redactor));
+    let kept: Vec<_> = text.split('\n').filter_map(|l| stream.line(l)).collect();
+    kept.join("\n")
 }
 
 /// Output captured from one pipe, capped.
@@ -321,7 +369,7 @@ fn combined_text(result: &RunResult) -> String {
     tail_str(&text, OUTPUT_TEXT_BYTES).to_string()
 }
 
-fn run_gate(worktree: &Path, gate: &GateSpec) -> GateOutcome {
+fn run_gate(worktree: &Path, gate: &GateSpec, redactor: &Arc<Redactor>) -> GateOutcome {
     let result = run_bounded(&RunSpec {
         program: gate.program.clone(),
         args: gate.args.clone(),
@@ -330,8 +378,9 @@ fn run_gate(worktree: &Path, gate: &GateSpec) -> GateOutcome {
         timeout_ms: gate.timeout_ms,
         max_output: MAX_GATE_OUTPUT,
     });
-    let text = combined_text(&result);
-    match gate.format {
+    // Redacted before evaluation so a cut at the tail limit cannot leave half a secret behind.
+    let text = redact_block(redactor, &combined_text(&result));
+    let mut outcome = match gate.format {
         GateFormat::Exit => evaluate_exit(&gate.name, &result.exit, &text),
         GateFormat::RefcheckJson => {
             let parsed = crate::json::parse_value(&result.stdout, MAX_GATE_OUTPUT);
@@ -342,7 +391,11 @@ fn run_gate(worktree: &Path, gate: &GateSpec) -> GateOutcome {
                 &text,
             )
         }
-    }
+    };
+    // The summary of a structured gate comes from its stdout, not from `text`.
+    outcome.summary = redact_block(redactor, &outcome.summary);
+    outcome.output = redact_block(redactor, &outcome.output);
+    outcome
 }
 
 fn command_summary(exit: &ExitKind) -> String {
@@ -356,7 +409,7 @@ fn command_summary(exit: &ExitKind) -> String {
 }
 
 /// Runs a job to completion on the calling thread.
-fn execute(job: &Job) -> JobDone {
+fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
     match job {
         Job::Gates {
             run,
@@ -367,7 +420,10 @@ fn execute(job: &Job) -> JobDone {
         } => {
             let dir = PathBuf::from(worktree);
             // Every gate runs, also after a failure: the retry brief lists all of them.
-            let outcomes = gates.iter().map(|gate| run_gate(&dir, gate)).collect();
+            let outcomes = gates
+                .iter()
+                .map(|gate| run_gate(&dir, gate, redactor))
+                .collect();
             JobDone::Gates {
                 run: run.clone(),
                 task: task.clone(),
@@ -383,15 +439,26 @@ fn execute(job: &Job) -> JobDone {
             env,
             timeout_ms,
         } => {
+            let program = match trusted_program(Path::new(program), Path::new(worktree)) {
+                Ok(path) => path,
+                Err(why) => {
+                    return JobDone::Command {
+                        approval: approval.clone(),
+                        exit_code: None,
+                        summary: why,
+                        output: String::new(),
+                    };
+                }
+            };
             let result = run_bounded(&RunSpec {
-                program: program.clone(),
+                program: program.display().to_string(),
                 args: args.clone(),
                 cwd: PathBuf::from(worktree),
                 env: env.clone(),
                 timeout_ms: *timeout_ms,
                 max_output: MAX_GATE_OUTPUT,
             });
-            let text = sanitize_text(combined_text(&result).as_bytes());
+            let text = redact_block(redactor, &sanitize_text(combined_text(&result).as_bytes()));
             JobDone::Command {
                 approval: approval.clone(),
                 exit_code: match result.exit {
@@ -451,23 +518,28 @@ impl Drop for RunningGuard {
 /// channel and collected by [`JobRunner::poll`].
 pub struct ThreadJobRunner {
     max_concurrent: usize,
+    redactor: Arc<Redactor>,
     running: Arc<AtomicUsize>,
     tx: Sender<JobDone>,
     rx: Receiver<JobDone>,
 }
 
+type JobFn = fn(&Job, &Arc<Redactor>) -> JobDone;
+
 impl ThreadJobRunner {
-    pub fn new(max_concurrent: usize) -> ThreadJobRunner {
+    /// `redactor` is applied to everything gates and commands print before it is reported.
+    pub fn new(max_concurrent: usize, redactor: Arc<Redactor>) -> ThreadJobRunner {
         let (tx, rx) = channel();
         ThreadJobRunner {
             max_concurrent,
+            redactor,
             running: Arc::new(AtomicUsize::new(0)),
             tx,
             rx,
         }
     }
 
-    fn start_with(&mut self, job: Job, exec: fn(&Job) -> JobDone) -> Result<()> {
+    fn start_with(&mut self, job: Job, exec: JobFn) -> Result<()> {
         // Only this method increments, so the check and the increment cannot race.
         if self.running.load(Ordering::SeqCst) >= self.max_concurrent {
             return Err(FleetError::limit(format!(
@@ -478,11 +550,12 @@ impl ThreadJobRunner {
         self.running.fetch_add(1, Ordering::SeqCst);
         let counter = Arc::clone(&self.running);
         let tx = self.tx.clone();
+        let redactor = Arc::clone(&self.redactor);
         let spawned = thread::Builder::new()
             .name("fleet-job".into())
             .spawn(move || {
                 let guard = RunningGuard(counter);
-                let done = catch_unwind(AssertUnwindSafe(|| exec(&job)))
+                let done = catch_unwind(AssertUnwindSafe(|| exec(&job, &redactor)))
                     .unwrap_or_else(|_| panic_result(&job));
                 // The result is queued before the job stops counting as running.
                 let _ = tx.send(done);
@@ -720,8 +793,8 @@ mod tests {
             resolve_program("tool", dir.path(), &first_wins),
             Some(bin.join("tool"))
         );
-        // Entries that are missing or empty are skipped, later ones still searched.
-        let skipping = env(format!("::/nonexistent:{}", other.display()));
+        // Entries that are missing, empty or relative are skipped, later ones still searched.
+        let skipping = env(format!("::bin:/nonexistent:{}", other.display()));
         assert_eq!(
             resolve_program("tool", dir.path(), &skipping),
             Some(other.join("tool"))
@@ -774,6 +847,10 @@ mod tests {
 
     // ---- gates ---------------------------------------------------------------------------------
 
+    fn rd() -> Arc<Redactor> {
+        Arc::new(Redactor::builtin())
+    }
+
     fn gate(dir: &TempDir, name: &str, body: &str, format: GateFormat) -> GateSpec {
         let script = dir.script(&format!("{name}.sh"), &format!("#!/bin/sh\n{body}\n"));
         GateSpec {
@@ -789,7 +866,7 @@ mod tests {
     fn run_one(body: &str, format: GateFormat) -> GateOutcome {
         let dir = TempDir::new("job-gate");
         let g = gate(&dir, "g", body, format);
-        run_gate(dir.path(), &g)
+        run_gate(dir.path(), &g, &rd())
     }
 
     #[test]
@@ -866,10 +943,10 @@ mod tests {
         let dir = TempDir::new("job-gate-bad");
         let mut slow = gate(&dir, "slow", "sleep 30", GateFormat::Exit);
         slow.timeout_ms = 300;
-        assert_eq!(run_gate(dir.path(), &slow).summary, "timed out");
+        assert_eq!(run_gate(dir.path(), &slow, &rd()).summary, "timed out");
         let mut missing = gate(&dir, "missing", "", GateFormat::Exit);
         missing.program = "/nonexistent/prog".to_string();
-        let o = run_gate(dir.path(), &missing);
+        let o = run_gate(dir.path(), &missing, &rd());
         assert!(!o.passed);
         assert!(o.summary.starts_with("could not start"), "{o:?}");
     }
@@ -900,7 +977,7 @@ mod tests {
             task,
             attempt,
             outcomes,
-        } = execute(&job)
+        } = execute(&job, &rd())
         else {
             panic!("expected a gates result");
         };
@@ -922,18 +999,20 @@ mod tests {
         let work = dir.join("wt");
         std::fs::create_dir_all(&work).unwrap();
         let g = gate(&dir, "pwd", "echo here > marker", GateFormat::Exit);
-        let o = run_gate(&work, &g);
+        let o = run_gate(&work, &g, &rd());
         assert!(o.passed);
         assert!(work.join("marker").exists());
     }
 
     // ---- command jobs --------------------------------------------------------------------------
 
+    /// A command job whose program lives next to, not inside, the worktree.
     fn command_job(dir: &TempDir, body: &str, timeout_ms: u64) -> Job {
         let script = dir.script("cmd.sh", &format!("#!/bin/sh\n{body}\n"));
+        dir.write("wt/.keep", "");
         Job::Command {
             approval: ApprovalId::parse("a7").unwrap(),
-            worktree: dir.path().display().to_string(),
+            worktree: dir.join("wt").display().to_string(),
             program: script.display().to_string(),
             args: Vec::new(),
             env: env_path(),
@@ -954,7 +1033,7 @@ mod tests {
             exit_code,
             summary,
             output,
-        } = execute(&job)
+        } = execute(&job, &rd())
         else {
             panic!("expected a command result");
         };
@@ -969,7 +1048,7 @@ mod tests {
     fn command_job_output_is_a_bounded_tail() {
         let dir = TempDir::new("job-cmd-tail");
         let job = command_job(&dir, "i=0; while [ $i -lt 2000 ]; do echo line-$i-padding-padding-padding; i=$((i+1)); done; echo THE-END", 20_000);
-        let JobDone::Command { output, .. } = execute(&job) else {
+        let JobDone::Command { output, .. } = execute(&job, &rd()) else {
             panic!("expected a command result");
         };
         assert!(output.len() <= COMMAND_OUTPUT_BYTES);
@@ -981,7 +1060,7 @@ mod tests {
         let dir = TempDir::new("job-cmd-fail");
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&command_job(&dir, "sleep 30", 300))
+        } = execute(&command_job(&dir, "sleep 30", 300), &rd())
         else {
             panic!("expected a command result");
         };
@@ -989,7 +1068,7 @@ mod tests {
 
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&command_job(&dir, "kill -9 $$", 10_000))
+        } = execute(&command_job(&dir, "kill -9 $$", 10_000), &rd())
         else {
             panic!("expected a command result");
         };
@@ -997,7 +1076,7 @@ mod tests {
 
         let job = Job::Command {
             approval: ApprovalId::parse("a1").unwrap(),
-            worktree: dir.path().display().to_string(),
+            worktree: dir.join("wt").display().to_string(),
             program: "/nonexistent/prog".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -1005,7 +1084,7 @@ mod tests {
         };
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&job)
+        } = execute(&job, &rd())
         else {
             panic!("expected a command result");
         };
@@ -1060,7 +1139,7 @@ mod tests {
             gate(&dir, "bad", "exit 1", GateFormat::Exit),
             gate(&dir, "good", "exit 0", GateFormat::Exit),
         ];
-        let mut runner = ThreadJobRunner::new(2);
+        let mut runner = ThreadJobRunner::new(2, rd());
         assert!(runner.poll().is_empty());
         runner.start(gates_job(&dir, gates)).unwrap();
         let got = collect(&mut runner, 1);
@@ -1087,7 +1166,7 @@ mod tests {
             g.args = vec![release.display().to_string()];
             g
         };
-        let mut runner = ThreadJobRunner::new(1);
+        let mut runner = ThreadJobRunner::new(1, rd());
         runner.start(gates_job(&dir, vec![waiting("a")])).unwrap();
         assert_eq!(runner.running(), 1);
         let err = runner
@@ -1112,20 +1191,20 @@ mod tests {
     #[test]
     fn runner_with_zero_slots_refuses_everything() {
         let dir = TempDir::new("job-runner-zero");
-        let mut runner = ThreadJobRunner::new(0);
+        let mut runner = ThreadJobRunner::new(0, rd());
         let err = runner.start(gates_job(&dir, Vec::new())).unwrap_err();
         assert_eq!(err.code, fleet_domain::error::ErrorCode::Limit);
         assert_eq!(runner.running(), 0);
     }
 
-    fn exploding(_: &Job) -> JobDone {
+    fn exploding(_: &Job, _: &Arc<Redactor>) -> JobDone {
         panic!("simulated failure inside a job");
     }
 
     #[test]
     fn a_panicking_job_yields_a_failure_and_releases_its_slot() {
         let dir = TempDir::new("job-runner-panic");
-        let mut runner = ThreadJobRunner::new(1);
+        let mut runner = ThreadJobRunner::new(1, rd());
         let job = gates_job(
             &dir,
             vec![
@@ -1170,7 +1249,7 @@ mod tests {
     #[test]
     fn runner_runs_command_jobs() {
         let dir = TempDir::new("job-runner-cmd");
-        let mut runner = ThreadJobRunner::new(2);
+        let mut runner = ThreadJobRunner::new(2, rd());
         runner
             .start(command_job(&dir, "echo hi; exit 4", 10_000))
             .unwrap();
@@ -1187,5 +1266,228 @@ mod tests {
         assert_eq!(*exit_code, Some(4));
         assert_eq!(summary, "exit code 4");
         assert_eq!(output.trim(), "hi");
+    }
+
+    // ---- program trust (a worker controls the worktree and its repository) ----------------------
+
+    /// `<root>/repo/.fleet-worktrees/r1/t1` plus a trusted tool directory `<root>/tools`.
+    fn fleet_layout(dir: &TempDir) -> (PathBuf, PathBuf) {
+        dir.write("repo/.fleet-worktrees/r1/t1/.keep", "");
+        dir.write("repo/tools/.keep", "");
+        (dir.join("repo/.fleet-worktrees/r1/t1"), dir.join("repo"))
+    }
+
+    #[test]
+    fn programs_inside_the_worktree_or_its_repository_are_refused() {
+        let dir = TempDir::new("job-trust");
+        let (worktree, repo) = fleet_layout(&dir);
+        let in_worktree = dir.script("repo/.fleet-worktrees/r1/t1/evil.sh", "#!/bin/sh\n");
+        let in_repo = dir.script("repo/tools/evil.sh", "#!/bin/sh\n");
+        let in_sibling_worktree = dir.script("repo/.fleet-worktrees/r1/t2/evil.sh", "#!/bin/sh\n");
+        for program in [&in_worktree, &in_repo, &in_sibling_worktree] {
+            let err = trusted_program(program, &worktree).unwrap_err();
+            assert!(err.starts_with("refused: "), "{err}");
+        }
+        // A symlink outside the repository that points into it is judged by its target.
+        dir.write("outside/.keep", "");
+        let link = dir.join("outside/looks-fine");
+        std::os::unix::fs::symlink(&in_repo, &link).unwrap();
+        assert!(trusted_program(&link, &worktree).is_err());
+        // Neither a lookalike directory name nor a place outside the repository is refused.
+        let lookalike = dir.script("repo-other/ok.sh", "#!/bin/sh\n");
+        let elsewhere = dir.script("elsewhere/ok.sh", "#!/bin/sh\n");
+        assert_eq!(
+            trusted_program(&lookalike, &worktree).unwrap(),
+            fs::canonicalize(&lookalike).unwrap()
+        );
+        assert!(trusted_program(&elsewhere, &worktree).is_ok());
+        assert!(repo.exists());
+    }
+
+    #[test]
+    fn a_worktree_outside_the_fleet_layout_only_protects_itself() {
+        let dir = TempDir::new("job-trust-plain");
+        dir.write("wt/.keep", "");
+        let inside = dir.script("wt/evil.sh", "#!/bin/sh\n");
+        let beside = dir.script("tool.sh", "#!/bin/sh\n");
+        assert!(trusted_program(&inside, &dir.join("wt")).is_err());
+        assert!(trusted_program(&beside, &dir.join("wt")).is_ok());
+    }
+
+    #[test]
+    fn relative_and_unresolvable_programs_are_refused_with_a_clear_reason() {
+        let dir = TempDir::new("job-trust-rel");
+        dir.write("wt/.keep", "");
+        let wt = dir.join("wt");
+        let rel = trusted_program(Path::new("tool.sh"), &wt).unwrap_err();
+        assert!(rel.contains("must be absolute"), "{rel}");
+        let missing = trusted_program(Path::new("/nonexistent/prog"), &wt).unwrap_err();
+        assert!(missing.starts_with("could not start: "), "{missing}");
+    }
+
+    #[test]
+    fn a_command_planted_in_the_worktree_is_never_run() {
+        let dir = TempDir::new("job-cmd-planted");
+        let (worktree, _) = fleet_layout(&dir);
+        let marker = dir.join("ran");
+        let planted = dir.script(
+            "repo/.fleet-worktrees/r1/t1/evil.sh",
+            &format!("#!/bin/sh\necho x > '{}'\n", marker.display()),
+        );
+        let job = Job::Command {
+            approval: ApprovalId::parse("a7").unwrap(),
+            worktree: worktree.display().to_string(),
+            program: planted.display().to_string(),
+            args: Vec::new(),
+            env: env_path(),
+            timeout_ms: 5_000,
+        };
+        let JobDone::Command {
+            exit_code,
+            summary,
+            output,
+            ..
+        } = execute(&job, &rd())
+        else {
+            panic!("expected a command result");
+        };
+        assert_eq!(exit_code, None);
+        assert!(summary.starts_with("refused: "), "{summary}");
+        assert!(output.is_empty());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_relative_command_path_is_refused_even_when_it_exists_in_the_worktree() {
+        let dir = TempDir::new("job-cmd-relative");
+        dir.write("wt/.keep", "");
+        dir.script("wt/evil.sh", "#!/bin/sh\ntouch ran\n");
+        let job = Job::Command {
+            approval: ApprovalId::parse("a7").unwrap(),
+            worktree: dir.join("wt").display().to_string(),
+            program: "./evil.sh".to_string(),
+            args: Vec::new(),
+            env: env_path(),
+            timeout_ms: 5_000,
+        };
+        let JobDone::Command {
+            exit_code, summary, ..
+        } = execute(&job, &rd())
+        else {
+            panic!("expected a command result");
+        };
+        assert_eq!(exit_code, None);
+        assert!(summary.contains("must be absolute"), "{summary}");
+        assert!(!dir.exists("wt/ran"));
+    }
+
+    // ---- relative PATH entries ------------------------------------------------------------------
+
+    #[test]
+    fn relative_path_entries_never_resolve_a_program_in_the_working_directory() {
+        let dir = TempDir::new("job-relpath");
+        dir.script("bin/tool", "#!/bin/sh\n");
+        dir.script("tool", "#!/bin/sh\n");
+        dir.script("trusted/tool", "#!/bin/sh\n");
+        let env = |p: &str| vec![("PATH".to_string(), p.to_string())];
+        let cwd = dir.path();
+        assert_eq!(resolve_program("tool", cwd, &env(".")), None);
+        assert_eq!(resolve_program("tool", cwd, &env("bin")), None);
+        assert_eq!(resolve_program("tool", cwd, &env("./bin:..:")), None);
+        let trusted = dir.join("trusted");
+        // A later absolute entry is still used, after the relative ones were skipped.
+        let mixed = format!(".:bin:{}", trusted.display());
+        assert_eq!(
+            resolve_program("tool", cwd, &env(&mixed)),
+            Some(trusted.join("tool"))
+        );
+        // The same through the process runner: the planted `tool` in the cwd is not started.
+        let mut s = spec(Path::new("tool"), &[], &dir);
+        s.env = env(".");
+        assert!(matches!(run_bounded(&s).exit, ExitKind::SpawnFailed(_)));
+    }
+
+    // ---- redaction at ingestion -----------------------------------------------------------------
+
+    /// Shaped like a GitHub token, built at run time so no secret-looking literal is in the code.
+    fn token() -> String {
+        format!("ghp_{}", "a1B2".repeat(10))
+    }
+
+    #[test]
+    fn gate_output_and_summary_are_redacted() {
+        let dir = TempDir::new("job-redact-gate");
+        let mut g = gate(
+            &dir,
+            "leaky",
+            "echo \"token=$1\"; echo \"again $1\" >&2; exit 1",
+            GateFormat::Exit,
+        );
+        g.args = vec![token()];
+        let o = run_gate(dir.path(), &g, &rd());
+        assert!(!o.passed);
+        assert!(
+            !o.output.contains(&token()) && !o.summary.contains(&token()),
+            "{o:?}"
+        );
+        assert!(o.output.contains("[REDACTED:github-token]"), "{o:?}");
+        assert!(
+            o.output.contains("token=") && o.output.contains("again "),
+            "{o:?}"
+        );
+    }
+
+    #[test]
+    fn structured_gate_findings_are_redacted() {
+        let dir = TempDir::new("job-redact-refcheck");
+        let body = r#"printf '{"version":1,"summary":{"errors":1},"findings":[{"severity":"error","file":"a.rs","line":3,"message":"leaked %s"}]}\n' "$1"; exit 1"#;
+        let mut g = gate(&dir, "refcheck", body, GateFormat::RefcheckJson);
+        g.args = vec![token()];
+        let o = run_gate(dir.path(), &g, &rd());
+        assert!(!o.passed);
+        assert!(
+            !o.output.contains(&token()) && !o.summary.contains(&token()),
+            "{o:?}"
+        );
+        assert!(o.output.contains("leaked"), "{o:?}");
+    }
+
+    #[test]
+    fn command_output_is_redacted_before_it_is_reported() {
+        let dir = TempDir::new("job-redact-cmd");
+        let mut job = command_job(&dir, "echo \"got $1\"; exit 0", 10_000);
+        if let Job::Command { args, .. } = &mut job {
+            args.push(token());
+        }
+        let JobDone::Command { output, .. } = execute(&job, &rd()) else {
+            panic!("expected a command result");
+        };
+        assert!(!output.contains(&token()), "{output}");
+        assert!(output.contains("got [REDACTED:github-token]"), "{output}");
+    }
+
+    #[test]
+    fn the_runner_hands_its_redactor_to_the_jobs() {
+        let dir = TempDir::new("job-redact-runner");
+        let mut job = command_job(&dir, "echo \"got $1\"", 10_000);
+        if let Job::Command { args, .. } = &mut job {
+            args.push(token());
+        }
+        let mut runner = ThreadJobRunner::new(1, rd());
+        runner.start(job).unwrap();
+        let got = collect(&mut runner, 1);
+        let JobDone::Command { output, .. } = &got[0] else {
+            panic!("expected a command result");
+        };
+        assert!(!output.contains(&token()), "{output}");
+    }
+
+    #[test]
+    fn redact_block_keeps_line_structure_and_drops_key_blocks() {
+        let text = "a\n\nb\n-----BEGIN PRIVATE KEY-----\nsecretbody\n-----END PRIVATE KEY-----\nc";
+        assert_eq!(
+            redact_block(&rd(), text),
+            "a\n\nb\n[REDACTED:private-key]\nc"
+        );
     }
 }

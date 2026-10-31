@@ -896,6 +896,9 @@ impl GitVcs {
         Ok(())
     }
 
+    /// Merges `branch`. With `approved`, the branch must still point at that commit (it is what a
+    /// human approved) and exactly that commit is merged, not whatever the name points to by the
+    /// time git resolves it.
     fn merge_one(
         &self,
         wt: &Path,
@@ -903,8 +906,28 @@ impl GitVcs {
         ff_flag: &str,
         message: Option<&str>,
         branch: &str,
+        approved: Option<&Sha>,
     ) -> Result<MergeOutcome> {
         let full = format!("refs/heads/{branch}");
+        let target = match approved {
+            Some(sha) => {
+                let spec = format!("{full}^{{commit}}");
+                let out = self.run(
+                    wt,
+                    None,
+                    &["rev-parse", "--verify", "--end-of-options", &spec],
+                )?;
+                if !out.ok() || out.text().trim() != sha.as_str() {
+                    return Err(FleetError::conflict(format!(
+                        "the branch {} moved since it was approved; it no longer points at {}",
+                        show(branch),
+                        show(sha.as_str())
+                    )));
+                }
+                sha.as_str().to_string()
+            }
+            None => full,
+        };
         let mut args = vec![
             "merge",
             "--no-verify",
@@ -917,7 +940,7 @@ impl GitVcs {
             args.push("-m");
             args.push(m);
         }
-        args.push(&full);
+        args.push(&target);
         let out = self.run(wt, Some(ident), &args)?;
         if out.ok() {
             return Ok(MergeOutcome::Merged {
@@ -1006,7 +1029,7 @@ impl Vcs for GitVcs {
         let wt = self.check_worktree(worktree)?;
         for b in branches {
             if let conflict @ MergeOutcome::Conflict { .. } =
-                self.merge_one(&wt, identity, "--ff", None, b)?
+                self.merge_one(&wt, identity, "--ff", None, b, None)?
             {
                 return Ok(conflict);
             }
@@ -1076,6 +1099,7 @@ impl Vcs for GitVcs {
             "--no-ff",
             Some(&message),
             &req.task_branch,
+            Some(&req.head),
         )?;
         Ok(IntegrationResult { outcome, created })
     }
@@ -1301,6 +1325,10 @@ mod tests {
         }
 
         fn integrate(&self, run: &str, task: &str) -> IntegrationResult {
+            let head = self
+                .vcs
+                .branch_head(self.repo_s(), &format!("fleet/{run}/{task}"))
+                .unwrap();
             self.vcs
                 .merge_into_integration(&IntegrationMerge {
                     repo: self.repo_s().to_string(),
@@ -1311,6 +1339,7 @@ mod tests {
                     task_branch: format!("fleet/{run}/{task}"),
                     message: format!("merge {task}"),
                     identity: ident(),
+                    head,
                 })
                 .unwrap()
         }
@@ -1698,6 +1727,7 @@ mod tests {
                     task_branch: task.to_string(),
                     message: "m".to_string(),
                     identity: ident(),
+                    head: fx.base(),
                 })
                 .unwrap_err();
             assert_eq!(err.code, ErrorCode::Invalid);
@@ -1852,6 +1882,103 @@ mod tests {
             git(&fx.repo, &["rev-parse", "refs/heads/main"]),
             fx.base().as_str()
         );
+    }
+
+    fn merge_request(fx: &Fx, run: &str, task: &str, head: Sha) -> IntegrationMerge {
+        IntegrationMerge {
+            repo: fx.repo_s().to_string(),
+            run: rid(run),
+            task: tid(task),
+            base: fx.base(),
+            integration_branch: format!("fleet/{run}/integration"),
+            task_branch: format!("fleet/{run}/{task}"),
+            message: format!("merge {task}"),
+            identity: ident(),
+            head,
+        }
+    }
+
+    #[test]
+    fn integration_merges_exactly_the_approved_commit() {
+        need_git!();
+        let fx = Fx::new();
+        let w1 = fx.prepare("r1", "t1");
+        let approved = fx.edit_and_commit(&w1, "a.txt", "approved\n");
+        let result = fx
+            .vcs
+            .merge_into_integration(&merge_request(&fx, "r1", "t1", approved.clone()))
+            .unwrap();
+        let MergeOutcome::Merged { sha } = result.outcome else {
+            panic!("expected a merge");
+        };
+        let parents = git(
+            &fx.repo,
+            &["rev-list", "--parents", "-n", "1", sha.as_str()],
+        );
+        assert!(
+            parents.ends_with(approved.as_str()),
+            "the second parent must be the approved commit: {parents}"
+        );
+    }
+
+    #[test]
+    fn a_branch_that_moved_after_approval_is_not_merged() {
+        need_git!();
+        let fx = Fx::new();
+        let w1 = fx.prepare("r1", "t1");
+        let approved = fx.edit_and_commit(&w1, "a.txt", "approved\n");
+        // The worker keeps working after the approval; the branch now points elsewhere.
+        let moved = fx.edit_and_commit(&w1, "evil.txt", "unreviewed\n");
+        assert_ne!(approved, moved);
+        let err = fx
+            .vcs
+            .merge_into_integration(&merge_request(&fx, "r1", "t1", approved.clone()))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(
+            err.message.contains("moved since it was approved"),
+            "{}",
+            err.message
+        );
+        let integration = fx.repo.join(".fleet-worktrees/r1/_integration");
+        assert_eq!(
+            git(&integration, &["rev-parse", "HEAD"]),
+            fx.base().as_str(),
+            "nothing may have been merged"
+        );
+        assert!(!integration.join("a.txt").exists() && !integration.join("evil.txt").exists());
+        assert_eq!(git(&integration, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn a_branch_reset_to_another_commit_or_deleted_is_not_merged() {
+        need_git!();
+        let fx = Fx::new();
+        let w1 = fx.prepare("r1", "t1");
+        let approved = fx.edit_and_commit(&w1, "a.txt", "approved\n");
+        // Another commit is asserted as approved: refused although the branch exists.
+        let err = fx
+            .vcs
+            .merge_into_integration(&merge_request(&fx, "r1", "t1", fx.base()))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        // A branch that does not exist any more is refused the same way.
+        let w2 = fx.prepare("r1", "t2");
+        let sha = fx.edit_and_commit(&w2, "b.txt", "b\n");
+        fx.vcs
+            .remove_worktree(fx.repo_s(), &w2, "fleet/r1/t2", true)
+            .unwrap();
+        let err = fx
+            .vcs
+            .merge_into_integration(&merge_request(&fx, "r1", "t2", sha))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        // The approved one still merges afterwards.
+        let ok = fx
+            .vcs
+            .merge_into_integration(&merge_request(&fx, "r1", "t1", approved))
+            .unwrap();
+        assert!(matches!(ok.outcome, MergeOutcome::Merged { .. }));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use crate::protocol::{
     encode_request, encode_resize, parse_response, read_frame, read_line_bounded, write_frame,
     KIND_DETACH, KIND_EXIT, KIND_INPUT, KIND_NOTICE, KIND_OUTPUT, KIND_RESIZE, MAX_RESPONSE_BYTES,
 };
+use crate::statedir::read_token;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::limits::{MAX_FRAME_PAYLOAD, MAX_MESSAGE_BYTES};
 use fleet_domain::value::Value;
@@ -26,6 +27,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Client {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
+    /// The daemon's capability token. Deliberately not `Debug` and never printed.
+    token: String,
 }
 
 fn daemon_down(socket: &Path) -> FleetError {
@@ -103,12 +106,16 @@ fn map_io(e: &io::Error) -> FleetError {
 }
 
 impl Client {
+    /// Connects to the daemon at `socket` and reads the capability token it keeps next to the
+    /// socket; every request carries that token. The token is never shown or logged.
     pub fn connect(socket: &Path) -> Result<Client> {
         check_socket_path(socket)?;
         let stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
             io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => daemon_down(socket),
             _ => FleetError::io("connecting to the daemon", &e),
         })?;
+        // Only a socket somebody answers on is worth a token; a stale socket file is "down".
+        let token = read_token(socket)?;
         stream
             .set_read_timeout(Some(CALL_TIMEOUT))
             .and_then(|()| stream.set_write_timeout(Some(WRITE_TIMEOUT)))
@@ -119,22 +126,28 @@ impl Client {
         Ok(Client {
             writer: stream,
             reader: BufReader::new(reader),
+            token,
         })
     }
 
     /// Sends one command and returns the reply's data object. An error reply becomes a
     /// [`FleetError`] with the daemon's code, message and subject.
     pub fn call(&mut self, cmd: &str, args: Value) -> Result<Value> {
-        let mut line = encode_request(cmd, &args);
+        let mut line = encode_request(cmd, &args, Some(&self.token));
         if line.len() > MAX_MESSAGE_BYTES {
             return Err(FleetError::limit(format!(
                 "the request is larger than {MAX_MESSAGE_BYTES} bytes"
             )));
         }
         line.push('\n');
-        self.writer
-            .write_all(line.as_bytes())
-            .map_err(|e| map_io(&e))?;
+        if let Err(e) = self.writer.write_all(line.as_bytes()) {
+            // A daemon that refuses this connection answers and closes before the request is
+            // written; the refusal is still waiting to be read and is the real reason.
+            if let Ok(Some(reply)) = read_line_bounded(&mut self.reader, MAX_RESPONSE_BYTES) {
+                parse_response(&reply).map(drop)?;
+            }
+            return Err(map_io(&e));
+        }
         match read_line_bounded(&mut self.reader, MAX_RESPONSE_BYTES) {
             Ok(Some(reply)) => parse_response(&reply),
             Ok(None) => Err(closed_by_daemon()),
@@ -250,6 +263,93 @@ mod tests {
         (ts, fake, tx)
     }
 
+    /// Writes the token file `Client::connect` looks for next to `socket`.
+    fn token_for(socket: &Path) -> String {
+        crate::statedir::create_token_file(&crate::statedir::token_path(socket)).unwrap()
+    }
+
+    #[test]
+    fn a_request_carries_the_token_from_the_file_as_its_own_field() {
+        let dir = TempDir::new("cl");
+        let path = dir.join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let token = token_for(&path);
+        let acceptor = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let line = read_line_bounded(&mut reader, MAX_MESSAGE_BYTES)
+                .unwrap()
+                .unwrap();
+            let reply = format!(
+                "{}\n",
+                crate::protocol::encode_ok(&obj(&[("schema", Value::str("fleet.ping/1"))]))
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            line
+        });
+        let mut client = Client::connect(&path).unwrap();
+        let args = obj(&[("task", Value::str("r1/t1"))]);
+        client.call("approve", args.clone()).unwrap();
+        let line = acceptor.join().unwrap();
+        let request = crate::protocol::parse_request(&line).unwrap();
+        assert_eq!(request.cmd, "approve");
+        assert_eq!(request.token.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            request.args, args,
+            "the arguments are exactly what the caller gave"
+        );
+    }
+
+    #[test]
+    fn a_socket_without_a_token_is_refused_before_any_request_is_sent() {
+        let dir = TempDir::new("cl");
+        let path = dir.join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let acceptor = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            read_line_bounded(&mut reader, MAX_MESSAGE_BYTES).unwrap()
+        });
+        let err = Client::connect(&path).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert!(err.message.contains("token"), "{}", err.message);
+        assert_eq!(
+            acceptor.join().unwrap(),
+            None,
+            "nothing may be sent without the token"
+        );
+    }
+
+    #[test]
+    fn a_token_file_other_users_can_read_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+        let (ts, _fake, _tx) = serve();
+        let token_file = crate::statedir::token_path(&ts.path);
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = Client::connect(&ts.path).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Client::connect(&ts.path).is_ok());
+    }
+
+    #[test]
+    fn the_daemons_refusal_is_the_error_whether_the_request_is_written_early_or_late() {
+        let (fake, _tx) = Fake::new();
+        fake.refuse_admit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ts = TestServer::start(Arc::clone(&fake) as Arc<dyn crate::server::RequestHandler>);
+        let mut early = Client::connect(&ts.path).unwrap();
+        let err = early.call("echo", Value::Null).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(err.message, "not welcome here");
+        // The daemon has long closed this connection when the request is finally written.
+        let mut late = Client::connect(&ts.path).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let err = late.call("echo", Value::Null).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "{err:?}");
+        assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn call_round_trip() {
         let (ts, _fake, _tx) = serve();
@@ -349,6 +449,7 @@ mod tests {
         let dir = TempDir::new("cl");
         let path = dir.join("s");
         let listener = UnixListener::bind(&path).unwrap();
+        token_for(&path);
         let acceptor = std::thread::spawn(move || {
             // accept one connection, read the request, close without answering
             if let Ok((stream, _)) = listener.accept() {
@@ -377,6 +478,7 @@ mod tests {
             let dir = TempDir::new("cl");
             let path = dir.join("s");
             let listener = UnixListener::bind(&path).unwrap();
+            token_for(&path);
             let acceptor = std::thread::spawn(move || {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -461,6 +563,7 @@ mod tests {
         let dir = TempDir::new("cl");
         let path = dir.join("s");
         let listener = UnixListener::bind(&path).unwrap();
+        token_for(&path);
         let acceptor = std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;

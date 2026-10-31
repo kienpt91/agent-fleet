@@ -3,8 +3,10 @@
 //! One JSON object per line: `{"seq","ts","prev","body","hash"}`. The chain (see
 //! `fleet_domain::chain`) detects edits, deletions, reordering and insertions. Truncation of the
 //! tail is caught by a small sidecar (`<log stem>.head`) that records the record count and last
-//! hash after every append. Like the log it is writable by anyone with the same user id, so this
-//! is tamper evidence against accidents and careless edits, not against a determined attacker.
+//! hash after every append. The sidecar is created together with the log (0 records, the genesis
+//! hash), so a log with records and no sidecar is reported as tampered. Like the log it is
+//! writable by anyone with the same user id, so this is tamper evidence against accidents and
+//! careless edits, not against a determined attacker.
 
 use crate::digest::Sha256Digest;
 use crate::fsx::{self, FileKind, ReadError};
@@ -44,7 +46,7 @@ struct Head {
 fn read_head(path: &Path) -> Result<Option<Head>> {
     let bytes = match fsx::read_regular(path, 256) {
         Ok(b) => b,
-        // Not written yet: the first append creates it.
+        // `scan` decides what a missing head means: only a log without records may lack it.
         Err(ReadError::Missing) => return Ok(None),
         Err(e) => return Err(tampered(format!("event log head file {e}"))),
     };
@@ -192,10 +194,19 @@ fn scan(
         visit(&link)?;
         valid_len = valid_len.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
     }
-    if let Some(h) = head {
-        verifier
+    match head {
+        Some(h) => verifier
             .check_head(h.records, &h.hash)
-            .map_err(|fault| tampered(format!("event log: {fault}")))?;
+            .map_err(|fault| tampered(format!("event log: {fault}")))?,
+        // The head exists from the moment the log does, so a log with records and no head
+        // was cut back and had its head removed to hide it.
+        None if verifier.records() > 0 => {
+            return Err(tampered(format!(
+                "event log has {} records but its head file is missing",
+                verifier.records()
+            )))
+        }
+        None => {}
     }
     Ok(Scan {
         records: verifier.records(),
@@ -264,6 +275,14 @@ impl FileEventStore {
         let head = read_head(&head_path)?;
         let (file, len) = open_log_read(path)?;
         let s = scan(file, len, &*digest, head.as_ref(), &mut |_| Ok(()))?;
+        if head.is_none() {
+            // Only a log without records can lack its head (scan refuses the others): it is
+            // created together with the log, so that deleting it later is noticed.
+            fsx::write_private_atomic(
+                &head_path,
+                format!("0 {}\n", fleet_domain::chain::GENESIS).as_bytes(),
+            )?;
+        }
         if s.partial_tail {
             // Drop the fragment of an interrupted append so the next record starts on a line.
             let f = OpenOptions::new()
@@ -541,9 +560,43 @@ mod tests {
             verify_file(&t.join("events.log")).unwrap_err().code,
             ErrorCode::Tampered
         );
-        // Without the head the shorter log is internally consistent.
+        // Deleting the head as well must not hide the cut: see the next test.
+    }
+
+    #[test]
+    fn a_new_log_gets_its_head_at_the_same_time() {
+        let t = TempDir::new("evlog-newhead");
+        drop(open(&t));
+        assert_eq!(
+            t.read("events.head"),
+            format!("0 {}\n", fleet_domain::chain::GENESIS)
+        );
+        assert_eq!(
+            fs::metadata(t.join("events.head")).unwrap().mode() & 0o777,
+            0o600
+        );
+        let report = verify_file(&t.join("events.log")).unwrap();
+        assert_eq!(report.records, 0);
+        // A log that was cut back to nothing and lost its head is the empty log again: the
+        // head is recreated, nothing else can be told.
         fs::remove_file(t.join("events.head")).unwrap();
-        assert_eq!(open(&t).replay(&mut |_| Ok(())).unwrap().records, 3);
+        drop(open(&t));
+        assert!(t.exists("events.head"));
+    }
+
+    #[test]
+    fn cutting_the_log_at_a_record_boundary_and_deleting_the_head_is_detected() {
+        let t = TempDir::new("evlog-cut-nohead");
+        drop(fill(&t, 5));
+        let mut l = lines(&t);
+        l.truncate(3);
+        set_lines(&t, &l);
+        fs::remove_file(t.join("events.head")).unwrap();
+        assert_eq!(reopen_err(&t).code, ErrorCode::Tampered);
+        assert_eq!(
+            verify_file(&t.join("events.log")).unwrap_err().code,
+            ErrorCode::Tampered
+        );
     }
 
     #[test]
@@ -639,14 +692,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_head_is_tampered_but_a_missing_one_is_not() {
+    fn an_unreadable_or_missing_head_is_tampered_once_the_log_has_records() {
         let t = TempDir::new("evlog-badhead");
         drop(fill(&t, 2));
         fs::write(t.join("events.head"), "garbage").unwrap();
         assert_eq!(reopen_err(&t).code, ErrorCode::Tampered);
         fs::remove_file(t.join("events.head")).unwrap();
-        let _ = open(&t);
-        // A head that lags (crash between log and head write) is fine.
+        let err = reopen_err(&t);
+        assert_eq!(err.code, ErrorCode::Tampered);
+        assert!(
+            err.message.contains("head file is missing"),
+            "{}",
+            err.message
+        );
+        assert!(
+            !t.exists("events.head"),
+            "opening must not recreate the head"
+        );
+        assert_eq!(
+            verify_file(&t.join("events.log")).unwrap_err().code,
+            ErrorCode::Tampered
+        );
+        // A head that lags by whole records (crash between log and head write) is accepted.
+        let first = lines(&t)[0].clone();
+        let hash = parse_link(first.as_bytes(), 1).unwrap().hash;
+        fs::write(t.join("events.head"), format!("1 {hash}\n")).unwrap();
+        assert_eq!(verify_file(&t.join("events.log")).unwrap().records, 2);
         fs::write(t.join("events.head"), format!("1 {}\n", "0".repeat(64))).unwrap();
         let _ = open(&t);
         // The same count with another hash is not.
@@ -669,7 +740,7 @@ mod tests {
         let mut l = lines(&t);
         l.push(link_line(&link));
         set_lines(&t, &l);
-        let _ = fs::remove_file(t.join("events.head"));
+        // The head still lags the log by one record, which is accepted.
         let s = open(&t);
         let err = replay_all(&s).unwrap_err();
         assert_eq!(err.code, ErrorCode::Tampered);

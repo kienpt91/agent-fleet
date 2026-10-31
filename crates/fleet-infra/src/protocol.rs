@@ -61,18 +61,23 @@ pub fn read_line_bounded(r: &mut impl BufRead, max: usize) -> io::Result<Option<
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "line is not valid UTF-8"))
 }
 
-/// One request line (no newline). A null `args` is sent as an empty object.
-pub fn encode_request(cmd: &str, args: &Value) -> String {
+/// One request line (no newline). A null `args` is sent as an empty object. `token` is the
+/// daemon's per-run capability token (see `statedir`); `None` leaves the field out.
+pub fn encode_request(cmd: &str, args: &Value, token: Option<&str>) -> String {
     let args = if args.is_null() {
         Value::object(std::iter::empty::<(String, Value)>())
     } else {
         args.clone()
     };
-    json::to_line(&Value::object([
+    let mut fields = vec![
         ("v", Value::Int(VERSION)),
         ("cmd", Value::str(cmd)),
         ("args", args),
-    ]))
+    ];
+    if let Some(token) = token {
+        fields.push(("token", Value::str(token)));
+    }
+    json::to_line(&Value::object(fields))
 }
 
 fn bad(message: &str) -> FleetError {
@@ -87,8 +92,19 @@ fn check_version(doc: &Value) -> Result<()> {
     }
 }
 
-/// Validates one request line and returns the command and its arguments (an object).
-pub fn parse_request(line: &str) -> Result<(String, Value)> {
+/// One validated request line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Request {
+    pub cmd: String,
+    /// Always an object.
+    pub args: Value,
+    /// The capability token the client presented, if any. Not validated here: the server
+    /// compares it against its own.
+    pub token: Option<String>,
+}
+
+/// Validates one request line.
+pub fn parse_request(line: &str) -> Result<Request> {
     let doc = json::parse_value(line.as_bytes(), MAX_MESSAGE_BYTES)
         .map_err(|e| FleetError::invalid(format!("malformed request: {e}")))?;
     if doc.as_object().is_none() {
@@ -112,7 +128,16 @@ pub fn parse_request(line: &str) -> Result<(String, Value)> {
         Some(v @ Value::Object(_)) => v.clone(),
         Some(_) => return Err(bad("args must be an object")),
     };
-    Ok((cmd.to_string(), args))
+    let token = match doc.get("token") {
+        None | Some(Value::Null) => None,
+        Some(Value::Str(s)) => Some(s.clone()),
+        Some(_) => return Err(bad("token must be a string")),
+    };
+    Ok(Request {
+        cmd: cmd.to_string(),
+        args,
+        token,
+    })
 }
 
 pub fn encode_ok(data: &Value) -> String {
@@ -251,21 +276,42 @@ mod tests {
     #[test]
     fn request_round_trip() {
         let args = obj(&[("task", Value::str("r1/t1")), ("max", Value::int(5))]);
-        let line = encode_request("task.tail", &args);
+        let line = encode_request("task.tail", &args, None);
         assert!(!line.contains('\n'));
-        let (cmd, got) = parse_request(&line).unwrap();
-        assert_eq!(cmd, "task.tail");
-        assert_eq!(got, args);
+        let req = parse_request(&line).unwrap();
+        assert_eq!(req.cmd, "task.tail");
+        assert_eq!(req.args, args);
+        assert_eq!(req.token, None);
+    }
+
+    #[test]
+    fn the_token_travels_as_a_top_level_field_not_inside_args() {
+        let args = obj(&[("task", Value::str("r1/t1"))]);
+        let token = "ab".repeat(32);
+        let line = encode_request("approve", &args, Some(&token));
+        let req = parse_request(&line).unwrap();
+        assert_eq!(req.token.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            req.args, args,
+            "the token must not leak into the command arguments"
+        );
+        // a token that is not a string is a malformed request, not a missing token
+        let err = parse_request(r#"{"v":1,"cmd":"ping","token":7}"#).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid);
+        let req = parse_request(r#"{"v":1,"cmd":"ping","token":null}"#).unwrap();
+        assert_eq!(req.token, None);
     }
 
     #[test]
     fn null_or_missing_args_become_an_empty_object() {
-        let line = encode_request("ping", &Value::Null);
-        let (_, args) = parse_request(&line).unwrap();
+        let line = encode_request("ping", &Value::Null, None);
+        let args = parse_request(&line).unwrap().args;
         assert_eq!(args, obj(&[]));
-        let (_, args) = parse_request(r#"{"v":1,"cmd":"ping"}"#).unwrap();
+        let args = parse_request(r#"{"v":1,"cmd":"ping"}"#).unwrap().args;
         assert_eq!(args, obj(&[]));
-        let (_, args) = parse_request(r#"{"v":1,"cmd":"ping","args":null}"#).unwrap();
+        let args = parse_request(r#"{"v":1,"cmd":"ping","args":null}"#)
+            .unwrap()
+            .args;
         assert_eq!(args, obj(&[]));
     }
 

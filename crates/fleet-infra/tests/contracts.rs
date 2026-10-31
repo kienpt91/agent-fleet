@@ -8,6 +8,7 @@ use fleet_app::testing::contracts::{
     contract_files_contract, event_store_contract, output_logs_contract, ContractFile,
     ContractHarness, Plant, PLANT_MARKER, VALID_QUESTION_JSON, VALID_RESULT_JSON,
 };
+use fleet_domain::redact::Redactor;
 use fleet_infra::contract_fs::FsContractFiles;
 use fleet_infra::digest::Sha256Digest;
 use fleet_infra::eventlog::FileEventStore;
@@ -17,6 +18,7 @@ use nix::sys::stat::Mode;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ---- event store ----------------------------------------------------------------------------
 
@@ -118,7 +120,7 @@ impl FsHarness {
         fs::create_dir(dir.join("wt")).unwrap();
         FsHarness {
             dir,
-            files: FsContractFiles,
+            files: FsContractFiles::new(Arc::new(Redactor::builtin())),
         }
     }
 

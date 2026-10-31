@@ -2,9 +2,12 @@
 //! output buffer.
 //!
 //! Input reaches a session only through [`SessionIo::write_input`], which the control socket calls
-//! for `send` and `attach`; nothing else in the daemon writes to a worker's terminal. Output is
-//! read by one thread per session into the domain's `OutputBuffer` (sanitized, redacted, capped),
-//! so a worker that prints without limit cannot grow the daemon's memory.
+//! for `send` and `attach`; nothing else in the daemon writes to a worker's terminal. It goes
+//! through a bounded queue to a writer thread per session, so a worker that never reads its
+//! stdin yields an error (`the worker is not reading its input`) instead of blocking a control
+//! connection. Output is read by one thread per session into the domain's `OutputBuffer`
+//! (sanitized, redacted, capped), so a worker that prints without limit cannot grow the
+//! daemon's memory.
 
 use crate::procid;
 use fleet_app::ports::{
@@ -18,11 +21,11 @@ use fleet_domain::redact::Redactor;
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
 use nix::sys::signal::Signal as NixSignal;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const DEFAULT_ROWS: u16 = 40;
@@ -38,10 +41,110 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Most chunks waiting for the writer thread of one session.
+const INPUT_QUEUE_CHUNKS: usize = 64;
+/// Largest chunk of the queue; longer input is split.
+const INPUT_CHUNK_BYTES: usize = 4096;
+/// The refusal for input that does not fit the queue.
+const NOT_READING: &str = "the worker is not reading its input";
+
+#[derive(Default)]
+struct InputState {
+    chunks: VecDeque<Vec<u8>>,
+    closed: bool,
+}
+
+/// A bounded queue of input for one session. `push` never blocks; the writer thread of the
+/// session is the only consumer.
+struct InputQueue {
+    state: Mutex<InputState>,
+    ready: Condvar,
+}
+
+impl InputQueue {
+    fn new() -> InputQueue {
+        InputQueue {
+            state: Mutex::new(InputState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// All of `bytes` or nothing: a refused input is never half-queued.
+    fn push(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let needed = bytes.len().div_ceil(INPUT_CHUNK_BYTES);
+        if needed > INPUT_QUEUE_CHUNKS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the input is too large",
+            ));
+        }
+        let mut state = lock(&self.state);
+        if state.closed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the session has ended",
+            ));
+        }
+        if state.chunks.len().saturating_add(needed) > INPUT_QUEUE_CHUNKS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                NOT_READING,
+            ));
+        }
+        for chunk in bytes.chunks(INPUT_CHUNK_BYTES) {
+            state.chunks.push_back(chunk.to_vec());
+        }
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// Refuses further input, forgets what is queued and wakes the writer thread.
+    fn close(&self) {
+        let mut state = lock(&self.state);
+        state.closed = true;
+        state.chunks.clear();
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    /// The next chunk, waiting for one; `None` once the queue is closed.
+    fn next(&self) -> Option<Vec<u8>> {
+        let mut state = lock(&self.state);
+        loop {
+            if state.closed {
+                return None;
+            }
+            if let Some(chunk) = state.chunks.pop_front() {
+                return Some(chunk);
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// The only code that writes to the worker's terminal. It blocks in `write` when the worker
+/// does not read; the queue in front of it is what keeps everybody else from blocking too.
+fn run_input_writer(queue: &InputQueue, mut writer: Box<dyn Write + Send>) {
+    while let Some(chunk) = queue.next() {
+        if writer
+            .write_all(&chunk)
+            .and_then(|()| writer.flush())
+            .is_err()
+        {
+            break;
+        }
+    }
+    queue.close();
+}
+
 /// The terminal side of a session, shared with the reader thread and the control socket.
 pub struct SessionIo {
     out: Mutex<OutputBuffer>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    input: Arc<InputQueue>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     started: Instant,
     /// Milliseconds since `started` at the last output.
@@ -84,6 +187,8 @@ impl SessionIo {
     fn end_of_stream(&self) {
         lock(&self.out).finish();
         self.eof.store(true, Ordering::SeqCst);
+        // Nobody reads input of an ended session; drop what is queued and refuse the rest.
+        self.input.close();
         // Dropping the sender tells an attached client that the session is over.
         *lock(&self.subscriber) = None;
     }
@@ -99,11 +204,13 @@ impl SessionIo {
         rx
     }
 
-    /// Writes keystrokes or text into the terminal. The only way input reaches a worker.
+    /// Queues keystrokes or text for the terminal and returns at once. The only way input
+    /// reaches a worker. A writer thread per session does the blocking write, so a worker that
+    /// does not read its stdin can never hold a control connection or the engine. When the
+    /// queue is full the input is refused whole (`WouldBlock`, "the worker is not reading its
+    /// input"); once the session has ended it is `BrokenPipe`.
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut w = lock(&self.writer);
-        w.write_all(bytes)?;
-        w.flush()
+        self.input.push(bytes)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -137,6 +244,13 @@ impl SessionIo {
 
     pub fn raw_bytes(&self) -> u64 {
         lock(&self.out).raw_bytes()
+    }
+}
+
+impl Drop for SessionIo {
+    fn drop(&mut self) {
+        // Lets the writer thread end even when the worker never read what is queued.
+        self.input.close();
     }
 }
 
@@ -304,12 +418,13 @@ impl SessionHost for PtySessionHost {
                 return Err(e);
             }
         };
+        let input = Arc::new(InputQueue::new());
         let io = Arc::new(SessionIo {
             out: Mutex::new(OutputBuffer::new(
                 self.ring_bytes,
                 Arc::clone(&self.redactor),
             )),
-            writer: Mutex::new(writer),
+            input: Arc::clone(&input),
             master: Mutex::new(pair.master),
             started: Instant::now(),
             last_output_ms: AtomicU64::new(0),
@@ -342,6 +457,17 @@ impl SessionHost for PtySessionHost {
             let _ = child.wait();
             return Err(FleetError::internal(format!(
                 "could not start the output reader: {e}"
+            )));
+        }
+        let writer_queue = Arc::clone(&input);
+        let writer_thread = std::thread::Builder::new()
+            .name(format!("pty-writer-{}", self.next_id.saturating_add(1)))
+            .spawn(move || run_input_writer(&writer_queue, writer));
+        if let Err(e) = writer_thread {
+            let _ = procid::signal_verified(&ProcessIdentity::new(pid, token), NixSignal::SIGKILL);
+            let _ = child.wait();
+            return Err(FleetError::internal(format!(
+                "could not start the input writer: {e}"
             )));
         }
         self.next_id = self.next_id.saturating_add(1);
@@ -664,6 +790,109 @@ mod tests {
         wait_exit(&mut h, s.id);
         let out = h.release(s.id);
         assert!(out.text.contains("got:forty-two"), "{:?}", out.text);
+    }
+
+    #[test]
+    fn input_longer_than_one_chunk_arrives_whole_and_in_order() {
+        let dir = TempDir::new("pty");
+        let mut h = host();
+        // raw mode first, so the line discipline neither edits nor limits what is written
+        let s = h
+            .spawn(&spec(
+                &dir,
+                "stty raw -echo; echo ready; head -c 10000 > got.bin",
+            ))
+            .unwrap();
+        assert!(wait_until(10_000, || h
+            .snapshot(s.id, 100)
+            .unwrap_or_default()
+            .contains("ready")));
+        let sent: Vec<u8> = (0..10_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let io = h.registry().get(s.id).unwrap();
+        io.write_input(&sent).unwrap();
+        wait_exit(&mut h, s.id);
+        h.release(s.id);
+        assert_eq!(std::fs::read(dir.join("got.bin")).unwrap(), sent);
+    }
+
+    #[test]
+    fn input_to_a_worker_that_never_reads_is_refused_quickly_and_nothing_else_blocks() {
+        let dir = TempDir::new("pty");
+        let mut h = host();
+        let s = h.spawn(&spec(&dir, "sleep 60")).unwrap();
+        let io = h.registry().get(s.id).unwrap();
+
+        let started = Instant::now();
+        let mut refused = 0;
+        for i in 0..1000 {
+            let call = Instant::now();
+            if let Err(e) = io.write_input(&[b'x'; INPUT_CHUNK_BYTES]) {
+                assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "input {i}: {e}");
+                assert_eq!(e.to_string(), "the worker is not reading its input");
+                refused += 1;
+            }
+            assert!(
+                call.elapsed() < Duration::from_secs(2),
+                "input {i} blocked for {:?}",
+                call.elapsed()
+            );
+        }
+        assert!(
+            refused > 0,
+            "4 MB of input into a worker that reads nothing was all accepted"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        // the memory held for the worker is bounded by the queue, not by what was sent
+        assert!(lock(&io.input.state).chunks.len() <= INPUT_QUEUE_CHUNKS);
+
+        // everything but writing still works while the input is jammed
+        io.resize(100, 30).unwrap();
+        assert!(h.snapshot(s.id, 100).is_some());
+        assert_eq!(h.poll(s.id), SessionState::Running);
+
+        // the worker can still be stopped, and afterwards input says the session ended
+        assert_eq!(h.signal(s.id, Signal::Kill), SignalOutcome::Sent);
+        wait_exit(&mut h, s.id);
+        assert!(
+            wait_until(10_000, || matches!(
+                io.write_input(b"x"),
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe
+            )),
+            "input to an ended session must fail as ended, not as jammed"
+        );
+        h.release(s.id);
+    }
+
+    #[test]
+    fn a_refused_input_is_never_half_queued_and_oversized_input_is_invalid() {
+        let queue = InputQueue::new();
+        let chunk = vec![1u8; INPUT_CHUNK_BYTES];
+        // 63 chunks queued; a 2-chunk input does not fit the one free slot and leaves it free
+        for _ in 0..INPUT_QUEUE_CHUNKS - 1 {
+            queue.push(&chunk).unwrap();
+        }
+        let two = vec![2u8; INPUT_CHUNK_BYTES + 1];
+        let err = queue.push(&two).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(lock(&queue.state).chunks.len(), INPUT_QUEUE_CHUNKS - 1);
+        queue.push(&chunk).unwrap();
+        assert_eq!(
+            queue.push(&[0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        // chunks come out in the order they went in, then a closed queue ends the writer
+        assert_eq!(queue.next().as_deref(), Some(chunk.as_slice()));
+        queue.close();
+        assert_eq!(queue.next(), None);
+        assert_eq!(
+            queue.push(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let big = vec![0u8; INPUT_QUEUE_CHUNKS * INPUT_CHUNK_BYTES + 1];
+        assert_eq!(
+            InputQueue::new().push(&big).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

@@ -63,15 +63,39 @@ fn ps(pid: u32, columns: &str) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// Reads the kernel's boot id: a UUID that changes with every boot.
+#[cfg(target_os = "linux")]
+fn read_boot_id() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    parse_boot_id(&text)
+}
+
+/// Accepts the text of `boot_id`: a short hexadecimal UUID, possibly with dashes.
+pub fn parse_boot_id(text: &str) -> Option<String> {
+    let id = text.trim();
+    let valid =
+        !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+    valid.then(|| id.to_string())
+}
+
+/// The start token of a Linux process: `<boot_id>:<start ticks>`. The tick count restarts from
+/// zero at every boot, so without the boot id a process of an earlier boot with a recorded pid
+/// and ticks could be mistaken for a new one that happens to match.
+pub fn boot_scoped_token(boot_id: &str, start_ticks: &str) -> String {
+    format!("{boot_id}:{start_ticks}")
+}
+
 /// A token that stays the same for the lifetime of one process and differs for any later process
-/// that reuses the pid. `None` when no such process exists or it cannot be read.
+/// that reuses the pid. `None` when no such process exists or it cannot be read. On Linux it is
+/// scoped to the boot (`<boot_id>:<ticks>`); elsewhere it is the process's start time.
 pub fn start_token(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
     #[cfg(target_os = "linux")]
     {
-        read_stat(pid).map(|s| s.start_ticks)
+        let stat = read_stat(pid)?;
+        Some(boot_scoped_token(&read_boot_id()?, &stat.start_ticks))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -238,6 +262,45 @@ mod tests {
         assert!(parse_stat("garbage").is_none());
         assert!(parse_stat("1 (x) S 1").is_none());
         assert!(parse_stat("1 (x) S a b c d e f g h i j k l m n o p q 5").is_none());
+    }
+
+    #[test]
+    fn boot_ids_are_parsed_strictly() {
+        let id = "3f2b8c1e-9a4d-4c55-8e0a-1b2c3d4e5f60\n";
+        assert_eq!(
+            parse_boot_id(id).as_deref(),
+            Some("3f2b8c1e-9a4d-4c55-8e0a-1b2c3d4e5f60")
+        );
+        assert_eq!(parse_boot_id(""), None);
+        assert_eq!(parse_boot_id("\n"), None);
+        assert_eq!(parse_boot_id("not a uuid"), None);
+        assert_eq!(
+            parse_boot_id("abc:def"),
+            None,
+            "the separator must not appear in an id"
+        );
+        assert_eq!(parse_boot_id(&"a".repeat(65)), None);
+    }
+
+    #[test]
+    fn the_token_differs_between_boots_with_equal_ticks() {
+        let a = boot_scoped_token("aaaa-1111", "987654");
+        let b = boot_scoped_token("bbbb-2222", "987654");
+        assert_eq!(a, "aaaa-1111:987654");
+        assert_ne!(a, b);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_token_is_boot_id_colon_ticks_of_the_live_process() {
+        let me = std::process::id();
+        let token = start_token(me).unwrap();
+        let boot = read_boot_id().unwrap();
+        let ticks = read_stat(me).unwrap().start_ticks;
+        assert_eq!(token, format!("{boot}:{ticks}"));
+        let (left, right) = token.rsplit_once(':').unwrap();
+        assert_eq!(left, boot);
+        assert!(right.bytes().all(|b| b.is_ascii_digit()));
     }
 
     #[test]

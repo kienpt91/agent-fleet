@@ -5,25 +5,37 @@
 //! `fsx::read_regular_in`, which handles all of those.
 
 use crate::fsx::{self, FileKind, ReadError};
+use crate::jobs::redact_block;
 use crate::json;
 use fleet_app::ports::ContractFiles;
 use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::{MAX_BRIEF_FILE_BYTES, MAX_CONTRACT_FILE};
+use fleet_domain::redact::Redactor;
 use fleet_domain::sanitize::head_str;
 use fleet_domain::value::Value;
 use std::path::Path;
+use std::sync::Arc;
 
 const DIR_NAME: &str = ".fleet";
 const RESULT_FILE: &str = "result.json";
 const QUESTION_FILE: &str = "question.json";
 const BRIEF_FILE: &str = "brief.md";
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FsContractFiles;
+/// Reads and prepares the contract files. Free text a worker writes (result summary, question
+/// text and choices) is redacted on the way in, so no secret reaches the log or other briefs.
+#[derive(Clone, Debug)]
+pub struct FsContractFiles {
+    redactor: Arc<Redactor>,
+}
 
 impl FsContractFiles {
+    pub fn new(redactor: Arc<Redactor>) -> FsContractFiles {
+        FsContractFiles { redactor }
+    }
+
     fn read<T>(
+        &self,
         worktree: &str,
         name: &str,
         parse: fn(&Value) -> std::result::Result<T, String>,
@@ -83,11 +95,27 @@ impl ContractFiles for FsContractFiles {
     }
 
     fn read_question(&self, worktree: &str) -> ContractRead<WorkerQuestion> {
-        Self::read(worktree, QUESTION_FILE, WorkerQuestion::from_value)
+        match self.read(worktree, QUESTION_FILE, WorkerQuestion::from_value) {
+            ContractRead::Valid(mut q) => {
+                // The action's command and arguments stay exact: an approval is bound to them.
+                q.text = redact_block(&self.redactor, &q.text);
+                for choice in &mut q.choices {
+                    *choice = redact_block(&self.redactor, choice);
+                }
+                ContractRead::Valid(q)
+            }
+            other => other,
+        }
     }
 
     fn read_result(&self, worktree: &str) -> ContractRead<WorkerResult> {
-        Self::read(worktree, RESULT_FILE, WorkerResult::from_value)
+        match self.read(worktree, RESULT_FILE, WorkerResult::from_value) {
+            ContractRead::Valid(mut r) => {
+                r.summary = redact_block(&self.redactor, &r.summary);
+                ContractRead::Valid(r)
+            }
+            other => other,
+        }
     }
 
     fn question_present(&self, worktree: &str) -> bool {
@@ -111,6 +139,10 @@ mod tests {
     const GOOD_QUESTION: &str =
         r#"{"version":1,"kind":"question","text":"which db?","choices":["a","b"]}"#;
 
+    fn files() -> FsContractFiles {
+        FsContractFiles::new(Arc::new(Redactor::builtin()))
+    }
+
     fn wt(t: &TempDir) -> String {
         t.path().to_str().unwrap().to_string()
     }
@@ -127,7 +159,7 @@ mod tests {
         let t = TempDir::new("contract-valid");
         t.write(".fleet/result.json", GOOD_RESULT);
         t.write(".fleet/question.json", GOOD_QUESTION);
-        let c = FsContractFiles;
+        let c = files();
         match c.read_result(&wt(&t)) {
             ContractRead::Valid(r) => {
                 assert_eq!(r.status, ResultStatus::Done);
@@ -148,7 +180,7 @@ mod tests {
     #[test]
     fn missing_files_are_absent() {
         let t = TempDir::new("contract-missing");
-        let c = FsContractFiles;
+        let c = files();
         assert_eq!(c.read_result(&wt(&t)), ContractRead::Absent);
         assert_eq!(c.read_question(&wt(&t)), ContractRead::Absent);
         assert!(!c.question_present(&wt(&t)));
@@ -159,7 +191,7 @@ mod tests {
     #[test]
     fn malformed_json_and_wrong_shapes_are_invalid() {
         let t = TempDir::new("contract-bad");
-        let c = FsContractFiles;
+        let c = files();
         t.write(".fleet/result.json", "{not json");
         assert!(invalid_text(c.read_result(&wt(&t))).starts_with("result.json: "));
         t.write(".fleet/result.json", r#"{"version":1,"status":"maybe"}"#);
@@ -182,7 +214,7 @@ mod tests {
             "x".repeat(usize::try_from(MAX_CONTRACT_FILE).unwrap())
         );
         t.write(".fleet/result.json", &big);
-        let text = invalid_text(FsContractFiles.read_result(&wt(&t)));
+        let text = invalid_text(files().read_result(&wt(&t)));
         assert!(text.contains("larger than"), "{text}");
     }
 
@@ -195,7 +227,7 @@ mod tests {
         let flag = done.clone();
         let path = wt(&t);
         let handle = std::thread::spawn(move || {
-            let r = FsContractFiles.read_result(&path);
+            let r = files().read_result(&path);
             flag.store(true, Ordering::SeqCst);
             r
         });
@@ -216,7 +248,7 @@ mod tests {
             .unwrap();
         fs::create_dir(t.join(".fleet")).unwrap();
         symlink(&big, t.join(".fleet/result.json")).unwrap();
-        let text = invalid_text(FsContractFiles.read_result(&wt(&t)));
+        let text = invalid_text(files().read_result(&wt(&t)));
         assert_eq!(text, "result.json: is a symlink");
 
         // Even a link to a perfectly valid file elsewhere is refused.
@@ -224,7 +256,7 @@ mod tests {
         fs::remove_file(t.join(".fleet/result.json")).unwrap();
         symlink(&good, t.join(".fleet/result.json")).unwrap();
         assert!(matches!(
-            FsContractFiles.read_result(&wt(&t)),
+            files().read_result(&wt(&t)),
             ContractRead::Invalid(_)
         ));
     }
@@ -240,7 +272,7 @@ mod tests {
         fs::write(outside.join("question.json"), GOOD_QUESTION).unwrap();
         symlink(&outside, work.join(".fleet")).unwrap();
         let w = work.to_str().unwrap();
-        let c = FsContractFiles;
+        let c = files();
         assert!(matches!(c.read_result(w), ContractRead::Invalid(_)));
         assert!(matches!(c.read_question(w), ContractRead::Invalid(_)));
     }
@@ -248,7 +280,7 @@ mod tests {
     #[test]
     fn prepare_creates_fleet_dir_and_private_brief() {
         let t = TempDir::new("contract-prepare");
-        FsContractFiles.prepare(&wt(&t), "# brief\n").unwrap();
+        files().prepare(&wt(&t), "# brief\n").unwrap();
         assert_eq!(t.read(".fleet/brief.md"), "# brief\n");
         assert_eq!(
             fs::metadata(t.join(".fleet")).unwrap().mode() & 0o777,
@@ -259,7 +291,7 @@ mod tests {
             0o600
         );
         // Rewriting replaces the brief.
-        FsContractFiles.prepare(&wt(&t), "second").unwrap();
+        files().prepare(&wt(&t), "second").unwrap();
         assert_eq!(t.read(".fleet/brief.md"), "second");
     }
 
@@ -267,7 +299,7 @@ mod tests {
     fn prepare_truncates_an_oversized_brief_on_a_char_boundary() {
         let t = TempDir::new("contract-brief-cap");
         let brief = "\u{e9}".repeat(MAX_BRIEF_FILE_BYTES);
-        FsContractFiles.prepare(&wt(&t), &brief).unwrap();
+        files().prepare(&wt(&t), &brief).unwrap();
         let written = fs::read(t.join(".fleet/brief.md")).unwrap();
         assert!(written.len() <= MAX_BRIEF_FILE_BYTES);
         assert!(String::from_utf8(written).is_ok());
@@ -278,7 +310,7 @@ mod tests {
         let t = TempDir::new("contract-stale");
         t.write(".fleet/result.json", GOOD_RESULT);
         t.write(".fleet/question.json", GOOD_QUESTION);
-        let c = FsContractFiles;
+        let c = files();
         c.prepare(&wt(&t), "b").unwrap();
         assert_eq!(c.read_result(&wt(&t)), ContractRead::Absent);
         assert!(!c.question_present(&wt(&t)));
@@ -291,7 +323,7 @@ mod tests {
         fs::create_dir(t.join(".fleet")).unwrap();
         symlink(&victim, t.join(".fleet/result.json")).unwrap();
         nix::unistd::mkfifo(&t.join(".fleet/question.json"), Mode::S_IRWXU).unwrap();
-        FsContractFiles.prepare(&wt(&t), "b").unwrap();
+        files().prepare(&wt(&t), "b").unwrap();
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
         assert!(!t.exists(".fleet/result.json"));
         assert!(!t.exists(".fleet/question.json"));
@@ -306,9 +338,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("result.json"), "outside").unwrap();
         symlink(&outside, work.join(".fleet")).unwrap();
-        FsContractFiles
-            .prepare(work.to_str().unwrap(), "brief")
-            .unwrap();
+        files().prepare(work.to_str().unwrap(), "brief").unwrap();
         assert!(fsx::is_real_dir(&work.join(".fleet")));
         assert!(work.join(".fleet/brief.md").exists());
         // Nothing was written into, or removed from, the link target.
@@ -321,14 +351,14 @@ mod tests {
         // A plain file named `.fleet` is replaced too.
         let t2 = TempDir::new("contract-fleet-file");
         t2.write(".fleet", "junk");
-        FsContractFiles.prepare(&wt(&t2), "brief").unwrap();
+        files().prepare(&wt(&t2), "brief").unwrap();
         assert!(fsx::is_real_dir(&t2.join(".fleet")));
     }
 
     #[test]
     fn prepare_rejects_bad_worktrees_and_directory_results() {
         let t = TempDir::new("contract-prepare-bad");
-        let c = FsContractFiles;
+        let c = files();
         assert!(c.prepare(t.join("missing").to_str().unwrap(), "b").is_err());
         let file = t.write("f", "x");
         assert!(c.prepare(file.to_str().unwrap(), "b").is_err());
@@ -336,5 +366,43 @@ mod tests {
         let err = c.prepare(&wt(&t), "b").unwrap_err();
         assert!(err.message.contains("result.json"));
         assert!(t.exists(".fleet/result.json"));
+    }
+
+    /// Shaped like a GitHub token, built at run time so no secret-looking literal is in the code.
+    fn token() -> String {
+        format!("ghp_{}", "a1B2".repeat(10))
+    }
+
+    #[test]
+    fn result_summary_is_redacted() {
+        let t = TempDir::new("contract-redact-result");
+        let body = format!(
+            r#"{{"version":1,"status":"done","summary":"deployed with {}"}}"#,
+            token()
+        );
+        t.write(".fleet/result.json", &body);
+        match files().read_result(&wt(&t)) {
+            ContractRead::Valid(r) => {
+                assert_eq!(r.summary, "deployed with [REDACTED:github-token]");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn question_text_and_choices_are_redacted_but_the_action_stays_exact() {
+        let t = TempDir::new("contract-redact-question");
+        let tok = token();
+        let body = format!(
+            r#"{{"version":1,"kind":"question","text":"use {tok}?","choices":["yes {tok}","no"]}}"#
+        );
+        t.write(".fleet/question.json", &body);
+        match files().read_question(&wt(&t)) {
+            ContractRead::Valid(q) => {
+                assert_eq!(q.text, "use [REDACTED:github-token]?");
+                assert_eq!(q.choices, vec!["yes [REDACTED:github-token]", "no"]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

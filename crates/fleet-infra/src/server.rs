@@ -9,13 +9,14 @@ use crate::protocol::{
     decode_resize, encode_err, encode_ok, parse_request, read_frame, read_line_bounded,
     write_frame, KIND_EXIT, KIND_INPUT, KIND_OUTPUT, KIND_RESIZE, MAX_RESPONSE_BYTES,
 };
+use crate::statedir::{create_token_file, remove_token_file, token_path, tokens_equal};
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::limits::{MAX_CONNECTIONS, MAX_FRAME_PAYLOAD, MAX_MESSAGE_BYTES};
 use fleet_domain::sanitize::{head_str, Mode, Sanitizer};
 use fleet_domain::value::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -29,8 +30,14 @@ use std::time::{Duration, Instant};
 
 /// How often the accept loop looks at the stop flag.
 const POLL: Duration = Duration::from_millis(20);
-/// Idle time allowed between request lines.
+/// How long a client has to deliver one complete request line: counted from the accept for the
+/// first request and from the end of the previous reply for the next ones. It is a deadline for
+/// the whole line, not a timeout per read, so a client that trickles bytes cannot hold a slot.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a refused client may keep sending before the connection is closed anyway.
+const REFUSAL_DRAIN: Duration = Duration::from_millis(250);
+/// Most bytes read from a refused client while draining.
+const REFUSAL_DRAIN_BYTES: usize = 64 * 1024;
 /// A client that does not read its replies is dropped after this long.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Consecutive accept failures (about five seconds) after which the server gives up.
@@ -118,7 +125,54 @@ pub enum HandlerReply {
 }
 
 pub trait RequestHandler: Send + Sync {
+    /// Decides once per connection, right after it is accepted and before any request is read,
+    /// whether this peer may talk to the daemon at all. An error is sent to the peer as the only
+    /// reply and the connection is closed; `call` is never reached.
+    fn admit(&self, peer: &PeerInfo) -> Result<()>;
+
     fn call(&self, peer: &PeerInfo, cmd: &str, args: Value) -> Result<HandlerReply>;
+}
+
+/// Reads from a socket under one deadline for everything read until the deadline is replaced or
+/// cleared, instead of a fresh timeout per `read` call.
+struct DeadlineReader {
+    stream: UnixStream,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineReader {
+    fn new(stream: UnixStream) -> DeadlineReader {
+        DeadlineReader {
+            stream,
+            deadline: None,
+        }
+    }
+
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    /// For the attach phase, where the terminal may stay quiet for hours.
+    fn clear_deadline(&mut self) {
+        self.deadline = None;
+        let _ = self.stream.set_read_timeout(None);
+    }
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the request was not complete in time",
+                ));
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+        }
+        self.stream.read(buf)
+    }
 }
 
 /// The daemon side of an attached terminal. Dropping it detaches; the worker keeps running.
@@ -248,6 +302,9 @@ pub struct Server {
     path: PathBuf,
     handler: Arc<dyn RequestHandler>,
     my_uid: u32,
+    /// The capability token every request but `ping` must carry.
+    token: Arc<str>,
+    request_timeout: Duration,
     shared: Arc<Shared>,
 }
 
@@ -295,13 +352,24 @@ impl Server {
             Err(e) => return Err(FleetError::io("inspecting the control socket path", &e)),
         }
 
-        let listener = UnixListener::bind(socket).map_err(|e| match e.kind() {
+        // The token is created only now: a daemon that is already listening (conflict above)
+        // keeps its own. Whatever fails from here on takes the new token away again.
+        let token_file = token_path(socket);
+        let token = create_token_file(&token_file)?;
+        let bound = UnixListener::bind(socket).map_err(|e| match e.kind() {
             io::ErrorKind::InvalidInput => FleetError::invalid(format!(
                 "cannot bind {}: the path is too long for a Unix socket",
                 socket.display()
             )),
             _ => FleetError::io("binding the control socket", &e),
-        })?;
+        });
+        let listener = match bound {
+            Ok(l) => l,
+            Err(e) => {
+                remove_token_file(&token_file);
+                return Err(e);
+            }
+        };
         // The umask decides the mode bind creates; fix it explicitly, then check what is on disk.
         let finish = || -> Result<()> {
             fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
@@ -313,6 +381,7 @@ impl Server {
         };
         if let Err(e) = finish() {
             remove_socket(socket);
+            remove_token_file(&token_file);
             return Err(e);
         }
         Ok(Server {
@@ -320,6 +389,8 @@ impl Server {
             path: socket.to_path_buf(),
             handler,
             my_uid: uid,
+            token: Arc::from(token),
+            request_timeout: REQUEST_TIMEOUT,
             shared: Arc::new(Shared {
                 active: AtomicUsize::new(0),
                 closing: AtomicBool::new(false),
@@ -393,12 +464,16 @@ impl Server {
             Err(_) => return,
         }
         let handler = Arc::clone(&self.handler);
-        let uid = self.my_uid;
+        let cfg = ConnConfig {
+            uid: self.my_uid,
+            token: Arc::clone(&self.token),
+            request_timeout: self.request_timeout,
+        };
         // If the thread cannot start, the closure (and with it the guard) is dropped and the
         // connection closes.
         let _ = thread::Builder::new()
             .name("fleet-conn".to_string())
-            .spawn(move || serve_connection(stream, &*handler, uid, &guard));
+            .spawn(move || serve_connection(stream, &*handler, &cfg, &guard));
     }
 }
 
@@ -429,32 +504,84 @@ fn send_ok(w: &mut impl Write, data: &Value) -> io::Result<()> {
     send_line(w, line)
 }
 
-fn serve_connection(stream: UnixStream, handler: &dyn RequestHandler, uid: u32, guard: &ConnGuard) {
+/// What a connection thread needs besides the stream and the handler.
+struct ConnConfig {
+    uid: u32,
+    token: Arc<str>,
+    request_timeout: Duration,
+}
+
+/// Sends `err` as the only reply and ends the connection. The write side is shut down first
+/// (the client reads the refusal followed by end of stream) and what the client still sends is
+/// read and dropped for a moment, so closing a socket with unread data cannot turn into a reset
+/// that destroys the refusal before the client reads it. Both the time and the amount are
+/// bounded, so a refused client does not hold the connection slot.
+fn refuse(stream: &mut UnixStream, err: &FleetError) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let _ = send_line(stream, encode_err(err));
+    let _ = stream.shutdown(Shutdown::Write);
+    let deadline = Instant::now() + REFUSAL_DRAIN;
+    let mut drained = 0usize;
+    let mut buf = [0u8; 4096];
+    let mut source: &UnixStream = stream;
+    while drained < REFUSAL_DRAIN_BYTES {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || source.set_read_timeout(Some(remaining)).is_err() {
+            break;
+        }
+        match source.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained = drained.saturating_add(n),
+        }
+    }
+}
+
+fn handler_failed() -> FleetError {
+    FleetError::internal("the daemon failed while handling the request")
+}
+
+fn serve_connection(
+    stream: UnixStream,
+    handler: &dyn RequestHandler,
+    cfg: &ConnConfig,
+    guard: &ConnGuard,
+) {
+    let accepted = Instant::now();
     // Accepted sockets may inherit O_NONBLOCK from the listener on BSD-derived systems.
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let peer = peer_info(&stream);
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
     let mut writer = stream;
-    if !peer_allowed(&peer, uid) {
-        let _ = send_line(
+    if !peer_allowed(&peer, cfg.uid) {
+        refuse(
             &mut writer,
-            encode_err(&FleetError::forbidden(
-                "this daemon only serves the user that started it",
-            )),
+            &FleetError::forbidden("this daemon only serves the user that started it"),
         );
         return;
     }
-    let mut reader = BufReader::with_capacity(8 * 1024, read_half);
+    // Who may talk to the daemon is decided here, once, before a single request byte is read;
+    // a refusal closes the connection at once. Nothing a peer does later (exiting, handing the
+    // socket on) can change that decision.
+    let admitted = catch_unwind(AssertUnwindSafe(|| handler.admit(&peer)))
+        .unwrap_or_else(|_| Err(handler_failed()));
+    if let Err(e) = admitted {
+        refuse(&mut writer, &e);
+        return;
+    }
+    let mut reader = BufReader::with_capacity(8 * 1024, DeadlineReader::new(read_half));
+    // The first request is due `request_timeout` after the accept, later ones that long after
+    // the previous reply.
+    let mut due = accepted + cfg.request_timeout;
     loop {
         if guard.shared.closing.load(Ordering::Acquire) {
             return;
         }
+        reader.get_mut().set_deadline(due);
         let line = match read_line_bounded(&mut reader, MAX_MESSAGE_BYTES) {
             Ok(Some(line)) => line,
             Ok(None) => return,
@@ -466,20 +593,49 @@ fn serve_connection(stream: UnixStream, handler: &dyn RequestHandler, uid: u32, 
                 );
                 return;
             }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                refuse(
+                    &mut writer,
+                    &FleetError::new(
+                        ErrorCode::Timeout,
+                        "no complete request arrived in time; closing the connection",
+                    ),
+                );
+                return;
+            }
             Err(_) => return,
         };
-        let (cmd, args) = match parse_request(&line) {
+        let request = match parse_request(&line) {
             Ok(parsed) => parsed,
             Err(e) => {
                 let _ = send_line(&mut writer, encode_err(&e));
                 return;
             }
         };
+        // `ping` only proves that something answers; everything else needs the token.
+        if request.cmd != "ping"
+            && !request
+                .token
+                .as_deref()
+                .is_some_and(|presented| tokens_equal(presented, &cfg.token))
+        {
+            refuse(
+                &mut writer,
+                &FleetError::forbidden(
+                    "a valid control token is required; `fleet` reads it from the state directory",
+                ),
+            );
+            return;
+        }
+        let (cmd, args) = (request.cmd, request.args);
         let reply = match catch_unwind(AssertUnwindSafe(|| handler.call(&peer, &cmd, args))) {
             Ok(reply) => reply,
-            Err(_) => Err(FleetError::internal(
-                "the daemon failed while handling the request",
-            )),
+            Err(_) => Err(handler_failed()),
         };
         match reply {
             Ok(HandlerReply::Data(data)) => {
@@ -494,24 +650,30 @@ fn serve_connection(stream: UnixStream, handler: &dyn RequestHandler, uid: u32, 
                 run_attach(reader, writer, session);
                 return;
             }
+            // A refusal ends the connection: whoever was refused gets nothing more from it.
+            Err(e) if e.code == ErrorCode::Forbidden => {
+                refuse(&mut writer, &e);
+                return;
+            }
             Err(e) => {
                 if send_line(&mut writer, encode_err(&e)).is_err() {
                     return;
                 }
             }
         }
+        due = Instant::now() + cfg.request_timeout;
     }
 }
 
 /// Binary-frame phase of an attach connection. This thread reads client frames; a second thread
 /// is the only writer and sends the session's output.
 fn run_attach(
-    mut reader: BufReader<UnixStream>,
+    mut reader: BufReader<DeadlineReader>,
     writer: UnixStream,
     mut session: Box<dyn AttachSession>,
 ) {
-    // An attached terminal may be quiet for a long time.
-    let _ = writer.set_read_timeout(None);
+    // An attached terminal may be quiet for a long time: the request deadline ends here.
+    reader.get_mut().clear_deadline();
     let output = session.output();
     let Ok(forward_stream) = writer.try_clone() else {
         return;
@@ -616,6 +778,11 @@ pub(crate) mod test_support {
         attach_rx: Mutex<Option<Receiver<Vec<u8>>>>,
         pub events: Arc<Mutex<Vec<String>>>,
         pub input: Arc<Mutex<Vec<u8>>>,
+        /// While set, `admit` refuses every connection.
+        pub refuse_admit: AtomicBool,
+        /// Connections that reached `admit`, and requests that reached `call`.
+        pub admits: AtomicUsize,
+        pub calls: AtomicUsize,
     }
 
     impl Fake {
@@ -626,6 +793,9 @@ pub(crate) mod test_support {
                 attach_rx: Mutex::new(Some(rx)),
                 events: Arc::new(Mutex::new(Vec::new())),
                 input: Arc::new(Mutex::new(Vec::new())),
+                refuse_admit: AtomicBool::new(false),
+                admits: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
             };
             (Arc::new(fake), tx)
         }
@@ -663,7 +833,16 @@ pub(crate) mod test_support {
     }
 
     impl RequestHandler for Fake {
+        fn admit(&self, _peer: &PeerInfo) -> Result<()> {
+            self.admits.fetch_add(1, Ordering::SeqCst);
+            if self.refuse_admit.load(Ordering::SeqCst) {
+                return Err(FleetError::forbidden("not welcome here"));
+            }
+            Ok(())
+        }
+
         fn call(&self, peer: &PeerInfo, cmd: &str, args: Value) -> Result<HandlerReply> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             match cmd {
                 "ping" => Ok(HandlerReply::Data(obj(&[(
                     "schema",
@@ -678,6 +857,7 @@ pub(crate) mod test_support {
                     ("uid", peer.uid.map(Value::int).unwrap_or(Value::Null)),
                 ]))),
                 "fail" => Err(FleetError::conflict("not allowed now").with_subject("a1")),
+                "forbid" => Err(FleetError::forbidden("go away")),
                 "boom" => panic!("handler exploded"),
                 "attach" | "task.attach" => {
                     let Some(rx) = lock(&self.attach_rx).take() else {
@@ -716,9 +896,19 @@ pub(crate) mod test_support {
 
     impl TestServer {
         pub fn start(handler: Arc<dyn RequestHandler>) -> TestServer {
+            TestServer::start_tuned(handler, |_| {})
+        }
+
+        /// Like `start`, after `tune` changed the server's settings.
+        pub fn start_tuned(
+            handler: Arc<dyn RequestHandler>,
+            tune: impl FnOnce(&mut Server),
+        ) -> TestServer {
             let dir = TempDir::new("sv");
             let path = private_dir(&dir).join("s");
-            let server = Arc::new(Server::bind(&path, handler).unwrap());
+            let mut server = Server::bind(&path, handler).unwrap();
+            tune(&mut server);
+            let server = Arc::new(server);
             let stop = Arc::new(AtomicBool::new(false));
             let thread = {
                 let (server, stop) = (Arc::clone(&server), Arc::clone(&stop));
@@ -757,13 +947,14 @@ mod tests {
     use crate::protocol::KIND_DETACH;
     use crate::protocol::{encode_request, encode_resize, parse_response};
     use crate::testutil::{wait_until, TempDir};
-    use std::io::Read;
 
     /// A plain line-oriented client with timeouts, so a server bug fails a test instead of
     /// hanging it.
     struct Raw {
         writer: UnixStream,
         reader: BufReader<UnixStream>,
+        /// The token of the server at `path`, as `fleet` itself would read it.
+        token: Option<String>,
     }
 
     impl Raw {
@@ -778,7 +969,15 @@ mod tests {
             Raw {
                 reader: BufReader::new(stream.try_clone().unwrap()),
                 writer: stream,
+                token: crate::statedir::read_token(path).ok(),
             }
+        }
+
+        /// A client that does not present the token.
+        fn connect_without_token(path: &Path) -> Raw {
+            let mut raw = Raw::connect(path);
+            raw.token = None;
+            raw
         }
 
         fn send_line(&mut self, line: &str) {
@@ -794,7 +993,7 @@ mod tests {
         }
 
         fn call(&mut self, cmd: &str, args: Value) -> Result<Value> {
-            self.send_line(&encode_request(cmd, &args));
+            self.send_line(&encode_request(cmd, &args, self.token.as_deref()));
             self.read_reply()
         }
 
@@ -863,10 +1062,12 @@ mod tests {
     fn a_line_of_exactly_the_maximum_size_is_read() {
         let ts = start();
         let mut c = Raw::connect(&ts.path);
-        // {"v":1,"cmd":"echo","args":{"k":"...."}} padded to exactly MAX_MESSAGE_BYTES
-        let frame = r#"{"v":1,"cmd":"echo","args":{"k":""}}"#;
+        // {"v":1,"cmd":"echo","args":{"k":"...."},"token":"<64 hex>"} padded to exactly
+        // MAX_MESSAGE_BYTES
+        let token = c.token.clone().unwrap();
+        let frame = format!(r#"{{"v":1,"cmd":"echo","args":{{"k":""}},"token":"{token}"}}"#);
         let pad = "p".repeat(MAX_MESSAGE_BYTES - frame.len());
-        let line = format!(r#"{{"v":1,"cmd":"echo","args":{{"k":"{pad}"}}}}"#);
+        let line = format!(r#"{{"v":1,"cmd":"echo","args":{{"k":"{pad}"}},"token":"{token}"}}"#);
         assert_eq!(line.len(), MAX_MESSAGE_BYTES);
         c.send_line(&line);
         assert!(c.read_reply().is_ok());
@@ -922,7 +1123,7 @@ mod tests {
         drop(open.pop());
         let recovered = wait_until(3000, || {
             let mut c = Raw::connect(&ts.path);
-            c.send_line(&encode_request("ping", &Value::Null));
+            c.send_line(&encode_request("ping", &Value::Null, None));
             c.read_reply().is_ok()
         });
         assert!(recovered, "a freed slot must be usable again");
@@ -1126,6 +1327,271 @@ mod tests {
         ts.shut_down();
         assert!(c.closed());
         assert_eq!(ts.server.shared.active.load(Ordering::Acquire), 0);
+    }
+
+    // ---- the control token, admission and deadlines --------------------------------------------
+
+    fn forbidden_and_closed(c: &mut Raw, what: &str) {
+        let err = c.read_reply().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "{what}: {err:?}");
+        assert!(c.closed(), "{what}: the connection must be closed");
+    }
+
+    #[test]
+    fn every_command_but_ping_needs_the_token() {
+        let (fake, _tx) = Fake::new();
+        let ts = TestServer::start(Arc::clone(&fake) as Arc<dyn RequestHandler>);
+        for cmd in [
+            "echo",
+            "fail",
+            "peer",
+            "attach",
+            "task.attach",
+            "boom",
+            "nope",
+            "approve",
+        ] {
+            let mut c = Raw::connect_without_token(&ts.path);
+            c.send_line(&encode_request(cmd, &Value::Null, None));
+            forbidden_and_closed(&mut c, cmd);
+        }
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            0,
+            "no request without the token may reach the handler"
+        );
+        // ping answers without a token (it proves nothing but liveness) ...
+        let mut c = Raw::connect_without_token(&ts.path);
+        assert!(c.call("ping", Value::Null).is_ok());
+        // ... but the same connection is still refused for anything else
+        c.send_line(&encode_request("echo", &Value::Null, None));
+        forbidden_and_closed(&mut c, "echo after ping");
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            1,
+            "only the ping got through"
+        );
+        // with the token the very same commands work
+        let mut c = Raw::connect(&ts.path);
+        assert!(c.call("echo", Value::Null).is_ok());
+    }
+
+    #[test]
+    fn a_wrong_or_malformed_token_is_refused_and_closes_the_connection() {
+        let ts = start();
+        let other = start();
+        let real = crate::statedir::read_token(&ts.path).unwrap();
+        let foreign = crate::statedir::read_token(&other.path).unwrap();
+        assert_ne!(real, foreign, "every server has its own token");
+        let mut almost = real.clone();
+        almost.replace_range(63.., if real.ends_with('0') { "1" } else { "0" });
+        for (what, token) in [
+            ("another daemon's token", foreign),
+            ("one character off", almost),
+            ("a prefix", real[..63].to_string()),
+            ("too long", format!("{real}0")),
+            ("empty", String::new()),
+            ("uppercase", real.to_uppercase()),
+        ] {
+            let mut c = Raw::connect_without_token(&ts.path);
+            c.send_line(&encode_request("echo", &Value::Null, Some(&token)));
+            forbidden_and_closed(&mut c, what);
+        }
+        // not a string at all: a malformed request, never accepted
+        let mut c = Raw::connect_without_token(&ts.path);
+        c.send_line(r#"{"v":1,"cmd":"echo","args":{},"token":12}"#);
+        let err = c.read_reply().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid);
+        assert!(c.closed());
+        // the token inside the arguments is not the token
+        let mut c = Raw::connect_without_token(&ts.path);
+        let args = obj(&[("token", Value::str(real.as_str()))]);
+        c.send_line(&encode_request("echo", &args, None));
+        forbidden_and_closed(&mut c, "token in args");
+        // and the real one still works afterwards
+        assert!(Raw::connect(&ts.path).call("echo", Value::Null).is_ok());
+    }
+
+    #[test]
+    fn bind_creates_a_fresh_private_token_and_a_new_bind_replaces_it() {
+        let dir = TempDir::new("sv");
+        let path = private_dir(&dir).join("s");
+        let token_file = token_path(&path);
+        let first = Server::bind(&path, Fake::new().0).unwrap();
+        assert_eq!(mode_of(&fs::symlink_metadata(&token_file).unwrap()), 0o600);
+        let first_token = crate::statedir::read_token(&path).unwrap();
+        assert_eq!(first_token.len(), 64);
+        // the first daemon dies without cleaning up; the next one must not reuse its token
+        drop(first);
+        let second = Server::bind(&path, Fake::new().0).unwrap();
+        let second_token = crate::statedir::read_token(&path).unwrap();
+        assert_ne!(first_token, second_token);
+        assert_eq!(mode_of(&fs::symlink_metadata(&token_file).unwrap()), 0o600);
+        drop(second);
+    }
+
+    #[test]
+    fn a_failed_bind_never_replaces_the_token_of_a_live_daemon() {
+        let ts = start();
+        let before = crate::statedir::read_token(&ts.path).unwrap();
+        assert!(Server::bind(&ts.path, Fake::new().0).is_err());
+        assert_eq!(crate::statedir::read_token(&ts.path).unwrap(), before);
+        // the live daemon keeps accepting its own token
+        assert!(Raw::connect(&ts.path).call("echo", Value::Null).is_ok());
+    }
+
+    #[test]
+    fn a_token_path_that_is_a_symlink_stops_the_server_from_binding() {
+        let dir = TempDir::new("sv");
+        let state = private_dir(&dir);
+        let target = dir.write("elsewhere", "precious");
+        std::os::unix::fs::symlink(&target, state.join("token")).unwrap();
+        let err = Server::bind(&state.join("s"), Fake::new().0).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "precious");
+        assert!(!state.join("s").exists(), "no socket without a token");
+    }
+
+    #[test]
+    fn a_refused_admit_sends_one_forbidden_line_and_closes_before_any_request_is_read() {
+        let (fake, _tx) = Fake::new();
+        fake.refuse_admit.store(true, Ordering::SeqCst);
+        let ts = TestServer::start(Arc::clone(&fake) as Arc<dyn RequestHandler>);
+        // a client that says nothing at all is refused
+        let mut quiet = Raw::connect(&ts.path);
+        let err = quiet.read_reply().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(err.message, "not welcome here");
+        assert!(quiet.closed());
+        // a client that already pipelined requests (valid token, the worst case) still reads the
+        // refusal instead of a reset, and none of its requests is handled
+        let mut eager = Raw::connect(&ts.path);
+        for _ in 0..3 {
+            eager.send_line(&encode_request(
+                "echo",
+                &Value::Null,
+                eager.token.as_deref(),
+            ));
+        }
+        forbidden_and_closed(&mut eager, "pipelined");
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+
+        // admission is per connection: lifting the refusal admits new connections
+        fake.refuse_admit.store(false, Ordering::SeqCst);
+        assert!(Raw::connect(&ts.path).call("echo", Value::Null).is_ok());
+    }
+
+    #[test]
+    fn a_forbidden_reply_to_a_request_closes_the_connection_other_errors_do_not() {
+        let ts = start();
+        let mut c = Raw::connect(&ts.path);
+        assert_eq!(
+            c.call("fail", Value::Null).unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        assert!(
+            c.call("ping", Value::Null).is_ok(),
+            "an ordinary error keeps the connection"
+        );
+        let err = c.call("forbid", Value::Null).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(err.message, "go away");
+        assert!(c.closed(), "a refusal must end the connection");
+        assert!(Raw::connect(&ts.path).call("ping", Value::Null).is_ok());
+    }
+
+    #[test]
+    fn admission_is_decided_once_per_connection_not_per_request() {
+        let (fake, _tx) = Fake::new();
+        let ts = TestServer::start(Arc::clone(&fake) as Arc<dyn RequestHandler>);
+        let mut c = Raw::connect(&ts.path);
+        for _ in 0..3 {
+            assert!(c.call("echo", Value::Null).is_ok());
+        }
+        assert_eq!(fake.admits.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+        // a refusal later does not reach into the connection that was admitted
+        fake.refuse_admit.store(true, Ordering::SeqCst);
+        assert!(c.call("echo", Value::Null).is_ok());
+    }
+
+    fn tuned(request_timeout: Duration) -> (TestServer, Arc<Fake>) {
+        let (fake, _tx) = Fake::new();
+        let ts = TestServer::start_tuned(Arc::clone(&fake) as Arc<dyn RequestHandler>, |s| {
+            s.request_timeout = request_timeout;
+        });
+        (ts, fake)
+    }
+
+    #[test]
+    fn a_client_that_trickles_one_request_cannot_hold_the_connection() {
+        // A new byte every 100 ms satisfies any per-read timeout; only an overall deadline for
+        // the request line ends this connection.
+        let (ts, _fake) = tuned(Duration::from_millis(500));
+        let mut c = Raw::connect(&ts.path);
+        let started = Instant::now();
+        let mut sent = 0;
+        while sent < 40 {
+            if c.writer.write_all(b"a").is_err() {
+                break;
+            }
+            sent += 1;
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(3000) && sent < 40,
+            "the server kept the connection for {:?} ({sent} bytes accepted)",
+            started.elapsed()
+        );
+        // the server said why before it closed
+        assert_eq!(c.read_reply().unwrap_err().code, ErrorCode::Timeout);
+        assert!(c.closed());
+        // the slot is free again
+        assert!(Raw::connect(&ts.path).call("ping", Value::Null).is_ok());
+    }
+
+    #[test]
+    fn a_silent_connection_is_cut_off_after_the_first_deadline() {
+        let (ts, _fake) = tuned(Duration::from_millis(300));
+        let mut c = Raw::connect(&ts.path);
+        let started = Instant::now();
+        assert_eq!(c.read_reply().unwrap_err().code, ErrorCode::Timeout);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(c.closed());
+    }
+
+    #[test]
+    fn every_request_gets_its_own_deadline_but_each_deadline_is_enforced() {
+        let (ts, _fake) = tuned(Duration::from_millis(1500));
+        let mut c = Raw::connect(&ts.path);
+        // 0.9 s per request is inside one deadline each, though 1.8 s is beyond a single one
+        thread::sleep(Duration::from_millis(900));
+        assert!(c.call("echo", Value::Null).is_ok());
+        thread::sleep(Duration::from_millis(900));
+        assert!(c.call("echo", Value::Null).is_ok());
+        // then silence: the deadline of the next request runs out
+        assert_eq!(c.read_reply().unwrap_err().code, ErrorCode::Timeout);
+        assert!(c.closed());
+    }
+
+    #[test]
+    fn an_attached_terminal_may_stay_quiet_longer_than_the_request_deadline() {
+        let (fake, _tx) = Fake::new();
+        let ts = TestServer::start_tuned(Arc::clone(&fake) as Arc<dyn RequestHandler>, |s| {
+            s.request_timeout = Duration::from_millis(400);
+        });
+        let mut c = attach(&ts);
+        thread::sleep(Duration::from_millis(1200));
+        write_frame(&mut c.writer, KIND_INPUT, b"still here").unwrap();
+        assert!(wait_until(3000, || fake.has_event("input:10")));
+        assert!(
+            !fake.has_event("dropped"),
+            "the attach must not have been closed"
+        );
     }
 
     // ---- attach -----------------------------------------------------------------------------
