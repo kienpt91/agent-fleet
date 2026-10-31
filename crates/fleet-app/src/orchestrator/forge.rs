@@ -752,7 +752,7 @@ impl Orchestrator {
                 Err(FleetError::new(
                     ErrorCode::ApprovalRequired,
                     format!(
-                        "opening a pull request for {} on {} needs approval {approval} (digest {prefix}); read what it covers with `fleet approvals`, approve it with `fleet approve {approval}` and run the same `fleet pr create` again",
+                        "opening a pull request for {} on {} needs approval {approval} (digest {prefix}); read what it covers with `fleet approval list`, approve it with `fleet approve {approval}` and run the same `fleet pr create` again",
                         qualified(&plan.key),
                         plan.repo
                     ),
