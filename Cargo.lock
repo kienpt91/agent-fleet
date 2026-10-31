@@ -277,6 +277,8 @@ version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
+ "neo-goals",
+ "neo-verify",
 ]
 
 [[package]]
@@ -301,6 +303,7 @@ version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
+ "neo-verify",
  "nix 0.31.3",
  "portable-pty",
  "serde",
@@ -483,6 +486,21 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "neo-goals"
+version = "0.1.0"
+dependencies = [
+ "fleet-domain",
+ "neo-verify",
+]
+
+[[package]]
+name = "neo-verify"
+version = "0.1.0"
+dependencies = [
+ "fleet-domain",
 ]
 
 [[package]]

@@ -7,12 +7,13 @@
 
 use crate::args::Parsed;
 use crate::render;
+use crate::render_neo;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::show;
 use fleet_domain::limits::{MAX_ID_LEN, MAX_SPEC};
 use fleet_domain::value::Value;
 use fleet_infra::client::Client;
-use fleet_infra::config_file::load_plan;
+use fleet_infra::config_file::{load_contract, load_plan};
 use fleet_infra::daemon::{run_daemon, DaemonOptions};
 use fleet_infra::doctor::{self, DoctorInput};
 use fleet_infra::eventlog::verify_file;
@@ -21,10 +22,10 @@ use fleet_infra::web::{parse_bind, WebOptions};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Every subcommand, as typed. The help text must mention each (a test enforces it).
-pub const SUBCOMMANDS: [&str; 25] = [
+pub const SUBCOMMANDS: [&str; 32] = [
     "daemon",
     "run create",
     "task add",
@@ -50,6 +51,13 @@ pub const SUBCOMMANDS: [&str; 25] = [
     "tui",
     "doctor",
     "verify-log",
+    "goals add",
+    "goals attach",
+    "goals status",
+    "goals list",
+    "goals show",
+    "goals remaining",
+    "verify",
 ];
 
 pub const HELP: &str = "\
@@ -95,13 +103,29 @@ decisions:
   gate list                          open questions and conflicts
   gate resolve <id> --answer <text>  answer a gate (or give the answer as the rest of the line)
   approval list                      approvals and their digests
-  approve <id> [--digest <hex>]      approve a pending action
+  approve <id> [--digest <hex>]      approve a pending action (names the digest it covers: the listed
+                                     one unless --digest is given)
   deny <id> [--digest <hex>]         deny it
 
 results:
   merge <task>                       merge a reviewed task into the integration branch
   cleanup [--run <run>] [--branches] remove finished worktrees (and branches)
   undo <task> [--apply]              preview or revert the last worker changes (needs agent-undo)
+
+goals and verification (NEO):
+  goals add --title <text> [--id <id>] [--parent <goal>] [--intent <text>|-]
+            [--task <run>/<task>]... [--contract <file.json>]
+                                     add a goal to the ledger, optionally with its verification contract
+  goals attach <goal> --contract <file.json>
+                                     make a contract the acceptance criteria of a goal
+  goals status <goal> <open|in_progress|blocked|abandoned> [--reason <text>]
+                                     (verified is never set by hand: only recorded evidence does it)
+  goals list                         the goal tree with status, contract and task verification
+  goals show <goal>                  one goal: its checks, the newest evidence of each, the history
+  goals remaining                    open leaves, blockers and the tasks that can start next
+  verify <goal|task> [--task <run>/<task>] [--timeout <secs>]
+                                     run the contracts independently of the worker and record
+                                     evidence; exit 6 when a mandatory check did not pass
 
 dashboard:
   tui                                terminal dashboard
@@ -115,6 +139,9 @@ exit codes: 0 ok, 1 internal, 2 usage, 3 daemon down, 4 not found, 5 approval re
 const TAIL_CHUNK: u64 = 16 * 1024;
 const DEFAULT_TAIL_LINES: usize = 40;
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
+/// How often `fleet verify` asks whether the contracts finished, and how long it waits by default.
+const VERIFY_POLL: Duration = Duration::from_millis(100);
+const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 900;
 
 /// One request/reply exchange with the daemon.
 pub trait Caller {
@@ -149,6 +176,12 @@ pub enum View {
     Merge,
     Cleanup,
     Undo(bool),
+    GoalAdded,
+    GoalAttached,
+    GoalStatus,
+    GoalList,
+    GoalShow,
+    GoalRemaining,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +220,30 @@ pub enum Command {
         task: String,
         follow: bool,
         lines: usize,
+    },
+    GoalAdd {
+        id: Option<String>,
+        parent: Option<String>,
+        title: String,
+        intent: Option<String>,
+        tasks: Vec<String>,
+        contract: Option<PathBuf>,
+    },
+    GoalAttach {
+        goal: String,
+        contract: PathBuf,
+    },
+    Verify {
+        target: String,
+        task: Option<String>,
+        timeout_secs: u64,
+    },
+    /// `approve` and `deny`. The daemon requires the digest of the action a decision covers; when
+    /// the person gave none, the digest the daemon lists for the approval is used.
+    Decide {
+        id: String,
+        approve: bool,
+        digest: Option<String>,
     },
     Request(Request),
 }
@@ -532,20 +589,11 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
             let approve = word == "approve";
             let digest = p.opt("--digest")?;
             let id = one_arg(p, "approval id")?;
-            let view = View::Ack(format!(
-                "approval {} {}",
-                token(&id),
-                if approve { "approved" } else { "denied" }
-            ));
-            request(
-                "approval.decide",
-                obj(vec![
-                    ("id", st(id)),
-                    ("approve", Some(Value::Bool(approve))),
-                    ("digest", digest.and_then(st)),
-                ]),
-                view,
-            )
+            Command::Decide {
+                id,
+                approve,
+                digest,
+            }
         }
         "merge" => request(
             "merge",
@@ -610,11 +658,102 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
             no_args(p)?;
             Command::VerifyLog
         }
+        "goals" => parse_goals(p, stdin)?,
+        "verify" => {
+            let task = p.opt("--task")?;
+            let timeout = opt_uint(&mut p, "--timeout")?;
+            if timeout == Some(0) {
+                return Err(FleetError::usage("option --timeout must be at least 1"));
+            }
+            Command::Verify {
+                target: one_arg(p, "<goal|task>")?,
+                task,
+                timeout_secs: timeout.unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS),
+            }
+        }
         other => {
             return Err(FleetError::usage(format!(
                 "unknown command {}",
                 show(other)
             )))
+        }
+    })
+}
+
+fn parse_goals(mut p: Parsed, stdin: &mut dyn Read) -> Result<Command> {
+    let sub = p.take_word();
+    Ok(match sub.as_deref() {
+        Some("add") => {
+            let title = required(&mut p, "--title")?;
+            let id = p.opt("--id")?;
+            let parent = p.opt("--parent")?;
+            let intent = p
+                .opt("--intent")?
+                .map(|i| read_spec(i, stdin))
+                .transpose()?;
+            let tasks = p.multi("--task")?;
+            let contract = p.opt("--contract")?.map(PathBuf::from);
+            no_args(p)?;
+            Command::GoalAdd {
+                id,
+                parent,
+                title,
+                intent,
+                tasks,
+                contract,
+            }
+        }
+        Some("attach") => {
+            let contract = required(&mut p, "--contract")?;
+            Command::GoalAttach {
+                goal: one_arg(p, "<goal>")?,
+                contract: PathBuf::from(contract),
+            }
+        }
+        Some("status") => {
+            let reason = p.opt("--reason")?;
+            let mut words = p.finish()?.into_iter();
+            let goal = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing <goal>"))?;
+            let status = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing status"))?;
+            if let Some(extra) = words.next() {
+                return Err(FleetError::usage(format!(
+                    "unexpected argument {}",
+                    show(&extra)
+                )));
+            }
+            request(
+                "goal.status",
+                obj(vec![
+                    ("goal", st(goal)),
+                    ("status", st(status)),
+                    ("reason", reason.and_then(st)),
+                ]),
+                View::GoalStatus,
+            )
+        }
+        Some("list") => {
+            no_args(p)?;
+            request("goal.list", obj(vec![]), View::GoalList)
+        }
+        Some("show") => request(
+            "goal.show",
+            obj(vec![("goal", st(one_arg(p, "<goal>")?))]),
+            View::GoalShow,
+        ),
+        Some("remaining") => {
+            no_args(p)?;
+            request("goal.remaining", obj(vec![]), View::GoalRemaining)
+        }
+        other => {
+            return Err(subcommand_error(
+                "goals",
+                other,
+                "add, attach, status, list, show or remaining",
+            ))
         }
     })
 }
@@ -676,6 +815,12 @@ fn render_view(view: &View, data: &Value) -> String {
         View::Merge => render::render_merge(data),
         View::Cleanup => render::render_cleanup(data),
         View::Undo(apply) => render::render_undo(data, *apply),
+        View::GoalAdded => render_neo::render_goal_added(data),
+        View::GoalAttached => render_neo::render_goal_attached(data),
+        View::GoalStatus => render_neo::render_goal_status(data),
+        View::GoalList => render_neo::render_goal_list(data),
+        View::GoalShow => render_neo::render_goal_show(data),
+        View::GoalRemaining => render_neo::render_goal_remaining(data),
     }
 }
 
@@ -694,6 +839,115 @@ pub fn execute_request(
         render_view(&req.view, &data)
     };
     write_out(out, &text)
+}
+
+/// `fleet approve` / `fleet deny`: the decision names the digest of the action it covers, either
+/// the one given with `--digest` or, without it, the one the daemon lists for that approval right
+/// now (so the person decides on exactly what `fleet approval list` shows).
+pub fn execute_decide(
+    id: &str,
+    approve: bool,
+    digest: Option<&str>,
+    caller: &mut dyn Caller,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let digest = match digest {
+        Some(d) => d.to_string(),
+        None => {
+            let list = caller.call("approval.list", obj(vec![]))?;
+            list.get("approvals")
+                .and_then(Value::as_array)
+                .and_then(|all| {
+                    all.iter()
+                        .find(|a| a.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .and_then(|a| a.get("digest").and_then(Value::as_str))
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    FleetError::not_found(format!("approval {} does not exist", show(id)))
+                })?
+        }
+    };
+    let req = Request {
+        cmd: "approval.decide",
+        args: obj(vec![
+            ("id", st(id.to_string())),
+            ("approve", Some(Value::Bool(approve))),
+            ("digest", st(digest)),
+        ]),
+        view: View::Ack(format!(
+            "approval {} {}",
+            token(id),
+            if approve { "approved" } else { "denied" }
+        )),
+    };
+    execute_request(req, caller, json, out)
+}
+
+/// `fleet verify`: asks the daemon to run the contracts, waits until they finished (polling every
+/// `poll`, for at most `timeout`) and prints where they stand. The exit code is 0 when every
+/// contract passed and 6 (conflict: the work cannot be accepted) when one did not.
+pub fn execute_verify(
+    target: &str,
+    task: Option<&str>,
+    timeout: Duration,
+    caller: &mut dyn Caller,
+    json: bool,
+    out: &mut dyn Write,
+    poll: Duration,
+) -> Result<i32> {
+    let started = caller.call(
+        "verify",
+        obj(vec![
+            ("target", st(target.to_string())),
+            ("task", task.map(Value::str)),
+        ]),
+    )?;
+    // Ask about this run, by its ticket: the ledger may already say "passed" because of an
+    // earlier run, and a run that could not be recorded must not look like a success.
+    let ticket = started
+        .get("ticket")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| FleetError::internal("the daemon's verify reply has no ticket"))?;
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        let data = caller.call(
+            "verify.status",
+            obj(vec![
+                ("target", st(target.to_string())),
+                ("task", task.map(Value::str)),
+                ("ticket", Some(Value::int(ticket))),
+            ]),
+        )?;
+        if data.get("running").and_then(Value::as_bool) != Some(true) {
+            let text = if json {
+                json_line(&data)
+            } else {
+                render_neo::render_verify(&data)
+            };
+            write_out(out, &text)?;
+            let passed = data.get("passed").and_then(Value::as_bool) == Some(true);
+            return Ok(if passed {
+                0
+            } else {
+                ErrorCode::Conflict.exit_code()
+            });
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(FleetError::new(
+                ErrorCode::Timeout,
+                format!(
+                    "the verification did not finish within {} seconds; it keeps running in the \
+                     daemon (see `fleet goals show` for the evidence when it ends)",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        if !poll.is_zero() {
+            std::thread::sleep(poll);
+        }
+    }
 }
 
 /// The last `n` lines of `text`.
@@ -919,6 +1173,68 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
             ctx.json,
             out,
             FOLLOW_POLL,
+        )?,
+        Command::GoalAdd {
+            id,
+            parent,
+            title,
+            intent,
+            tasks,
+            contract,
+        } => {
+            let contract = contract.map(|p| load_contract(&p)).transpose()?;
+            let req = Request {
+                cmd: "goal.add",
+                args: obj(vec![
+                    ("id", id.and_then(st)),
+                    ("parent", parent.and_then(st)),
+                    ("title", st(title)),
+                    ("intent", intent.and_then(st)),
+                    (
+                        "tasks",
+                        Some(Value::array(tasks.into_iter().map(Value::Str))),
+                    ),
+                    ("contract", contract),
+                ]),
+                view: View::GoalAdded,
+            };
+            execute_request(req, &mut connect(ctx)?, ctx.json, out)?;
+        }
+        Command::GoalAttach { goal, contract } => {
+            let contract = load_contract(&contract)?;
+            let req = Request {
+                cmd: "goal.attach",
+                args: obj(vec![("goal", st(goal)), ("contract", Some(contract))]),
+                view: View::GoalAttached,
+            };
+            execute_request(req, &mut connect(ctx)?, ctx.json, out)?;
+        }
+        Command::Verify {
+            target,
+            task,
+            timeout_secs,
+        } => {
+            return execute_verify(
+                &target,
+                task.as_deref(),
+                Duration::from_secs(timeout_secs),
+                &mut connect(ctx)?,
+                ctx.json,
+                out,
+                VERIFY_POLL,
+            )
+        }
+        Command::Decide {
+            id,
+            approve,
+            digest,
+        } => execute_decide(
+            &id,
+            approve,
+            digest.as_deref(),
+            &mut connect(ctx)?,
+            ctx.json,
+            out,
         )?,
         Command::Request(req) => execute_request(req, &mut connect(ctx)?, ctx.json, out)?,
     }
@@ -1197,24 +1513,20 @@ mod tests {
                 req("approval.list", vec![], View::Approvals),
             ),
             (
-                vec!["approve", "a1", "--digest", "abcd"],
-                req(
-                    "approval.decide",
-                    vec![
-                        ("id", s("a1")),
-                        ("approve", Value::Bool(true)),
-                        ("digest", s("abcd")),
-                    ],
-                    View::Ack("approval a1 approved".into()),
-                ),
+                vec!["approve", "a1", "--digest", "abcdef012345"],
+                Command::Decide {
+                    id: "a1".into(),
+                    approve: true,
+                    digest: Some("abcdef012345".into()),
+                },
             ),
             (
                 vec!["deny", "a1"],
-                req(
-                    "approval.decide",
-                    vec![("id", s("a1")), ("approve", Value::Bool(false))],
-                    View::Ack("approval a1 denied".into()),
-                ),
+                Command::Decide {
+                    id: "a1".into(),
+                    approve: false,
+                    digest: None,
+                },
             ),
             (
                 vec!["merge", "r1/t1"],
@@ -1726,6 +2038,414 @@ mod tests {
             f.calls[0].1,
             Value::object([("task", s("t1")), ("max", Value::int(TAIL_CHUNK))])
         );
+    }
+
+    fn approval_list(id: &str, digest: &str) -> Result<Value> {
+        Ok(Value::object([(
+            "approvals",
+            Value::array([Value::object([("id", s(id)), ("digest", s(digest))])]),
+        )]))
+    }
+
+    #[test]
+    fn a_decision_without_a_digest_uses_the_one_the_daemon_lists() {
+        let digest = "ab".repeat(32);
+        let mut f = Fake::new(vec![approval_list("a1", &digest), Ok(Value::Null)]);
+        let mut out = Vec::new();
+        execute_decide("a1", true, None, &mut f, false, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "approval a1 approved\n");
+        assert_eq!(f.calls[0].0, "approval.list");
+        assert_eq!(f.calls[1].0, "approval.decide");
+        assert_eq!(
+            f.calls[1].1,
+            Value::object([
+                ("id", s("a1")),
+                ("approve", Value::Bool(true)),
+                ("digest", s(&digest)),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_decision_with_a_digest_asks_for_nothing_first() {
+        let mut f = Fake::new(vec![Ok(Value::Null)]);
+        let mut out = Vec::new();
+        execute_decide("a1", false, Some("0123456789ab"), &mut f, false, &mut out).unwrap();
+        assert_eq!(f.calls.len(), 1);
+        assert_eq!(f.calls[0].1.get("digest"), Some(&s("0123456789ab")));
+        assert_eq!(String::from_utf8(out).unwrap(), "approval a1 denied\n");
+    }
+
+    #[test]
+    fn deciding_on_an_unknown_approval_is_not_found_and_sends_no_decision() {
+        let mut f = Fake::new(vec![approval_list("a2", &"ab".repeat(32))]);
+        let mut out = Vec::new();
+        let err = execute_decide("a1", true, None, &mut f, false, &mut out).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(f.calls.len(), 1);
+        let mut f = Fake::new(vec![Err(FleetError::new(ErrorCode::DaemonDown, "down"))]);
+        assert_eq!(
+            execute_decide("a1", true, None, &mut f, false, &mut out)
+                .unwrap_err()
+                .code,
+            ErrorCode::DaemonDown
+        );
+    }
+
+    #[test]
+    fn goals_commands_parse() {
+        assert_eq!(
+            parse_ok(&["goals", "list"]),
+            req("goal.list", vec![], View::GoalList)
+        );
+        assert_eq!(
+            parse_ok(&["goals", "remaining"]),
+            req("goal.remaining", vec![], View::GoalRemaining)
+        );
+        assert_eq!(
+            parse_ok(&["goals", "show", "ship"]),
+            req("goal.show", vec![("goal", s("ship"))], View::GoalShow)
+        );
+        assert_eq!(
+            parse_ok(&["goals", "status", "ship", "blocked", "--reason", "api key"]),
+            req(
+                "goal.status",
+                vec![
+                    ("goal", s("ship")),
+                    ("status", s("blocked")),
+                    ("reason", s("api key"))
+                ],
+                View::GoalStatus
+            )
+        );
+        assert_eq!(
+            parse_ok(&["goals", "status", "ship", "open"]),
+            req(
+                "goal.status",
+                vec![("goal", s("ship")), ("status", s("open"))],
+                View::GoalStatus
+            )
+        );
+        assert_eq!(
+            parse_ok(&[
+                "goals",
+                "add",
+                "--title",
+                "Ship",
+                "--id",
+                "ship",
+                "--parent",
+                "root",
+                "--intent",
+                "why",
+                "--task",
+                "r1/a",
+                "--task",
+                "r1/b",
+                "--contract",
+                "c.json"
+            ]),
+            Command::GoalAdd {
+                id: Some("ship".into()),
+                parent: Some("root".into()),
+                title: "Ship".into(),
+                intent: Some("why".into()),
+                tasks: vec!["r1/a".into(), "r1/b".into()],
+                contract: Some(PathBuf::from("c.json")),
+            }
+        );
+        assert_eq!(
+            parse_ok(&["goals", "add", "--title", "T"]),
+            Command::GoalAdd {
+                id: None,
+                parent: None,
+                title: "T".into(),
+                intent: None,
+                tasks: vec![],
+                contract: None,
+            }
+        );
+        assert_eq!(
+            parse_ok(&["goals", "attach", "ship", "--contract", "c.json"]),
+            Command::GoalAttach {
+                goal: "ship".into(),
+                contract: PathBuf::from("c.json")
+            }
+        );
+        let mut stdin = Cursor::new(b"intent from stdin".to_vec());
+        let cli = parse_cli(
+            &argv(&["goals", "add", "--title", "T", "--intent", "-"]),
+            &mut stdin,
+        )
+        .unwrap();
+        let Command::GoalAdd { intent, .. } = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(intent.as_deref(), Some("intent from stdin"));
+    }
+
+    #[test]
+    fn verify_parses_with_its_options() {
+        assert_eq!(
+            parse_ok(&["verify", "r1/a"]),
+            Command::Verify {
+                target: "r1/a".into(),
+                task: None,
+                timeout_secs: DEFAULT_VERIFY_TIMEOUT_SECS
+            }
+        );
+        assert_eq!(
+            parse_ok(&["verify", "ship", "--task", "r1/a", "--timeout", "30"]),
+            Command::Verify {
+                target: "ship".into(),
+                task: Some("r1/a".into()),
+                timeout_secs: 30
+            }
+        );
+    }
+
+    #[test]
+    fn goals_and_verify_usage_errors() {
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec!["goals"], "needs a subcommand"),
+            (vec!["goals", "frobnicate"], "unknown goals subcommand"),
+            (vec!["goals", "add"], "--title is required"),
+            (
+                vec!["goals", "add", "--title", "t", "extra"],
+                "unexpected argument",
+            ),
+            (vec!["goals", "attach", "g"], "--contract is required"),
+            (
+                vec!["goals", "attach", "--contract", "c.json"],
+                "missing <goal>",
+            ),
+            (vec!["goals", "status"], "missing <goal>"),
+            (vec!["goals", "status", "g"], "missing status"),
+            (
+                vec!["goals", "status", "g", "open", "x"],
+                "unexpected argument",
+            ),
+            (vec!["goals", "show"], "missing <goal>"),
+            (vec!["goals", "list", "x"], "unexpected argument"),
+            (vec!["goals", "remaining", "x"], "unexpected argument"),
+            (vec!["verify"], "missing <goal|task>"),
+            (vec!["verify", "a", "b"], "unexpected argument"),
+            (vec!["verify", "a", "--timeout", "0"], "at least 1"),
+            (vec!["verify", "a", "--timeout", "soon"], "whole number"),
+        ];
+        for (a, want) in cases {
+            let e = parse(&a).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Usage, "{a:?}");
+            assert!(e.message.contains(want), "{a:?}: {}", e.message);
+        }
+    }
+
+    fn verify_status(running: bool, passed: bool) -> Result<Value> {
+        Ok(Value::object([
+            ("schema", s("fleet.verify/1")),
+            ("target", s("r1/a")),
+            ("task", s("r1/a")),
+            (
+                "verification",
+                s(if passed { "verified" } else { "unverified" }),
+            ),
+            ("ticket", Value::int(7u64)),
+            ("running", Value::Bool(running)),
+            ("passed", Value::Bool(passed)),
+            ("goals", Value::array([])),
+        ]))
+    }
+
+    fn started() -> Result<Value> {
+        Ok(Value::object([
+            ("schema", s("fleet.verify.started/1")),
+            ("ticket", Value::int(7u64)),
+        ]))
+    }
+
+    fn run_verify(
+        replies: Vec<Result<Value>>,
+        json: bool,
+        timeout: Duration,
+    ) -> (Result<i32>, String, Fake) {
+        let mut f = Fake::new(replies);
+        let mut out = Vec::new();
+        let r = execute_verify(
+            "r1/a",
+            None,
+            timeout,
+            &mut f,
+            json,
+            &mut out,
+            Duration::ZERO,
+        );
+        (r, String::from_utf8(out).unwrap(), f)
+    }
+
+    #[test]
+    fn verify_waits_until_the_contracts_finished_then_reports_by_exit_code() {
+        let started = started();
+        let (r, out, f) = run_verify(
+            vec![
+                started.clone(),
+                verify_status(true, false),
+                verify_status(true, false),
+                verify_status(false, true),
+            ],
+            false,
+            Duration::from_secs(5),
+        );
+        assert_eq!(r.unwrap(), 0);
+        assert!(out.starts_with("verification of r1/a: PASSED"), "{out}");
+        let names: Vec<&str> = f.calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            ["verify", "verify.status", "verify.status", "verify.status"]
+        );
+        assert_eq!(f.calls[0].1, Value::object([("target", s("r1/a"))]));
+        let (r, out, _) = run_verify(
+            vec![started.clone(), verify_status(false, false)],
+            false,
+            Duration::from_secs(5),
+        );
+        assert_eq!(r.unwrap(), 6, "a failed contract exits with 6");
+        assert!(out.contains("NOT PASSED"), "{out}");
+        let (r, out, _) = run_verify(
+            vec![started, verify_status(false, true)],
+            true,
+            Duration::from_secs(5),
+        );
+        assert_eq!(r.unwrap(), 0);
+        assert!(
+            out.starts_with("{\"goals\""),
+            "json mode prints the final document: {out}"
+        );
+        assert_eq!(out.lines().count(), 1);
+    }
+
+    #[test]
+    fn verify_asks_about_its_own_run_and_a_run_that_was_not_recorded_is_not_a_pass() {
+        let mut lost = verify_status(false, false).unwrap();
+        if let Value::Object(m) = &mut lost {
+            m.insert("recorded".into(), Value::Bool(false));
+            m.insert("note".into(), s("the result could not be recorded"));
+        }
+        let (r, out, f) = run_verify(vec![started(), Ok(lost)], false, Duration::from_secs(5));
+        assert_eq!(r.unwrap(), 6);
+        assert!(
+            out.contains("note: the result could not be recorded"),
+            "{out}"
+        );
+        assert_eq!(f.calls[1].0, "verify.status");
+        assert_eq!(f.calls[1].1.get("ticket").and_then(Value::as_u64), Some(7));
+        // a daemon that gives no ticket cannot be asked about a run
+        let (r, _, _) = run_verify(
+            vec![Ok(Value::object([("schema", s("x"))]))],
+            false,
+            Duration::from_secs(1),
+        );
+        assert_eq!(r.unwrap_err().code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn verify_times_out_while_the_daemon_keeps_working() {
+        let started = started();
+        let (r, out, _) = run_verify(
+            vec![started, verify_status(true, false)],
+            false,
+            Duration::ZERO,
+        );
+        let e = r.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Timeout);
+        assert!(e.message.contains("keeps running"), "{}", e.message);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn verify_passes_errors_of_the_daemon_through() {
+        let (r, _, f) = run_verify(
+            vec![Err(FleetError::not_found("no goal names that task"))],
+            false,
+            Duration::from_secs(1),
+        );
+        assert_eq!(r.unwrap_err().code, ErrorCode::NotFound);
+        assert_eq!(f.calls.len(), 1);
+        let (r, _, _) = run_verify(
+            vec![Ok(Value::Null), Err(FleetError::internal("gone"))],
+            false,
+            Duration::from_secs(1),
+        );
+        assert_eq!(r.unwrap_err().code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn a_contract_file_problem_is_reported_before_the_daemon_is_asked() {
+        let dir = TempDir::new("goals-contract");
+        let state = dir.path().to_str().unwrap().to_string();
+        let missing = dir.join("nope.json").display().to_string();
+        for args in [
+            vec![
+                "--state-dir",
+                &state,
+                "goals",
+                "add",
+                "--title",
+                "t",
+                "--contract",
+                &missing,
+            ],
+            vec![
+                "--state-dir",
+                &state,
+                "goals",
+                "attach",
+                "g",
+                "--contract",
+                &missing,
+            ],
+        ] {
+            let (code, out, err) = run_args(&args);
+            assert_ne!(code, ErrorCode::DaemonDown.exit_code(), "{args:?}: {err}");
+            assert_eq!(out, "");
+            assert!(err.starts_with("fleet: "), "{err}");
+        }
+        let wrong = dir.write("c.toml", "x = 1");
+        let (code, _, err) = run_args(&[
+            "--state-dir",
+            &state,
+            "goals",
+            "add",
+            "--title",
+            "t",
+            "--contract",
+            wrong.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ErrorCode::Invalid.exit_code(), "{err}");
+        assert!(err.contains(".json"), "{err}");
+    }
+
+    #[test]
+    fn goals_requests_render_their_views() {
+        let mut f = Fake::new(vec![Ok(Value::object([
+            ("id", s("ship")),
+            ("status", s("open")),
+            ("contract_id", Value::Null),
+        ]))]);
+        let (r, out) = exec(
+            parse_ok(&["goals", "status", "ship", "open"]),
+            &mut f,
+            false,
+        );
+        r.unwrap();
+        assert_eq!(out, "goal ship is open\n");
+        let mut f = Fake::new(vec![Ok(Value::object([("goals", Value::array([]))]))]);
+        let (r, out) = exec(parse_ok(&["goals", "list"]), &mut f, false);
+        r.unwrap();
+        assert_eq!(out, "no goals\n");
+        let mut f = Fake::new(vec![Ok(Value::object([("goals", Value::array([]))]))]);
+        let (r, out) = exec(parse_ok(&["goals", "list"]), &mut f, true);
+        r.unwrap();
+        assert_eq!(out, "{\"goals\":[]}\n");
     }
 
     #[test]

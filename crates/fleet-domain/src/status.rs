@@ -115,6 +115,30 @@ string_enum!(
     }
 );
 
+string_enum!(
+    /// State of a goal in the goal ledger. `verified` is reached only through recorded evidence.
+    GoalStatus {
+        Open => "open",
+        InProgress => "in_progress",
+        Blocked => "blocked",
+        /// The goal's contract passed (and every child is verified); set by the ledger, never by a person.
+        Verified => "verified",
+        /// Dropped from the scope; counts as neither remaining nor verified.
+        Abandoned => "abandoned",
+    }
+);
+
+string_enum!(
+    /// What one verification check came to.
+    Verdict {
+        Passed => "passed",
+        /// The check ran and its result was wrong.
+        Failed => "failed",
+        /// The check could not be evaluated (timeout, cannot start, unreadable file).
+        Error => "error",
+    }
+);
+
 impl TaskStatus {
     /// Statuses a task never leaves without an operator or a dependency change.
     pub fn is_terminal(self) -> bool {
@@ -138,6 +162,19 @@ mod tests {
         for s in ApprovalStatus::ALL {
             assert_eq!(s.to_string(), s.as_str());
         }
+    }
+
+    #[test]
+    fn goal_statuses_and_verdicts_round_trip() {
+        for s in GoalStatus::ALL {
+            assert_eq!(GoalStatus::parse(s.as_str()), Some(*s));
+            assert_eq!(GoalStatus::from_value(&s.to_value()), Some(*s));
+        }
+        for v in Verdict::ALL {
+            assert_eq!(Verdict::parse(v.as_str()), Some(*v));
+        }
+        assert_eq!(GoalStatus::parse("done"), None);
+        assert_eq!(Verdict::parse("ok"), None);
     }
 
     #[test]

@@ -8,10 +8,12 @@ use fleet_domain::approval::Digest;
 use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{ApprovalId, RunId, Sha, TaskId};
+use fleet_domain::ids::{ApprovalId, GoalId, RunId, Sha, TaskId};
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::{GateFormat, GateOutcome};
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
+use neo_verify::contract::{ContractId, VerificationContract};
+use neo_verify::judge::CheckReport;
 
 // ---- time -------------------------------------------------------------------------------
 
@@ -92,6 +94,26 @@ pub struct IntegrationResult {
     pub created: bool,
 }
 
+/// What a task's worktree looks like right now, for verification. Verification is about the
+/// *commit*: what is merged is the branch, never the working state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeState {
+    /// The commit checked out in the worktree.
+    pub head: Sha,
+    /// The tree object of `head`.
+    pub tree: Sha,
+    /// Paths the commits since the run's base commit changed (`base..head`), relative to the
+    /// repository root, at most `neo_verify::limits::MAX_CHANGED_PATHS` of them. Paths under
+    /// `.fleet/` are listed like any other: a branch that carries one is not within any scope that
+    /// does not allow it.
+    pub changed: Vec<String>,
+    /// There were more changed paths than `changed` lists.
+    pub truncated: bool,
+    /// The worktree has changes that are not in `head` (staged, modified or untracked files that
+    /// are not ignored, apart from fleet's own `.fleet` directory).
+    pub dirty: bool,
+}
+
 /// Version control. Every operation happens on fleet's own branches and worktrees; the user's
 /// checked-out branch and working tree are never touched.
 pub trait Vcs: Send {
@@ -134,6 +156,9 @@ pub trait Vcs: Send {
     ) -> Result<()>;
     /// True when `branch` is contained in `into`.
     fn is_merged(&self, repo: &str, branch: &str, into: &str) -> Result<bool>;
+    /// The commit, its tree, the paths it changed since `base` and whether the worktree has
+    /// uncommitted changes.
+    fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState>;
 }
 
 // ---- sessions -----------------------------------------------------------------------------
@@ -243,6 +268,63 @@ pub struct GateSpec {
     pub timeout_ms: u64,
 }
 
+/// One goal's contract to run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyTarget {
+    pub goal: GoalId,
+    pub contract_id: ContractId,
+    pub contract: VerificationContract,
+}
+
+/// Why a contract is being run: as part of reviewing a task (its result decides whether the task
+/// may complete) or because an operator asked (`fleet verify`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyOrigin {
+    Review,
+    Manual,
+}
+
+/// Runs the contracts of goals, independently of the worker, in the task's worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyJob {
+    pub run: RunId,
+    pub task: TaskId,
+    pub attempt: u32,
+    pub origin: VerifyOrigin,
+    pub worktree: String,
+    /// What the worktree looked like when the job was started: the commit the checks run on (a
+    /// clean export of it, not the worktree), what that commit changed (for diff constraints) and
+    /// whether the worktree had uncommitted changes.
+    pub state: WorktreeState,
+    /// The environment of every command before the adapter isolates it: the operator's allowlist
+    /// and nothing else. The adapter replaces the home and temporary directories, the working
+    /// directory and everything that points into the worktree.
+    pub env: Vec<(String, String)>,
+    pub targets: Vec<VerifyTarget>,
+}
+
+/// What running one goal's contract produced: a report per check, in contract order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedContract {
+    pub goal: GoalId,
+    pub contract_id: ContractId,
+    pub reports: Vec<CheckReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyDone {
+    pub run: RunId,
+    pub task: TaskId,
+    pub attempt: u32,
+    pub origin: VerifyOrigin,
+    /// The commit that was exported and checked, its tree and whether the worktree had
+    /// uncommitted changes when the run started (the job's [`WorktreeState`]).
+    pub commit: Sha,
+    pub tree: Sha,
+    pub dirty: bool,
+    pub results: Vec<VerifiedContract>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
     Gates {
@@ -261,6 +343,8 @@ pub enum Job {
         env: Vec<(String, String)>,
         timeout_ms: u64,
     },
+    /// The contracts of the goals a task works on.
+    Verify(Box<VerifyJob>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +361,7 @@ pub enum JobDone {
         summary: String,
         output: String,
     },
+    Verify(Box<VerifyDone>),
 }
 
 /// Runs long commands off the orchestrator's thread.
@@ -285,6 +370,10 @@ pub trait JobRunner: Send {
     /// Results that arrived since the last call.
     fn poll(&mut self) -> Vec<JobDone>;
     fn running(&self) -> usize;
+    /// The process groups of the children running jobs have started. They run code a worker
+    /// wrote (gates, approved commands, verification checks): the origin check of the control
+    /// socket treats them, and what they start, like workers.
+    fn live(&self) -> Vec<LiveSession>;
 }
 
 // ---- stored output ------------------------------------------------------------------------------

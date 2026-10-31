@@ -146,9 +146,54 @@ pub fn read_regular_in(dir: &Path, name: &str, max: u64) -> Result<Vec<u8>, Read
     read_open(File::from(fd), max)
 }
 
+/// Opens `rel` (a relative path of `/`-separated, non-empty, non-dot components) below `root`
+/// without following a symlink anywhere on the way: every directory component is opened relative
+/// to the descriptor of the one before, with `O_NOFOLLOW | O_DIRECTORY`, and so is the final
+/// file. A worker that replaces a component by a link to somewhere else (or swaps it later) cannot
+/// make the open land outside `root`. The result is not yet known to be a regular file; check it
+/// on the open descriptor ([`read_open`] does).
+pub fn open_beneath(root: &Path, rel: &str) -> Result<File, ReadError> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains('\0'))
+    {
+        return Err(ReadError::Io("invalid path".to_string()));
+    }
+    let Some((last, dirs)) = parts.split_last() else {
+        return Err(ReadError::Io("invalid path".to_string()));
+    };
+    let inside_link = || ReadError::NotRegular("is inside a symlink or a non-directory");
+    let dir_flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let mut dir = nix::fcntl::open(root, dir_flags, Mode::empty()).map_err(|e| match e {
+        Errno::ENOENT => ReadError::Missing,
+        Errno::ELOOP | Errno::ENOTDIR => inside_link(),
+        other => ReadError::Io(other.desc().to_string()),
+    })?;
+    for part in dirs {
+        dir = openat(&dir, *part, dir_flags, Mode::empty()).map_err(|e| match e {
+            Errno::ENOENT => ReadError::Missing,
+            Errno::ELOOP | Errno::ENOTDIR => inside_link(),
+            other => ReadError::Io(other.desc().to_string()),
+        })?;
+    }
+    let fd = openat(
+        &dir,
+        *last,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::ENOENT => ReadError::Missing,
+        Errno::ELOOP => ReadError::NotRegular("is a symlink"),
+        other => ReadError::Io(other.desc().to_string()),
+    })?;
+    Ok(File::from(fd))
+}
+
 /// Re-checks the open descriptor (the path may have changed since it was examined) and reads
 /// with a hard byte cap, so a file that grows during the read stays bounded.
-fn read_open(file: File, max: u64) -> Result<Vec<u8>, ReadError> {
+pub fn read_open(file: File, max: u64) -> Result<Vec<u8>, ReadError> {
     let meta = file
         .metadata()
         .map_err(|e| ReadError::Io(e.kind().to_string()))?;
@@ -299,6 +344,63 @@ mod tests {
 
     fn mkfifo(path: &Path) {
         nix::unistd::mkfifo(path, Mode::S_IRWXU).unwrap();
+    }
+
+    #[test]
+    fn open_beneath_opens_nested_files_and_refuses_links_everywhere() {
+        let t = TempDir::new("fsx-beneath");
+        t.write("root/a/b/c.txt", "deep");
+        t.write("outside/secret.txt", "secret");
+        let root = t.join("root");
+        let read = |rel: &str| open_beneath(&root, rel).and_then(|f| read_open(f, 100));
+        assert_eq!(read("a/b/c.txt").unwrap(), b"deep");
+        assert_eq!(read("a/b/nope.txt"), Err(ReadError::Missing));
+        assert_eq!(read("a/nope/c.txt"), Err(ReadError::Missing));
+        assert!(matches!(read("a/b"), Err(ReadError::NotRegular(_))));
+        // a final symlink, and a symlink in the middle that leads out of the root
+        symlink(t.join("outside/secret.txt"), root.join("a/link.txt")).unwrap();
+        symlink(t.join("outside"), root.join("a/linkdir")).unwrap();
+        assert_eq!(
+            read("a/link.txt"),
+            Err(ReadError::NotRegular("is a symlink"))
+        );
+        assert!(matches!(
+            read("a/linkdir/secret.txt"),
+            Err(ReadError::NotRegular(_))
+        ));
+        // a file used as a directory
+        assert!(matches!(read("a/b/c.txt/x"), Err(ReadError::NotRegular(_))));
+        // a root that is itself a link is refused
+        symlink(&root, t.join("rootlink")).unwrap();
+        assert!(open_beneath(&t.join("rootlink"), "a/b/c.txt").is_err());
+        assert_eq!(
+            open_beneath(&t.join("missing-root"), "x").unwrap_err(),
+            ReadError::Missing
+        );
+        // malformed relative paths never reach the file system
+        for bad in [
+            "",
+            "/a",
+            "a//b",
+            "a/./b",
+            "../outside/secret.txt",
+            "a/../a",
+            "a\0b",
+        ] {
+            assert!(
+                matches!(open_beneath(&root, bad), Err(ReadError::Io(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_beneath_does_not_block_on_a_fifo() {
+        let t = TempDir::new("fsx-beneath-fifo");
+        t.write("root/.keep", "");
+        mkfifo(&t.join("root/pipe"));
+        let file = open_beneath(&t.join("root"), "pipe").unwrap();
+        assert!(matches!(read_open(file, 10), Err(ReadError::NotRegular(_))));
     }
 
     #[test]

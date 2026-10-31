@@ -13,6 +13,7 @@ mod reconcile;
 mod supervise;
 
 use crate::config::AppConfig;
+use crate::neo::{VerifyOutcome, Verifying};
 use crate::ports::{Ports, SessionId, StoredEvent};
 use crate::views::Recent;
 use fleet_domain::error::Result;
@@ -22,6 +23,7 @@ use fleet_domain::ids::{ApprovalId, RunId, TaskId};
 use fleet_domain::run::{RetryPolicy, WorkerEnd};
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::supervision::{KillEscalation, SupervisionPolicy};
+use neo_goals::ledger::Ledger;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Entries kept for the activity feed.
@@ -48,6 +50,8 @@ pub struct Orchestrator {
     pub(crate) cfg: AppConfig,
     pub(crate) ports: Ports,
     pub(crate) state: FleetState,
+    /// The goal ledger, a projection of the same event log as `state`.
+    pub(crate) ledger: Ledger,
     pub(crate) policy: Policy,
     pub(crate) live: BTreeMap<Key, Live>,
     /// Quality-gate jobs in flight: (run, task, attempt).
@@ -55,6 +59,14 @@ pub struct Orchestrator {
     /// Reviews whose worker output was committed already.
     pub(crate) committed: BTreeSet<(RunId, TaskId, u32)>,
     pub(crate) command_jobs: BTreeSet<ApprovalId>,
+    /// Verification jobs in flight: the task's attempt and why they run.
+    pub(crate) verifying: BTreeMap<Key, Verifying>,
+    /// Tickets handed out by `verify`, and how the last runs ended.
+    pub(crate) verify_seq: u64,
+    pub(crate) verify_outcomes: VecDeque<VerifyOutcome>,
+    /// Reviews whose contracts passed in fleet's own run: (run, task, attempt). Only these may
+    /// go on to the quality gates and complete.
+    pub(crate) verified: BTreeSet<(RunId, TaskId, u32)>,
     /// Session ends that could not be recorded yet (the store failed); retried every tick so a
     /// task never stays `running` without a session.
     pub(crate) pending_ends: BTreeMap<Key, WorkerEnd>,
@@ -72,10 +84,12 @@ impl Orchestrator {
     pub fn new(cfg: AppConfig, ports: Ports) -> Result<Orchestrator> {
         cfg.validate()?;
         let mut state = FleetState::new();
+        let mut ledger = Ledger::new();
         let mut recent: VecDeque<Recent> = VecDeque::new();
         ports.store.replay(&mut |s: StoredEvent| {
             push_recent(&mut recent, s.seq, s.ts_ms, &s.event);
             state.apply(&s.event);
+            ledger.apply_checked(&s.event, ports.digest.as_ref());
             Ok(())
         })?;
         let policy = Policy {
@@ -91,11 +105,16 @@ impl Orchestrator {
             cfg,
             ports,
             state,
+            ledger,
             policy,
             live: BTreeMap::new(),
             gate_jobs: BTreeSet::new(),
             committed: BTreeSet::new(),
             command_jobs: BTreeSet::new(),
+            verifying: BTreeMap::new(),
+            verify_seq: 0,
+            verify_outcomes: VecDeque::new(),
+            verified: BTreeSet::new(),
             pending_ends: BTreeMap::new(),
             recent,
             started_ms,
@@ -124,9 +143,13 @@ impl Orchestrator {
         self.live.len()
     }
 
-    /// Live sessions for the control socket's worker-origin check.
+    /// The process groups that count as worker origin for the control socket: live worker
+    /// sessions and the children of running jobs (gates, approved commands, verification checks),
+    /// which execute files a worker wrote.
     pub fn live_sessions(&self) -> Vec<fleet_domain::supervision::LiveSession> {
-        self.ports.sessions.live()
+        let mut live = self.ports.sessions.live();
+        live.extend(self.ports.jobs.live());
+        live
     }
 
     /// The session of a live task, for the transport's attach and send paths.
@@ -150,9 +173,13 @@ impl Orchestrator {
         let count = events.len() as u64;
         let first = last.saturating_add(1).saturating_sub(count);
         let mut stored = Vec::with_capacity(events.len());
+        let mut committed_task = false;
         for (i, event) in events.into_iter().enumerate() {
             let seq = first.saturating_add(i as u64);
             self.state.apply(&event);
+            self.ledger
+                .apply_checked(&event, self.ports.digest.as_ref());
+            committed_task |= matches!(event, DomainEvent::TaskCommitted { .. });
             push_recent(&mut self.recent, seq, ts, &event);
             stored.push(StoredEvent {
                 seq,
@@ -161,6 +188,12 @@ impl Orchestrator {
             });
         }
         self.ports.publisher.publish(&stored);
+        if committed_task {
+            // The commit a task's evidence has to name changed: what was verified at an earlier
+            // commit is not verified any more.
+            let settle = self.ledger.resettle();
+            self.commit(settle)?;
+        }
         Ok(())
     }
 

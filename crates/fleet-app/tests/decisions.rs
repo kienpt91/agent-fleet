@@ -248,11 +248,41 @@ fn decide(
     approve: bool,
     digest: Option<&str>,
 ) -> Result<Reply, FleetError> {
-    let mut pairs = vec![("id", s(id)), ("approve", Value::Bool(approve))];
-    if let Some(d) = digest {
-        pairs.push(("digest", s(d)));
-    }
-    h.call("approval.decide", obj(pairs))
+    // A person reads the approval before deciding: without a digest of their own, the one the
+    // daemon lists. A call without any digest is `decide_blind`.
+    let seen = match digest {
+        Some(d) => d.to_string(),
+        None => h
+            .call("approval.list", Value::Null)
+            .ok()
+            .and_then(|r| {
+                r.data()
+                    .get("approvals")
+                    .and_then(Value::as_array)
+                    .and_then(|list| {
+                        list.iter()
+                            .find(|a| a.get("id").and_then(Value::as_str) == Some(id))
+                            .and_then(|a| a.get("digest").and_then(Value::as_str))
+                            .map(str::to_string)
+                    })
+            })
+            .unwrap_or_else(|| "0".repeat(16)),
+    };
+    h.call(
+        "approval.decide",
+        obj(vec![
+            ("id", s(id)),
+            ("approve", Value::Bool(approve)),
+            ("digest", s(&seen)),
+        ]),
+    )
+}
+
+fn decide_blind(h: &mut Harness, id: &str, approve: bool) -> Result<Reply, FleetError> {
+    h.call(
+        "approval.decide",
+        obj(vec![("id", s(id)), ("approve", Value::Bool(approve))]),
+    )
 }
 
 fn approval_id(id: &str) -> ApprovalId {
@@ -1053,6 +1083,30 @@ fn deciding_an_unknown_or_malformed_approval_fails() {
         )
         .unwrap_err();
     assert_eq!(wrong_type.code, ErrorCode::Invalid);
+}
+
+#[test]
+fn a_decision_without_the_digest_of_the_action_is_refused_and_changes_nothing() {
+    let mut h = harness(&["a"]);
+    request(&mut h, "a", "format", Some(("/usr/bin/cargo", &["fmt"])));
+    let events = h.world.stored_events().len();
+    for approve in [true, false] {
+        let err = decide_blind(&mut h, "a1", approve).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{err:?}");
+    }
+    for short in ["", "abc", "0123456789a"] {
+        let err = decide(&mut h, "a1", true, Some(short)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{short:?}");
+    }
+    assert_eq!(
+        h.world.stored_events().len(),
+        events,
+        "nothing was recorded"
+    );
+    assert_eq!(approval_status(&mut h, "a1"), "pending");
+    // with the digest the daemon lists, the decision goes through
+    decide(&mut h, "a1", true, None).unwrap();
+    assert_eq!(count(&h, "approval_decided"), 1);
 }
 
 #[test]

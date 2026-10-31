@@ -47,7 +47,7 @@ pub fn truncate(s: &str, width: usize) -> String {
     out
 }
 
-fn text(v: &Value, key: &str) -> String {
+pub(crate) fn text(v: &Value, key: &str) -> String {
     match v.get(key) {
         Some(Value::Str(s)) => clean(s),
         Some(Value::Int(n)) => n.to_string(),
@@ -56,7 +56,7 @@ fn text(v: &Value, key: &str) -> String {
     }
 }
 
-fn text_or_dash(v: &Value, key: &str) -> String {
+pub(crate) fn text_or_dash(v: &Value, key: &str) -> String {
     let t = text(v, key);
     if t.is_empty() {
         "-".to_string()
@@ -65,15 +65,15 @@ fn text_or_dash(v: &Value, key: &str) -> String {
     }
 }
 
-fn num(v: &Value, key: &str) -> u64 {
+pub(crate) fn num(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
-fn items<'a>(v: &'a Value, key: &str) -> &'a [Value] {
+pub(crate) fn items<'a>(v: &'a Value, key: &str) -> &'a [Value] {
     v.get(key).and_then(Value::as_array).unwrap_or(&[])
 }
 
-fn prefix(s: &str, n: usize) -> String {
+pub(crate) fn prefix(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 

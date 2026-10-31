@@ -35,6 +35,10 @@ fleet plan plan.toml  ->  fleet start  ->  one worker per ready task, in .fleet-
 - **Quality gates.** Configured commands run in the worktree after the worker finishes. A task completes only when
   all pass. The `refcheck-json` format understands the report of the `refcheck` tool and fails on errors,
   unparseable output, the wrong shape or death by signal.
+- **Goals and proof of work (NEO N1).** A goal ledger records what the objective is and what is left; a goal can carry
+  a *verification contract* (commands, `refcheck-json`, file assertions, a diff constraint) that fleet runs itself,
+  independently of the worker, in the task's worktree. A task such a goal names completes only after that run passed;
+  what an agent reports is shown as `unverified` until there is evidence. See [NEO N1](#neo-n1-goals-and-verification).
 - **Supervised and recoverable.** Idle and total timeouts, TERM then KILL of the whole process group, pid-reuse
   protection (pid *and* start time are verified before any signal), and an append-only hash-chained event log:
   after a crash (or `kill -9`) the daemon replays the log, stops sessions that survived and re-queues their tasks.
@@ -291,6 +295,127 @@ because its quality gate failed once; every merge first returned exit 5 with an 
 exact merge (including the commit being merged); the repository's own branch and working tree were untouched
 (`git status --short` empty, branch still `main`).
 
+## NEO N1: goals and verification
+
+NEO is a planned layer above the orchestrator (goal ledger, context compiler, knowledge store, token governor,
+credential broker). **Only milestone N1 exists**: the goal ledger and verification contracts; see
+[docs/neo.md](docs/neo.md) for what it does, the contract format and what is not there.
+
+```text
+fleet goals add --title <text> [--id <id>] [--parent <goal>] [--task <run>/<task>]... [--contract <file.json>]
+fleet goals attach | status | list | show | remaining          (all with --json)
+fleet verify <goal|task>                                         run the contracts now, record evidence
+```
+
+The output below was produced by [`scripts/neo-demo.sh`](scripts/neo-demo.sh) in a throwaway container with a fake HOME
+and a fake repository. The agent is a [scripted shell script](examples/agents/neo-agent.sh) that reports `done` on every
+attempt; its first attempt writes the wrong answer. The [contract](examples/neo/contract.json) has three mandatory
+checks (the file says `ready`, a command, the work touches only `answer.txt`). Fleet runs it itself after the worker
+finished, on a clean export of the committed work (not in the worktree): attempt 1 fails (evidence `e1`), the failing check is quoted in the brief of attempt 2, attempt 2 passes
+(`e4` to `e6`), and only then does the task complete and the goal become verified. Nothing was edited afterwards.
+
+<details>
+<summary>Full output (click to expand)</summary>
+
+```text
+
+$ /target/release/fleet plan /tmp/tmp.un21Dsbx2r/plan.toml
+plan loaded into run r1 (1 tasks)
+
+$ /target/release/fleet goals add --id feature --title The answer file says ready --intent answer.txt exists, says ready, and nothing else changed --task r1/answer --contract /work/examples/neo/contract.json
+goal feature added (open), contract dd2a18ee6128
+
+$ /target/release/fleet goals remaining
+1 goals, 0 verified, 0 abandoned
+open leaves:
+  GOAL     STATUS  CONTRACT  TASKS                       TITLE
+  feature  open    pending   r1/answer (ready, pending)  The answer file says ready
+blockers:
+  none
+next ready tasks:
+  r1/answer  (goal feature)  Write the answer file
+
+$ /target/release/fleet start --run r1
+run r1 started
+
+$ /target/release/fleet status
+daemon pid 20 | v0.1.0 | up 0s | sessions 0/2 | undo unavailable | rss 4000 kB
+
+run r1 [finished] max-parallel 2
+  objective  NEO demo
+  repo       /tmp/tmp.un21Dsbx2r/repo (base HEAD @ 9016d72c)
+  branch     fleet/r1/integration
+  tasks      pending 0, ready 0, running 0, review 0, completed 1, failed 0, blocked 0
+  ID      STATUS     DEPS  TRY  WORKER  NOTE
+  answer  completed  -     2    -       done, every check passes
+
+recent
+  #19 r1/answer note added
+  #20 r1/answer dispatched (attempt 2)
+  #21 r1/answer session exited
+  #22 r1/answer in review
+  #23 r1/answer committed
+  #24 evidence e4: goal feature check "answer" passed
+  #25 evidence e5: goal feature check "tests" passed
+  #26 evidence e6: goal feature check "scope" passed
+  #27 goal feature is verified
+  #28 r1/answer completed
+
+$ /target/release/fleet goals show feature
+goal feature [verified]
+title:    The answer file says ready
+reason:   every mandatory check of the contract passed
+intent:
+  > answer.txt exists, says ready, and nothing else changed
+contract: passed (id dd2a18ee6128)
+tasks:
+  r1/answer  completed  verification: verified
+checks (newest evidence of each):
+  answer [file, mandatory] passed: the file contains the text
+    answer.txt contains "ready"
+  tests [command, mandatory] passed: exit code 0
+    /bin/sh -c test -s answer.txt (expect exit 0)
+  scope [diff, mandatory] passed: 1 changed path(s), all allowed
+    changes only answer.txt
+evidence history (newest first):
+  EVIDENCE  CHECK   VERDICT  COMMIT        TASK    SUMMARY
+  e6        scope   passed   cfda8ce4158a  answer  1 changed path(s), all allowed
+  e5        tests   passed   cfda8ce4158a  answer  exit code 0
+  e4        answer  passed   cfda8ce4158a  answer  the file contains the text
+  e3        scope   passed   57493d9c8288  answer  1 changed path(s), all allowed
+  e2        tests   passed   57493d9c8288  answer  exit code 0
+  e1        answer  failed   57493d9c8288  answer  the file does not contain the text
+
+$ /target/release/fleet verify r1/answer
+verification of r1/answer: PASSED
+task r1/answer: verified
+goal feature [verified] contract passed
+  answer [file, mandatory] passed: the file contains the text
+    answer.txt contains "ready"
+  tests [command, mandatory] passed: exit code 0
+    /bin/sh -c test -s answer.txt (expect exit 0)
+  scope [diff, mandatory] passed: 1 changed path(s), all allowed
+    changes only answer.txt
+
+$ /target/release/fleet goals remaining
+1 goals, 1 verified, 0 abandoned
+nothing is left to do
+
+$ /target/release/fleet verify-log
+event log ok: 31 records, head db5bc136ba2ab76080f18cfc277f6720c323abcf8987854ae1e2694816898200
+```
+
+</details>
+
+What the end-to-end tests ([`e2e_neo.rs`](crates/fleet-cli/tests/e2e_neo.rs)) additionally pin down with the real
+binary: a worker that claims success with a wrong result never completes its task and its dependents never start; a
+task whose worker finished is shown as `unverified` while the contract runs; the ledger and the evidence survive
+`kill -9` of the daemon in the middle of a verification (the lost run recorded nothing and is repeated); a worker
+cannot use any of the commands; **processes started by a contract check or a quality gate are refused on the control
+socket like workers**; a check never sees ignored or uncommitted files, runs in a private export with a home of its own
+and not the operator's; a contract command planted in the worktree is never run; a `.fleet/` path a worker committed
+fails the diff constraint; secrets in check output are redacted before they reach the audit log.
+
 ## Concepts
 
 | Term | Meaning |
@@ -301,6 +426,8 @@ exact merge (including the commit being merged); the repository's own branch and
 | **Decision gate** | A question a worker (or a merge conflict) puts to a person. `fleet gate list|resolve`. |
 | **Approval** | A person's yes/no for one exact action, bound to a digest and an expiry. `fleet approve|deny`. |
 | **Quality gate** | A configured command that must pass before a task completes. |
+| **Goal** | A node of the goal ledger with a status, tasks and an optional verification contract. `verified` is reached only through evidence. `fleet goals`. |
+| **Verification contract / evidence** | Checks fleet runs itself to decide whether a goal's work counts as done; the immutable record (verdict, redacted output, commit) of each run. `fleet verify`. |
 
 The full glossary, the layer diagram and the context map are in [docs/domain.md](docs/domain.md); the reasons for the
 main design decisions are the short ADRs in [docs/adr](docs/adr).
@@ -366,13 +493,29 @@ decisions:
   gate list                          open questions and conflicts
   gate resolve <id> --answer <text>  answer a gate (or give the answer as the rest of the line)
   approval list                      approvals and their digests
-  approve <id> [--digest <hex>]      approve a pending action
+  approve <id> [--digest <hex>]      approve a pending action (names the digest it covers: the listed
+                                     one unless --digest is given)
   deny <id> [--digest <hex>]         deny it
 
 results:
   merge <task>                       merge a reviewed task into the integration branch
   cleanup [--run <run>] [--branches] remove finished worktrees (and branches)
   undo <task> [--apply]              preview or revert the last worker changes (needs agent-undo)
+
+goals and verification (NEO):
+  goals add --title <text> [--id <id>] [--parent <goal>] [--intent <text>|-]
+            [--task <run>/<task>]... [--contract <file.json>]
+                                     add a goal to the ledger, optionally with its verification contract
+  goals attach <goal> --contract <file.json>
+                                     make a contract the acceptance criteria of a goal
+  goals status <goal> <open|in_progress|blocked|abandoned> [--reason <text>]
+                                     (verified is never set by hand: only recorded evidence does it)
+  goals list                         the goal tree with status, contract and task verification
+  goals show <goal>                  one goal: its checks, the newest evidence of each, the history
+  goals remaining                    open leaves, blockers and the tasks that can start next
+  verify <goal|task> [--task <run>/<task>] [--timeout <secs>]
+                                     run the contracts independently of the worker and record
+                                     evidence; exit 6 when a mandatory check did not pass
 
 dashboard:
   tui                                terminal dashboard
@@ -499,9 +642,15 @@ refused unless `--web-allow-remote` is also given, and then a warning about the 
   expiry, with Approve and Deny; the request carries the digest the page showed (it is mandatory), so an approval is still
   bound to it. A **merge** button asks the daemon to merge; the daemon answers `approval_required` exactly as `fleet merge`
   does and the operator approves in the queue first;
+- the **goal ledger and verification** of [NEO N1](#neo-n1-goals-and-verification), read only: the remaining work (open
+  leaf goals, blockers, the next ready tasks), the goal tree with each goal's status and contract state, the checks of a
+  contract with their newest verdict, and the evidence history with the commit and tree digest each piece was taken on (not
+  counting pieces are dimmed). A task a goal governs shows an `unverified` badge while its worker has reported done (or the task
+  is in review or completed) and fleet has no passing evidence; it is also shown on the run's DAG and on the task page;
 - the **event log** with its hash-chain verification status, and a **health panel** (the `fleet doctor` checks).
 
-Starting runs, stopping or cancelling tasks, attaching and shutting the daemon down stay on the command line.
+Starting runs, stopping or cancelling tasks, attaching, shutting the daemon down, adding goals, attaching contracts and
+`fleet verify` (which starts processes) stay on the command line: the dashboard cannot start a verification.
 
 **Login and credentials.** The daemon prints the login URL once, and only when stderr is a terminal (otherwise it says why it did
 not, and `--web-print-login-url` overrides that), so the token does not end up in a log file by accident:
@@ -616,31 +765,52 @@ data: {"lost":false,"next":0,"text":"agent: starting docs\nagent: finished docs\
 event: end
 data: {"reason":"the worker has finished"}
 
+$ # the goal ledger over http: read only (a POST finds no route), newest evidence with commit and tree digests
+{"abandoned":0,"goals":[{"children":0,"contract":"passed","contract_id":"<64 hex>","depth":1,"evidence":6,"id":"feature","parent":null,"reason":"every mandatory check of the contract passed","status":"verified","tasks":[{"status":"completed","task":"r3/answer","verification":"verified"}],"title":"The answer file says ready"},
+ {"children":0,"contract":"pending","contract_id":"<64 hex>","depth":1,"evidence":0,"id":"docs-written","parent":null,"reason":"added","status":"open","tasks":[{"status":"completed","task":"r1/docs","verification":"unverified"}],"title":"The docs exist"}],"schema":"fleet.goals.list/1","total":2,"verified":1}
+HTTP/1.1 405 Method Not Allowed
+{"checks":[{"check":"answer","detail":"answer.txt contains \"ready\"","kind":"file","latest":{"at_ms":...,"check":"answer","commit":"<40 hex>","counts":true,"dirty":false,"exit_code":null,"id":"e4","output":"","summary":"the file contains the text","task":"answer","tree":"<40 hex>","verdict":"passed"},"mandatory":true},...
+
+$ # the goals pages in the browser: remaining work, verified and unverified badges, evidence with commit and tree
+  [goals] found: The answer file says ready
+  [goals] found: The docs exist
+  [goals] found: unverified
+  [goal] found: answer.txt contains
+  [goal] found: failed
+  [goal] found: passed
+
 $ # logging out ends the session: the same id is refused afterwards
 HTTP/1.1 200 OK
 HTTP/1.1 401 Unauthorized
 ```
 
-Three screenshots taken by that Chromium (1200 px wide, headless, in the container) in the same run: the DAG of `r1` while `api`
-waits for an answer, the approval queue with the pending merge approval, and the task page of a running worker with its live output:
+Five screenshots taken by that Chromium (1200 px wide, headless, in the container) in the same run: the DAG of `r1` while `api`
+waits for an answer, the approval queue with the pending merge approval, the task page of a running worker with its live output,
+the goals page (one goal verified through fleet's own run, one task `unverified`) and a goal with its checks and evidence:
 
 ![The run r1 as a DAG: schema and docs completed, api blocked behind a decision gate, release pending](docs/img/web-dag.png)
 ![An approval to merge r1/schema: the exact action, each argument, the digest, the time left and the Approve and Deny buttons](docs/img/web-approvals.png)
 ![The task r2/slow while it runs: its fields, the send-input box and the live output panel with two ticks](docs/img/web-live.png)
+![The goals page: remaining work, the goal tree with a verified goal and a goal whose completed task is unverified](docs/img/web-goals.png)
+![A verified goal: its contract id, its three checks with passing evidence and the evidence history with the failed first attempt dimmed](docs/img/web-goal.png)
 
 ### What was and was not verified
 
-- **Protocol level, over real sockets:** [`web_http.rs`](crates/fleet-infra/tests/web_http.rs) (40 tests: authentication, per-client
+- **Protocol level, over real sockets:** [`web_http.rs`](crates/fleet-infra/tests/web_http.rs) (@@WEBHTTP@@ tests: authentication, per-client
   lockout, Host, Origin, `Sec-Fetch-Site`, CSRF, header sessions and the rejected old-style cookie, strict JSON, control characters
   in input, malformed and oversized requests, a trickling client and an idle one, the connection cap, event-stream bounds and
-  their end with the session, shutdown) and [`e2e_web.rs`](crates/fleet-cli/tests/e2e_web.rs) (12 tests against the real daemon:
+  their end with the session, shutdown) and [`e2e_web.rs`](crates/fleet-cli/tests/e2e_web.rs) (@@E2EWEB@@ tests against the real daemon:
   login, the gate/approval/merge flow, live output and input, the token absent from every worker-visible place and from disk,
   a worker, a quality-gate child and a descendant of an approved command that were all handed the token and are all still
   refused on the web port and on the socket, the flag policy, the quiet start, shutdown, hostile text, health and tamper
-  detection). Without the new origin rule the gate and approved-command tests fail (an approved command's script logs in
-  with HTTP 200), which was checked by switching the rule off.
+  detection; the goal, evidence and verification documents, read only, with hostile text and a verification check that was handed
+  the token and is refused). Without the origin rule the gate, approved-command and verification-check tests fail (the script logs
+  in with HTTP 200): that was checked by switching the job tracker off (the detached and reparented cases fail) and both
+  mechanisms off (the older socket tests fail too); with only the ancestry rule off nothing in the end-to-end tests changes
+  because the tracker also lists the groups, so the ancestry rule has its own test with real child processes
+  ([`origin.rs`](crates/fleet-infra/tests/origin.rs)), which fails without it.
 - **The page script** is checked three ways: a source scan test that fails on `innerHTML`, `EventSource`, cookies and their
-  relatives, a node script ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), 252 checks against a hand-written fake DOM, hostile
+  relatives, a node script ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), @@SMOKE@@ checks against a hand-written fake DOM, hostile
   strings and a frame-splitting stream reader included) and the headless Chromium run above, which loaded the real page, logged in
   through the fragment, and found the expected text in the rendered DOM and in the screenshots. The live page was in its
   "Streaming live output" state with two ticks; the check does not distinguish what came from the first read and what from the stream.
@@ -658,8 +828,10 @@ the manifests.
 | Crate | Layer | Depends on |
 | --- | --- | --- |
 | `fleet-domain` | pure rules: runs/tasks (aggregate), decision gates, approvals, quality judgement, supervision rules, sanitizer, redactor, output buffer, events, hash chain | `std` only |
-| `fleet-app` | use cases (`Orchestrator`), commands, read models, port traits, in-memory fakes and port contract suites | `fleet-domain` |
-| `fleet-infra` | adapters: git, ptys, files, event log, job runner, sockets, TOML, the web dashboard (hand-written HTTP on `std::net`), daemon wiring | app, domain |
+| `neo-verify` | NEO: verification contracts, checks, glob matcher, judging, evidence | `std`, `fleet-domain` |
+| `neo-goals` | NEO: the goal ledger aggregate and its status machine | `std`, `fleet-domain`, `neo-verify` |
+| `fleet-app` | use cases (`Orchestrator`, with a `neo` module for goals and verification), commands, read models, port traits, in-memory fakes and port contract suites | the three domain crates |
+| `fleet-infra` | adapters: git, ptys, files, event log, job runner (gates, approved commands, verification contracts), sockets, TOML, the web dashboard (hand-written HTTP on `std::net`), daemon wiring | app, domain crates |
 | `fleet-cli` | the `fleet` binary: argument parsing, rendering, dashboard, attach | all |
 
 State is event-sourced: every change is a domain event, appended to a hash-chained log before it is applied;
@@ -671,15 +843,15 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1163 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+@@TESTCOUNT@@ tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy | 250 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves (19 tests); plus the port contract suites against the fakes | 247 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets (unit tests of the parser, sessions, lockout and peer lookup, and 40 socket tests); the origin rule for gates and approved commands and the process-group registry | 447 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | @@DOMAIN@@ |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | @@APP@@ |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | @@ADAPTERS@@ |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (including: no HTTP, async or TLS crate anywhere, the inner layers know nothing of the web adapter), and the web dashboard against the real daemon (12 tests) | 218 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | @@E2E@@ |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -694,11 +866,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               3384     3272    96.7%
-application          1845     1726    93.6%
-infrastructure       5166     4756    92.1%
-cli                  2199     1939    88.2%
-overall             12594    11693    92.8%
+domain               @@COV_DOMAIN@@
+application          @@COV_APP@@
+infrastructure       @@COV_INFRA@@
+cli                  @@COV_CLI@@
+overall              @@COV_ALL@@
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -755,6 +927,11 @@ gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 6
   keep working); a local process that passes admission can still keep connection slots busy for short periods (see SECURITY.md).
 - macOS: the code type-checks for `aarch64-apple-darwin` but was **not run**; pty, peer-credential, `ps`-based
   process-identity and the `lsof`-based dashboard admission behaviour there is unverified. Windows is not supported.
+- NEO N1 is the goal ledger and verification only: no context compiler, knowledge store, token governor or credential
+  broker. A verification contract is only as strong as its checks. Checks run on an export of the committed work with a
+  home of their own and their processes are refused on the control socket, but they are not sandboxed: `make test` runs
+  the *committed* build scripts as you, with network access (use a container, a VM or another user for isolation); see
+  [docs/neo.md](docs/neo.md).
 - Not verified here: real coding agents (only scripted ones), very large repositories, concurrent daemons on
   network file systems, and any adversary that can already run code as your user.
 
@@ -785,8 +962,8 @@ remove it from the tree and rewrite the history if it was not published.
 What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
-`scripts/demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
-`node scripts/web-smoke.mjs` (167 checks) and `check-crates-age` (every locked crate version published on or before 2026-10-24: 0 too new). A secret scan of the
+`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
+`node scripts/web-smoke.mjs` (@@SMOKE@@ checks) and `check-crates-age` (@@CRATES@@ locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
 
@@ -810,10 +987,11 @@ DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/demo.sh
 docker build -f docker/Dockerfile.web -t fleet-web docker/
 IMAGE=fleet-web DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/web-demo.sh /target/release/fleet'
 node scripts/web-smoke.mjs   # any node 22 or newer on the host or in a container; no npm packages
+DOCKER_NET=none run 'scripts/neo-demo.sh /target/release/fleet'   # the NEO N1 demo
 ```
 
-Layout: `crates/fleet-domain`, `crates/fleet-app`, `crates/fleet-infra`, `crates/fleet-cli`, `docs/`,
-`examples/`, `scripts/`, `docker/`.
+Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/fleet-app`, `crates/fleet-infra`,
+`crates/fleet-cli`, `docs/`, `examples/`, `scripts/`, `docker/`.
 
 ## License
 

@@ -137,10 +137,20 @@ fn merge(h: &mut Harness, task: &str) -> Result<Reply, FleetError> {
     h.call("merge", obj(vec![("task", s(task))]))
 }
 
+/// Decides on the digest the daemon lists for the approval, as a person who read it would.
 fn decide(h: &mut Harness, id: &str, approve: bool) -> Result<Reply, FleetError> {
+    let digest = approvals(h)
+        .iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|a| a.get("digest").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "0".repeat(16));
     h.call(
         "approval.decide",
-        obj(vec![("id", s(id)), ("approve", Value::Bool(approve))]),
+        obj(vec![
+            ("id", s(id)),
+            ("approve", Value::Bool(approve)),
+            ("digest", s(&digest)),
+        ]),
     )
 }
 

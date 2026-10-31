@@ -12,6 +12,7 @@ use fleet_domain::limits::MAX_GATE_OUTPUT;
 use fleet_domain::quality::{evaluate_exit, evaluate_refcheck, ExitKind, GateFormat, GateOutcome};
 use fleet_domain::redact::{Redactor, StreamRedactor};
 use fleet_domain::sanitize::{sanitize_text, tail_str};
+use fleet_domain::supervision::LiveSession;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use std::fs;
@@ -57,6 +58,143 @@ pub struct RunResult {
     pub exit: ExitKind,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+/// The process groups of the children the daemon has started on behalf of workers and not yet
+/// cleaned up: quality gates, approved commands, verification checks, the undo tool and git. The
+/// daemon treats every process in one of them, and every process one of them started (also one
+/// that left the group: see [`Sweeper`]), like a worker: the code these run is made of files a
+/// worker wrote, or is steered by them. There is one tracker per daemon, cloned into every
+/// adapter that starts children (clones share the list), and it is what both the control socket
+/// and the web dashboard consult, through `JobRunner::live`, next to the live worker sessions.
+#[derive(Clone, Default)]
+pub struct JobTracker(Arc<Mutex<Vec<(u32, u32)>>>);
+
+/// Most entries remembered. More than this many concurrent children and descendants is not a
+/// normal daemon; the origin check still refuses everything below the daemon in the process tree.
+const MAX_TRACKED: usize = 8192;
+
+impl JobTracker {
+    pub fn new() -> JobTracker {
+        JobTracker::default()
+    }
+
+    /// The groups alive now (each child leads its own group, so pid and pgid are the same).
+    pub fn live(&self) -> Vec<LiveSession> {
+        lock(&self.0)
+            .iter()
+            .map(|(pid, pgid)| LiveSession {
+                pid: *pid,
+                pgid: *pgid,
+            })
+            .collect()
+    }
+
+    /// A child that leads its own group.
+    pub(crate) fn track(&self, pid: u32) -> Tracked {
+        self.track_entry(pid, pid)
+    }
+
+    /// A process of a job that is known only by its pid (a descendant that left the group).
+    fn track_loose(&self, pid: u32) -> Tracked {
+        self.track_entry(pid, 0)
+    }
+
+    fn track_entry(&self, pid: u32, pgid: u32) -> Tracked {
+        {
+            let mut all = lock(&self.0);
+            if all.len() < MAX_TRACKED {
+                all.push((pid, pgid));
+            }
+        }
+        Tracked {
+            tracker: self.clone(),
+            entry: (pid, pgid),
+        }
+    }
+}
+
+/// Keeps a child registered until the job has dealt with its whole process group.
+pub(crate) struct Tracked {
+    tracker: JobTracker,
+    entry: (u32, u32),
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        let mut all = lock(&self.tracker.0);
+        if let Some(i) = all.iter().position(|p| *p == self.entry) {
+            all.swap_remove(i);
+        }
+    }
+}
+
+/// How often the descendants of a running job child are looked up.
+const SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Follows the processes a job child starts, so that those that leave its process group
+/// (`setsid`, a double fork) can still be stopped when the check is over and are treated as
+/// untrusted origin meanwhile.
+///
+/// What this does and does not cover: a descendant is found when a sample (every 200 ms, and one
+/// at the very end) sees it below the child. A process that detaches *and* whose whole chain of
+/// parents is gone before the next sample is not found; neither is one that starts after the
+/// last sample. The group kill of the child still takes every process that stayed in the group.
+/// Without cgroups or a sandbox there is no complete answer; run checks in a container or as
+/// another user when that matters.
+pub(crate) struct Sweeper<'a> {
+    tracker: &'a JobTracker,
+    root: u32,
+    seen: Vec<(u32, String, Tracked)>,
+    last: Option<Instant>,
+}
+
+impl<'a> Sweeper<'a> {
+    /// The first look is one interval after the child started: a process that was just started
+    /// has no descendants yet, and most children (every git call) are over before then.
+    pub(crate) fn new(tracker: &'a JobTracker, root: u32) -> Sweeper<'a> {
+        Sweeper {
+            tracker,
+            root,
+            seen: Vec::new(),
+            last: Some(Instant::now()),
+        }
+    }
+
+    /// Looks for new descendants if the last look is older than the interval (or `force`).
+    pub(crate) fn sample(&mut self, force: bool) {
+        if !force && self.last.is_some_and(|t| t.elapsed() < SWEEP_INTERVAL) {
+            return;
+        }
+        self.last = Some(Instant::now());
+        let table = crate::procid::process_table();
+        for pid in crate::procid::descendants_in(&table, self.root) {
+            if self.seen.iter().any(|(p, _, _)| *p == pid) {
+                continue;
+            }
+            if let Some(token) = crate::procid::start_token(pid) {
+                self.seen.push((pid, token, self.tracker.track_loose(pid)));
+            }
+        }
+    }
+
+    /// Kills every process seen that is still the same process, then forgets them.
+    pub(crate) fn kill_all(&mut self) {
+        for (pid, token, _) in &self.seen {
+            crate::procid::kill_if_same(*pid, token);
+        }
+        self.seen.clear();
+    }
+}
+
+/// What a job needs from the adapter besides its own description.
+#[derive(Clone)]
+pub struct JobContext {
+    pub redactor: Arc<Redactor>,
+    pub tracker: JobTracker,
+    /// What verification jobs export commits with and where; `None` where there is none (such a
+    /// job then fails every check instead of running it in the worktree).
+    pub verify: Option<Arc<crate::verify::VerifyHost>>,
 }
 
 fn spawn_failed(why: impl Into<String>) -> RunResult {
@@ -243,45 +381,14 @@ fn status_kind(status: ExitStatus) -> ExitKind {
     }
 }
 
-/// Process groups of everything the daemon is running on behalf of workers right now (quality
-/// gates, approved commands, the undo tool, git). The origin check of the control socket and of
-/// the web dashboard refuses connections from these groups: a process that is adopted by init
-/// but still sits in the group of a gate is still the gate's. Process wide on purpose: the
-/// daemon's request handler, which does the checking, does not own the runners.
-static RUNNING_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-/// Most groups remembered; more than this many concurrent children is not a normal daemon.
-const MAX_TRACKED_GROUPS: usize = 256;
-
-pub fn running_groups() -> Vec<u32> {
-    lock(&RUNNING_GROUPS).clone()
-}
-
-/// Keeps one process group in [`running_groups`] for as long as it lives.
-pub struct GroupGuard(u32);
-
-impl GroupGuard {
-    /// `pgid` is the pid of a child started with `process_group(0)`.
-    pub fn register(pgid: u32) -> GroupGuard {
-        let mut groups = lock(&RUNNING_GROUPS);
-        if groups.len() < MAX_TRACKED_GROUPS {
-            groups.push(pgid);
-        }
-        GroupGuard(pgid)
-    }
-}
-
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        let mut groups = lock(&RUNNING_GROUPS);
-        if let Some(i) = groups.iter().position(|g| *g == self.0) {
-            groups.swap_remove(i);
-        }
-    }
-}
-
 /// Runs one program to completion within the limits of `spec`. Never panics, never uses a shell.
 pub fn run_bounded(spec: &RunSpec) -> RunResult {
+    run_bounded_tracked(spec, &JobTracker::new())
+}
+
+/// [`run_bounded`], with the child's process group registered in `tracker` from the moment the
+/// child exists until its group was killed and the output readers are done.
+pub fn run_bounded_tracked(spec: &RunSpec, tracker: &JobTracker) -> RunResult {
     let Some(program) = resolve_program(&spec.program, &spec.cwd, &spec.env) else {
         return spawn_failed(format!(
             "program {} not found or not executable",
@@ -304,8 +411,8 @@ pub fn run_bounded(spec: &RunSpec) -> RunResult {
         Err(e) => return spawn_failed(e.to_string()),
     };
     let pid = child.id();
-    // Registered until this function returns, which is after the group was killed.
-    let _group = GroupGuard::register(pid);
+    let _tracked = tracker.track(pid);
+    let mut sweeper = Sweeper::new(tracker, pid);
 
     let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
         terminate(&mut child, pid);
@@ -343,11 +450,15 @@ pub fn run_bounded(spec: &RunSpec) -> RunResult {
             break ExitKind::OutputLimit;
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
+            sweeper.sample(true);
             stop_gracefully(&mut child, pid);
             break ExitKind::TimedOut;
         }
+        sweeper.sample(false);
         thread::sleep(POLL_INTERVAL);
     };
+    // Whatever left the group is stopped too; the group itself was killed above.
+    sweeper.kill_all();
 
     let reader_end = Instant::now() + READER_GRACE;
     while !(out.done.load(Ordering::SeqCst) && err.done.load(Ordering::SeqCst))
@@ -393,32 +504,38 @@ pub(crate) fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<std:
 }
 
 /// Last `max` bytes of `bytes`.
-fn last_bytes(bytes: &[u8], max: usize) -> &[u8] {
-    bytes.split_at(bytes.len().saturating_sub(max)).1
-}
-
-/// Lossy text of stdout (+ stderr under a separator), at most the last 64 KiB.
-fn combined_text(result: &RunResult) -> String {
-    let mut bytes = last_bytes(&result.stdout, OUTPUT_TEXT_BYTES).to_vec();
+/// Lossy text of stdout (+ stderr under a separator), redacted line by line over the *whole*
+/// capture (at most 4 MiB per stream) and only then cut to the last 64 KiB. Cutting first would
+/// let a token or a private-key block that spans the cut lose the part the redaction rules
+/// recognize.
+pub(crate) fn redacted_tail(result: &RunResult, redactor: &Arc<Redactor>) -> String {
+    let mut text = redact_block(redactor, &String::from_utf8_lossy(&result.stdout));
     if !result.stderr.is_empty() {
-        bytes.extend_from_slice(STDERR_SEPARATOR.as_bytes());
-        bytes.extend_from_slice(last_bytes(&result.stderr, OUTPUT_TEXT_BYTES));
+        text.push_str(STDERR_SEPARATOR);
+        text.push_str(&redact_block(
+            redactor,
+            &String::from_utf8_lossy(&result.stderr),
+        ));
     }
-    let text = String::from_utf8_lossy(&bytes);
     tail_str(&text, OUTPUT_TEXT_BYTES).to_string()
 }
 
-fn run_gate(worktree: &Path, gate: &GateSpec, redactor: &Arc<Redactor>) -> GateOutcome {
-    let result = run_bounded(&RunSpec {
-        program: gate.program.clone(),
-        args: gate.args.clone(),
-        cwd: worktree.to_path_buf(),
-        env: gate.env.clone(),
-        timeout_ms: gate.timeout_ms,
-        max_output: MAX_GATE_OUTPUT,
-    });
-    // Redacted before evaluation so a cut at the tail limit cannot leave half a secret behind.
-    let text = redact_block(redactor, &combined_text(&result));
+fn run_gate(worktree: &Path, gate: &GateSpec, ctx: &JobContext) -> GateOutcome {
+    let redactor = &ctx.redactor;
+    let result = run_bounded_tracked(
+        &RunSpec {
+            program: gate.program.clone(),
+            args: gate.args.clone(),
+            cwd: worktree.to_path_buf(),
+            env: gate.env.clone(),
+            timeout_ms: gate.timeout_ms,
+            max_output: MAX_GATE_OUTPUT,
+        },
+        &ctx.tracker,
+    );
+    // Redacted before evaluation, and the whole capture before it is cut to its tail, so a cut
+    // can neither leave half a secret behind nor hide the start of a key block.
+    let text = redacted_tail(&result, redactor);
     let mut outcome = match gate.format {
         GateFormat::Exit => evaluate_exit(&gate.name, &result.exit, &text),
         GateFormat::RefcheckJson => {
@@ -448,8 +565,9 @@ fn command_summary(exit: &ExitKind) -> String {
 }
 
 /// Runs a job to completion on the calling thread.
-fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
+fn execute(job: &Job, ctx: &JobContext) -> JobDone {
     match job {
+        Job::Verify(v) => JobDone::Verify(Box::new(crate::verify::run_verify(v, ctx))),
         Job::Gates {
             run,
             task,
@@ -459,10 +577,7 @@ fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
         } => {
             let dir = PathBuf::from(worktree);
             // Every gate runs, also after a failure: the retry brief lists all of them.
-            let outcomes = gates
-                .iter()
-                .map(|gate| run_gate(&dir, gate, redactor))
-                .collect();
+            let outcomes = gates.iter().map(|gate| run_gate(&dir, gate, ctx)).collect();
             JobDone::Gates {
                 run: run.clone(),
                 task: task.clone(),
@@ -489,15 +604,18 @@ fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
                     };
                 }
             };
-            let result = run_bounded(&RunSpec {
-                program: program.display().to_string(),
-                args: args.clone(),
-                cwd: PathBuf::from(worktree),
-                env: env.clone(),
-                timeout_ms: *timeout_ms,
-                max_output: MAX_GATE_OUTPUT,
-            });
-            let text = redact_block(redactor, &sanitize_text(combined_text(&result).as_bytes()));
+            let result = run_bounded_tracked(
+                &RunSpec {
+                    program: program.display().to_string(),
+                    args: args.clone(),
+                    cwd: PathBuf::from(worktree),
+                    env: env.clone(),
+                    timeout_ms: *timeout_ms,
+                    max_output: MAX_GATE_OUTPUT,
+                },
+                &ctx.tracker,
+            );
+            let text = sanitize_text(redacted_tail(&result, &ctx.redactor).as_bytes());
             JobDone::Command {
                 approval: approval.clone(),
                 exit_code: match result.exit {
@@ -515,6 +633,7 @@ fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
 fn panic_result(job: &Job) -> JobDone {
     const WHY: &str = "internal error: the job panicked";
     match job {
+        Job::Verify(v) => JobDone::Verify(Box::new(crate::verify::failed_run(v, WHY))),
         Job::Gates {
             run,
             task,
@@ -557,13 +676,13 @@ impl Drop for RunningGuard {
 /// channel and collected by [`JobRunner::poll`].
 pub struct ThreadJobRunner {
     max_concurrent: usize,
-    redactor: Arc<Redactor>,
+    ctx: JobContext,
     running: Arc<AtomicUsize>,
     tx: Sender<JobDone>,
     rx: Receiver<JobDone>,
 }
 
-type JobFn = fn(&Job, &Arc<Redactor>) -> JobDone;
+type JobFn = fn(&Job, &JobContext) -> JobDone;
 
 impl ThreadJobRunner {
     /// `redactor` is applied to everything gates and commands print before it is reported.
@@ -571,11 +690,27 @@ impl ThreadJobRunner {
         let (tx, rx) = channel();
         ThreadJobRunner {
             max_concurrent,
-            redactor,
+            ctx: JobContext {
+                redactor,
+                tracker: JobTracker::new(),
+                verify: None,
+            },
             running: Arc::new(AtomicUsize::new(0)),
             tx,
             rx,
         }
+    }
+
+    /// Lists the children of this runner in `tracker`, the one the daemon's other adapters share.
+    pub fn with_tracker(mut self, tracker: JobTracker) -> ThreadJobRunner {
+        self.ctx.tracker = tracker;
+        self
+    }
+
+    /// Lets this runner run verification jobs: commits are exported with `host`.
+    pub fn with_verification(mut self, host: crate::verify::VerifyHost) -> ThreadJobRunner {
+        self.ctx.verify = Some(Arc::new(host));
+        self
     }
 
     fn start_with(&mut self, job: Job, exec: JobFn) -> Result<()> {
@@ -589,12 +724,12 @@ impl ThreadJobRunner {
         self.running.fetch_add(1, Ordering::SeqCst);
         let counter = Arc::clone(&self.running);
         let tx = self.tx.clone();
-        let redactor = Arc::clone(&self.redactor);
+        let ctx = self.ctx.clone();
         let spawned = thread::Builder::new()
             .name("fleet-job".into())
             .spawn(move || {
                 let guard = RunningGuard(counter);
-                let done = catch_unwind(AssertUnwindSafe(|| exec(&job, &redactor)))
+                let done = catch_unwind(AssertUnwindSafe(|| exec(&job, &ctx)))
                     .unwrap_or_else(|_| panic_result(&job));
                 // The result is queued before the job stops counting as running.
                 let _ = tx.send(done);
@@ -620,6 +755,10 @@ impl JobRunner for ThreadJobRunner {
 
     fn running(&self) -> usize {
         self.running.load(Ordering::SeqCst)
+    }
+
+    fn live(&self) -> Vec<LiveSession> {
+        self.ctx.tracker.live()
     }
 }
 
@@ -649,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn a_running_job_group_is_listed_until_the_job_has_ended() {
+    fn the_tracker_lists_a_running_group_leader_until_the_job_has_ended() {
         let dir = TempDir::new("job-groups");
         // the script publishes its own pid (the group leader) so the test knows what to look for
         let script = dir.script(
@@ -659,32 +798,41 @@ mod tests {
                 dir.path().display()
             ),
         );
+        let tracker = JobTracker::new();
         let job = std::thread::spawn({
-            let s = spec(&script, &[], &dir);
-            move || run_bounded(&s)
+            let (s, t) = (spec(&script, &[], &dir), tracker.clone());
+            move || run_bounded_tracked(&s, &t)
         });
         assert!(
             wait_until(10_000, || dir.exists("pid")),
             "the script started"
         );
         let leader: u32 = dir.read("pid").trim().parse().unwrap();
-        assert!(running_groups().contains(&leader), "listed while it runs");
+        assert!(
+            tracker
+                .live()
+                .iter()
+                .any(|l| l.pid == leader && l.pgid == leader),
+            "listed while it runs: {:?}",
+            tracker.live()
+        );
         job.join().unwrap();
-        assert!(!running_groups().contains(&leader), "gone after it ended");
+        assert!(tracker.live().is_empty(), "gone after it ended");
     }
 
     #[test]
-    fn the_group_list_is_bounded() {
-        let guards: Vec<GroupGuard> = (0..MAX_TRACKED_GROUPS + 20)
-            .map(|i| GroupGuard::register(4_000_000 + i as u32))
+    fn clones_of_a_tracker_share_one_list_and_it_is_bounded() {
+        let tracker = JobTracker::new();
+        let other = tracker.clone();
+        let guards: Vec<Tracked> = (0..MAX_TRACKED + 20)
+            .map(|i| other.track(4_000_000 + i as u32))
             .collect();
-        let tracked = running_groups()
-            .into_iter()
-            .filter(|g| *g >= 4_000_000)
-            .count();
-        assert!(tracked <= MAX_TRACKED_GROUPS);
+        assert_eq!(tracker.live().len(), MAX_TRACKED);
         drop(guards);
-        assert!(running_groups().iter().all(|g| *g < 4_000_000));
+        assert!(
+            tracker.live().is_empty(),
+            "every guard removed its entry (or had none)"
+        );
     }
 
     fn run_script(body: &str) -> RunResult {
@@ -757,6 +905,61 @@ mod tests {
             wait_until(5_000, || !process_alive(&pid)),
             "grandchild {pid} survived the timeout"
         );
+    }
+
+    #[test]
+    fn a_descendant_that_left_the_group_is_killed_when_the_check_is_over() {
+        if !Path::new("/usr/bin/setsid").exists() && !Path::new("/bin/setsid").exists() {
+            return;
+        }
+        let dir = TempDir::new("job-setsid");
+        // the grandchild starts a session of its own: the group kill cannot reach it
+        let script = dir.script(
+            "s.sh",
+            "#!/bin/sh\nsetsid sh -c 'echo $$ > \"$1\"; sleep 60' x \"$1\" &\nsleep 1\nexit 0\n",
+        );
+        let pidfile = dir.join("detached.pid");
+        let tracker = JobTracker::new();
+        let result =
+            run_bounded_tracked(&spec(&script, &[pidfile.to_str().unwrap()], &dir), &tracker);
+        assert_eq!(result.exit, ExitKind::Code(0));
+        let pid = read_pid(&dir, "detached.pid").expect("the detached process wrote its pid");
+        assert!(
+            wait_until(5_000, || !process_alive(&pid)),
+            "the detached descendant {pid} survived"
+        );
+        assert!(tracker.live().is_empty(), "nothing stays registered");
+    }
+
+    #[test]
+    fn a_detached_descendant_counts_as_worker_origin_while_it_runs() {
+        if !Path::new("/usr/bin/setsid").exists() && !Path::new("/bin/setsid").exists() {
+            return;
+        }
+        let dir = TempDir::new("job-setsid-live");
+        let script = dir.script(
+            "s.sh",
+            "#!/bin/sh\nsetsid sh -c 'echo $$ > \"$1\"; sleep 60' x \"$1\" &\ni=0; while [ ! -f go ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\nexit 0\n",
+        );
+        let pidfile = dir.join("detached.pid");
+        let tracker = JobTracker::new();
+        let t2 = tracker.clone();
+        let mut s = spec(&script, &[pidfile.to_str().unwrap()], &dir);
+        s.cwd = dir.path().to_path_buf();
+        let handle = thread::spawn(move || run_bounded_tracked(&s, &t2));
+        assert!(wait_until(10_000, || dir.exists("detached.pid")));
+        let pid: u32 = dir.read("detached.pid").trim().parse().unwrap();
+        assert!(
+            wait_until(5_000, || tracker
+                .live()
+                .iter()
+                .any(|l| l.pid == pid && l.pgid == 0)),
+            "{:?}",
+            tracker.live()
+        );
+        dir.write("go", "");
+        handle.join().unwrap();
+        assert!(tracker.live().is_empty());
     }
 
     #[test]
@@ -929,6 +1132,14 @@ mod tests {
         Arc::new(Redactor::builtin())
     }
 
+    fn ctx() -> JobContext {
+        JobContext {
+            redactor: rd(),
+            tracker: JobTracker::new(),
+            verify: None,
+        }
+    }
+
     fn gate(dir: &TempDir, name: &str, body: &str, format: GateFormat) -> GateSpec {
         let script = dir.script(&format!("{name}.sh"), &format!("#!/bin/sh\n{body}\n"));
         GateSpec {
@@ -944,7 +1155,7 @@ mod tests {
     fn run_one(body: &str, format: GateFormat) -> GateOutcome {
         let dir = TempDir::new("job-gate");
         let g = gate(&dir, "g", body, format);
-        run_gate(dir.path(), &g, &rd())
+        run_gate(dir.path(), &g, &ctx())
     }
 
     #[test]
@@ -1021,10 +1232,10 @@ mod tests {
         let dir = TempDir::new("job-gate-bad");
         let mut slow = gate(&dir, "slow", "sleep 30", GateFormat::Exit);
         slow.timeout_ms = 300;
-        assert_eq!(run_gate(dir.path(), &slow, &rd()).summary, "timed out");
+        assert_eq!(run_gate(dir.path(), &slow, &ctx()).summary, "timed out");
         let mut missing = gate(&dir, "missing", "", GateFormat::Exit);
         missing.program = "/nonexistent/prog".to_string();
-        let o = run_gate(dir.path(), &missing, &rd());
+        let o = run_gate(dir.path(), &missing, &ctx());
         assert!(!o.passed);
         assert!(o.summary.starts_with("could not start"), "{o:?}");
     }
@@ -1055,7 +1266,7 @@ mod tests {
             task,
             attempt,
             outcomes,
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a gates result");
         };
@@ -1077,7 +1288,7 @@ mod tests {
         let work = dir.join("wt");
         std::fs::create_dir_all(&work).unwrap();
         let g = gate(&dir, "pwd", "echo here > marker", GateFormat::Exit);
-        let o = run_gate(&work, &g, &rd());
+        let o = run_gate(&work, &g, &ctx());
         assert!(o.passed);
         assert!(work.join("marker").exists());
     }
@@ -1111,7 +1322,7 @@ mod tests {
             exit_code,
             summary,
             output,
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1126,7 +1337,7 @@ mod tests {
     fn command_job_output_is_a_bounded_tail() {
         let dir = TempDir::new("job-cmd-tail");
         let job = command_job(&dir, "i=0; while [ $i -lt 2000 ]; do echo line-$i-padding-padding-padding; i=$((i+1)); done; echo THE-END", 20_000);
-        let JobDone::Command { output, .. } = execute(&job, &rd()) else {
+        let JobDone::Command { output, .. } = execute(&job, &ctx()) else {
             panic!("expected a command result");
         };
         assert!(output.len() <= COMMAND_OUTPUT_BYTES);
@@ -1138,7 +1349,7 @@ mod tests {
         let dir = TempDir::new("job-cmd-fail");
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&command_job(&dir, "sleep 30", 300), &rd())
+        } = execute(&command_job(&dir, "sleep 30", 300), &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1146,7 +1357,7 @@ mod tests {
 
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&command_job(&dir, "kill -9 $$", 10_000), &rd())
+        } = execute(&command_job(&dir, "kill -9 $$", 10_000), &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1162,7 +1373,7 @@ mod tests {
         };
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1208,6 +1419,129 @@ mod tests {
             got.len()
         );
         got
+    }
+
+    // ---- process groups of running jobs count as worker origin ------------------------------
+
+    fn live_pids(runner: &ThreadJobRunner) -> Vec<(u32, u32)> {
+        runner.live().iter().map(|l| (l.pid, l.pgid)).collect()
+    }
+
+    #[test]
+    fn the_children_of_running_jobs_are_listed_until_their_group_is_gone() {
+        let dir = TempDir::new("job-live");
+        let mut runner = ThreadJobRunner::new(4, rd());
+        assert!(runner.live().is_empty());
+        // a command job whose child leaves a grandchild behind in the group, then waits
+        let job = command_job(
+            &dir,
+            "echo $$ > pid; (sleep 5 &) ; i=0; while [ ! -f go ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done",
+            20_000,
+        );
+        let Job::Command { worktree, .. } = &job else {
+            panic!("a command job")
+        };
+        let wt = PathBuf::from(worktree);
+        runner.start(job).unwrap();
+        assert!(wait_until(10_000, || wt.join("pid").exists()));
+        let pid: u32 = std::fs::read_to_string(wt.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let live = live_pids(&runner);
+        assert!(
+            live.contains(&(pid, pid)),
+            "the group leader is registered: {live:?}"
+        );
+        std::fs::write(wt.join("go"), "").unwrap();
+        collect(&mut runner, 1);
+        // the result is queued before the guard of the child is dropped; both happen right away
+        assert!(wait_until(5_000, || runner.live().is_empty()));
+        assert!(
+            !crate::procid::group_exists(pid),
+            "the group was killed before it was forgotten"
+        );
+    }
+
+    #[test]
+    fn gates_and_several_jobs_at_once_are_all_listed() {
+        let dir = TempDir::new("job-live-gates");
+        let mut runner = ThreadJobRunner::new(4, rd());
+        let slow = gate(
+            &dir,
+            "slow",
+            "echo $$ > pid-slow; i=0; while [ ! -f go ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done",
+            GateFormat::Exit,
+        );
+        runner.start(gates_job(&dir, vec![slow])).unwrap();
+        assert!(wait_until(10_000, || dir.exists("pid-slow")));
+        let pid: u32 = dir.read("pid-slow").trim().parse().unwrap();
+        assert!(live_pids(&runner).contains(&(pid, pid)));
+        dir.write("go", "");
+        collect(&mut runner, 1);
+        assert!(wait_until(5_000, || runner.live().is_empty()));
+    }
+
+    #[test]
+    fn a_child_that_cannot_start_is_never_listed() {
+        let tracker = JobTracker::new();
+        let dir = TempDir::new("job-live-none");
+        let r = run_bounded_tracked(&spec(Path::new("/nonexistent/prog"), &[], &dir), &tracker);
+        assert!(matches!(r.exit, ExitKind::SpawnFailed(_)));
+        assert!(tracker.live().is_empty());
+    }
+
+    // ---- redaction happens on the whole capture, before the tail is cut ---------------------------
+
+    /// What the code did before: cut the last 64 KiB, then redact.
+    fn legacy_cut_then_redact(result: &RunResult) -> String {
+        let text = String::from_utf8_lossy(&result.stdout);
+        redact_block(&rd(), tail_str(&text, OUTPUT_TEXT_BYTES))
+    }
+
+    #[test]
+    fn a_token_that_spans_the_start_of_the_kept_tail_is_still_redacted() {
+        let token = token();
+        // the kept window starts 12 bytes into the token
+        let keep_after_token = OUTPUT_TEXT_BYTES - (token.len() - 12) - 1;
+        let result = RunResult {
+            exit: ExitKind::Code(0),
+            stdout: format!(
+                "{}\n{token}{}\n",
+                "x".repeat(1000),
+                "y".repeat(keep_after_token)
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+        };
+        let fragment = &token[12..];
+        assert!(
+            legacy_cut_then_redact(&result).contains(fragment),
+            "the scenario must leak with the old order (it is the finding)"
+        );
+        let text = redacted_tail(&result, &rd());
+        assert!(!text.contains(fragment), "{}", &text[..80.min(text.len())]);
+        assert!(!text.contains(&token));
+        assert!(text.len() <= OUTPUT_TEXT_BYTES);
+    }
+
+    #[test]
+    fn a_private_key_block_that_starts_before_the_kept_tail_is_dropped_whole() {
+        let body = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\n".repeat(40);
+        let block = format!(
+            "-----BEGIN {} KEY-----\n{body}-----END {} KEY-----\n",
+            "PRIVATE", "PRIVATE"
+        );
+        let filler = "z".repeat(OUTPUT_TEXT_BYTES);
+        let result = RunResult {
+            exit: ExitKind::Code(0),
+            stdout: format!("{filler}\n{block}after\n").into_bytes(),
+            stderr: format!("{filler}\n{block}err-after\n").into_bytes(),
+        };
+        let text = redacted_tail(&result, &rd());
+        assert!(!text.contains("QUJDREVG"), "{text}");
+        assert!(text.contains("err-after"));
     }
 
     #[test]
@@ -1275,7 +1609,7 @@ mod tests {
         assert_eq!(runner.running(), 0);
     }
 
-    fn exploding(_: &Job, _: &Arc<Redactor>) -> JobDone {
+    fn exploding(_: &Job, _: &JobContext) -> JobDone {
         panic!("simulated failure inside a job");
     }
 
@@ -1425,7 +1759,7 @@ mod tests {
             summary,
             output,
             ..
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1450,7 +1784,7 @@ mod tests {
         };
         let JobDone::Command {
             exit_code, summary, ..
-        } = execute(&job, &rd())
+        } = execute(&job, &ctx())
         else {
             panic!("expected a command result");
         };
@@ -1502,7 +1836,7 @@ mod tests {
             GateFormat::Exit,
         );
         g.args = vec![token()];
-        let o = run_gate(dir.path(), &g, &rd());
+        let o = run_gate(dir.path(), &g, &ctx());
         assert!(!o.passed);
         assert!(
             !o.output.contains(&token()) && !o.summary.contains(&token()),
@@ -1521,7 +1855,7 @@ mod tests {
         let body = r#"printf '{"version":1,"summary":{"errors":1},"findings":[{"severity":"error","file":"a.rs","line":3,"message":"leaked %s"}]}\n' "$1"; exit 1"#;
         let mut g = gate(&dir, "refcheck", body, GateFormat::RefcheckJson);
         g.args = vec![token()];
-        let o = run_gate(dir.path(), &g, &rd());
+        let o = run_gate(dir.path(), &g, &ctx());
         assert!(!o.passed);
         assert!(
             !o.output.contains(&token()) && !o.summary.contains(&token()),
@@ -1537,7 +1871,7 @@ mod tests {
         if let Job::Command { args, .. } = &mut job {
             args.push(token());
         }
-        let JobDone::Command { output, .. } = execute(&job, &rd()) else {
+        let JobDone::Command { output, .. } = execute(&job, &ctx()) else {
             panic!("expected a command result");
         };
         assert!(!output.contains(&token()), "{output}");

@@ -12,6 +12,7 @@ use fleet_domain::run::NewTask;
 use fleet_domain::sanitize::sanitize_text;
 use fleet_domain::status::{EndKind, TaskStatus};
 use fleet_domain::value::Value;
+use neo_goals::ledger::TaskContract;
 use std::collections::BTreeSet;
 
 fn data(schema: &str, pairs: Vec<(&str, Value)>) -> Reply {
@@ -75,7 +76,7 @@ impl Orchestrator {
                 let events = self.state.decide_approval(
                     &id,
                     approve,
-                    digest.as_deref(),
+                    &digest,
                     now,
                     self.ports.digest.as_ref(),
                 )?;
@@ -101,6 +102,22 @@ impl Orchestrator {
                 "fleet.events/1",
                 vec![("events", views::recent_value(&self.recent, limit))],
             )),
+            Command::GoalAdd(args) => self.goal_add(args),
+            Command::GoalAttach { goal, contract } => self.goal_attach(&goal, &contract),
+            Command::GoalSetStatus {
+                goal,
+                status,
+                reason,
+            } => self.goal_set_status(&goal, status, &reason),
+            Command::GoalList => Ok(self.goal_list()),
+            Command::GoalShow { goal } => self.goal_show(&goal),
+            Command::GoalRemaining => Ok(self.goal_remaining()),
+            Command::Verify { target, task } => self.verify_command(&target, task.as_deref()),
+            Command::VerifyStatus {
+                target,
+                task,
+                ticket,
+            } => self.verify_status(&target, task.as_deref(), ticket),
             Command::Shutdown => {
                 self.shutdown_requested = true;
                 self.begin_shutdown();
@@ -444,6 +461,19 @@ impl Orchestrator {
             )
         };
         let head = self.ports.vcs.branch_head(&repo, &branch)?;
+        // A task a verification contract guards is merged only as the commit that was proven:
+        // the branch may have moved since (a worker process, a commit made while the gates ran).
+        match self.ledger.task_contract_at(&key.0, &key.1, &head) {
+            TaskContract::NotGoverned | TaskContract::Passed => {}
+            _ => {
+                return Err(FleetError::conflict(format!(
+                    "{} is guarded by a verification contract and has no passing evidence for the commit that would be merged ({}); run `fleet verify {}` first",
+                    qualified(&key.0, &key.1),
+                    head.as_str().get(..12).unwrap_or(head.as_str()),
+                    qualified(&key.0, &key.1)
+                )))
+            }
+        }
         let now = self.now();
         let gate = self.state.request_merge(
             &key.0,

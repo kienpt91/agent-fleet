@@ -5,10 +5,11 @@
 
 use crate::ports::SessionId;
 use fleet_domain::error::{FleetError, Result};
-use fleet_domain::ids::{ApprovalId, DecisionId, RunId, TaskId, WorkerName};
+use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, RunId, TaskId, WorkerName};
 use fleet_domain::limits::MAX_SEND_BYTES;
 use fleet_domain::run::NewTask;
-use fleet_domain::value::Value;
+use fleet_domain::status::GoalStatus;
+use fleet_domain::value::{Document, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewRunArgs {
@@ -17,6 +18,19 @@ pub struct NewRunArgs {
     pub repo: String,
     pub base: Option<String>,
     pub max_parallel: Option<u32>,
+}
+
+/// A goal to add to the goal ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewGoalArgs {
+    pub id: Option<GoalId>,
+    pub parent: Option<GoalId>,
+    pub title: String,
+    pub intent: String,
+    /// `run/task` references (or bare task ids that are unique across runs).
+    pub tasks: Vec<String>,
+    /// A verification contract document, validated by the application.
+    pub contract: Option<Document>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,7 +86,8 @@ pub enum Command {
     Decide {
         id: ApprovalId,
         approve: bool,
-        digest: Option<String>,
+        /// The digest of the action the decision covers (at least 12 hex digits). Required.
+        digest: String,
     },
     Merge {
         task: String,
@@ -87,6 +102,33 @@ pub enum Command {
     },
     Events {
         limit: usize,
+    },
+    GoalAdd(NewGoalArgs),
+    GoalAttach {
+        goal: GoalId,
+        contract: Document,
+    },
+    GoalSetStatus {
+        goal: GoalId,
+        status: GoalStatus,
+        reason: String,
+    },
+    GoalList,
+    GoalShow {
+        goal: GoalId,
+    },
+    GoalRemaining,
+    /// Runs the contract of a goal, or the contracts of every goal a task works on, in the
+    /// task's worktree. `task` names the worktree for a goal that does not name exactly one task.
+    Verify {
+        target: String,
+        task: Option<String>,
+    },
+    VerifyStatus {
+        target: String,
+        task: Option<String>,
+        /// The ticket `verify` returned: report on that run.
+        ticket: Option<u64>,
     },
     Shutdown,
 }
@@ -199,6 +241,36 @@ fn parse_new_task(v: &Value) -> Result<NewTask> {
     })
 }
 
+fn parse_document(v: &Value, key: &str) -> Result<Document> {
+    match v.get(key) {
+        Some(doc) if doc.as_object().is_some() => Ok(Document(doc.clone())),
+        _ => Err(FleetError::invalid(format!("`{key}` must be an object"))),
+    }
+}
+
+fn parse_goal_id(a: &Args<'_>, key: &str) -> Result<GoalId> {
+    GoalId::parse(a.req_str(key)?)
+}
+
+fn parse_new_goal(v: &Value) -> Result<NewGoalArgs> {
+    let a = Args(v);
+    Ok(NewGoalArgs {
+        id: a.opt_str("id")?.map(GoalId::parse).transpose()?,
+        parent: a.opt_str("parent")?.map(GoalId::parse).transpose()?,
+        title: a.req_str("title")?.to_string(),
+        intent: a.opt_str("intent")?.unwrap_or("").to_string(),
+        tasks: a
+            .str_list("tasks")?
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        contract: match v.get("contract") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(parse_document(v, "contract")?),
+        },
+    })
+}
+
 fn parse_new_run(v: &Value) -> Result<NewRunArgs> {
     if v.as_object().is_none() {
         return Err(FleetError::invalid("a run must be an object"));
@@ -294,7 +366,7 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
             approve: a
                 .opt_bool("approve")?
                 .ok_or_else(|| FleetError::invalid("`approve` is required"))?,
-            digest: a.opt_str("digest")?.map(str::to_string),
+            digest: a.req_str("digest")?.to_string(),
         },
         "merge" => Command::Merge { task: task()? },
         "cleanup" => Command::Cleanup {
@@ -310,6 +382,34 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
                 .opt_u64("limit")?
                 .map_or(50, |n| usize::try_from(n).unwrap_or(usize::MAX))
                 .clamp(1, 500),
+        },
+        "goal.add" => Command::GoalAdd(parse_new_goal(args)?),
+        "goal.attach" => Command::GoalAttach {
+            goal: parse_goal_id(&a, "goal")?,
+            contract: parse_document(args, "contract")?,
+        },
+        "goal.status" => Command::GoalSetStatus {
+            goal: parse_goal_id(&a, "goal")?,
+            status: GoalStatus::parse(a.req_str("status")?).ok_or_else(|| {
+                FleetError::invalid(
+                    "`status` must be open, in_progress, blocked, verified or abandoned",
+                )
+            })?,
+            reason: a.opt_str("reason")?.unwrap_or("").to_string(),
+        },
+        "goal.list" => Command::GoalList,
+        "goal.show" => Command::GoalShow {
+            goal: parse_goal_id(&a, "goal")?,
+        },
+        "goal.remaining" => Command::GoalRemaining,
+        "verify" => Command::Verify {
+            target: a.req_str("target")?.to_string(),
+            task: a.opt_str("task")?.map(str::to_string),
+        },
+        "verify.status" => Command::VerifyStatus {
+            target: a.req_str("target")?.to_string(),
+            task: a.opt_str("task")?.map(str::to_string),
+            ticket: a.opt_u64("ticket")?,
         },
         "shutdown" => Command::Shutdown,
         other => {
@@ -332,6 +432,10 @@ pub fn is_read_only(cmd: &Command) -> bool {
             | Command::GateList
             | Command::ApprovalList
             | Command::Events { .. }
+            | Command::GoalList
+            | Command::GoalShow { .. }
+            | Command::GoalRemaining
+            | Command::VerifyStatus { .. }
     )
 }
 
@@ -435,6 +539,18 @@ mod tests {
             ("approval.decide", vec![("id", Value::str("a1"))]),
             (
                 "approval.decide",
+                vec![("id", Value::str("a1")), ("approve", Value::Bool(true))],
+            ),
+            (
+                "approval.decide",
+                vec![
+                    ("id", Value::str("a1")),
+                    ("approve", Value::Bool(true)),
+                    ("digest", Value::Null),
+                ],
+            ),
+            (
+                "approval.decide",
                 vec![("id", Value::str("a1")), ("approve", Value::str("yes"))],
             ),
             (
@@ -518,6 +634,166 @@ mod tests {
             id: DecisionId::from_seq(1),
             answer: "x".into()
         }));
+    }
+
+    #[test]
+    fn goal_commands_parse() {
+        let contract = obj(vec![("version", Value::int(1))]);
+        let Command::GoalAdd(args) = parse(
+            "goal.add",
+            vec![
+                ("id", Value::str("ship")),
+                ("parent", Value::str("root")),
+                ("title", Value::str("Ship")),
+                ("intent", Value::str("why")),
+                ("tasks", Value::array([Value::str("r1/a")])),
+                ("contract", contract.clone()),
+            ],
+        )
+        .unwrap() else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.id.unwrap().as_str(), "ship");
+        assert_eq!(args.parent.unwrap().as_str(), "root");
+        assert_eq!((args.title.as_str(), args.intent.as_str()), ("Ship", "why"));
+        assert_eq!(args.tasks, vec!["r1/a".to_string()]);
+        assert_eq!(args.contract, Some(Document(contract.clone())));
+        let Command::GoalAdd(bare) = parse("goal.add", vec![("title", Value::str("T"))]).unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!((bare.id, bare.parent, bare.contract), (None, None, None));
+        assert!(bare.tasks.is_empty() && bare.intent.is_empty());
+        assert_eq!(
+            parse(
+                "goal.attach",
+                vec![("goal", Value::str("g")), ("contract", contract.clone())]
+            )
+            .unwrap(),
+            Command::GoalAttach {
+                goal: GoalId::parse("g").unwrap(),
+                contract: Document(contract)
+            }
+        );
+        assert_eq!(
+            parse(
+                "goal.status",
+                vec![
+                    ("goal", Value::str("g")),
+                    ("status", Value::str("blocked")),
+                    ("reason", Value::str("why"))
+                ]
+            )
+            .unwrap(),
+            Command::GoalSetStatus {
+                goal: GoalId::parse("g").unwrap(),
+                status: GoalStatus::Blocked,
+                reason: "why".into()
+            }
+        );
+        assert_eq!(parse("goal.list", vec![]).unwrap(), Command::GoalList);
+        assert_eq!(
+            parse("goal.remaining", vec![]).unwrap(),
+            Command::GoalRemaining
+        );
+        assert_eq!(
+            parse("goal.show", vec![("goal", Value::str("g"))]).unwrap(),
+            Command::GoalShow {
+                goal: GoalId::parse("g").unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn verify_commands_parse() {
+        assert_eq!(
+            parse("verify", vec![("target", Value::str("r1/a"))]).unwrap(),
+            Command::Verify {
+                target: "r1/a".into(),
+                task: None
+            }
+        );
+        assert_eq!(
+            parse(
+                "verify.status",
+                vec![("target", Value::str("g")), ("task", Value::str("r1/a"))]
+            )
+            .unwrap(),
+            Command::VerifyStatus {
+                target: "g".into(),
+                task: Some("r1/a".into()),
+                ticket: None
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_goal_requests_are_rejected() {
+        let cases: Vec<(&str, Vec<(&str, Value)>)> = vec![
+            ("goal.add", vec![]),
+            (
+                "goal.add",
+                vec![("title", Value::str("t")), ("id", Value::str("Bad Id"))],
+            ),
+            (
+                "goal.add",
+                vec![("title", Value::str("t")), ("tasks", Value::str("r1/a"))],
+            ),
+            (
+                "goal.add",
+                vec![("title", Value::str("t")), ("contract", Value::str("x"))],
+            ),
+            ("goal.attach", vec![("goal", Value::str("g"))]),
+            (
+                "goal.attach",
+                vec![("goal", Value::str("g")), ("contract", Value::int(1))],
+            ),
+            (
+                "goal.status",
+                vec![("goal", Value::str("g")), ("status", Value::str("done"))],
+            ),
+            ("goal.status", vec![("goal", Value::str("g"))]),
+            ("goal.show", vec![]),
+            ("goal.show", vec![("goal", Value::str("../x"))]),
+            ("verify", vec![]),
+            ("verify", vec![("target", Value::int(3))]),
+            ("verify.status", vec![]),
+        ];
+        for (name, pairs) in cases {
+            let err = parse(name, pairs.clone()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Invalid, "{name} {pairs:?}");
+        }
+    }
+
+    #[test]
+    fn goal_reads_are_read_only_and_writes_are_not() {
+        for cmd in [
+            Command::GoalList,
+            Command::GoalRemaining,
+            Command::GoalShow {
+                goal: GoalId::parse("g").unwrap(),
+            },
+            Command::VerifyStatus {
+                target: "g".into(),
+                task: None,
+                ticket: None,
+            },
+        ] {
+            assert!(is_read_only(&cmd), "{cmd:?}");
+        }
+        for cmd in [
+            Command::Verify {
+                target: "g".into(),
+                task: None,
+            },
+            Command::GoalSetStatus {
+                goal: GoalId::parse("g").unwrap(),
+                status: GoalStatus::Open,
+                reason: String::new(),
+            },
+        ] {
+            assert!(!is_read_only(&cmd), "{cmd:?}");
+        }
     }
 
     #[test]

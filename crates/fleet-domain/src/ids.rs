@@ -242,6 +242,16 @@ string_id!(
     |s| validate_counter_id("approval", 'a', s)
 );
 string_id!(
+    /// Identifies a goal of the goal ledger. Same character rules as run and task ids.
+    GoalId,
+    |s| validate_id("goal", s)
+);
+string_id!(
+    /// Identifies one piece of evidence: `e` followed by a number.
+    EvidenceId,
+    |s| validate_counter_id("evidence", 'e', s)
+);
+string_id!(
     /// A git object id in lowercase hex (SHA-1 or SHA-256 repositories).
     Sha,
     validate_sha
@@ -268,6 +278,27 @@ impl RunId {
 impl TaskId {
     pub fn from_seq(n: u64) -> Self {
         TaskId(format!("t{n}"))
+    }
+}
+
+impl GoalId {
+    /// The id the ledger gives a goal that was added without a name: `goal-<n>`.
+    pub fn from_seq(n: u64) -> Self {
+        GoalId(format!("goal-{n}"))
+    }
+}
+
+impl EvidenceId {
+    pub fn from_seq(n: u64) -> Self {
+        EvidenceId(format!("e{n}"))
+    }
+
+    /// The number after the `e`; evidence is ordered by it.
+    pub fn seq(&self) -> u64 {
+        self.0
+            .strip_prefix('e')
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0)
     }
 }
 
@@ -307,6 +338,21 @@ mod tests {
     fn ids_accept_plain_names() {
         for ok in ["a", "t1", "build-api", "x_y", "0day", "r12"] {
             assert!(validate_id("task", ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn goal_and_evidence_ids() {
+        assert_eq!(GoalId::from_seq(3).as_str(), "goal-3");
+        assert!(GoalId::parse(GoalId::from_seq(3).as_str()).is_ok());
+        assert!(GoalId::parse("Goal").is_err());
+        assert!(GoalId::parse("a/b").is_err());
+        let e = EvidenceId::from_seq(12);
+        assert_eq!(e.as_str(), "e12");
+        assert_eq!(e.seq(), 12);
+        assert!(EvidenceId::parse("e12").is_ok());
+        for bad in ["12", "e", "e1x", "g1", "e-1"] {
+            assert!(EvidenceId::parse(bad).is_err(), "{bad}");
         }
     }
 

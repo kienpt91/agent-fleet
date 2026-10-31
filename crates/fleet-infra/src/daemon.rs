@@ -11,13 +11,14 @@ use crate::contract_fs::FsContractFiles;
 use crate::digest::Sha256Digest;
 use crate::eventlog::FileEventStore;
 use crate::git::GitVcs;
-use crate::jobs::ThreadJobRunner;
+use crate::jobs::{JobTracker, ThreadJobRunner};
 use crate::logs::FileOutputLogs;
 use crate::procid;
 use crate::pty::{PtySessionHost, SessionIo, SessionRegistry};
 use crate::server::{AttachSession, HandlerReply, PeerInfo, RequestHandler, Server};
 use crate::statedir::{DaemonLock, StateLayout};
 use crate::undo::AgentUndo;
+use crate::verify::VerifyHost;
 use crate::web::{WebBackend, WebOptions, WebServer};
 use fleet_app::api::{parse_command, Command, Reply};
 use fleet_app::config::AppConfig;
@@ -178,6 +179,9 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     // output, and what workers write into their result and question files.
     let redactor = Arc::new(loaded.redactor);
     let registry = SessionRegistry::default();
+    // The children of gates, approved commands, verification checks, the undo tool and git are
+    // all listed here; the origin checks of the control socket and of the dashboard refuse them.
+    let tracker = JobTracker::new();
 
     // The handler is shared by the control socket and the dashboard, so both apply the same
     // admission rule and the same command validation. The dashboard is bound before anything
@@ -208,19 +212,25 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
             &layout.events,
             Box::new(Sha256Digest),
         )?),
-        vcs: Box::new(GitVcs::new(env.clone(), app.env.clone())),
+        vcs: Box::new(GitVcs::new(env.clone(), app.env.clone()).with_tracker(tracker.clone())),
         sessions: Box::new(PtySessionHost::new(
             loaded.ring_bytes,
             Arc::clone(&redactor),
             registry.clone(),
         )),
         contract: Box::new(FsContractFiles::new(Arc::clone(&redactor))),
-        jobs: Box::new(ThreadJobRunner::new(
-            MAX_CONCURRENT_JOBS,
-            Arc::clone(&redactor),
-        )),
+        jobs: Box::new(
+            ThreadJobRunner::new(MAX_CONCURRENT_JOBS, Arc::clone(&redactor))
+                .with_tracker(tracker.clone())
+                .with_verification(VerifyHost::new(
+                    GitVcs::new(env.clone(), app.env.clone()).with_tracker(tracker.clone()),
+                    layout.verify_dir.clone(),
+                )?),
+        ),
         logs: Box::new(FileOutputLogs::new(layout.logs_dir.clone())),
-        undo: Box::new(AgentUndo::detect_with_env(path_env.as_deref(), undo_env)),
+        undo: Box::new(
+            AgentUndo::detect_with_env(path_env.as_deref(), undo_env).with_tracker(tracker),
+        ),
         digest: Box::new(Sha256Digest),
         publisher: Box::new(NullPublisher),
     };
@@ -387,14 +397,10 @@ impl DaemonHandler {
     /// the socket). It runs at accept (`admit`, binding the decision to the connection) and
     /// again per request.
     fn check_origin(&self, peer: &PeerInfo) -> Result<()> {
-        let mut live = self.ask(|reply| EngineMsg::Live { reply })?;
-        // Gates, approved commands, the undo tool and git run code an agent influenced: their
-        // process groups count as worker origin too, even after a member was adopted by init.
-        live.extend(
-            crate::jobs::running_groups()
-                .into_iter()
-                .map(|g| LiveSession { pid: g, pgid: g }),
-        );
+        // The engine's answer is every live worker session plus every child a job, the undo tool
+        // or git has running (the shared `JobTracker`), also the descendants that left their
+        // group; see `Orchestrator::live_sessions`.
+        let live = self.ask(|reply| EngineMsg::Live { reply })?;
         decide_origin(peer, &live, std::process::id(), procid::ancestry)
     }
 
@@ -556,6 +562,12 @@ pub const WEB_COMMANDS: &[&str] = &[
     "gate.resolve",
     "approval.decide",
     "merge",
+    // the goal ledger and verification, read only: `goal.add`, `goal.attach`, `goal.status` and
+    // `verify` (which starts processes) are not offered
+    "goal.list",
+    "goal.show",
+    "goal.remaining",
+    "verify.status",
 ];
 
 /// The dashboard's view of the daemon: the same handler as the control socket, restricted to
@@ -678,6 +690,57 @@ mod tests {
     fn an_operator_process_is_admitted_whether_or_not_workers_are_running() {
         assert!(decide_origin(&peer(Some(900)), &[WORKER], DAEMON, table).is_ok());
         assert!(decide_origin(&peer(Some(900)), &[], DAEMON, table).is_ok());
+    }
+
+    #[test]
+    fn the_dashboard_offers_the_goal_ledger_and_verification_read_only() {
+        let args = |pairs: &[(&str, &str)]| {
+            Value::object(pairs.iter().map(|(k, v)| (k.to_string(), Value::str(*v))))
+        };
+        for (cmd, a) in [
+            ("goal.list", args(&[])),
+            ("goal.show", args(&[("goal", "g")])),
+            ("goal.remaining", args(&[])),
+            ("verify.status", args(&[("target", "r1/a")])),
+        ] {
+            assert!(WEB_COMMANDS.contains(&cmd), "{cmd}");
+            let parsed = parse_command(cmd, &a).unwrap();
+            assert!(
+                fleet_app::api::is_read_only(&parsed),
+                "{cmd} changes nothing"
+            );
+        }
+        // everything that changes the ledger, starts a process or controls the daemon stays on the socket
+        for cmd in [
+            "goal.add",
+            "goal.attach",
+            "goal.status",
+            "verify",
+            "run.create",
+            "task.add",
+            "plan.load",
+            "run.start",
+            "task.stop",
+            "task.retry",
+            "task.cancel",
+            "task.attach",
+            "cleanup",
+            "undo",
+            "shutdown",
+        ] {
+            assert!(!WEB_COMMANDS.contains(&cmd), "{cmd} must not be offered");
+        }
+        // and everything on the list is either read only or one of the decisions a person makes
+        for cmd in WEB_COMMANDS {
+            assert!(
+                matches!(
+                    *cmd,
+                    "task.send" | "gate.resolve" | "approval.decide" | "merge"
+                ) || cmd.starts_with("goal.")
+                    || matches!(*cmd, "status" | "events" | "task.tail" | "verify.status"),
+                "{cmd}"
+            );
+        }
     }
 
     fn web_info(allow_remote: bool, print: bool, addr: &str) -> WebInfo {

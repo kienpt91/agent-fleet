@@ -208,12 +208,13 @@ impl Approval {
         self.action.digest(&self.task, hasher) == self.digest
     }
 
-    /// A human decision. `expect_digest` is what the human saw and wants to decide on; when
-    /// given it must match (at least 12 hex digits of the digest).
+    /// A human decision. `seen_digest` is what the human saw and decides on: it is required and
+    /// must match (at least 12 hex digits of the digest), so a decision always names the exact
+    /// action it covers.
     pub fn decide(
         &self,
         approve: bool,
-        expect_digest: Option<&str>,
+        seen_digest: &str,
         now_ms: u64,
         hasher: &dyn Digest,
     ) -> Result<DomainEvent> {
@@ -226,13 +227,11 @@ impl Approval {
                 )))
             }
         }
-        if let Some(seen) = expect_digest {
-            if seen.len() < 12 || !self.digest.starts_with(seen) {
-                return Err(FleetError::invalid(format!(
-                    "digest does not match approval {}: the action may have changed",
-                    self.id
-                )));
-            }
+        if seen_digest.len() < 12 || !self.digest.starts_with(seen_digest) {
+            return Err(FleetError::invalid(format!(
+                "digest does not match approval {}: a decision names the digest of the action it covers (at least 12 hex digits)",
+                self.id
+            )));
         }
         if !self.stored_digest_is_consistent(hasher) {
             return Err(FleetError::new(
@@ -385,7 +384,9 @@ mod tests {
 
     fn approved(ttl: u64) -> Approval {
         let mut a = approval(ttl);
-        let ev = a.decide(true, None, 1001, &FakeDigest).unwrap();
+        let ev = a
+            .decide(true, &a.digest.clone(), 1001, &FakeDigest)
+            .unwrap();
         a.apply(&ev);
         a
     }
@@ -451,7 +452,9 @@ mod tests {
     #[test]
     fn deciding_flips_the_status() {
         let mut a = approval(5000);
-        let ev = a.decide(true, None, 1500, &FakeDigest).unwrap();
+        let ev = a
+            .decide(true, &a.digest.clone(), 1500, &FakeDigest)
+            .unwrap();
         assert!(matches!(
             ev,
             DomainEvent::ApprovalDecided { approved: true, .. }
@@ -460,7 +463,9 @@ mod tests {
         assert_eq!(a.status, ApprovalStatus::Approved);
 
         let mut d = approval(5000);
-        let ev = d.decide(false, None, 1500, &FakeDigest).unwrap();
+        let ev = d
+            .decide(false, &d.digest.clone(), 1500, &FakeDigest)
+            .unwrap();
         d.apply(&ev);
         assert_eq!(d.status, ApprovalStatus::Denied);
     }
@@ -469,11 +474,15 @@ mod tests {
     fn cannot_decide_twice_or_after_expiry() {
         let a = approved(5000);
         assert_eq!(
-            a.decide(true, None, 1500, &FakeDigest).unwrap_err().code,
+            a.decide(true, &a.digest.clone(), 1500, &FakeDigest)
+                .unwrap_err()
+                .code,
             ErrorCode::Conflict
         );
         let late = approval(5000);
-        let err = late.decide(true, None, 6000, &FakeDigest).unwrap_err();
+        let err = late
+            .decide(true, &late.digest.clone(), 6000, &FakeDigest)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::Conflict);
         assert!(err.message.contains("expired"));
     }
@@ -482,12 +491,10 @@ mod tests {
     fn digest_check_requires_a_matching_prefix() {
         let a = approval(5000);
         let full = a.digest.clone();
-        assert!(a.decide(true, Some(&full), 1500, &FakeDigest).is_ok());
-        assert!(a.decide(true, Some(&full[..12]), 1500, &FakeDigest).is_ok());
-        assert!(a.decide(true, Some(&full[..8]), 1500, &FakeDigest).is_err());
-        assert!(a
-            .decide(true, Some(&"0".repeat(64)), 1500, &FakeDigest)
-            .is_err());
+        assert!(a.decide(true, &full, 1500, &FakeDigest).is_ok());
+        assert!(a.decide(true, &full[..12], 1500, &FakeDigest).is_ok());
+        assert!(a.decide(true, &full[..8], 1500, &FakeDigest).is_err());
+        assert!(a.decide(true, &"0".repeat(64), 1500, &FakeDigest).is_err());
     }
 
     #[test]
@@ -495,7 +502,9 @@ mod tests {
         let mut a = approval(5000);
         a.action.args.push("--force".into());
         assert_eq!(
-            a.decide(true, None, 1500, &FakeDigest).unwrap_err().code,
+            a.decide(true, &a.digest.clone(), 1500, &FakeDigest)
+                .unwrap_err()
+                .code,
             ErrorCode::Tampered
         );
         let mut b = approved(5000);
@@ -521,6 +530,17 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_must_name_the_digest_of_the_action_it_covers() {
+        let a = approval(5000);
+        for seen in ["", "abc", &a.digest[..11], "0".repeat(64).as_str()] {
+            let err = a.decide(true, seen, 1500, &FakeDigest).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Invalid, "{seen:?}");
+            assert!(err.message.contains("digest"), "{}", err.message);
+        }
+        assert!(a.decide(true, &a.digest[..12], 1500, &FakeDigest).is_ok());
+    }
+
+    #[test]
     fn consume_is_single_use() {
         let mut a = approved(5000);
         let act = a.action.clone();
@@ -539,7 +559,9 @@ mod tests {
         assert_eq!(err.subject.as_deref(), Some("a1"));
 
         let mut denied = approval(5000);
-        let ev = denied.decide(false, None, 1500, &FakeDigest).unwrap();
+        let ev = denied
+            .decide(false, &denied.digest.clone(), 1500, &FakeDigest)
+            .unwrap();
         denied.apply(&ev);
         assert!(denied.consume(&act, 1500, &FakeDigest).is_err());
 
@@ -579,7 +601,9 @@ mod tests {
         )
         .unwrap();
         let mut a = Approval::from_event(&ev).unwrap();
-        let decided = a.decide(true, None, 1001, &FakeDigest).unwrap();
+        let decided = a
+            .decide(true, &a.digest.clone(), 1001, &FakeDigest)
+            .unwrap();
         a.apply(&decided);
         a
     }

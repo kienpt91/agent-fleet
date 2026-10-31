@@ -3,17 +3,23 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fleet_app::ports::{ContractFiles, EventStore, OutputLogs};
+use fleet_app::ports::{ContractFiles, EventStore, JobRunner, OutputLogs, Vcs, WorktreeState};
 use fleet_app::testing::contracts::{
-    contract_files_contract, event_store_contract, output_logs_contract, ContractFile,
-    ContractHarness, Plant, PLANT_MARKER, VALID_QUESTION_JSON, VALID_RESULT_JSON,
+    contract_files_contract, event_store_contract, output_logs_contract, verify_jobs_contract,
+    ContractFile, ContractHarness, Plant, VerifyHarness, PLANT_MARKER, VALID_QUESTION_JSON,
+    VALID_RESULT_JSON,
 };
+use fleet_domain::env::EnvPolicy;
+use fleet_domain::ids::{RunId, Sha, TaskId};
 use fleet_domain::redact::Redactor;
 use fleet_infra::contract_fs::FsContractFiles;
 use fleet_infra::digest::Sha256Digest;
 use fleet_infra::eventlog::FileEventStore;
+use fleet_infra::git::GitVcs;
+use fleet_infra::jobs::ThreadJobRunner;
 use fleet_infra::logs::FileOutputLogs;
-use fleet_infra::testutil::TempDir;
+use fleet_infra::testutil::{git, make_repo, TempDir};
+use fleet_infra::verify::VerifyHost;
 use nix::sys::stat::Mode;
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -235,4 +241,82 @@ fn fs_contract_files_satisfy_the_contract() {
             "outside file was modified"
         );
     }
+}
+
+// ---- verification jobs ------------------------------------------------------------------------
+
+/// A real repository with a fleet worktree whose committed files are exactly the ones the suite
+/// asks for; verification jobs export that commit.
+struct FsVerifyHarness {
+    dir: TempDir,
+    wt: PathBuf,
+    vcs: GitVcs,
+    base: Sha,
+}
+
+fn verify_git() -> GitVcs {
+    GitVcs::new(
+        vec![(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        )],
+        EnvPolicy::default_policy(),
+    )
+}
+
+impl FsVerifyHarness {
+    fn new() -> FsVerifyHarness {
+        let dir = TempDir::new("contract-verify");
+        let repo = make_repo(&dir);
+        let vcs = verify_git();
+        let base = vcs
+            .resolve_base(repo.to_str().unwrap(), "HEAD")
+            .unwrap()
+            .sha;
+        let wt = PathBuf::from(
+            vcs.prepare_worktree(
+                repo.to_str().unwrap(),
+                &RunId::parse("r1").unwrap(),
+                &TaskId::parse("t1").unwrap(),
+                "fleet/r1/t1",
+                &base,
+            )
+            .unwrap(),
+        );
+        FsVerifyHarness { dir, wt, vcs, base }
+    }
+}
+
+impl VerifyHarness for FsVerifyHarness {
+    fn runner(&mut self) -> Box<dyn JobRunner> {
+        let host = VerifyHost::new(verify_git(), self.dir.join("scratch")).unwrap();
+        Box::new(ThreadJobRunner::new(4, Arc::new(Redactor::builtin())).with_verification(host))
+    }
+
+    fn worktree(&self) -> String {
+        self.wt.display().to_string()
+    }
+
+    fn state(&self) -> WorktreeState {
+        self.vcs
+            .worktree_state(self.wt.to_str().unwrap(), &self.base)
+            .unwrap()
+    }
+
+    fn place(&mut self, present: &[&str]) {
+        git(&self.wt, &["rm", "-r", "-q", "--ignore-unmatch", "."]);
+        for file in present {
+            fs::write(self.wt.join(file), "x").unwrap();
+        }
+        git(&self.wt, &["add", "-A"]);
+        git(
+            &self.wt,
+            &["commit", "-q", "--allow-empty", "-m", "place files"],
+        );
+    }
+}
+
+#[test]
+fn thread_job_runner_satisfies_the_verify_jobs_contract() {
+    verify_jobs_contract(&mut FsVerifyHarness::new());
 }

@@ -27,6 +27,7 @@ pub mod pty;
 pub mod server;
 pub mod statedir;
 pub mod undo;
+pub mod verify;
 pub mod web;
 
 #[doc(hidden)]

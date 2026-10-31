@@ -1,7 +1,7 @@
 //! Scheduling: starting workers for ready tasks, reviewing finished ones and running jobs.
 
 use super::{Key, Live, Orchestrator};
-use crate::ports::{GateSpec, Job, JobDone, MergeOutcome, SessionSpec};
+use crate::ports::{GateSpec, Job, JobDone, MergeOutcome, SessionSpec, VerifyOrigin};
 use fleet_domain::brief::{build_brief, expand_placeholders, BriefInput};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
@@ -11,6 +11,7 @@ use fleet_domain::run::WorkerEnd;
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::status::{EndKind, TaskStatus};
 use fleet_domain::supervision::SupervisionPolicy;
+use neo_verify::limits::MAX_CONCURRENT_VERIFICATIONS;
 
 impl Orchestrator {
     /// Starts workers for ready tasks while capacity allows.
@@ -345,6 +346,27 @@ impl Orchestrator {
             }
             self.committed.insert(rkey.clone());
         }
+        // The contracts of the goals this task works on run first, in fleet's own run: nothing the
+        // worker said counts. Only a pass lets the review go on to the quality gates.
+        let targets = self.verification_targets(&key.0, &key.1);
+        if !targets.is_empty() && !self.verified.contains(&rkey) {
+            if self.verifying.contains_key(key)
+                || self.verifying.len() >= MAX_CONCURRENT_VERIFICATIONS
+                || self.ports.jobs.running() >= MAX_CONCURRENT_JOBS
+            {
+                return;
+            }
+            if let Err(e) = self
+                .start_verification(key, task.attempt, VerifyOrigin::Review, &worktree, targets)
+                .map(|_| ())
+            {
+                self.fail_task(
+                    key,
+                    format!("could not start the verification: {}", e.message),
+                );
+            }
+            return;
+        }
         if self.cfg.gates.is_empty() {
             self.committed.remove(&rkey);
             self.apply_gate_results(key, task.attempt, &[]);
@@ -405,12 +427,23 @@ impl Orchestrator {
         }
     }
 
-    fn apply_gate_results(
+    pub(crate) fn apply_gate_results(
         &mut self,
         key: &Key,
         attempt: u32,
         outcomes: &[fleet_domain::quality::GateOutcome],
     ) {
+        // A second line of defence for the rule that a task with a contract completes only after
+        // fleet's own run passed it: results that would complete such a task without that pass
+        // are dropped, and the review goes through verification again.
+        let rkey = (key.0.clone(), key.1.clone(), attempt);
+        let unguarded =
+            self.verification_targets(&key.0, &key.1).is_empty() || self.verified.contains(&rkey);
+        if outcomes.iter().all(|o| o.passed) && !unguarded {
+            self.committed.remove(&rkey);
+            return;
+        }
+        self.verified.remove(&rkey);
         let events = self
             .state
             .run(&key.0)
@@ -436,6 +469,7 @@ impl Orchestrator {
                     self.committed.remove(&rkey);
                     self.apply_gate_results(&(run, task), attempt, &outcomes);
                 }
+                JobDone::Verify(done) => self.handle_verify_done(*done),
                 JobDone::Command {
                     approval,
                     exit_code,

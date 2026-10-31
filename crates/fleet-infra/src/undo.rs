@@ -2,11 +2,13 @@
 //!
 //! `agent-undo` is a separate project and never a dependency. When it is not installed every
 //! method fails with an "unavailable" error and the rest of fleet works unchanged. It runs
-//! through [`run_bounded`]: no shell, an absolute canonical program path resolved once at
+//! through [`run_bounded_tracked`]: no shell, an absolute canonical program path resolved once at
 //! detection, `/` as working directory, an empty environment plus a small allowlist, a time
 //! limit and a cap on captured output.
 
-use crate::jobs::{resolve_program, run_bounded, trusted_program, RunResult, RunSpec};
+use crate::jobs::{
+    resolve_program, run_bounded_tracked, trusted_program, JobTracker, RunResult, RunSpec,
+};
 use fleet_app::ports::UndoTool;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::ids::show;
@@ -32,6 +34,8 @@ const EXIT_REFUSED: i32 = 3;
 pub struct AgentUndo {
     program: Option<PathBuf>,
     env: Vec<(String, String)>,
+    /// Where the tool's process group is listed while it runs (see `JobTracker`).
+    tracker: JobTracker,
 }
 
 impl AgentUndo {
@@ -53,7 +57,15 @@ impl AgentUndo {
         AgentUndo {
             program: path_env.and_then(find_in_path),
             env: child_env,
+            tracker: JobTracker::new(),
         }
+    }
+
+    /// Lists the tool's children in the daemon's shared tracker, so the origin checks refuse them
+    /// (and what they start) like the children of every other job.
+    pub fn with_tracker(mut self, tracker: JobTracker) -> AgentUndo {
+        self.tracker = tracker;
+        self
     }
 
     /// Uses the given executable; for tests. It is canonicalized like a detected one.
@@ -61,6 +73,7 @@ impl AgentUndo {
         AgentUndo {
             program: Some(fs::canonicalize(&program).unwrap_or(program)),
             env: Vec::new(),
+            tracker: JobTracker::new(),
         }
     }
 
@@ -87,14 +100,17 @@ impl AgentUndo {
             .map_err(|why| FleetError::forbidden(format!("agent-undo was not run: {why}")))?;
         let mut args = vec!["-C".to_string(), worktree.to_string(), "--json".to_string()];
         args.extend(tail.iter().map(|s| s.to_string()));
-        Ok(run_bounded(&RunSpec {
-            program: program.display().to_string(),
-            args,
-            cwd: PathBuf::from("/"),
-            env: self.env.clone(),
-            timeout_ms: TIMEOUT_MS,
-            max_output: MAX_OUTPUT,
-        }))
+        Ok(run_bounded_tracked(
+            &RunSpec {
+                program: program.display().to_string(),
+                args,
+                cwd: PathBuf::from("/"),
+                env: self.env.clone(),
+                timeout_ms: TIMEOUT_MS,
+                max_output: MAX_OUTPUT,
+            },
+            &self.tracker,
+        ))
     }
 }
 

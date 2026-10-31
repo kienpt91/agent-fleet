@@ -440,12 +440,12 @@ impl FleetState {
         &self,
         id: &ApprovalId,
         approve: bool,
-        expect_digest: Option<&str>,
+        seen_digest: &str,
         now_ms: u64,
         hasher: &dyn Digest,
     ) -> Result<Vec<DomainEvent>> {
         let approval = self.approval(id)?;
-        let decided = approval.decide(approve, expect_digest, now_ms, hasher)?;
+        let decided = approval.decide(approve, seen_digest, now_ms, hasher)?;
         let mut events = vec![decided];
         let needs_unblock = match approval.purpose {
             Purpose::Merge => false,
@@ -816,6 +816,20 @@ fn prune<K: Ord + Clone, V>(map: &mut BTreeMap<K, V>, cap: usize, finished: impl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl FleetState {
+        /// Decides an approval on the digest it has, as a person who read it would.
+        fn decide_seen(
+            &self,
+            id: &ApprovalId,
+            approve: bool,
+            now_ms: u64,
+            hasher: &dyn Digest,
+        ) -> Result<Vec<DomainEvent>> {
+            let digest = self.approval(id)?.digest.clone();
+            self.decide_approval(id, approve, &digest, now_ms, hasher)
+        }
+    }
     use crate::approval::test_support::FakeDigest;
     use crate::contract::{ActionRequest, ResultStatus, WorkerResult};
     use crate::error::ErrorCode;
@@ -1181,9 +1195,7 @@ mod tests {
         apply_all(&mut s, &events);
         let id = ApprovalId::from_seq(1);
         if approve {
-            let events = s
-                .decide_approval(&id, true, None, 200, &FakeDigest)
-                .unwrap();
+            let events = s.decide_seen(&id, true, 200, &FakeDigest).unwrap();
             apply_all(&mut s, &events);
         }
         (s, run, id)
@@ -1342,9 +1354,7 @@ mod tests {
         );
         // Denied.
         let (mut s, _run, id) = approved_command(false);
-        let events = s
-            .decide_approval(&id, false, None, 200, &FakeDigest)
-            .unwrap();
+        let events = s.decide_seen(&id, false, 200, &FakeDigest).unwrap();
         apply_all(&mut s, &events);
         assert!(s.start_command(&id, 300, &FakeDigest).is_err());
         // A manual approval has nothing to start.
@@ -1355,9 +1365,7 @@ mod tests {
             .unwrap();
         apply_all(&mut s, &events);
         let id = ApprovalId::from_seq(1);
-        let events = s
-            .decide_approval(&id, true, None, 200, &FakeDigest)
-            .unwrap();
+        let events = s.decide_seen(&id, true, 200, &FakeDigest).unwrap();
         apply_all(&mut s, &events);
         assert_eq!(
             s.start_command(&id, 300, &FakeDigest).unwrap_err().code,
@@ -1489,9 +1497,7 @@ mod tests {
     #[test]
     fn denying_an_external_command_unblocks_with_a_denial_note() {
         let (mut s, run, id) = approved_command(false);
-        let events = s
-            .decide_approval(&id, false, None, 200, &FakeDigest)
-            .unwrap();
+        let events = s.decide_seen(&id, false, 200, &FakeDigest).unwrap();
         assert_eq!(
             kinds(&events),
             vec!["approval_decided", "note_added", "task_unblocked"]
@@ -1512,7 +1518,7 @@ mod tests {
                 .unwrap();
             apply_all(&mut s, &events);
             let events = s
-                .decide_approval(&ApprovalId::from_seq(1), approve, None, 200, &FakeDigest)
+                .decide_seen(&ApprovalId::from_seq(1), approve, 200, &FakeDigest)
                 .unwrap();
             assert_eq!(
                 kinds(&events),
@@ -1533,7 +1539,7 @@ mod tests {
         apply_all(&mut s, &events);
         assert!(s.expire_approvals(99_999).is_empty());
         assert_eq!(
-            s.decide_approval(&ApprovalId::from_seq(1), true, None, 20_000, &FakeDigest)
+            s.decide_seen(&ApprovalId::from_seq(1), true, 20_000, &FakeDigest)
                 .unwrap_err()
                 .code,
             ErrorCode::Conflict
@@ -1591,9 +1597,7 @@ mod tests {
             }
         );
 
-        let events = s
-            .decide_approval(&approval, true, None, 1200, &FakeDigest)
-            .unwrap();
+        let events = s.decide_seen(&approval, true, 1200, &FakeDigest).unwrap();
         apply_all(&mut s, &events);
         let go = s
             .request_merge(&run, &tid("a"), &sha('c'), &POLICY, 1300, &FakeDigest)
@@ -1621,9 +1625,7 @@ mod tests {
             panic!("expected pending")
         };
         apply_all(&mut s, &events);
-        let events = s
-            .decide_approval(&approval, true, None, 1100, &FakeDigest)
-            .unwrap();
+        let events = s.decide_seen(&approval, true, 1100, &FakeDigest).unwrap();
         apply_all(&mut s, &events);
         let other = s
             .request_merge(&run, &tid("a"), &sha('d'), &POLICY, 1200, &FakeDigest)
@@ -1649,9 +1651,7 @@ mod tests {
             panic!("expected pending")
         };
         apply_all(&mut s, &events);
-        let events = s
-            .decide_approval(&approval, true, None, 1100, &FakeDigest)
-            .unwrap();
+        let events = s.decide_seen(&approval, true, 1100, &FakeDigest).unwrap();
         apply_all(&mut s, &events);
         let late = s
             .request_merge(
@@ -1676,9 +1676,7 @@ mod tests {
             panic!("expected pending")
         };
         apply_all(&mut s, &events);
-        let events = s
-            .decide_approval(&approval, false, None, 1100, &FakeDigest)
-            .unwrap();
+        let events = s.decide_seen(&approval, false, 1100, &FakeDigest).unwrap();
         assert_eq!(kinds(&events), vec!["approval_decided"]);
         apply_all(&mut s, &events);
         assert_eq!(
