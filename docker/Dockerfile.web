@@ -1,0 +1,7 @@
+# Development image plus what the web dashboard checks need: curl (to show the HTTP login flow) and a
+# headless Chromium (to load the dashboard in a real browser engine). Build the base first:
+#   docker build -f docker/Dockerfile.dev -t fleet-dev docker/
+#   docker build -f docker/Dockerfile.web -t fleet-web docker/
+FROM fleet-dev
+RUN apt-get update && apt-get install -y --no-install-recommends curl chromium \
+ && rm -rf /var/lib/apt/lists/*
