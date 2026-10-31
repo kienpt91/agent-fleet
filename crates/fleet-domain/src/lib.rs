@@ -19,3 +19,5 @@ pub mod redact;
 pub mod sanitize;
 pub mod status;
 pub mod value;
+pub mod dag;
+pub mod quality;
