@@ -225,6 +225,13 @@ pub enum Command {
         task: Option<String>,
         timeout_secs: u64,
     },
+    /// `approve` and `deny`. The daemon requires the digest of the action a decision covers; when
+    /// the person gave none, the digest the daemon lists for the approval is used.
+    Decide {
+        id: String,
+        approve: bool,
+        digest: Option<String>,
+    },
     Request(Request),
 }
 
@@ -558,20 +565,11 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
             let approve = word == "approve";
             let digest = p.opt("--digest")?;
             let id = one_arg(p, "approval id")?;
-            let view = View::Ack(format!(
-                "approval {} {}",
-                token(&id),
-                if approve { "approved" } else { "denied" }
-            ));
-            request(
-                "approval.decide",
-                obj(vec![
-                    ("id", st(id)),
-                    ("approve", Some(Value::Bool(approve))),
-                    ("digest", digest.and_then(st)),
-                ]),
-                view,
-            )
+            Command::Decide {
+                id,
+                approve,
+                digest,
+            }
         }
         "merge" => request(
             "merge",
@@ -817,6 +815,50 @@ pub fn execute_request(
         render_view(&req.view, &data)
     };
     write_out(out, &text)
+}
+
+/// `fleet approve` / `fleet deny`: the decision names the digest of the action it covers, either
+/// the one given with `--digest` or, without it, the one the daemon lists for that approval right
+/// now (so the person decides on exactly what `fleet approval list` shows).
+pub fn execute_decide(
+    id: &str,
+    approve: bool,
+    digest: Option<&str>,
+    caller: &mut dyn Caller,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let digest = match digest {
+        Some(d) => d.to_string(),
+        None => {
+            let list = caller.call("approval.list", obj(vec![]))?;
+            list.get("approvals")
+                .and_then(Value::as_array)
+                .and_then(|all| {
+                    all.iter()
+                        .find(|a| a.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .and_then(|a| a.get("digest").and_then(Value::as_str))
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    FleetError::not_found(format!("approval {} does not exist", show(id)))
+                })?
+        }
+    };
+    let req = Request {
+        cmd: "approval.decide",
+        args: obj(vec![
+            ("id", st(id.to_string())),
+            ("approve", Some(Value::Bool(approve))),
+            ("digest", st(digest)),
+        ]),
+        view: View::Ack(format!(
+            "approval {} {}",
+            token(id),
+            if approve { "approved" } else { "denied" }
+        )),
+    };
+    execute_request(req, caller, json, out)
 }
 
 /// `fleet verify`: asks the daemon to run the contracts, waits until they finished (polling every
@@ -1135,6 +1177,18 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
                 VERIFY_POLL,
             )
         }
+        Command::Decide {
+            id,
+            approve,
+            digest,
+        } => execute_decide(
+            &id,
+            approve,
+            digest.as_deref(),
+            &mut connect(ctx)?,
+            ctx.json,
+            out,
+        )?,
         Command::Request(req) => execute_request(req, &mut connect(ctx)?, ctx.json, out)?,
     }
     Ok(0)
@@ -1412,24 +1466,20 @@ mod tests {
                 req("approval.list", vec![], View::Approvals),
             ),
             (
-                vec!["approve", "a1", "--digest", "abcd"],
-                req(
-                    "approval.decide",
-                    vec![
-                        ("id", s("a1")),
-                        ("approve", Value::Bool(true)),
-                        ("digest", s("abcd")),
-                    ],
-                    View::Ack("approval a1 approved".into()),
-                ),
+                vec!["approve", "a1", "--digest", "abcdef012345"],
+                Command::Decide {
+                    id: "a1".into(),
+                    approve: true,
+                    digest: Some("abcdef012345".into()),
+                },
             ),
             (
                 vec!["deny", "a1"],
-                req(
-                    "approval.decide",
-                    vec![("id", s("a1")), ("approve", Value::Bool(false))],
-                    View::Ack("approval a1 denied".into()),
-                ),
+                Command::Decide {
+                    id: "a1".into(),
+                    approve: false,
+                    digest: None,
+                },
             ),
             (
                 vec!["merge", "r1/t1"],
@@ -1884,6 +1934,58 @@ mod tests {
         assert_eq!(
             f.calls[0].1,
             Value::object([("task", s("t1")), ("max", Value::int(TAIL_CHUNK))])
+        );
+    }
+
+    fn approval_list(id: &str, digest: &str) -> Result<Value> {
+        Ok(Value::object([(
+            "approvals",
+            Value::array([Value::object([("id", s(id)), ("digest", s(digest))])]),
+        )]))
+    }
+
+    #[test]
+    fn a_decision_without_a_digest_uses_the_one_the_daemon_lists() {
+        let digest = "ab".repeat(32);
+        let mut f = Fake::new(vec![approval_list("a1", &digest), Ok(Value::Null)]);
+        let mut out = Vec::new();
+        execute_decide("a1", true, None, &mut f, false, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "approval a1 approved\n");
+        assert_eq!(f.calls[0].0, "approval.list");
+        assert_eq!(f.calls[1].0, "approval.decide");
+        assert_eq!(
+            f.calls[1].1,
+            Value::object([
+                ("id", s("a1")),
+                ("approve", Value::Bool(true)),
+                ("digest", s(&digest)),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_decision_with_a_digest_asks_for_nothing_first() {
+        let mut f = Fake::new(vec![Ok(Value::Null)]);
+        let mut out = Vec::new();
+        execute_decide("a1", false, Some("0123456789ab"), &mut f, false, &mut out).unwrap();
+        assert_eq!(f.calls.len(), 1);
+        assert_eq!(f.calls[0].1.get("digest"), Some(&s("0123456789ab")));
+        assert_eq!(String::from_utf8(out).unwrap(), "approval a1 denied\n");
+    }
+
+    #[test]
+    fn deciding_on_an_unknown_approval_is_not_found_and_sends_no_decision() {
+        let mut f = Fake::new(vec![approval_list("a2", &"ab".repeat(32))]);
+        let mut out = Vec::new();
+        let err = execute_decide("a1", true, None, &mut f, false, &mut out).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(f.calls.len(), 1);
+        let mut f = Fake::new(vec![Err(FleetError::new(ErrorCode::DaemonDown, "down"))]);
+        assert_eq!(
+            execute_decide("a1", true, None, &mut f, false, &mut out)
+                .unwrap_err()
+                .code,
+            ErrorCode::DaemonDown
         );
     }
 

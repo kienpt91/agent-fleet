@@ -347,9 +347,19 @@ fn a_decision_made_before_a_restart_is_still_valid_after_it() {
     .unwrap();
     assert_eq!(task_status(&mut h, "c"), "running");
     assert!(last_brief(&h).contains("Operator says: sqlite"));
+    let list = h.call("approval.list", Value::Null).unwrap().data().clone();
+    let digest = list.get("approvals").and_then(Value::as_array).unwrap()[0]
+        .get("digest")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
     h.call(
         "approval.decide",
-        obj(vec![("id", s("a1")), ("approve", Value::Bool(true))]),
+        obj(vec![
+            ("id", s("a1")),
+            ("approve", Value::Bool(true)),
+            ("digest", s(&digest)),
+        ]),
     )
     .unwrap();
     assert_eq!(task_status(&mut h, "e"), "running");

@@ -86,7 +86,8 @@ pub enum Command {
     Decide {
         id: ApprovalId,
         approve: bool,
-        digest: Option<String>,
+        /// The digest of the action the decision covers (at least 12 hex digits). Required.
+        digest: String,
     },
     Merge {
         task: String,
@@ -363,7 +364,7 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
             approve: a
                 .opt_bool("approve")?
                 .ok_or_else(|| FleetError::invalid("`approve` is required"))?,
-            digest: a.opt_str("digest")?.map(str::to_string),
+            digest: a.req_str("digest")?.to_string(),
         },
         "merge" => Command::Merge { task: task()? },
         "cleanup" => Command::Cleanup {
@@ -533,6 +534,18 @@ mod tests {
                 vec![("id", Value::str("a1")), ("answer", Value::str("x"))],
             ),
             ("approval.decide", vec![("id", Value::str("a1"))]),
+            (
+                "approval.decide",
+                vec![("id", Value::str("a1")), ("approve", Value::Bool(true))],
+            ),
+            (
+                "approval.decide",
+                vec![
+                    ("id", Value::str("a1")),
+                    ("approve", Value::Bool(true)),
+                    ("digest", Value::Null),
+                ],
+            ),
             (
                 "approval.decide",
                 vec![("id", Value::str("a1")), ("approve", Value::str("yes"))],

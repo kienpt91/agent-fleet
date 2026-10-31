@@ -75,7 +75,7 @@ impl Orchestrator {
                 let events = self.state.decide_approval(
                     &id,
                     approve,
-                    digest.as_deref(),
+                    &digest,
                     now,
                     self.ports.digest.as_ref(),
                 )?;
