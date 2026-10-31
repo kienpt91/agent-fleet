@@ -4061,4 +4061,100 @@ mod tests {
         let ol = v.as_array().unwrap().get(1).unwrap();
         assert_eq!(ol.get("start"), Some(&Value::int(3)));
     }
+
+    /// Link and image targets from random pieces that are (or imitate) schemes, escapes and paths:
+    /// whatever comes out is an http(s) URL that passed the policy, a path inside the repository, or
+    /// nothing loadable.
+    #[test]
+    fn property_random_targets_never_become_dangerous_links() {
+        let pieces = [
+            "javascript:",
+            "JaVaScRiPt:",
+            "java%73cript:",
+            "%6Aavascript:",
+            "data:",
+            "vbscript:",
+            "file:",
+            "http:",
+            "https:",
+            "HTTP://",
+            "//",
+            "/",
+            "../",
+            "./",
+            "..",
+            "%2e%2e/",
+            "%00",
+            "%0a",
+            "%09",
+            "\\",
+            " ",
+            "\t",
+            "\n",
+            "\u{202e}",
+            "\u{200b}",
+            "\u{1b}",
+            "alert(1)",
+            "x.png",
+            "a b",
+            "host.example",
+            "@",
+            ":",
+            "#",
+            "?",
+            "%",
+            "%zz",
+            "%e9",
+            "\u{e9}",
+            "<",
+            ">",
+            "\"",
+            "'",
+        ];
+        let dir = RepoPath::parse("docs/sub").unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..30_000 {
+            let n = 1 + next() % 6;
+            let mut t = String::new();
+            for _ in 0..n {
+                t.push_str(pieces[usize::try_from(next() % pieces.len() as u64).unwrap()]);
+            }
+            if let Some(target) = classify_link(&t, &dir) {
+                match target {
+                    LinkTarget::External(u) => {
+                        let l = u.to_ascii_lowercase();
+                        assert!(
+                            l.starts_with("http://") || l.starts_with("https://"),
+                            "{t:?} -> {u:?}"
+                        );
+                        assert!(
+                            u.chars()
+                                .all(|c| !c.is_control() && !c.is_whitespace() && c != '\\'),
+                            "{u:?}"
+                        );
+                    }
+                    LinkTarget::Repo(p) => {
+                        assert!(RepoPath::parse(p.as_str()).is_ok(), "{t:?}");
+                        assert!(
+                            scheme_of(t.trim()).is_none() && !decoded_has_scheme(t.trim()),
+                            "{t:?}"
+                        );
+                    }
+                }
+            }
+            let (path, src, note) = classify_image(&t, &dir);
+            assert!(src.chars().count() <= MAX_SRC_CHARS);
+            match (&path, note) {
+                (Some(p), None) => assert!(RepoPath::parse(p.as_str()).is_ok(), "{t:?}"),
+                (None, Some(_)) => {}
+                other => panic!("an image has a path or a note: {other:?} for {t:?}"),
+            }
+        }
+    }
 }
