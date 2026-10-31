@@ -104,10 +104,22 @@ fn open_log_read(path: &Path) -> Result<(File, u64)> {
 fn parse_link(line: &[u8], index: u64) -> std::result::Result<Link, String> {
     let bad = |why: &str| format!("record {index} is damaged: {why}");
     let v = json::parse_value(line, MAX_EVENT_LINE).map_err(|e| bad(&e))?;
-    let seq = v.get("seq").and_then(Value::as_u64).ok_or_else(|| bad("no seq"))?;
-    let ts_ms = v.get("ts").and_then(Value::as_u64).ok_or_else(|| bad("no ts"))?;
-    let prev = v.get("prev").and_then(Value::as_str).ok_or_else(|| bad("no prev"))?;
-    let hash = v.get("hash").and_then(Value::as_str).ok_or_else(|| bad("no hash"))?;
+    let seq = v
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| bad("no seq"))?;
+    let ts_ms = v
+        .get("ts")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| bad("no ts"))?;
+    let prev = v
+        .get("prev")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("no prev"))?;
+    let hash = v
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("no hash"))?;
     let body = v.get("body").ok_or_else(|| bad("no body"))?;
     Ok(Link {
         seq,
@@ -141,7 +153,9 @@ fn scan(
     let mut buf: Vec<u8> = Vec::new();
     let mut valid_len = 0u64;
     let mut partial_tail = false;
-    let limit = u64::try_from(MAX_EVENT_LINE).unwrap_or(u64::MAX).saturating_add(1);
+    let limit = u64::try_from(MAX_EVENT_LINE)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     loop {
         buf.clear();
         let n = (&mut reader)
@@ -329,7 +343,10 @@ impl EventStore for FileEventStore {
         }
         // One write call for the whole batch; on failure cut back to the last good record so a
         // retry does not leave a torn line in the middle of the file.
-        if let Err(e) = file.write_all(batch.as_bytes()).and_then(|()| file.sync_data()) {
+        if let Err(e) = file
+            .write_all(batch.as_bytes())
+            .and_then(|()| file.sync_data())
+        {
             let _ = file.set_len(self.size);
             return Err(FleetError::io("cannot append to the event log", &e));
         }
@@ -417,9 +434,15 @@ mod tests {
         s.append(20, &[warn(3)]).unwrap();
         let got = replay_all(&s).unwrap();
         assert_eq!(got.len(), 3);
-        assert_eq!((got[0].seq, got[0].ts_ms, got[0].event.clone()), (1, 10, warn(1)));
+        assert_eq!(
+            (got[0].seq, got[0].ts_ms, got[0].event.clone()),
+            (1, 10, warn(1))
+        );
         assert_eq!((got[2].seq, got[2].ts_ms), (3, 20));
-        assert_eq!(fs::metadata(t.join("events.log")).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(t.join("events.log")).unwrap().mode() & 0o777,
+            0o600
+        );
         let report = verify_file(&t.join("events.log")).unwrap();
         assert_eq!(report.records, 3);
         assert_eq!(report.head_hash.len(), 64);
@@ -432,7 +455,10 @@ mod tests {
         let mut s = open(&t);
         s.append(2000, &[warn(4)]).unwrap();
         let got = replay_all(&s).unwrap();
-        assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
         assert_eq!(verify_file(&t.join("events.log")).unwrap().records, 4);
     }
 
@@ -457,7 +483,10 @@ mod tests {
         let mut parts = head.split_whitespace();
         assert_eq!(parts.next(), Some("2"));
         assert_eq!(parts.next().map(str::len), Some(64));
-        assert_eq!(fs::metadata(t.join("events.head")).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(t.join("events.head")).unwrap().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -470,7 +499,10 @@ mod tests {
         let err = reopen_err(&t);
         assert_eq!(err.code, ErrorCode::Tampered);
         assert!(err.message.contains("record 3"), "{}", err.message);
-        assert_eq!(verify_file(&t.join("events.log")).unwrap_err().code, ErrorCode::Tampered);
+        assert_eq!(
+            verify_file(&t.join("events.log")).unwrap_err().code,
+            ErrorCode::Tampered
+        );
     }
 
     #[test]
@@ -505,7 +537,10 @@ mod tests {
         let err = reopen_err(&t);
         assert_eq!(err.code, ErrorCode::Tampered);
         assert!(err.message.contains("3 records but 5"), "{}", err.message);
-        assert_eq!(verify_file(&t.join("events.log")).unwrap_err().code, ErrorCode::Tampered);
+        assert_eq!(
+            verify_file(&t.join("events.log")).unwrap_err().code,
+            ErrorCode::Tampered
+        );
         // Without the head the shorter log is internally consistent.
         fs::remove_file(t.join("events.head")).unwrap();
         assert_eq!(open(&t).replay(&mut |_| Ok(())).unwrap().records, 3);
@@ -548,7 +583,10 @@ mod tests {
         let err = reopen_err(&t);
         assert_eq!(err.code, ErrorCode::Tampered);
         assert!(err.message.contains("symlink"));
-        assert_eq!(verify_file(&t.join("events.log")).unwrap_err().code, ErrorCode::Tampered);
+        assert_eq!(
+            verify_file(&t.join("events.log")).unwrap_err().code,
+            ErrorCode::Tampered
+        );
         assert_eq!(fs::read(&target).unwrap(), b"");
 
         let t2 = TempDir::new("evlog-dir");
@@ -571,7 +609,10 @@ mod tests {
         text.push_str("{\"seq\":4,\"ts\":1,\"pre");
         fs::write(t.join("events.log"), text).unwrap();
         let mut s = open(&t);
-        assert_eq!(fs::metadata(t.join("events.log")).unwrap().len() as usize, good_len);
+        assert_eq!(
+            fs::metadata(t.join("events.log")).unwrap().len() as usize,
+            good_len
+        );
         s.append(9, &[warn(4)]).unwrap();
         assert_eq!(verify_file(&t.join("events.log")).unwrap().records, 4);
         assert_eq!(replay_all(&s).unwrap().len(), 4);
@@ -606,11 +647,7 @@ mod tests {
         fs::remove_file(t.join("events.head")).unwrap();
         let _ = open(&t);
         // A head that lags (crash between log and head write) is fine.
-        fs::write(
-            t.join("events.head"),
-            format!("1 {}\n", "0".repeat(64)),
-        )
-        .unwrap();
+        fs::write(t.join("events.head"), format!("1 {}\n", "0".repeat(64))).unwrap();
         let _ = open(&t);
         // The same count with another hash is not.
         fs::write(t.join("events.head"), format!("2 {}\n", "0".repeat(64))).unwrap();

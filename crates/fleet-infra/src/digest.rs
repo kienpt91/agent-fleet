@@ -37,6 +37,8 @@ mod tests {
     fn output_is_lowercase_hex_of_fixed_length() {
         let h = Sha256Digest.sha256_hex(&[0xff; 1000]);
         assert_eq!(h.len(), 64);
-        assert!(h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(h
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
     }
 }

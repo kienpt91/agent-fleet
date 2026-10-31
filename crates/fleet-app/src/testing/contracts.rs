@@ -44,7 +44,9 @@
 
 use super::World;
 use crate::ports::{ContractFiles, EventStore, OutputLogs, ReplayInfo, StoredEvent};
-use fleet_domain::contract::{ContractRead, QuestionKind, ResultStatus, WorkerQuestion, WorkerResult};
+use fleet_domain::contract::{
+    ContractRead, QuestionKind, ResultStatus, WorkerQuestion, WorkerResult,
+};
 use fleet_domain::error::{ErrorCode, FleetError};
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{ApprovalId, DecisionId, RunId, Sha, TaskId, WorkerName};
@@ -75,7 +77,10 @@ fn sample_events() -> Vec<DomainEvent> {
     let tricky = "line one\nline \"two\" with \\ backslash\tand tab\n\
                   日本語 — ünïcödé 🚀 {\"type\":\"warning\"} </script>";
     vec![
-        DomainEvent::DaemonStarted { pid: 4_294_967_296, version: "0.1.0".into() },
+        DomainEvent::DaemonStarted {
+            pid: 4_294_967_296,
+            version: "0.1.0".into(),
+        },
         DomainEvent::RunCreated {
             run: run.clone(),
             objective: tricky.into(),
@@ -84,7 +89,10 @@ fn sample_events() -> Vec<DomainEvent> {
             base_sha: sha(&"a".repeat(40)),
             max_parallel: 3,
         },
-        DomainEvent::RunStarted { run: run.clone(), max_parallel: 2 },
+        DomainEvent::RunStarted {
+            run: run.clone(),
+            max_parallel: 2,
+        },
         DomainEvent::TaskAdded {
             run: run.clone(),
             task: t2.clone(),
@@ -101,7 +109,10 @@ fn sample_events() -> Vec<DomainEvent> {
             deps: vec![],
             worker: None,
         },
-        DomainEvent::TaskReady { run: run.clone(), task: t1.clone() },
+        DomainEvent::TaskReady {
+            run: run.clone(),
+            task: t1.clone(),
+        },
         DomainEvent::TaskDispatched {
             run: run.clone(),
             task: t1.clone(),
@@ -117,7 +128,9 @@ fn sample_events() -> Vec<DomainEvent> {
             attempt: 1,
             outcome: EndKind::Exited,
             exit_code: Some(-9),
-            output_tail: "compiling\n\\x1b[31merror\\x1b[0m \\u{202e}hidden\\u{202c} \\x07 bell\nok 日本".into(),
+            output_tail:
+                "compiling\n\\x1b[31merror\\x1b[0m \\u{202e}hidden\\u{202c} \\x07 bell\nok 日本"
+                    .into(),
             stripped: 3,
         },
         DomainEvent::SessionEnded {
@@ -134,7 +147,11 @@ fn sample_events() -> Vec<DomainEvent> {
             task: t1.clone(),
             head: sha(&"b".repeat(40)),
         },
-        DomainEvent::TaskReviewing { run: run.clone(), task: t1.clone(), summary: "done it".into() },
+        DomainEvent::TaskReviewing {
+            run: run.clone(),
+            task: t1.clone(),
+            summary: "done it".into(),
+        },
         DomainEvent::GateChecked {
             run: run.clone(),
             task: t1.clone(),
@@ -144,11 +161,30 @@ fn sample_events() -> Vec<DomainEvent> {
             summary: "exit code 1".into(),
             output_tail: tricky.into(),
         },
-        DomainEvent::TaskCompleted { run: run.clone(), task: t1.clone() },
-        DomainEvent::TaskFailed { run: run.clone(), task: t2.clone(), reason: "gate \"tests\" failed".into() },
-        DomainEvent::RetryQueued { run: run.clone(), task: t2.clone(), retries_used: 1, reason: "again".into() },
-        DomainEvent::RetryReset { run: run.clone(), task: t2.clone() },
-        DomainEvent::NoteAdded { run: run.clone(), task: t1.clone(), note: tricky.into() },
+        DomainEvent::TaskCompleted {
+            run: run.clone(),
+            task: t1.clone(),
+        },
+        DomainEvent::TaskFailed {
+            run: run.clone(),
+            task: t2.clone(),
+            reason: "gate \"tests\" failed".into(),
+        },
+        DomainEvent::RetryQueued {
+            run: run.clone(),
+            task: t2.clone(),
+            retries_used: 1,
+            reason: "again".into(),
+        },
+        DomainEvent::RetryReset {
+            run: run.clone(),
+            task: t2.clone(),
+        },
+        DomainEvent::NoteAdded {
+            run: run.clone(),
+            task: t1.clone(),
+            note: tricky.into(),
+        },
         DomainEvent::TaskBlocked {
             run: run.clone(),
             task: t1.clone(),
@@ -156,7 +192,10 @@ fn sample_events() -> Vec<DomainEvent> {
             subject: "g3".into(),
             detail: "Which database?".into(),
         },
-        DomainEvent::TaskUnblocked { run: run.clone(), task: t1.clone() },
+        DomainEvent::TaskUnblocked {
+            run: run.clone(),
+            task: t1.clone(),
+        },
         DomainEvent::DecisionOpened {
             id: decision.clone(),
             run: run.clone(),
@@ -165,7 +204,10 @@ fn sample_events() -> Vec<DomainEvent> {
             text: "Which database?".into(),
             choices: vec!["postgres".into(), "sqlite \"embedded\"".into()],
         },
-        DomainEvent::DecisionResolved { id: decision, answer: tricky.into() },
+        DomainEvent::DecisionResolved {
+            id: decision,
+            answer: tricky.into(),
+        },
         DomainEvent::ApprovalRequested {
             id: approval.clone(),
             run: run.clone(),
@@ -173,14 +215,27 @@ fn sample_events() -> Vec<DomainEvent> {
             purpose: Purpose::ExternalCommand,
             tool: "shell".into(),
             command: "git push \"origin\" main".into(),
-            args: vec!["--flag".into(), "has space".into(), "quote\"d".into(), "ünï".into(), String::new()],
+            args: vec![
+                "--flag".into(),
+                "has space".into(),
+                "quote\"d".into(),
+                "ünï".into(),
+                String::new(),
+            ],
             digest: "ab".repeat(32),
             requested_ms: 1_700_000_000_000,
             expires_ms: 1_700_000_300_000,
         },
-        DomainEvent::ApprovalDecided { id: approval.clone(), approved: true },
-        DomainEvent::ApprovalExpired { id: approval.clone() },
-        DomainEvent::ApprovalConsumed { id: approval.clone() },
+        DomainEvent::ApprovalDecided {
+            id: approval.clone(),
+            approved: true,
+        },
+        DomainEvent::ApprovalExpired {
+            id: approval.clone(),
+        },
+        DomainEvent::ApprovalConsumed {
+            id: approval.clone(),
+        },
         DomainEvent::ExternalCommandRan {
             id: approval,
             exit_code: None,
@@ -204,9 +259,15 @@ fn sample_events() -> Vec<DomainEvent> {
             label: "before".into(),
             info: tricky.into(),
         },
-        DomainEvent::OrphanReconciled { run: run.clone(), task: t1.clone(), action: "terminated".into() },
+        DomainEvent::OrphanReconciled {
+            run: run.clone(),
+            task: t1.clone(),
+            action: "terminated".into(),
+        },
         DomainEvent::WorktreeRemoved { run, task: t1 },
-        DomainEvent::Warning { message: tricky.into() },
+        DomainEvent::Warning {
+            message: tricky.into(),
+        },
     ]
 }
 
@@ -222,12 +283,19 @@ impl Expected {
     }
 
     fn append(&mut self, store: &mut dyn EventStore, ts_ms: u64, batch: &[DomainEvent]) {
-        let returned = store
-            .append(ts_ms, batch)
-            .unwrap_or_else(|e| panic!("event store contract: append of {} events failed: {e}", batch.len()));
+        let returned = store.append(ts_ms, batch).unwrap_or_else(|e| {
+            panic!(
+                "event store contract: append of {} events failed: {e}",
+                batch.len()
+            )
+        });
         for event in batch {
             let seq = self.head() + 1;
-            self.events.push(StoredEvent { seq, ts_ms, event: event.clone() });
+            self.events.push(StoredEvent {
+                seq,
+                ts_ms,
+                event: event.clone(),
+            });
         }
         assert_eq!(
             returned,
@@ -243,9 +311,17 @@ impl Expected {
             self.head(),
             "event store contract ({when}): ReplayInfo.records must be the number of events"
         );
-        assert_eq!(got.len(), self.events.len(), "event store contract ({when}): wrong number of events replayed");
+        assert_eq!(
+            got.len(),
+            self.events.len(),
+            "event store contract ({when}): wrong number of events replayed"
+        );
         for (g, e) in got.iter().zip(&self.events) {
-            assert_eq!(g, e, "event store contract ({when}): event {} differs after replay", e.seq);
+            assert_eq!(
+                g, e,
+                "event store contract ({when}): event {} differs after replay",
+                e.seq
+            );
         }
     }
 }
@@ -269,7 +345,11 @@ fn reopen<T: ?Sized>(open: &mut dyn FnMut() -> Box<T>, old: Box<T>) -> Box<T> {
 
 fn notes(count: usize) -> Vec<DomainEvent> {
     (0..count)
-        .map(|i| DomainEvent::NoteAdded { run: run_id(), task: task_id("t1"), note: format!("note {i}") })
+        .map(|i| DomainEvent::NoteAdded {
+            run: run_id(),
+            task: task_id("t1"),
+            note: format!("note {i}"),
+        })
         .collect()
 }
 
@@ -286,10 +366,18 @@ pub fn event_store_contract(open: &mut dyn FnMut() -> Box<dyn EventStore>) {
 
     // 1. A new store is empty, and an empty batch on it is a no-op returning head 0.
     let (events, info) = replay_all(store.as_ref());
-    assert!(events.is_empty(), "event store contract: a new store must replay no events");
-    assert_eq!(info.records, 0, "event store contract: a new store must report 0 records");
+    assert!(
+        events.is_empty(),
+        "event store contract: a new store must replay no events"
+    );
     assert_eq!(
-        store.append(10, &[]).unwrap_or_else(|e| panic!("event store contract: empty append failed: {e}")),
+        info.records, 0,
+        "event store contract: a new store must report 0 records"
+    );
+    assert_eq!(
+        store
+            .append(10, &[])
+            .unwrap_or_else(|e| panic!("event store contract: empty append failed: {e}")),
         0,
         "event store contract: an empty batch on an empty store returns head 0"
     );
@@ -297,9 +385,17 @@ pub fn event_store_contract(open: &mut dyn FnMut() -> Box<dyn EventStore>) {
 
     // 2. The first batch is numbered from 1 and returns its last sequence number.
     let first = [
-        DomainEvent::DaemonStarted { pid: 1, version: "0.1.0".into() },
-        DomainEvent::RunStarted { run: run_id(), max_parallel: 2 },
-        DomainEvent::Warning { message: "third".into() },
+        DomainEvent::DaemonStarted {
+            pid: 1,
+            version: "0.1.0".into(),
+        },
+        DomainEvent::RunStarted {
+            run: run_id(),
+            max_parallel: 2,
+        },
+        DomainEvent::Warning {
+            message: "third".into(),
+        },
     ];
     expected.append(store.as_mut(), 1_000, &first);
     expected.check(store.as_ref(), "after the first batch");
@@ -310,22 +406,40 @@ pub fn event_store_contract(open: &mut dyn FnMut() -> Box<dyn EventStore>) {
     );
 
     // 3. Sequence numbers continue across batches; each batch keeps its own timestamp.
-    expected.append(store.as_mut(), 2_000, &[DomainEvent::Warning { message: "fourth".into() }]);
+    expected.append(
+        store.as_mut(),
+        2_000,
+        &[DomainEvent::Warning {
+            message: "fourth".into(),
+        }],
+    );
     expected.check(store.as_ref(), "after the second batch");
     let stamps: Vec<u64> = expected.events.iter().map(|e| e.ts_ms).collect();
-    assert_eq!(stamps, vec![1_000, 1_000, 1_000, 2_000], "event store contract: timestamps are kept per batch");
+    assert_eq!(
+        stamps,
+        vec![1_000, 1_000, 1_000, 2_000],
+        "event store contract: timestamps are kept per batch"
+    );
 
     // 4. An empty batch changes nothing and returns the current head.
     let head = store
         .append(9_999, &[])
         .unwrap_or_else(|e| panic!("event store contract: empty append failed: {e}"));
-    assert_eq!(head, expected.head(), "event store contract: an empty batch returns the current head");
+    assert_eq!(
+        head,
+        expected.head(),
+        "event store contract: an empty batch returns the current head"
+    );
     expected.check(store.as_ref(), "after an empty append");
 
     // 5. A larger batch is one unit: every event is there, in order, with one timestamp.
     expected.append(store.as_mut(), 3_000, &notes(40));
     expected.check(store.as_ref(), "after a batch of 40");
-    assert_eq!(expected.head(), 44, "event store contract: test bookkeeping");
+    assert_eq!(
+        expected.head(),
+        44,
+        "event store contract: test bookkeeping"
+    );
 
     // 6. Replay does not consume anything: a second replay gives the same events.
     expected.check(store.as_ref(), "on a second replay");
@@ -333,7 +447,13 @@ pub fn event_store_contract(open: &mut dyn FnMut() -> Box<dyn EventStore>) {
     // 7. Events survive reopening, and appending continues with the next sequence number.
     store = reopen(open, store);
     expected.check(store.as_ref(), "after reopening");
-    expected.append(store.as_mut(), 4_000, &[DomainEvent::Warning { message: "after reopen".into() }]);
+    expected.append(
+        store.as_mut(),
+        4_000,
+        &[DomainEvent::Warning {
+            message: "after reopen".into(),
+        }],
+    );
     expected.check(store.as_ref(), "after appending to a reopened store");
     store = reopen(open, store);
     expected.check(store.as_ref(), "after reopening a second time");
@@ -345,12 +465,21 @@ pub fn event_store_contract(open: &mut dyn FnMut() -> Box<dyn EventStore>) {
     kinds.dedup();
     let mut all: Vec<&str> = DomainEvent::KINDS.to_vec();
     all.sort_unstable();
-    assert!(kinds.len() >= 12, "event store contract: the sample must cover at least 12 kinds");
-    assert_eq!(kinds, all, "event store contract: the sample must cover every event kind of the domain");
+    assert!(
+        kinds.len() >= 12,
+        "event store contract: the sample must cover at least 12 kinds"
+    );
+    assert_eq!(
+        kinds, all,
+        "event store contract: the sample must cover every event kind of the domain"
+    );
     expected.append(store.as_mut(), 5_000, &sample);
     expected.check(store.as_ref(), "after storing every event kind");
     store = reopen(open, store);
-    expected.check(store.as_ref(), "after reopening with every event kind stored");
+    expected.check(
+        store.as_ref(),
+        "after reopening with every event kind stored",
+    );
 
     // 9. A visitor error aborts the replay and comes back unchanged; the store stays usable.
     let mut visited = 0;
@@ -364,16 +493,32 @@ pub fn event_store_contract(open: &mut dyn FnMut() -> Box<dyn EventStore>) {
             }
         })
         .expect_err("event store contract: an error from the visitor must be returned by replay");
-    assert_eq!(visited, 2, "event store contract: replay must stop at the first visitor error");
-    assert_eq!(err.code, ErrorCode::Conflict, "event store contract: the visitor's error code must be kept");
+    assert_eq!(
+        visited, 2,
+        "event store contract: replay must stop at the first visitor error"
+    );
+    assert_eq!(
+        err.code,
+        ErrorCode::Conflict,
+        "event store contract: the visitor's error code must be kept"
+    );
     assert!(
         err.message.contains("stop here"),
         "event store contract: the visitor's error message must be kept, got {:?}",
         err.message
     );
     expected.check(store.as_ref(), "after an aborted replay");
-    expected.append(store.as_mut(), 6_000, &[DomainEvent::Warning { message: "still works".into() }]);
-    expected.check(store.as_ref(), "after appending following an aborted replay");
+    expected.append(
+        store.as_mut(),
+        6_000,
+        &[DomainEvent::Warning {
+            message: "still works".into(),
+        }],
+    );
+    expected.check(
+        store.as_ref(),
+        "after appending following an aborted replay",
+    );
 }
 
 // ---- output logs ----------------------------------------------------------------------------
@@ -389,8 +534,9 @@ fn tail_of(logs: &dyn OutputLogs, run: &str, task: &str, max: usize) -> Option<S
 
 fn save(logs: &mut dyn OutputLogs, run: &str, task: &str, attempt: u32, text: &str) {
     let (r, t) = ids(run, task);
-    logs.save(&r, &t, attempt, text)
-        .unwrap_or_else(|e| panic!("output logs contract: save of {run}/{task} attempt {attempt} failed: {e}"));
+    logs.save(&r, &t, attempt, text).unwrap_or_else(|e| {
+        panic!("output logs contract: save of {run}/{task} attempt {attempt} failed: {e}")
+    });
 }
 
 fn remove(logs: &mut dyn OutputLogs, run: &str, task: &str) {
@@ -409,16 +555,32 @@ pub fn output_logs_contract(open: &mut dyn FnMut() -> Box<dyn OutputLogs>) {
     let all = usize::MAX;
 
     // 1. Nothing saved: None, for unknown runs and for unknown tasks of known runs.
-    assert_eq!(tail_of(logs.as_ref(), "r1", "t1", all), None, "output logs contract: no output saved yet");
+    assert_eq!(
+        tail_of(logs.as_ref(), "r1", "t1", all),
+        None,
+        "output logs contract: no output saved yet"
+    );
     save(logs.as_mut(), "r1", "t1", 1, "x");
-    assert_eq!(tail_of(logs.as_ref(), "r1", "t2", all), None, "output logs contract: other task of a known run");
-    assert_eq!(tail_of(logs.as_ref(), "r2", "t1", all), None, "output logs contract: same task id in another run");
+    assert_eq!(
+        tail_of(logs.as_ref(), "r1", "t2", all),
+        None,
+        "output logs contract: other task of a known run"
+    );
+    assert_eq!(
+        tail_of(logs.as_ref(), "r2", "t1", all),
+        None,
+        "output logs contract: same task id in another run"
+    );
     remove(logs.as_mut(), "r1", "t1");
 
     // 2. Save then tail round-trips exactly, including newlines, unicode and empty text.
     let text = "first line\r\nsecond \"line\"\t日本語 🚀\n\nlast line without newline";
     save(logs.as_mut(), "r1", "t1", 1, text);
-    assert_eq!(tail_of(logs.as_ref(), "r1", "t1", all).as_deref(), Some(text), "output logs contract: round trip");
+    assert_eq!(
+        tail_of(logs.as_ref(), "r1", "t1", all).as_deref(),
+        Some(text),
+        "output logs contract: round trip"
+    );
     save(logs.as_mut(), "r1", "t1", 1, "");
     assert_eq!(
         tail_of(logs.as_ref(), "r1", "t1", all).as_deref(),
@@ -434,7 +596,10 @@ pub fn output_logs_contract(open: &mut dyn FnMut() -> Box<dyn OutputLogs>) {
 
     // 3. The newest attempt wins, also when the numbers gain a digit.
     save(logs.as_mut(), "r1", "t1", 2, "second attempt");
-    assert_eq!(tail_of(logs.as_ref(), "r1", "t1", all).as_deref(), Some("second attempt"));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r1", "t1", all).as_deref(),
+        Some("second attempt")
+    );
     save(logs.as_mut(), "r1", "t1", 9, "ninth attempt");
     save(logs.as_mut(), "r1", "t1", 10, "tenth attempt");
     assert_eq!(
@@ -448,22 +613,45 @@ pub fn output_logs_contract(open: &mut dyn FnMut() -> Box<dyn OutputLogs>) {
     save(logs.as_mut(), "r1", "t2", 1, &mixed);
     for max in 0..=mixed.len() + 2 {
         let got = tail_of(logs.as_ref(), "r1", "t2", max).unwrap_or_default();
-        assert!(got.len() <= max, "output logs contract: tail({max}) returned {} bytes", got.len());
-        assert!(mixed.ends_with(&got), "output logs contract: tail({max}) must be a suffix of the output");
+        assert!(
+            got.len() <= max,
+            "output logs contract: tail({max}) returned {} bytes",
+            got.len()
+        );
+        assert!(
+            mixed.ends_with(&got),
+            "output logs contract: tail({max}) must be a suffix of the output"
+        );
         assert!(
             got.len() + 3 >= max.min(mixed.len()),
             "output logs contract: tail({max}) dropped more than a partial character ({} bytes returned)",
             got.len()
         );
     }
-    assert_eq!(tail_of(logs.as_ref(), "r1", "t2", mixed.len()).as_deref(), Some(mixed.as_str()));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r1", "t2", mixed.len()).as_deref(),
+        Some(mixed.as_str())
+    );
     save(logs.as_mut(), "r1", "t3", 1, &"🚀".repeat(10));
-    assert_eq!(tail_of(logs.as_ref(), "r1", "t3", 5).as_deref(), Some("🚀"), "output logs contract: 4-byte character");
-    assert_eq!(tail_of(logs.as_ref(), "r1", "t3", 8).as_deref(), Some("🚀🚀"));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r1", "t3", 5).as_deref(),
+        Some("🚀"),
+        "output logs contract: 4-byte character"
+    );
+    assert_eq!(
+        tail_of(logs.as_ref(), "r1", "t3", 8).as_deref(),
+        Some("🚀🚀")
+    );
     save(logs.as_mut(), "r1", "t4", 1, &"é".repeat(100));
-    assert_eq!(tail_of(logs.as_ref(), "r1", "t4", 50).as_deref(), Some("é".repeat(25).as_str()));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r1", "t4", 50).as_deref(),
+        Some("é".repeat(25).as_str())
+    );
     let odd = tail_of(logs.as_ref(), "r1", "t4", 51).unwrap_or_default();
-    assert!((50..=51).contains(&odd.len()) && odd.chars().all(|c| c == 'é'), "output logs contract: odd max");
+    assert!(
+        (50..=51).contains(&odd.len()) && odd.chars().all(|c| c == 'é'),
+        "output logs contract: odd max"
+    );
 
     // 5. Huge output keeps its end (adapters may drop anything older than the last MiB).
     let mib = 1024 * 1024;
@@ -474,14 +662,21 @@ pub fn output_logs_contract(open: &mut dyn FnMut() -> Box<dyn OutputLogs>) {
     huge.push_str("TAIL-MARKER\n");
     save(logs.as_mut(), "r2", "big", 1, &huge);
     let small = tail_of(logs.as_ref(), "r2", "big", 4096).unwrap_or_default();
-    assert!(huge.ends_with(&small) && small.len() <= 4096 && small.len() >= 4093, "output logs contract: tail of huge output");
+    assert!(
+        huge.ends_with(&small) && small.len() <= 4096 && small.len() >= 4093,
+        "output logs contract: tail of huge output"
+    );
     assert!(small.ends_with("TAIL-MARKER\n"));
     let large = tail_of(logs.as_ref(), "r2", "big", all).unwrap_or_default();
     assert!(
         large.ends_with("TAIL-MARKER\n") && huge.ends_with(&large),
         "output logs contract: the end of huge output must be kept"
     );
-    assert!(large.len() + 4 >= mib, "output logs contract: at least the last MiB must be kept, got {}", large.len());
+    assert!(
+        large.len() + 4 >= mib,
+        "output logs contract: at least the last MiB must be kept, got {}",
+        large.len()
+    );
     remove(logs.as_mut(), "r2", "big");
 
     // 6. remove forgets every attempt of that task only, and is idempotent.
@@ -489,17 +684,35 @@ pub fn output_logs_contract(open: &mut dyn FnMut() -> Box<dyn OutputLogs>) {
     save(logs.as_mut(), "r3", "t1", 2, "two");
     save(logs.as_mut(), "r3", "t2", 1, "other task");
     remove(logs.as_mut(), "r3", "t1");
-    assert_eq!(tail_of(logs.as_ref(), "r3", "t1", all), None, "output logs contract: remove drops all attempts");
-    assert_eq!(tail_of(logs.as_ref(), "r3", "t2", all).as_deref(), Some("other task"), "remove must keep other tasks");
+    assert_eq!(
+        tail_of(logs.as_ref(), "r3", "t1", all),
+        None,
+        "output logs contract: remove drops all attempts"
+    );
+    assert_eq!(
+        tail_of(logs.as_ref(), "r3", "t2", all).as_deref(),
+        Some("other task"),
+        "remove must keep other tasks"
+    );
     remove(logs.as_mut(), "r3", "t1");
     remove(logs.as_mut(), "r3", "never-saved");
     remove(logs.as_mut(), "never-run", "t1");
-    assert_eq!(tail_of(logs.as_ref(), "r3", "t2", all).as_deref(), Some("other task"));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r3", "t2", all).as_deref(),
+        Some("other task")
+    );
     save(logs.as_mut(), "r3", "t1", 1, "after removal");
-    assert_eq!(tail_of(logs.as_ref(), "r3", "t1", all).as_deref(), Some("after removal"), "save after remove");
+    assert_eq!(
+        tail_of(logs.as_ref(), "r3", "t1", all).as_deref(),
+        Some("after removal"),
+        "save after remove"
+    );
     remove(logs.as_mut(), "r3", "t2");
     assert_eq!(tail_of(logs.as_ref(), "r3", "t2", all), None);
-    assert_eq!(tail_of(logs.as_ref(), "r3", "t1", all).as_deref(), Some("after removal"));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r3", "t1", all).as_deref(),
+        Some("after removal")
+    );
     remove(logs.as_mut(), "r3", "t1");
 
     // 7. Runs and tasks are isolated, including task ids that are prefixes of each other.
@@ -507,10 +720,22 @@ pub fn output_logs_contract(open: &mut dyn FnMut() -> Box<dyn OutputLogs>) {
     save(logs.as_mut(), "r4", "a-1", 1, "task a-1");
     save(logs.as_mut(), "r4", "a-1-1", 1, "task a-1-1");
     save(logs.as_mut(), "r5", "a", 1, "run r5 task a");
-    assert_eq!(tail_of(logs.as_ref(), "r4", "a", all).as_deref(), Some("task a"));
-    assert_eq!(tail_of(logs.as_ref(), "r4", "a-1", all).as_deref(), Some("task a-1"));
-    assert_eq!(tail_of(logs.as_ref(), "r4", "a-1-1", all).as_deref(), Some("task a-1-1"));
-    assert_eq!(tail_of(logs.as_ref(), "r5", "a", all).as_deref(), Some("run r5 task a"));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r4", "a", all).as_deref(),
+        Some("task a")
+    );
+    assert_eq!(
+        tail_of(logs.as_ref(), "r4", "a-1", all).as_deref(),
+        Some("task a-1")
+    );
+    assert_eq!(
+        tail_of(logs.as_ref(), "r4", "a-1-1", all).as_deref(),
+        Some("task a-1-1")
+    );
+    assert_eq!(
+        tail_of(logs.as_ref(), "r5", "a", all).as_deref(),
+        Some("run r5 task a")
+    );
     remove(logs.as_mut(), "r4", "a");
     assert_eq!(tail_of(logs.as_ref(), "r4", "a", all), None);
     assert_eq!(
@@ -518,15 +743,27 @@ pub fn output_logs_contract(open: &mut dyn FnMut() -> Box<dyn OutputLogs>) {
         Some("task a-1"),
         "output logs contract: removing task `a` must not touch task `a-1`"
     );
-    assert_eq!(tail_of(logs.as_ref(), "r5", "a", all).as_deref(), Some("run r5 task a"));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r5", "a", all).as_deref(),
+        Some("run r5 task a")
+    );
     remove(logs.as_mut(), "r4", "a-1");
-    assert_eq!(tail_of(logs.as_ref(), "r4", "a-1-1", all).as_deref(), Some("task a-1-1"));
+    assert_eq!(
+        tail_of(logs.as_ref(), "r4", "a-1-1", all).as_deref(),
+        Some("task a-1-1")
+    );
     remove(logs.as_mut(), "r4", "a-1-1");
     remove(logs.as_mut(), "r5", "a");
 
     // 8. Unusual but valid ids work.
     let long = "z".repeat(40);
-    let pairs = [("0", "0"), ("r-9_x", "t_1-2"), (long.as_str(), long.as_str()), ("9", "a"), ("a", "9")];
+    let pairs = [
+        ("0", "0"),
+        ("r-9_x", "t_1-2"),
+        (long.as_str(), long.as_str()),
+        ("9", "a"),
+        ("a", "9"),
+    ];
     for (i, (run, task)) in pairs.iter().enumerate() {
         save(logs.as_mut(), run, task, 1, &format!("output {i}"));
     }
@@ -546,13 +783,29 @@ pub fn output_logs_contract(open: &mut dyn FnMut() -> Box<dyn OutputLogs>) {
     //    and a removal through one handle is seen through the other.
     save(logs.as_mut(), "r6", "t1", 1, "shared");
     let mut other = open();
-    assert_eq!(tail_of(other.as_ref(), "r6", "t1", all).as_deref(), Some("shared"), "visible through a second handle");
+    assert_eq!(
+        tail_of(other.as_ref(), "r6", "t1", all).as_deref(),
+        Some("shared"),
+        "visible through a second handle"
+    );
     logs = reopen(open, logs);
-    assert_eq!(tail_of(logs.as_ref(), "r6", "t1", all).as_deref(), Some("shared"), "output survives reopening");
+    assert_eq!(
+        tail_of(logs.as_ref(), "r6", "t1", all).as_deref(),
+        Some("shared"),
+        "output survives reopening"
+    );
     remove(other.as_mut(), "r6", "t1");
-    assert_eq!(tail_of(logs.as_ref(), "r6", "t1", all), None, "a removal is seen through the other handle");
+    assert_eq!(
+        tail_of(logs.as_ref(), "r6", "t1", all),
+        None,
+        "a removal is seen through the other handle"
+    );
     drop(other);
-    assert_eq!(tail_of(open().as_ref(), "r6", "t1", all), None, "output stays removed after reopening");
+    assert_eq!(
+        tail_of(open().as_ref(), "r6", "t1", all),
+        None,
+        "output stays removed after reopening"
+    );
 }
 
 // ---- contract files -------------------------------------------------------------------------
@@ -615,7 +868,11 @@ pub struct MemoryContractHarness {
 impl MemoryContractHarness {
     pub fn new(world: World) -> MemoryContractHarness {
         let files = world.ports().contract;
-        MemoryContractHarness { world, files, worktree: "/work/wt".to_string() }
+        MemoryContractHarness {
+            world,
+            files,
+            worktree: "/work/wt".to_string(),
+        }
     }
 }
 
@@ -636,8 +893,12 @@ impl ContractHarness for MemoryContractHarness {
         let reason = format!("{name}: planted {kind:?} file");
         match (file, kind) {
             (ContractFile::Result, Plant::Valid) => {
-                let valid = WorkerResult { status: ResultStatus::Done, summary: "done it".to_string() };
-                self.world.write_result(&self.worktree, ContractRead::Valid(valid));
+                let valid = WorkerResult {
+                    status: ResultStatus::Done,
+                    summary: "done it".to_string(),
+                };
+                self.world
+                    .write_result(&self.worktree, ContractRead::Valid(valid));
             }
             (ContractFile::Question, Plant::Valid) => {
                 let valid = WorkerQuestion {
@@ -646,10 +907,15 @@ impl ContractHarness for MemoryContractHarness {
                     choices: vec![],
                     action: None,
                 };
-                self.world.write_question(&self.worktree, ContractRead::Valid(valid));
+                self.world
+                    .write_question(&self.worktree, ContractRead::Valid(valid));
             }
-            (ContractFile::Result, _) => self.world.write_result(&self.worktree, ContractRead::Invalid(reason)),
-            (ContractFile::Question, _) => self.world.write_question(&self.worktree, ContractRead::Invalid(reason)),
+            (ContractFile::Result, _) => self
+                .world
+                .write_result(&self.worktree, ContractRead::Invalid(reason)),
+            (ContractFile::Question, _) => self
+                .world
+                .write_question(&self.worktree, ContractRead::Invalid(reason)),
         }
     }
 
@@ -660,11 +926,23 @@ impl ContractHarness for MemoryContractHarness {
 }
 
 const BOTH_FILES: [ContractFile; 2] = [ContractFile::Result, ContractFile::Question];
-const BROKEN: [Plant; 6] =
-    [Plant::Malformed, Plant::WrongShape, Plant::Oversize, Plant::Symlink, Plant::Fifo, Plant::Directory];
+const BROKEN: [Plant; 6] = [
+    Plant::Malformed,
+    Plant::WrongShape,
+    Plant::Oversize,
+    Plant::Symlink,
+    Plant::Fifo,
+    Plant::Directory,
+];
 /// Kinds that `prepare` must be able to clear (a directory is a conflict the adapter may refuse).
-const CLEARABLE: [Plant; 6] =
-    [Plant::Valid, Plant::Malformed, Plant::WrongShape, Plant::Oversize, Plant::Symlink, Plant::Fifo];
+const CLEARABLE: [Plant; 6] = [
+    Plant::Valid,
+    Plant::Malformed,
+    Plant::WrongShape,
+    Plant::Oversize,
+    Plant::Symlink,
+    Plant::Fifo,
+];
 
 #[derive(Debug)]
 enum Seen {
@@ -677,7 +955,10 @@ fn classify<T: PartialEq + Debug>(read: ContractRead<T>, expected: T, what: &str
     match read {
         ContractRead::Absent => Seen::Absent,
         ContractRead::Valid(v) => {
-            assert_eq!(v, expected, "contract files contract: the valid {what} was read back wrongly");
+            assert_eq!(
+                v, expected,
+                "contract files contract: the valid {what} was read back wrongly"
+            );
             Seen::Valid
         }
         ContractRead::Invalid(reason) => Seen::Invalid(reason),
@@ -688,7 +969,10 @@ fn read_file(h: &dyn ContractHarness, file: ContractFile) -> Seen {
     let wt = h.worktree();
     match file {
         ContractFile::Result => {
-            let expected = WorkerResult { status: ResultStatus::Done, summary: "done it".to_string() };
+            let expected = WorkerResult {
+                status: ResultStatus::Done,
+                summary: "done it".to_string(),
+            };
             classify(h.files().read_result(&wt), expected, "result")
         }
         ContractFile::Question => {
@@ -705,12 +989,18 @@ fn read_file(h: &dyn ContractHarness, file: ContractFile) -> Seen {
 
 fn assert_absent(h: &dyn ContractHarness, file: ContractFile, when: &str) {
     let seen = read_file(h, file);
-    assert!(matches!(seen, Seen::Absent), "contract files contract: {file:?} must be Absent {when}, got {seen:?}");
+    assert!(
+        matches!(seen, Seen::Absent),
+        "contract files contract: {file:?} must be Absent {when}, got {seen:?}"
+    );
 }
 
 fn assert_valid(h: &dyn ContractHarness, file: ContractFile, when: &str) {
     let seen = read_file(h, file);
-    assert!(matches!(seen, Seen::Valid), "contract files contract: {file:?} must be Valid {when}, got {seen:?}");
+    assert!(
+        matches!(seen, Seen::Valid),
+        "contract files contract: {file:?} must be Valid {when}, got {seen:?}"
+    );
 }
 
 fn assert_invalid(h: &dyn ContractHarness, file: ContractFile, kind: Plant) {
@@ -718,7 +1008,10 @@ fn assert_invalid(h: &dyn ContractHarness, file: ContractFile, kind: Plant) {
         Seen::Invalid(reason) => reason,
         other => panic!("contract files contract: a planted {kind:?} {file:?} must read as Invalid, got {other:?}"),
     };
-    assert!(!reason.trim().is_empty(), "contract files contract: the reason for {kind:?} {file:?} is empty");
+    assert!(
+        !reason.trim().is_empty(),
+        "contract files contract: the reason for {kind:?} {file:?} is empty"
+    );
     assert!(
         !reason.chars().any(char::is_control),
         "contract files contract: the reason for {kind:?} {file:?} has control characters: {reason:?}"
@@ -754,23 +1047,45 @@ pub fn contract_files_contract(h: &mut dyn ContractHarness) {
     for file in BOTH_FILES {
         assert_absent(h, file, "when nothing was planted");
     }
-    assert!(!question_present(h), "contract files contract: question_present must be false without a file");
+    assert!(
+        !question_present(h),
+        "contract files contract: question_present must be false without a file"
+    );
     let elsewhere = format!("{}/no-such-worktree", h.worktree());
-    assert!(matches!(h.files().read_result(&elsewhere), ContractRead::Absent), "unknown worktree: result");
-    assert!(matches!(h.files().read_question(&elsewhere), ContractRead::Absent), "unknown worktree: question");
-    assert!(!h.files().question_present(&elsewhere), "contract files contract: unknown worktree: question_present");
+    assert!(
+        matches!(h.files().read_result(&elsewhere), ContractRead::Absent),
+        "unknown worktree: result"
+    );
+    assert!(
+        matches!(h.files().read_question(&elsewhere), ContractRead::Absent),
+        "unknown worktree: question"
+    );
+    assert!(
+        !h.files().question_present(&elsewhere),
+        "contract files contract: unknown worktree: question_present"
+    );
 
     // 2. A valid result reads back; the question file is not affected by it.
     h.plant(ContractFile::Result, Plant::Valid);
     assert_valid(h, ContractFile::Result, "after planting a valid result");
     assert_absent(h, ContractFile::Question, "when only a result was planted");
-    assert!(!question_present(h), "contract files contract: a result is not a question");
+    assert!(
+        !question_present(h),
+        "contract files contract: a result is not a question"
+    );
 
     // 3. A valid question reads back and is present; the result is still valid.
     h.plant(ContractFile::Question, Plant::Valid);
     assert_valid(h, ContractFile::Question, "after planting a valid question");
-    assert!(question_present(h), "contract files contract: question_present must be true for a valid question");
-    assert_valid(h, ContractFile::Result, "after planting a question next to it");
+    assert!(
+        question_present(h),
+        "contract files contract: question_present must be true for a valid question"
+    );
+    assert_valid(
+        h,
+        ContractFile::Result,
+        "after planting a question next to it",
+    );
 
     // 4. Every kind of broken file reads as Invalid with a safe reason, for both files, and a
     //    file of any kind counts as a present question.
@@ -798,9 +1113,16 @@ pub fn contract_files_contract(h: &mut dyn ContractHarness) {
         }
         prepare(h, "the brief of a new attempt");
         for file in BOTH_FILES {
-            assert_absent(h, file, &format!("after prepare cleared a stale {kind:?} file"));
+            assert_absent(
+                h,
+                file,
+                &format!("after prepare cleared a stale {kind:?} file"),
+            );
         }
-        assert!(!question_present(h), "contract files contract: prepare must clear a stale {kind:?} question");
+        assert!(
+            !question_present(h),
+            "contract files contract: prepare must clear a stale {kind:?} question"
+        );
     }
 
     // 7. prepare is idempotent, also when there is nothing to clear.
@@ -815,7 +1137,11 @@ pub fn contract_files_contract(h: &mut dyn ContractHarness) {
     prepare(h, "brief");
     prepare(h, "brief");
     for file in BOTH_FILES {
-        assert_absent(h, file, "after stale files were cleared and prepare was repeated");
+        assert_absent(
+            h,
+            file,
+            "after stale files were cleared and prepare was repeated",
+        );
     }
 
     // 8. Files planted after prepare are read normally.
@@ -823,7 +1149,10 @@ pub fn contract_files_contract(h: &mut dyn ContractHarness) {
     h.plant(ContractFile::Question, Plant::Valid);
     assert_valid(h, ContractFile::Result, "when planted after prepare");
     assert_valid(h, ContractFile::Question, "when planted after prepare");
-    assert!(question_present(h), "contract files contract: question_present after prepare and a new question");
+    assert!(
+        question_present(h),
+        "contract files contract: question_present after prepare and a new question"
+    );
     h.plant(ContractFile::Result, Plant::Malformed);
     assert_invalid(h, ContractFile::Result, Plant::Malformed);
 }

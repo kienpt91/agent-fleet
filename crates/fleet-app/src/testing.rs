@@ -211,12 +211,18 @@ impl World {
     }
     pub fn exit(&self, id: SessionId, code: i64) {
         if let Some(s) = self.lock().sessions.get_mut(&id.0) {
-            s.state = SessionState::Exited { code: Some(code), signal: None };
+            s.state = SessionState::Exited {
+                code: Some(code),
+                signal: None,
+            };
         }
     }
     pub fn exit_by_signal(&self, id: SessionId, name: &str) {
         if let Some(s) = self.lock().sessions.get_mut(&id.0) {
-            s.state = SessionState::Exited { code: None, signal: Some(name.to_string()) };
+            s.state = SessionState::Exited {
+                code: None,
+                signal: Some(name.to_string()),
+            };
         }
     }
     pub fn set_timing(&self, id: SessionId, elapsed_ms: u64, idle_ms: u64) {
@@ -231,9 +237,19 @@ impl World {
         }
     }
     pub fn signals(&self, id: SessionId) -> Vec<Signal> {
-        self.lock().sessions.get(&id.0).map(|s| s.signals.clone()).unwrap_or_default()
+        self.lock()
+            .sessions
+            .get(&id.0)
+            .map(|s| s.signals.clone())
+            .unwrap_or_default()
     }
-    pub fn configure_session(&self, id: SessionId, exit_on_term: bool, exit_on_kill: bool, refuse: bool) {
+    pub fn configure_session(
+        &self,
+        id: SessionId,
+        exit_on_term: bool,
+        exit_on_kill: bool,
+        refuse: bool,
+    ) {
         if let Some(s) = self.lock().sessions.get_mut(&id.0) {
             s.exit_on_term = exit_on_term;
             s.exit_on_kill = exit_on_kill;
@@ -282,7 +298,13 @@ impl World {
             outcomes,
         });
     }
-    pub fn complete_command(&self, approval: &ApprovalId, exit_code: Option<i64>, summary: &str, output: &str) {
+    pub fn complete_command(
+        &self,
+        approval: &ApprovalId,
+        exit_code: Option<i64>,
+        summary: &str,
+        output: &str,
+    ) {
         let mut g = self.lock();
         g.jobs_running = g.jobs_running.saturating_sub(1);
         g.jobs_done.push_back(JobDone::Command {
@@ -318,11 +340,18 @@ pub struct ToyDigest;
 
 impl Digest for ToyDigest {
     fn sha256_hex(&self, data: &[u8]) -> String {
-        let mut acc: [u64; 4] = [0xcbf2_9ce4_8422_2325, 0x1000_0000_01b3, 0x9e37_79b9_7f4a_7c15, 0xff51_afd7_ed55_8ccd];
+        let mut acc: [u64; 4] = [
+            0xcbf2_9ce4_8422_2325,
+            0x1000_0000_01b3,
+            0x9e37_79b9_7f4a_7c15,
+            0xff51_afd7_ed55_8ccd,
+        ];
         for (i, b) in data.iter().enumerate() {
             let slot = i % 4;
             if let Some(a) = acc.get_mut(slot) {
-                *a = (*a ^ u64::from(*b)).wrapping_mul(0x1000_0000_01b3).rotate_left(5);
+                *a = (*a ^ u64::from(*b))
+                    .wrapping_mul(0x1000_0000_01b3)
+                    .rotate_left(5);
             }
             let next = (slot + 1) % 4;
             let prev = acc.get(slot).copied().unwrap_or(0);
@@ -355,7 +384,11 @@ impl EventStore for MemoryEventStore {
         }
         for e in events {
             let seq = g.events.len() as u64 + 1;
-            g.events.push(StoredEvent { seq, ts_ms, event: e.clone() });
+            g.events.push(StoredEvent {
+                seq,
+                ts_ms,
+                event: e.clone(),
+            });
         }
         Ok(g.events.len() as u64)
     }
@@ -395,7 +428,9 @@ impl Vcs for FakeVcs {
     fn resolve_base(&self, repo: &str, base_ref: &str) -> Result<BaseCommit> {
         let g = self.0.lock();
         if g.missing_repos.contains(repo) {
-            return Err(FleetError::not_found(format!("{repo} is not a git repository")));
+            return Err(FleetError::not_found(format!(
+                "{repo} is not a git repository"
+            )));
         }
         if base_ref != "HEAD" {
             fleet_domain::ids::validate_ref_name(base_ref)?;
@@ -404,10 +439,20 @@ impl Vcs for FakeVcs {
             Some(s) => s.clone(),
             None => Sha::parse(&"a".repeat(40))?,
         };
-        Ok(BaseCommit { ref_name: base_ref.to_string(), sha })
+        Ok(BaseCommit {
+            ref_name: base_ref.to_string(),
+            sha,
+        })
     }
 
-    fn prepare_worktree(&self, repo: &str, run: &RunId, task: &TaskId, branch: &str, _base: &Sha) -> Result<String> {
+    fn prepare_worktree(
+        &self,
+        repo: &str,
+        run: &RunId,
+        task: &TaskId,
+        branch: &str,
+        _base: &Sha,
+    ) -> Result<String> {
         let mut g = self.0.lock();
         if g.fail_prepare {
             return Err(FleetError::internal("git worktree add failed"));
@@ -417,17 +462,30 @@ impl Vcs for FakeVcs {
         Ok(path)
     }
 
-    fn merge_into_worktree(&self, worktree: &str, branches: &[String], _identity: &Identity) -> Result<MergeOutcome> {
+    fn merge_into_worktree(
+        &self,
+        worktree: &str,
+        branches: &[String],
+        _identity: &Identity,
+    ) -> Result<MergeOutcome> {
         let mut g = self.0.lock();
-        g.worktree_merges.push((worktree.to_string(), branches.to_vec()));
+        g.worktree_merges
+            .push((worktree.to_string(), branches.to_vec()));
         if branches.iter().any(|b| g.conflict_branches.contains(b)) {
-            return Ok(MergeOutcome::Conflict { files: vec!["src/shared.rs".to_string()] });
+            return Ok(MergeOutcome::Conflict {
+                files: vec!["src/shared.rs".to_string()],
+            });
         }
         let sha = Self::next_sha(&mut g, 'b');
         Ok(MergeOutcome::Merged { sha })
     }
 
-    fn commit_all(&self, worktree: &str, _message: &str, _identity: &Identity) -> Result<Option<Sha>> {
+    fn commit_all(
+        &self,
+        worktree: &str,
+        _message: &str,
+        _identity: &Identity,
+    ) -> Result<Option<Sha>> {
         let mut g = self.0.lock();
         if g.dirty_worktrees.remove(worktree) {
             Ok(Some(Self::next_sha(&mut g, 'c')))
@@ -445,19 +503,38 @@ impl Vcs for FakeVcs {
         let created = g.integration_created.insert(req.run.to_string());
         if g.conflict_branches.contains(&req.task_branch) {
             return Ok(IntegrationResult {
-                outcome: MergeOutcome::Conflict { files: vec!["src/lib.rs".to_string()] },
+                outcome: MergeOutcome::Conflict {
+                    files: vec!["src/lib.rs".to_string()],
+                },
                 created,
             });
         }
-        g.merges.push((req.integration_branch.clone(), req.task_branch.clone()));
+        g.merges
+            .push((req.integration_branch.clone(), req.task_branch.clone()));
         g.merged_branches.insert(req.task_branch.clone());
         let sha = Self::next_sha(&mut g, 'd');
-        Ok(IntegrationResult { outcome: MergeOutcome::Merged { sha }, created })
+        Ok(IntegrationResult {
+            outcome: MergeOutcome::Merged { sha },
+            created,
+        })
     }
 
-    fn remove_worktree(&self, _repo: &str, worktree: &str, branch: &str, delete_branch: bool) -> Result<()> {
+    fn remove_worktree(
+        &self,
+        _repo: &str,
+        worktree: &str,
+        branch: &str,
+        delete_branch: bool,
+    ) -> Result<()> {
         let mut g = self.0.lock();
-        g.removed.push((if worktree.is_empty() { branch.to_string() } else { worktree.to_string() }, delete_branch));
+        g.removed.push((
+            if worktree.is_empty() {
+                branch.to_string()
+            } else {
+                worktree.to_string()
+            },
+            delete_branch,
+        ));
         Ok(())
     }
 
@@ -495,28 +572,34 @@ impl SessionHost for FakeSessions {
                 refuse_signals: false,
             },
         );
-        Ok(Spawned { id: SessionId(id), identity })
+        Ok(Spawned {
+            id: SessionId(id),
+            identity,
+        })
     }
 
     fn poll(&mut self, id: SessionId) -> SessionState {
-        self.0
-            .lock()
-            .sessions
-            .get(&id.0)
-            .map_or(SessionState::Exited { code: None, signal: None }, |s| s.state.clone())
+        self.0.lock().sessions.get(&id.0).map_or(
+            SessionState::Exited {
+                code: None,
+                signal: None,
+            },
+            |s| s.state.clone(),
+        )
     }
 
     fn reading(&self, id: SessionId) -> Option<SessionReading> {
-        self.0
-            .lock()
-            .sessions
-            .get(&id.0)
-            .map(|s| SessionReading { elapsed_ms: s.elapsed_ms, idle_ms: s.idle_ms })
+        self.0.lock().sessions.get(&id.0).map(|s| SessionReading {
+            elapsed_ms: s.elapsed_ms,
+            idle_ms: s.idle_ms,
+        })
     }
 
     fn signal(&mut self, id: SessionId, signal: Signal) -> SignalOutcome {
         let mut g = self.0.lock();
-        let Some(s) = g.sessions.get_mut(&id.0) else { return SignalOutcome::Gone };
+        let Some(s) = g.sessions.get_mut(&id.0) else {
+            return SignalOutcome::Gone;
+        };
         if s.refuse_signals {
             return SignalOutcome::Refused("pid reused".to_string());
         }
@@ -531,7 +614,14 @@ impl SessionHost for FakeSessions {
         if dies {
             s.state = SessionState::Exited {
                 code: None,
-                signal: Some(if signal == Signal::Term { "SIGTERM" } else { "SIGKILL" }.to_string()),
+                signal: Some(
+                    if signal == Signal::Term {
+                        "SIGTERM"
+                    } else {
+                        "SIGKILL"
+                    }
+                    .to_string(),
+                ),
             };
         }
         SignalOutcome::Sent
@@ -551,9 +641,20 @@ impl SessionHost for FakeSessions {
         let total = s.output.len() as u64;
         let from = offset.min(total);
         let start = usize::try_from(from).unwrap_or(usize::MAX);
-        let text: String = s.output.get(start..).unwrap_or("").chars().take(max).collect();
+        let text: String = s
+            .output
+            .get(start..)
+            .unwrap_or("")
+            .chars()
+            .take(max)
+            .collect();
         let next = from + text.len() as u64;
-        Some(Chunk { from, next, text, lost: false })
+        Some(Chunk {
+            from,
+            next,
+            text,
+            lost: false,
+        })
     }
 
     fn release(&mut self, id: SessionId) -> SessionOutput {
@@ -561,9 +662,15 @@ impl SessionHost for FakeSessions {
         match g.sessions.get_mut(&id.0) {
             Some(s) => {
                 s.released = true;
-                SessionOutput { text: s.output.clone(), stripped: 0 }
+                SessionOutput {
+                    text: s.output.clone(),
+                    stripped: 0,
+                }
             }
-            None => SessionOutput { text: String::new(), stripped: 0 },
+            None => SessionOutput {
+                text: String::new(),
+                stripped: 0,
+            },
         }
     }
 
@@ -573,7 +680,10 @@ impl SessionHost for FakeSessions {
             .sessions
             .values()
             .filter(|s| !s.released)
-            .map(|s| LiveSession { pid: s.identity.pid, pgid: s.identity.pid })
+            .map(|s| LiveSession {
+                pid: s.identity.pid,
+                pgid: s.identity.pid,
+            })
             .collect()
     }
 
@@ -583,7 +693,9 @@ impl SessionHost for FakeSessions {
 
     fn terminate_orphan(&mut self, identity: &ProcessIdentity, _grace_ms: u64) -> SignalOutcome {
         let mut g = self.0.lock();
-        if g.start_tokens.get(&identity.pid).map(String::as_str) != Some(identity.start_token.as_str()) {
+        if g.start_tokens.get(&identity.pid).map(String::as_str)
+            != Some(identity.start_token.as_str())
+        {
             return SignalOutcome::Refused("start time differs".to_string());
         }
         g.start_tokens.remove(&identity.pid);
@@ -609,11 +721,21 @@ impl ContractFiles for FakeContract {
     }
 
     fn read_question(&self, worktree: &str) -> ContractRead<WorkerQuestion> {
-        self.0.lock().questions.get(worktree).cloned().unwrap_or(ContractRead::Absent)
+        self.0
+            .lock()
+            .questions
+            .get(worktree)
+            .cloned()
+            .unwrap_or(ContractRead::Absent)
     }
 
     fn read_result(&self, worktree: &str) -> ContractRead<WorkerResult> {
-        self.0.lock().results.get(worktree).cloned().unwrap_or(ContractRead::Absent)
+        self.0
+            .lock()
+            .results
+            .get(worktree)
+            .cloned()
+            .unwrap_or(ContractRead::Absent)
     }
 
     fn question_present(&self, worktree: &str) -> bool {
@@ -628,12 +750,24 @@ pub struct FakeJobs(World);
 impl JobRunner for FakeJobs {
     fn start(&mut self, job: Job) -> Result<()> {
         let mut g = self.0.lock();
-        if let Job::Gates { run, task, attempt, gates, .. } = &job {
+        if let Job::Gates {
+            run,
+            task,
+            attempt,
+            gates,
+            ..
+        } = &job
+        {
             let outcomes: Option<Vec<GateOutcome>> = match g.gate_mode.clone() {
                 Some(GateMode::Pass) => Some(
                     gates
                         .iter()
-                        .map(|s| GateOutcome { name: s.name.clone(), passed: true, summary: "exit code 0".into(), output: String::new() })
+                        .map(|s| GateOutcome {
+                            name: s.name.clone(),
+                            passed: true,
+                            summary: "exit code 0".into(),
+                            output: String::new(),
+                        })
                         .collect(),
                 ),
                 Some(GateMode::Fail(text)) => Some(
@@ -643,7 +777,11 @@ impl JobRunner for FakeJobs {
                         .map(|(i, s)| GateOutcome {
                             name: s.name.clone(),
                             passed: i != 0,
-                            summary: if i == 0 { "exit code 1".into() } else { "exit code 0".into() },
+                            summary: if i == 0 {
+                                "exit code 1".into()
+                            } else {
+                                "exit code 0".into()
+                            },
                             output: if i == 0 { text.clone() } else { String::new() },
                         })
                         .collect(),
@@ -651,7 +789,12 @@ impl JobRunner for FakeJobs {
                 Some(GateMode::Manual) | None => None,
             };
             if let Some(outcomes) = outcomes {
-                g.jobs_done.push_back(JobDone::Gates { run: run.clone(), task: task.clone(), attempt: *attempt, outcomes });
+                g.jobs_done.push_back(JobDone::Gates {
+                    run: run.clone(),
+                    task: task.clone(),
+                    attempt: *attempt,
+                    outcomes,
+                });
             } else {
                 g.jobs_running += 1;
             }
@@ -677,10 +820,10 @@ pub struct MemoryLogs(World);
 
 impl OutputLogs for MemoryLogs {
     fn save(&mut self, run: &RunId, task: &TaskId, attempt: u32, text: &str) -> Result<()> {
-        self.0
-            .lock()
-            .logs
-            .insert((run.to_string(), task.to_string()), (attempt, text.to_string()));
+        self.0.lock().logs.insert(
+            (run.to_string(), task.to_string()),
+            (attempt, text.to_string()),
+        );
         Ok(())
     }
 
@@ -693,7 +836,10 @@ impl OutputLogs for MemoryLogs {
     }
 
     fn remove(&mut self, run: &RunId, task: &TaskId) {
-        self.0.lock().logs.remove(&(run.to_string(), task.to_string()));
+        self.0
+            .lock()
+            .logs
+            .remove(&(run.to_string(), task.to_string()));
     }
 }
 
@@ -738,7 +884,13 @@ pub fn test_config() -> AppConfig {
         WorkerDef {
             name: name.clone(),
             command: "run-agent".to_string(),
-            args: vec!["--task".into(), "{task}".into(), "--dir".into(), "{worktree}".into(), "{brief}".into()],
+            args: vec![
+                "--task".into(),
+                "{task}".into(),
+                "--dir".into(),
+                "{worktree}".into(),
+                "{brief}".into(),
+            ],
             env_pass: vec![],
             env_set: vec![("AGENT_MODE".to_string(), "test".to_string())],
             timeout_ms: Some(60_000),
@@ -780,7 +932,11 @@ impl Harness {
         Ok(())
     }
 
-    pub fn call(&mut self, cmd: &str, args: fleet_domain::value::Value) -> Result<crate::api::Reply> {
+    pub fn call(
+        &mut self,
+        cmd: &str,
+        args: fleet_domain::value::Value,
+    ) -> Result<crate::api::Reply> {
         let command = crate::api::parse_command(cmd, &args)?;
         self.orch.handle(command)
     }

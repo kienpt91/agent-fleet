@@ -43,7 +43,11 @@ impl Orchestrator {
                         key: (r.id.clone(), t.id.clone()),
                         attempt: t.attempt,
                         pid: t.session.as_ref().map_or(0, |s| s.pid),
-                        token: t.session.as_ref().map(|s| s.start_token.clone()).unwrap_or_default(),
+                        token: t
+                            .session
+                            .as_ref()
+                            .map(|s| s.start_token.clone())
+                            .unwrap_or_default(),
                         worktree: t.worktree.clone().unwrap_or_default(),
                     })
                     .collect::<Vec<_>>()
@@ -52,7 +56,11 @@ impl Orchestrator {
         for o in orphans {
             let pid = u32::try_from(o.pid).unwrap_or(0);
             let identity = ProcessIdentity::new(pid, o.token.clone());
-            let running = if pid > 1 { self.ports.sessions.start_token(pid) } else { None };
+            let running = if pid > 1 {
+                self.ports.sessions.start_token(pid)
+            } else {
+                None
+            };
             let action = match orphan_action(&identity, running.as_deref()) {
                 OrphanAction::Gone => "its process was already gone".to_string(),
                 OrphanAction::PidReused => {

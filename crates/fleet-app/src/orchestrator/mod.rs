@@ -19,7 +19,7 @@ use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
 use fleet_domain::fleet::{FleetState, Policy};
 use fleet_domain::ids::{ApprovalId, RunId, TaskId};
-use fleet_domain::run::RetryPolicy;
+use fleet_domain::run::{RetryPolicy, WorkerEnd};
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::supervision::{KillEscalation, SupervisionPolicy};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -55,6 +55,9 @@ pub struct Orchestrator {
     /// Reviews whose worker output was committed already.
     pub(crate) committed: BTreeSet<(RunId, TaskId, u32)>,
     pub(crate) command_jobs: BTreeSet<ApprovalId>,
+    /// Session ends that could not be recorded yet (the store failed); retried every tick so a
+    /// task never stays `running` without a session.
+    pub(crate) pending_ends: BTreeMap<Key, WorkerEnd>,
     pub(crate) recent: VecDeque<Recent>,
     pub(crate) started_ms: u64,
     pub(crate) pid: u64,
@@ -93,6 +96,7 @@ impl Orchestrator {
             gate_jobs: BTreeSet::new(),
             committed: BTreeSet::new(),
             command_jobs: BTreeSet::new(),
+            pending_ends: BTreeMap::new(),
             recent,
             started_ms,
             pid: 0,
@@ -127,7 +131,9 @@ impl Orchestrator {
 
     /// The session of a live task, for the transport's attach and send paths.
     pub fn session_of(&self, run: &RunId, task: &TaskId) -> Option<SessionId> {
-        self.live.get(&(run.clone(), task.clone())).map(|l| l.session)
+        self.live
+            .get(&(run.clone(), task.clone()))
+            .map(|l| l.session)
     }
 
     pub(crate) fn now(&self) -> u64 {
@@ -148,7 +154,11 @@ impl Orchestrator {
             let seq = first.saturating_add(i as u64);
             self.state.apply(&event);
             push_recent(&mut self.recent, seq, ts, &event);
-            stored.push(StoredEvent { seq, ts_ms: ts, event });
+            stored.push(StoredEvent {
+                seq,
+                ts_ms: ts,
+                event,
+            });
         }
         self.ports.publisher.publish(&stored);
         Ok(())
@@ -156,7 +166,11 @@ impl Orchestrator {
 
     /// Records a warning (deduplicated); never fails the caller.
     pub(crate) fn warn(&mut self, message: impl AsRef<str>) {
-        let text = head_str(sanitize_text(message.as_ref().as_bytes()).trim(), WARNING_MAX).to_string();
+        let text = head_str(
+            sanitize_text(message.as_ref().as_bytes()).trim(),
+            WARNING_MAX,
+        )
+        .to_string();
         let now = self.now();
         if let Some((last, at)) = &self.last_warning {
             if *last == text && now.saturating_sub(*at) < WARNING_REPEAT_MS {

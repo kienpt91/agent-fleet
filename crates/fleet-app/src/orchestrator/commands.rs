@@ -35,18 +35,29 @@ impl Orchestrator {
             Command::Status { run } => Ok(Reply::Data(self.status(run.as_ref()))),
             Command::CreateRun(args) => self.create_run(args),
             Command::AddTask { run, task } => self.add_tasks(&run, vec![task], "fleet.task.add/1"),
-            Command::LoadPlan { run, new_run, tasks } => self.load_plan(run, new_run, tasks),
+            Command::LoadPlan {
+                run,
+                new_run,
+                tasks,
+            } => self.load_plan(run, new_run, tasks),
             Command::StartRun { run, max_parallel } => self.start_run(&run, max_parallel),
             Command::Stop { task } => self.stop(&task),
             Command::Retry { task } => self.retry(&task),
             Command::Cancel { task } => self.cancel(&task),
             Command::Tail { task, since, max } => self.tail(&task, since, max),
-            Command::Send { task, text, newline } => self.send(&task, &text, newline),
+            Command::Send {
+                task,
+                text,
+                newline,
+            } => self.send(&task, &text, newline),
             Command::Attach { task } => self.attach(&task),
             Command::GateList => Ok(self.gate_list()),
             Command::ResolveGate { id, answer } => {
                 let events = self.state.resolve_decision(&id, &answer)?;
-                let task = self.state.decision(&id).map(|d| qualified(&d.run, &d.task))?;
+                let task = self
+                    .state
+                    .decision(&id)
+                    .map(|d| qualified(&d.run, &d.task))?;
                 self.commit(events)?;
                 self.tick();
                 Ok(data(
@@ -55,11 +66,19 @@ impl Orchestrator {
                 ))
             }
             Command::ApprovalList => Ok(self.approval_list()),
-            Command::Decide { id, approve, digest } => {
+            Command::Decide {
+                id,
+                approve,
+                digest,
+            } => {
                 let now = self.now();
-                let events = self
-                    .state
-                    .decide_approval(&id, approve, digest.as_deref(), now, self.ports.digest.as_ref())?;
+                let events = self.state.decide_approval(
+                    &id,
+                    approve,
+                    digest.as_deref(),
+                    now,
+                    self.ports.digest.as_ref(),
+                )?;
                 let digest = self.state.approval(&id).map(|a| a.digest.clone())?;
                 self.commit(events)?;
                 self.tick();
@@ -67,7 +86,10 @@ impl Orchestrator {
                     "fleet.approval.decide/1",
                     vec![
                         ("id", Value::str(id.as_str())),
-                        ("decision", Value::str(if approve { "approved" } else { "denied" })),
+                        (
+                            "decision",
+                            Value::str(if approve { "approved" } else { "denied" }),
+                        ),
                         ("digest", Value::str(digest)),
                     ],
                 ))
@@ -82,7 +104,10 @@ impl Orchestrator {
             Command::Shutdown => {
                 self.shutdown_requested = true;
                 self.begin_shutdown();
-                Ok(data("fleet.shutdown/1", vec![("stopping", Value::Bool(true))]))
+                Ok(data(
+                    "fleet.shutdown/1",
+                    vec![("stopping", Value::Bool(true))],
+                ))
             }
         }
     }
@@ -107,7 +132,10 @@ impl Orchestrator {
                 ("undo_available", Value::Bool(self.ports.undo.available())),
                 ("runs", Value::int(runs as u64)),
                 ("tasks", Value::int(self.state.total_tasks() as u64)),
-                ("merge_needs_approval", Value::Bool(self.cfg.merge_needs_approval)),
+                (
+                    "merge_needs_approval",
+                    Value::Bool(self.cfg.merge_needs_approval),
+                ),
                 ("external_commands", Value::Bool(self.cfg.external_commands)),
                 ("gates", Value::int(self.cfg.gates.len() as u64)),
                 (
@@ -140,7 +168,10 @@ impl Orchestrator {
     fn gate_list(&self) -> Reply {
         data(
             "fleet.gate.list/1",
-            vec![("gates", Value::array(self.state.decisions().map(views::gate_value)))],
+            vec![(
+                "gates",
+                Value::array(self.state.decisions().map(views::gate_value)),
+            )],
         )
     }
 
@@ -150,7 +181,11 @@ impl Orchestrator {
             "fleet.approval.list/1",
             vec![(
                 "approvals",
-                Value::array(self.state.approvals().map(|a| views::approval_value(a, now))),
+                Value::array(
+                    self.state
+                        .approvals()
+                        .map(|a| views::approval_value(a, now)),
+                ),
             )],
         )
     }
@@ -174,7 +209,10 @@ impl Orchestrator {
     fn create_run(&mut self, args: NewRunArgs) -> Result<Reply> {
         let (id, event) = self.create_run_event(args)?;
         self.commit(vec![event])?;
-        Ok(data("fleet.run.create/1", vec![("run", Value::str(id.as_str()))]))
+        Ok(data(
+            "fleet.run.create/1",
+            vec![("run", Value::str(id.as_str()))],
+        ))
     }
 
     fn add_tasks(&mut self, run: &RunId, tasks: Vec<NewTask>, schema: &str) -> Result<Reply> {
@@ -185,17 +223,31 @@ impl Orchestrator {
             schema,
             vec![
                 ("run", Value::str(run.as_str())),
-                ("tasks", Value::array(ids.iter().map(|t| Value::str(t.as_str())))),
+                (
+                    "tasks",
+                    Value::array(ids.iter().map(|t| Value::str(t.as_str()))),
+                ),
             ],
         ))
     }
 
-    fn load_plan(&mut self, run: Option<RunId>, new_run: Option<NewRunArgs>, tasks: Vec<NewTask>) -> Result<Reply> {
+    fn load_plan(
+        &mut self,
+        run: Option<RunId>,
+        new_run: Option<NewRunArgs>,
+        tasks: Vec<NewTask>,
+    ) -> Result<Reply> {
         let run_id = match (run, new_run) {
             (Some(_), Some(_)) => {
-                return Err(FleetError::invalid("a plan names an existing run or describes a new one, not both"))
+                return Err(FleetError::invalid(
+                    "a plan names an existing run or describes a new one, not both",
+                ))
             }
-            (None, None) => return Err(FleetError::invalid("a plan needs a run: pass --run or add a [run] section")),
+            (None, None) => {
+                return Err(FleetError::invalid(
+                    "a plan needs a run: pass --run or add a [run] section",
+                ))
+            }
             (Some(r), None) => {
                 // Validate the tasks against the run before changing anything.
                 self.state.add_tasks(&r, tasks.clone())?;
@@ -237,16 +289,23 @@ impl Orchestrator {
         if self.begin_stop(&key, EndKind::Stopped) {
             return Ok(data(
                 "fleet.task.stop/1",
-                vec![("task", Value::str(qualified(&key.0, &key.1))), ("status", Value::str("stopping"))],
+                vec![
+                    ("task", Value::str(qualified(&key.0, &key.1))),
+                    ("status", Value::str("stopping")),
+                ],
             ));
         }
         match status {
-            Some(TaskStatus::Pending | TaskStatus::Ready | TaskStatus::Blocked) => self.cancel(reference),
+            Some(TaskStatus::Pending | TaskStatus::Ready | TaskStatus::Blocked) => {
+                self.cancel(reference)
+            }
             Some(other) => Err(FleetError::conflict(format!(
                 "task {} is {other}; only running tasks can be stopped",
                 qualified(&key.0, &key.1)
             ))),
-            None => Err(FleetError::not_found(format!("task {reference} does not exist"))),
+            None => Err(FleetError::not_found(format!(
+                "task {reference} does not exist"
+            ))),
         }
     }
 
@@ -258,7 +317,10 @@ impl Orchestrator {
         self.tick();
         Ok(data(
             "fleet.task.retry/1",
-            vec![("task", Value::str(qualified(&key.0, &key.1))), ("status", Value::str("ready"))],
+            vec![
+                ("task", Value::str(qualified(&key.0, &key.1))),
+                ("status", Value::str("ready")),
+            ],
         ))
     }
 
@@ -269,7 +331,10 @@ impl Orchestrator {
         self.promote()?;
         Ok(data(
             "fleet.task.cancel/1",
-            vec![("task", Value::str(qualified(&key.0, &key.1))), ("status", Value::str("failed"))],
+            vec![
+                ("task", Value::str(qualified(&key.0, &key.1))),
+                ("status", Value::str("failed")),
+            ],
         ))
     }
 
@@ -283,7 +348,11 @@ impl Orchestrator {
                     None => (String::new(), offset, false),
                 },
                 None => {
-                    let text = self.ports.sessions.snapshot(live.session, max).unwrap_or_default();
+                    let text = self
+                        .ports
+                        .sessions
+                        .snapshot(live.session, max)
+                        .unwrap_or_default();
                     let next = self
                         .ports
                         .sessions
@@ -303,7 +372,11 @@ impl Orchestrator {
                 ],
             ));
         }
-        let text = self.ports.logs.tail(&key.0, &key.1, max).unwrap_or_default();
+        let text = self
+            .ports
+            .logs
+            .tail(&key.0, &key.1, max)
+            .unwrap_or_default();
         Ok(data(
             "fleet.tail/1",
             vec![
@@ -318,10 +391,12 @@ impl Orchestrator {
 
     fn send(&mut self, reference: &str, text: &str, newline: bool) -> Result<Reply> {
         let key = self.resolve(reference)?;
-        let live = self
-            .live
-            .get(&key)
-            .ok_or_else(|| FleetError::conflict(format!("task {} has no running session", qualified(&key.0, &key.1))))?;
+        let live = self.live.get(&key).ok_or_else(|| {
+            FleetError::conflict(format!(
+                "task {} has no running session",
+                qualified(&key.0, &key.1)
+            ))
+        })?;
         let mut bytes = text.as_bytes().to_vec();
         if newline {
             bytes.push(b'\r');
@@ -340,10 +415,12 @@ impl Orchestrator {
 
     fn attach(&mut self, reference: &str) -> Result<Reply> {
         let key = self.resolve(reference)?;
-        let live = self
-            .live
-            .get(&key)
-            .ok_or_else(|| FleetError::conflict(format!("task {} has no running session", qualified(&key.0, &key.1))))?;
+        let live = self.live.get(&key).ok_or_else(|| {
+            FleetError::conflict(format!(
+                "task {} has no running session",
+                qualified(&key.0, &key.1)
+            ))
+        })?;
         Ok(Reply::Attach {
             session: live.session,
             data: Value::object([
@@ -368,9 +445,14 @@ impl Orchestrator {
         };
         let head = self.ports.vcs.branch_head(&repo, &branch)?;
         let now = self.now();
-        let gate = self
-            .state
-            .request_merge(&key.0, &key.1, &head, &self.policy, now, self.ports.digest.as_ref())?;
+        let gate = self.state.request_merge(
+            &key.0,
+            &key.1,
+            &head,
+            &self.policy,
+            now,
+            self.ports.digest.as_ref(),
+        )?;
         match gate {
             MergeGate::Pending { approval, events } => {
                 self.commit(events)?;
@@ -399,7 +481,12 @@ impl Orchestrator {
                 })?;
                 match result.outcome {
                     MergeOutcome::Merged { sha } => {
-                        let events = self.state.merge_succeeded(&key.0, &key.1, sha.clone(), result.created)?;
+                        let events = self.state.merge_succeeded(
+                            &key.0,
+                            &key.1,
+                            sha.clone(),
+                            result.created,
+                        )?;
                         self.commit(events)?;
                         Ok(data(
                             "fleet.merge/1",
@@ -412,9 +499,12 @@ impl Orchestrator {
                         ))
                     }
                     MergeOutcome::Conflict { files } => {
-                        let events = self
-                            .state
-                            .merge_conflicted(&key.0, &key.1, files.clone(), result.created)?;
+                        let events = self.state.merge_conflicted(
+                            &key.0,
+                            &key.1,
+                            files.clone(),
+                            result.created,
+                        )?;
                         let gate = events.iter().find_map(|e| match e {
                             DomainEvent::DecisionOpened { id, .. } => Some(id.to_string()),
                             _ => None,
@@ -451,7 +541,10 @@ impl Orchestrator {
             .flat_map(|r| {
                 r.tasks()
                     .iter()
-                    .filter(|t| (t.status == TaskStatus::Completed && t.merged.is_some()) || t.status == TaskStatus::Failed)
+                    .filter(|t| {
+                        (t.status == TaskStatus::Completed && t.merged.is_some())
+                            || t.status == TaskStatus::Failed
+                    })
                     .map(|t| Item {
                         key: (r.id.clone(), t.id.clone()),
                         repo: r.repo.clone(),
@@ -471,7 +564,12 @@ impl Orchestrator {
             }
             let name = qualified(&item.key.0, &item.key.1);
             if !item.worktree.is_empty() {
-                match self.ports.vcs.remove_worktree(&item.repo, &item.worktree, &item.branch, false) {
+                match self.ports.vcs.remove_worktree(
+                    &item.repo,
+                    &item.worktree,
+                    &item.branch,
+                    false,
+                ) {
                     Ok(()) => {
                         self.commit(vec![DomainEvent::WorktreeRemoved {
                             run: item.key.0.clone(),
@@ -491,16 +589,26 @@ impl Orchestrator {
                     .is_merged(&item.repo, &item.branch, &item.integration)
                     .unwrap_or(false);
                 if merged {
-                    match self.ports.vcs.remove_worktree(&item.repo, "", &item.branch, true) {
+                    match self
+                        .ports
+                        .vcs
+                        .remove_worktree(&item.repo, "", &item.branch, true)
+                    {
                         Ok(()) => deleted.push(Value::str(&item.branch)),
-                        Err(e) => self.warn(format!("{name}: could not delete the branch: {}", e.message)),
+                        Err(e) => self.warn(format!(
+                            "{name}: could not delete the branch: {}",
+                            e.message
+                        )),
                     }
                 }
             }
         }
         Ok(data(
             "fleet.cleanup/1",
-            vec![("removed", Value::array(removed)), ("branches_deleted", Value::array(deleted))],
+            vec![
+                ("removed", Value::array(removed)),
+                ("branches_deleted", Value::array(deleted)),
+            ],
         ))
     }
 

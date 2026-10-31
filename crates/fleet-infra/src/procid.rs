@@ -121,7 +121,10 @@ pub fn ancestry(pid: u32) -> Vec<ProcInfo> {
 }
 
 fn to_pid(pid: u32) -> Option<Pid> {
-    i32::try_from(pid).ok().filter(|p| *p > 1).map(Pid::from_raw)
+    i32::try_from(pid)
+        .ok()
+        .filter(|p| *p > 1)
+        .map(Pid::from_raw)
 }
 
 /// True while any process of the group exists.
@@ -148,7 +151,10 @@ pub fn signal_verified(identity: &ProcessIdentity, signal: Signal) -> SignalOutc
     match proc_info(identity.pid) {
         Some(info) if info.pgid == identity.pid => {}
         Some(_) => {
-            return SignalOutcome::Refused(format!("pid {} does not lead a process group", identity.pid));
+            return SignalOutcome::Refused(format!(
+                "pid {} does not lead a process group",
+                identity.pid
+            ));
         }
         None => return SignalOutcome::Gone,
     }
@@ -209,7 +215,11 @@ mod tests {
 
     fn spawn_sleeper(trap_term: bool) -> std::process::Child {
         use std::os::unix::process::CommandExt;
-        let script = if trap_term { "trap '' TERM; while :; do sleep 1; done" } else { "sleep 30" };
+        let script = if trap_term {
+            "trap '' TERM; while :; do sleep 1; done"
+        } else {
+            "sleep 30"
+        };
         Command::new("/bin/sh")
             .args(["-c", script])
             .stdin(Stdio::null())
@@ -273,9 +283,15 @@ mod tests {
             SignalOutcome::Refused(why) => assert!(why.contains("different process"), "{why}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
-        assert!(child.try_wait().unwrap().is_none(), "the process must still be running");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the process must still be running"
+        );
         let genuine = ProcessIdentity::new(child.id(), real);
-        assert_eq!(signal_verified(&genuine, Signal::SIGKILL), SignalOutcome::Sent);
+        assert_eq!(
+            signal_verified(&genuine, Signal::SIGKILL),
+            SignalOutcome::Sent
+        );
         child.wait().unwrap();
     }
 
@@ -285,7 +301,10 @@ mod tests {
         let me = std::process::id();
         let id = ProcessIdentity::new(me, start_token(me).unwrap());
         if proc_info(me).map(|i| i.pgid) != Some(me) {
-            assert!(matches!(signal_verified(&id, Signal::SIGCONT), SignalOutcome::Refused(_)));
+            assert!(matches!(
+                signal_verified(&id, Signal::SIGCONT),
+                SignalOutcome::Refused(_)
+            ));
         }
     }
 
@@ -301,7 +320,10 @@ mod tests {
     #[test]
     fn pids_zero_and_one_are_never_signalled() {
         let init = ProcessIdentity::new(1, start_token(1).unwrap_or_else(|| "x".into()));
-        assert!(!matches!(signal_verified(&init, Signal::SIGTERM), SignalOutcome::Sent));
+        assert!(!matches!(
+            signal_verified(&init, Signal::SIGTERM),
+            SignalOutcome::Sent
+        ));
         let zero = ProcessIdentity::new(0, "x");
         assert_eq!(signal_verified(&zero, Signal::SIGTERM), SignalOutcome::Gone);
         assert!(!group_exists(0) && !group_exists(1));
@@ -315,7 +337,10 @@ mod tests {
         let id = ProcessIdentity::new(child.id(), start_token(child.id()).unwrap());
         let started = Instant::now();
         assert_eq!(terminate_group_blocking(&id, 300), SignalOutcome::Sent);
-        assert!(started.elapsed() >= Duration::from_millis(250), "TERM was given its grace period");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "TERM was given its grace period"
+        );
         let status = child.wait().unwrap();
         assert!(!status.success());
     }
@@ -324,7 +349,10 @@ mod tests {
     fn terminate_refuses_a_reused_pid() {
         let mut child = spawn_sleeper(false);
         let id = ProcessIdentity::new(child.id(), "1");
-        assert!(matches!(terminate_group_blocking(&id, 100), SignalOutcome::Refused(_)));
+        assert!(matches!(
+            terminate_group_blocking(&id, 100),
+            SignalOutcome::Refused(_)
+        ));
         assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();

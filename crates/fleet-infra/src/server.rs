@@ -144,9 +144,8 @@ fn mode_of(meta: &fs::Metadata) -> u32 {
 /// The directory holding the socket must be a real directory (not a symlink) that only this user
 /// can enter.
 fn check_private_dir(dir: &Path, uid: u32) -> Result<()> {
-    let meta = fs::symlink_metadata(dir).map_err(|e| {
-        FleetError::io(&format!("the state directory {}", dir.display()), &e)
-    })?;
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|e| FleetError::io(&format!("the state directory {}", dir.display()), &e))?;
     if !meta.file_type().is_dir() {
         return Err(FleetError::forbidden(format!(
             "{} is not a real directory (symlinks are refused)",
@@ -284,11 +283,12 @@ impl Server {
                             io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
                         ) =>
                     {
-                        fs::remove_file(socket).map_err(|e| {
-                            FleetError::io("removing the stale control socket", &e)
-                        })?;
+                        fs::remove_file(socket)
+                            .map_err(|e| FleetError::io("removing the stale control socket", &e))?;
                     }
-                    Err(e) => return Err(FleetError::io("probing the existing control socket", &e)),
+                    Err(e) => {
+                        return Err(FleetError::io("probing the existing control socket", &e))
+                    }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -665,7 +665,10 @@ pub(crate) mod test_support {
     impl RequestHandler for Fake {
         fn call(&self, peer: &PeerInfo, cmd: &str, args: Value) -> Result<HandlerReply> {
             match cmd {
-                "ping" => Ok(HandlerReply::Data(obj(&[("schema", Value::str("fleet.ping/1"))]))),
+                "ping" => Ok(HandlerReply::Data(obj(&[(
+                    "schema",
+                    Value::str("fleet.ping/1"),
+                )]))),
                 "echo" => Ok(HandlerReply::Data(obj(&[
                     ("schema", Value::str("fleet.echo/1")),
                     ("args", args),
@@ -754,11 +757,9 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::protocol::{
-        encode_request, encode_resize, parse_response,
-    };
-    use crate::testutil::{wait_until, TempDir};
     use crate::protocol::KIND_DETACH;
+    use crate::protocol::{encode_request, encode_resize, parse_response};
+    use crate::testutil::{wait_until, TempDir};
     use std::io::Read;
 
     /// A plain line-oriented client with timeouts, so a server bug fails a test instead of
@@ -771,8 +772,12 @@ mod tests {
     impl Raw {
         fn connect(path: &Path) -> Raw {
             let stream = UnixStream::connect(path).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             Raw {
                 reader: BufReader::new(stream.try_clone().unwrap()),
                 writer: stream,
@@ -812,7 +817,10 @@ mod tests {
         let ts = start();
         let mut c = Raw::connect(&ts.path);
         let pong = c.call("ping", Value::Null).unwrap();
-        assert_eq!(pong.get("schema").and_then(Value::as_str), Some("fleet.ping/1"));
+        assert_eq!(
+            pong.get("schema").and_then(Value::as_str),
+            Some("fleet.ping/1")
+        );
         let args = obj(&[("task", Value::str("r1/t1")), ("n", Value::int(7))]);
         let echoed = c.call("echo", args.clone()).unwrap();
         assert_eq!(echoed.get("args"), Some(&args));
@@ -832,7 +840,10 @@ mod tests {
         let mut c = Raw::connect(&ts.path);
         let data = c.call("peer", Value::Null).unwrap();
         if CREDENTIALS_SUPPORTED {
-            assert_eq!(data.get("uid").and_then(Value::as_u64), Some(u64::from(my_uid())));
+            assert_eq!(
+                data.get("uid").and_then(Value::as_u64),
+                Some(u64::from(my_uid()))
+            );
         }
     }
 
@@ -889,7 +900,10 @@ mod tests {
         let mut c = Raw::connect(&ts.path);
         let err = c.call("boom", Value::Null).unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
-        assert!(!err.message.contains("exploded"), "panic text must not leak");
+        assert!(
+            !err.message.contains("exploded"),
+            "panic text must not leak"
+        );
         assert!(c.call("ping", Value::Null).is_ok());
         assert!(Raw::connect(&ts.path).call("ping", Value::Null).is_ok());
     }
@@ -931,7 +945,9 @@ mod tests {
     #[test]
     fn a_live_socket_is_a_conflict_and_is_left_alone() {
         let ts = start();
-        let err = Server::bind(&ts.path, Fake::new().0).err().expect("second bind fails");
+        let err = Server::bind(&ts.path, Fake::new().0)
+            .err()
+            .expect("second bind fails");
         assert_eq!(err.code, ErrorCode::Conflict);
         assert!(err.message.contains("already listening"));
         // the first daemon still answers
@@ -955,7 +971,10 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = Server::bind(&link, Fake::new().0).err().unwrap();
         assert_eq!(err.code, ErrorCode::Conflict);
-        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
@@ -994,17 +1013,26 @@ mod tests {
         verify_socket_permissions(&ts.path).unwrap();
 
         fs::set_permissions(&ts.path, fs::Permissions::from_mode(0o666)).unwrap();
-        assert_eq!(verify_socket_permissions(&ts.path).unwrap_err().code, ErrorCode::Forbidden);
+        assert_eq!(
+            verify_socket_permissions(&ts.path).unwrap_err().code,
+            ErrorCode::Forbidden
+        );
         fs::set_permissions(&ts.path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let parent = ts.path.parent().unwrap();
         fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(verify_socket_permissions(&ts.path).unwrap_err().code, ErrorCode::Forbidden);
+        assert_eq!(
+            verify_socket_permissions(&ts.path).unwrap_err().code,
+            ErrorCode::Forbidden
+        );
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
         verify_socket_permissions(&ts.path).unwrap();
 
         let missing = parent.join("absent");
-        assert_eq!(verify_socket_permissions(&missing).unwrap_err().code, ErrorCode::DaemonDown);
+        assert_eq!(
+            verify_socket_permissions(&missing).unwrap_err().code,
+            ErrorCode::DaemonDown
+        );
     }
 
     #[test]
@@ -1030,10 +1058,25 @@ mod tests {
         assert!(!accept_peer(Some(501), 0));
         assert!(accept_peer(None, 501));
         // supported platforms never run on the "no credentials" path
-        let unknown = PeerInfo { uid: None, pid: None };
+        let unknown = PeerInfo {
+            uid: None,
+            pid: None,
+        };
         assert_eq!(peer_allowed(&unknown, 501), !CREDENTIALS_SUPPORTED);
-        assert!(peer_allowed(&PeerInfo { uid: Some(501), pid: None }, 501));
-        assert!(!peer_allowed(&PeerInfo { uid: Some(0), pid: None }, 501));
+        assert!(peer_allowed(
+            &PeerInfo {
+                uid: Some(501),
+                pid: None
+            },
+            501
+        ));
+        assert!(!peer_allowed(
+            &PeerInfo {
+                uid: Some(0),
+                pid: None
+            },
+            501
+        ));
     }
 
     #[test]
@@ -1095,7 +1138,10 @@ mod tests {
         let data = c
             .call("attach", obj(&[("task", Value::str("t1"))]))
             .unwrap();
-        assert_eq!(data.get("schema").and_then(Value::as_str), Some("fleet.attach/1"));
+        assert_eq!(
+            data.get("schema").and_then(Value::as_str),
+            Some("fleet.attach/1")
+        );
         c
     }
 
@@ -1119,7 +1165,8 @@ mod tests {
         tx.send(b"\x1b[31mred\x1b[0m plain ".to_vec()).unwrap();
         // OSC 52 (clipboard write) split over two chunks, then a bidi override and a title.
         tx.send(b"\x1b]52;c;SGVsbG8=".to_vec()).unwrap();
-        tx.send(b"\x07after \xe2\x80\xaeevil \x1b]0;title\x07END".to_vec()).unwrap();
+        tx.send(b"\x07after \xe2\x80\xaeevil \x1b]0;title\x07END".to_vec())
+            .unwrap();
         let text = read_output_until(&mut c, "END");
         assert!(text.contains("\u{1b}[31mred\u{1b}[0m plain "), "{text:?}");
         assert!(text.contains("after "), "{text:?}");
@@ -1169,7 +1216,10 @@ mod tests {
         assert_eq!(*lock(&fake.input), b"ls -l\nx".to_vec());
 
         write_frame(&mut c.writer, KIND_DETACH, b"").unwrap();
-        assert!(wait_until(3000, || fake.has_event("dropped")), "session released");
+        assert!(
+            wait_until(3000, || fake.has_event("dropped")),
+            "session released"
+        );
         assert!(c.closed());
     }
 
@@ -1207,7 +1257,11 @@ mod tests {
     #[test]
     fn hostile_frames_end_the_attach_without_touching_the_session() {
         // unknown kind, oversized length, bad resize payload
-        let hostile: [&[u8]; 3] = [&[9, 0, 0], &[KIND_INPUT, 0xff, 0xff], &[KIND_RESIZE, 0, 1, 7]];
+        let hostile: [&[u8]; 3] = [
+            &[9, 0, 0],
+            &[KIND_INPUT, 0xff, 0xff],
+            &[KIND_RESIZE, 0, 1, 7],
+        ];
         for bytes in hostile {
             let (fake, _tx) = Fake::new();
             let ts = TestServer::start(Arc::clone(&fake) as Arc<dyn RequestHandler>);

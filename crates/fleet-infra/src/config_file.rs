@@ -158,7 +158,9 @@ fn toml_error(e: &toml::de::Error, text: &str) -> FleetError {
 fn check_identity_text(what: &str, value: &str) -> Result<()> {
     if value.trim().is_empty()
         || value.len() > MAX_AUTHOR_FIELD
-        || value.chars().any(|c| c.is_control() || c == '<' || c == '>')
+        || value
+            .chars()
+            .any(|c| c.is_control() || c == '<' || c == '>')
     {
         return Err(invalid(format!(
             "{what} must be 1-{MAX_AUTHOR_FIELD} characters without control characters or angle brackets"
@@ -387,13 +389,12 @@ pub fn load_plan(path: &Path) -> Result<Value> {
         json::parse_value(&bytes, usize::try_from(MAX_PLAN_FILE).unwrap_or(usize::MAX))
             .map_err(|e| invalid(format!("{}: {e}", shown_path(path))))
     };
-    doc.and_then(|d| plan_args(&d))
-        .map_err(|mut e| {
-            if !e.message.starts_with(&shown_path(path)) {
-                e.message = format!("{}: {}", shown_path(path), e.message);
-            }
-            e
-        })
+    doc.and_then(|d| plan_args(&d)).map_err(|mut e| {
+        if !e.message.starts_with(&shown_path(path)) {
+            e.message = format!("{}: {}", shown_path(path), e.message);
+        }
+        e
+    })
 }
 
 fn toml_to_value(v: &toml::Value, depth: usize) -> Result<Value> {
@@ -404,7 +405,9 @@ fn toml_to_value(v: &toml::Value, depth: usize) -> Result<Value> {
         toml::Value::String(s) => Value::Str(s.clone()),
         toml::Value::Integer(i) => Value::Int(i128::from(*i)),
         toml::Value::Boolean(b) => Value::Bool(*b),
-        toml::Value::Float(_) => return Err(invalid("plans cannot contain floating point numbers")),
+        toml::Value::Float(_) => {
+            return Err(invalid("plans cannot contain floating point numbers"))
+        }
         toml::Value::Datetime(_) => return Err(invalid("plans cannot contain dates or times")),
         toml::Value::Array(items) => Value::Array(
             items
@@ -429,7 +432,12 @@ fn check_keys(what: &str, obj: &BTreeMap<String, Value>, allowed: &[&str]) -> Re
     }
 }
 
-fn check_string(what: &str, obj: &BTreeMap<String, Value>, key: &str, required: bool) -> Result<()> {
+fn check_string(
+    what: &str,
+    obj: &BTreeMap<String, Value>,
+    key: &str,
+    required: bool,
+) -> Result<()> {
     match obj.get(key) {
         Some(Value::Str(_)) => Ok(()),
         Some(_) => Err(invalid(format!("{what}: {key} must be a string"))),
@@ -442,7 +450,11 @@ fn check_run(run: &Value) -> Result<()> {
     let obj = run
         .as_object()
         .ok_or_else(|| invalid("run must be a table"))?;
-    check_keys("run", obj, &["objective", "repo", "base", "id", "max_parallel"])?;
+    check_keys(
+        "run",
+        obj,
+        &["objective", "repo", "base", "id", "max_parallel"],
+    )?;
     for key in ["objective", "repo", "base", "id"] {
         check_string("run", obj, key, false)?;
     }
@@ -571,7 +583,10 @@ format = "refcheck-json"
         let loaded = parse(FULL).unwrap();
         let app = &loaded.app;
         assert_eq!(app.max_sessions, 4);
-        assert_eq!(app.default_worker.as_ref().map(|w| w.as_str()), Some("alpha"));
+        assert_eq!(
+            app.default_worker.as_ref().map(|w| w.as_str()),
+            Some("alpha")
+        );
         assert_eq!(app.max_retries, 3);
         assert_eq!(app.kill_grace_ms, 7_000);
         assert_eq!(app.approval_ttl_ms, 120_000);
@@ -579,7 +594,13 @@ format = "refcheck-json"
         assert!(!app.external_commands);
         assert_eq!(app.external_timeout_ms, 30_000);
         assert_eq!(app.question_grace_ms, 1_000);
-        assert_eq!(app.author, Identity { name: "Fleet Bot".into(), email: "bot@example.invalid".into() });
+        assert_eq!(
+            app.author,
+            Identity {
+                name: "Fleet Bot".into(),
+                email: "bot@example.invalid".into()
+            }
+        );
         assert_eq!(loaded.ring_bytes, 65_536);
         assert_eq!(app.env.allowed(), ["PATH", "HOME", "MY_AGENT_HOME"]);
 
@@ -670,7 +691,9 @@ format = "refcheck-json"
             "[daemon]\nmax_sessions = 4\nmax_sessions = 5",
             "[[gates]]\nname = \"g\"",
         ] {
-            let err = parse(text).err().unwrap_or_else(|| panic!("accepted: {text}"));
+            let err = parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {text}"));
             assert_eq!(err.code, ErrorCode::Invalid, "{text}");
         }
         let err = parse("# comment\n\n[daemon\nx = 1").err().unwrap();
@@ -679,14 +702,16 @@ format = "refcheck-json"
 
     #[test]
     fn bad_charset_is_rejected() {
-        let text = "[[redact.rules]]\nname = \"n\"\nprefix = \"zz_\"\ncharset = \"emoji\"\nmin_len = 8";
+        let text =
+            "[[redact.rules]]\nname = \"n\"\nprefix = \"zz_\"\ncharset = \"emoji\"\nmin_len = 8";
         let err = parse(text).err().unwrap();
         assert_eq!(err.code, ErrorCode::Invalid);
         assert!(err.message.contains("charset"), "{}", err.message);
         // an unusable rule is rejected by the redactor, not silently dropped
         let text = "[[redact.rules]]\nname = \"n\"\nprefix = \"\"\ncharset = \"hex\"\nmin_len = 8";
         assert_eq!(parse(text).err().unwrap().code, ErrorCode::Invalid);
-        let text = "[[redact.rules]]\nname = \"n\"\nprefix = \"zz_\"\ncharset = \"hex\"\nmin_len = 0";
+        let text =
+            "[[redact.rules]]\nname = \"n\"\nprefix = \"zz_\"\ncharset = \"hex\"\nmin_len = 0";
         assert_eq!(parse(text).err().unwrap().code, ErrorCode::Invalid);
     }
 
@@ -723,25 +748,38 @@ format = "refcheck-json"
             "[daemon]\nauthor_email = \"\"",
             "[daemon]\nauthor_name = \"line\\nbreak\"",
         ] {
-            let err = parse(text).err().unwrap_or_else(|| panic!("accepted: {text}"));
+            let err = parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {text}"));
             assert_eq!(err.code, ErrorCode::Invalid, "{text}: {}", err.message);
         }
     }
 
     #[test]
     fn ring_bytes_and_overflowing_seconds_are_bounded() {
-        let err = parse(&format!("[daemon]\nring_bytes = {}", MAX_RING_BYTES + 1)).err().unwrap();
+        let err = parse(&format!("[daemon]\nring_bytes = {}", MAX_RING_BYTES + 1))
+            .err()
+            .unwrap();
         assert_eq!(err.code, ErrorCode::Limit);
-        assert_eq!(parse("[daemon]\nring_bytes = 0").err().unwrap().code, ErrorCode::Limit);
         assert_eq!(
-            parse(&format!("[daemon]\nring_bytes = {MAX_RING_BYTES}")).unwrap().ring_bytes,
+            parse("[daemon]\nring_bytes = 0").err().unwrap().code,
+            ErrorCode::Limit
+        );
+        assert_eq!(
+            parse(&format!("[daemon]\nring_bytes = {MAX_RING_BYTES}"))
+                .unwrap()
+                .ring_bytes,
             MAX_RING_BYTES
         );
         // i64::MAX seconds does not fit in milliseconds
-        let err = parse("[daemon]\nkill_grace_secs = 9223372036854775807").err().unwrap();
+        let err = parse("[daemon]\nkill_grace_secs = 9223372036854775807")
+            .err()
+            .unwrap();
         assert_eq!(err.code, ErrorCode::Invalid);
         assert!(err.message.contains("too large"));
-        let err = parse("[workers.a]\ncommand = \"x\"\nidle_timeout_secs = 9223372036854775807").err().unwrap();
+        let err = parse("[workers.a]\ncommand = \"x\"\nidle_timeout_secs = 9223372036854775807")
+            .err()
+            .unwrap();
         assert_eq!(err.code, ErrorCode::Invalid);
     }
 
@@ -777,7 +815,9 @@ format = "refcheck-json"
         let dflt = parse("").unwrap();
         let child = dflt.app.env.build(&parent, &[], &[], &[]);
         assert!(child.iter().any(|(k, _)| k == "HOME"));
-        assert!(!child.iter().any(|(k, _)| k == "MY_VAR" || k == "SOME_TOKEN"));
+        assert!(!child
+            .iter()
+            .any(|(k, _)| k == "MY_VAR" || k == "SOME_TOKEN"));
     }
 
     #[test]
@@ -792,14 +832,21 @@ charset = "alnum"
 min_len = 16
 "#;
         let secret_env = "env-secret-value-1234";
-        let loaded = parse_config(text, env(&[("DEPLOY_TOKEN", secret_env), ("EDITOR", "vim-nonsecret")])).unwrap();
+        let loaded = parse_config(
+            text,
+            env(&[("DEPLOY_TOKEN", secret_env), ("EDITOR", "vim-nonsecret")]),
+        )
+        .unwrap();
         let r = &loaded.redactor;
 
         let custom = format!("zz_{}", "A1b2".repeat(8));
         let line = format!("key={custom} end");
         let out = r.redact(&line);
         assert!(!out.contains(&custom), "{out}");
-        assert!(out.contains("[REDACTED:internal-key]") && out.ends_with(" end"), "{out}");
+        assert!(
+            out.contains("[REDACTED:internal-key]") && out.ends_with(" end"),
+            "{out}"
+        );
 
         let out = r.redact("connect to internal-hostname-01 now");
         assert!(!out.contains("internal-hostname-01"), "{out}");
@@ -830,9 +877,15 @@ min_len = 16
 
     #[test]
     fn bad_redaction_literals_are_rejected() {
-        assert_eq!(parse("[redact]\nliterals = [\"abc\"]").err().unwrap().code, ErrorCode::Invalid);
         assert_eq!(
-            parse("[redact]\nliterals = [\"multi\\nline-value\"]").err().unwrap().code,
+            parse("[redact]\nliterals = [\"abc\"]").err().unwrap().code,
+            ErrorCode::Invalid
+        );
+        assert_eq!(
+            parse("[redact]\nliterals = [\"multi\\nline-value\"]")
+                .err()
+                .unwrap()
+                .code,
             ErrorCode::Invalid
         );
     }
@@ -845,26 +898,40 @@ min_len = 16
         assert_eq!(loaded.app.max_sessions, 4);
 
         // oversize: refused before parsing
-        let big = dir.write("big.toml", &format!("# {}\n", "x".repeat(MAX_CONFIG_FILE as usize)));
+        let big = dir.write(
+            "big.toml",
+            &format!("# {}\n", "x".repeat(MAX_CONFIG_FILE as usize)),
+        );
         let err = load_config(&big, Vec::new()).err().unwrap();
         assert_eq!(err.code, ErrorCode::Limit);
 
         // missing file
-        let err = load_config(&dir.join("nope.toml"), Vec::new()).err().unwrap();
+        let err = load_config(&dir.join("nope.toml"), Vec::new())
+            .err()
+            .unwrap();
         assert_eq!(err.code, ErrorCode::NotFound);
 
         // a symlink is not followed
         let link = dir.join("link.toml");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert_eq!(load_config(&link, Vec::new()).err().unwrap().code, ErrorCode::Invalid);
+        assert_eq!(
+            load_config(&link, Vec::new()).err().unwrap().code,
+            ErrorCode::Invalid
+        );
 
         // a directory is not a config file
-        assert_eq!(load_config(dir.path(), Vec::new()).err().unwrap().code, ErrorCode::Invalid);
+        assert_eq!(
+            load_config(dir.path(), Vec::new()).err().unwrap().code,
+            ErrorCode::Invalid
+        );
 
         // not UTF-8
         let bin = dir.join("bin.toml");
         std::fs::write(&bin, [0xff, 0xfe, 0x00]).unwrap();
-        assert_eq!(load_config(&bin, Vec::new()).err().unwrap().code, ErrorCode::Invalid);
+        assert_eq!(
+            load_config(&bin, Vec::new()).err().unwrap().code,
+            ErrorCode::Invalid
+        );
 
         // errors name the file
         let bad = dir.write("bad.toml", "[daemon]\nnope = 1\n");
@@ -920,15 +987,24 @@ after = ["a"]
         let from_json = plan(&dir, "p.json", PLAN_JSON).unwrap();
         assert_eq!(from_toml, from_json);
         let run = from_toml.get("new_run").unwrap();
-        assert_eq!(run.get("objective").and_then(Value::as_str), Some("Ship the feature"));
+        assert_eq!(
+            run.get("objective").and_then(Value::as_str),
+            Some("Ship the feature")
+        );
         assert_eq!(run.get("max_parallel").and_then(Value::as_u64), Some(2));
         let tasks = from_toml.get("tasks").and_then(Value::as_array).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(
-            tasks[1].get("after").and_then(Value::as_array).map(<[Value]>::len),
+            tasks[1]
+                .get("after")
+                .and_then(Value::as_array)
+                .map(<[Value]>::len),
             Some(1)
         );
-        assert!(from_toml.get("run").is_none(), "the run table is renamed to new_run");
+        assert!(
+            from_toml.get("run").is_none(),
+            "the run table is renamed to new_run"
+        );
     }
 
     #[test]
@@ -936,7 +1012,10 @@ after = ["a"]
         let dir = TempDir::new("cf");
         let v = plan(&dir, "p.toml", "[[tasks]]\ntitle = \"Only\"\n").unwrap();
         assert!(v.get("new_run").is_none());
-        assert_eq!(v.get("tasks").and_then(Value::as_array).map(<[Value]>::len), Some(1));
+        assert_eq!(
+            v.get("tasks").and_then(Value::as_array).map(<[Value]>::len),
+            Some(1)
+        );
     }
 
     #[test]
@@ -944,9 +1023,16 @@ after = ["a"]
         let dir = TempDir::new("cf");
         let text = "[[tasks]]\nid = \"a\"\ntitle = \"A\"\nafter = [\"b\"]\n[[tasks]]\nid = \"b\"\ntitle = \"B\"\nafter = [\"a\"]\n";
         let v = plan(&dir, "cycle.toml", text).unwrap();
-        assert_eq!(v.get("tasks").and_then(Value::as_array).map(<[Value]>::len), Some(2));
+        assert_eq!(
+            v.get("tasks").and_then(Value::as_array).map(<[Value]>::len),
+            Some(2)
+        );
         // unknown dependency ids pass through too: the domain checks them against the plan
-        let v = plan(&dir, "dangling.toml", "[[tasks]]\ntitle = \"A\"\nafter = [\"zzz\"]\n");
+        let v = plan(
+            &dir,
+            "dangling.toml",
+            "[[tasks]]\ntitle = \"A\"\nafter = [\"zzz\"]\n",
+        );
         assert!(v.is_ok());
     }
 
@@ -965,18 +1051,26 @@ after = ["a"]
             ("i.toml", "[[tasks]]\ntitle = \"a\"\nprio = 1"),             // unknown task key
             ("j.toml", "run = 5\n[[tasks]]\ntitle = \"a\""),              // run not a table
             ("k.toml", "[run]\nowner = \"x\"\n[[tasks]]\ntitle = \"a\""), // unknown run key
-            ("l.toml", "[run]\nmax_parallel = \"2\"\n[[tasks]]\ntitle = \"a\""),
-            ("m.toml", "[[tasks]]\ntitle = \"a\"\nspec = 1.5"),           // float
-            ("n.toml", "[[tasks]]\ntitle = \"a\"\nspec = 1979-05-27"),    // date
-            ("o.toml", "[[tasks]\ntitle = \"a\""),                        // syntax
-            ("p.json", "[]"),                                             // not an object
+            (
+                "l.toml",
+                "[run]\nmax_parallel = \"2\"\n[[tasks]]\ntitle = \"a\"",
+            ),
+            ("m.toml", "[[tasks]]\ntitle = \"a\"\nspec = 1.5"), // float
+            ("n.toml", "[[tasks]]\ntitle = \"a\"\nspec = 1979-05-27"), // date
+            ("o.toml", "[[tasks]\ntitle = \"a\""),              // syntax
+            ("p.json", "[]"),                                   // not an object
             ("q.json", "{\"tasks\": [{\"title\": null}]}"),
-            ("r.json", "{\"tasks\": [{\"title\": \"a\"}], \"run\": {\"max_parallel\": 1.5}}"),
+            (
+                "r.json",
+                "{\"tasks\": [{\"title\": \"a\"}], \"run\": {\"max_parallel\": 1.5}}",
+            ),
             ("s.json", "{\"tasks\": [{\"title\": \"a\"}]} trailing"),
             ("t.json", "not json"),
         ];
         for (name, text) in cases {
-            let err = plan(&dir, name, text).err().unwrap_or_else(|| panic!("accepted {name}"));
+            let err = plan(&dir, name, text)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {name}"));
             assert_eq!(err.code, ErrorCode::Invalid, "{name}: {}", err.message);
             assert!(err.message.contains(name), "{name}: {}", err.message);
         }
@@ -994,7 +1088,10 @@ after = ["a"]
         assert_eq!(load_plan(&no_ext).err().unwrap().code, ErrorCode::Invalid);
 
         // missing
-        assert_eq!(load_plan(&dir.join("none.toml")).err().unwrap().code, ErrorCode::NotFound);
+        assert_eq!(
+            load_plan(&dir.join("none.toml")).err().unwrap().code,
+            ErrorCode::NotFound
+        );
 
         // oversize
         let big = dir.write("big.json", &" ".repeat(MAX_PLAN_FILE as usize + 1));
@@ -1011,10 +1108,17 @@ after = ["a"]
         for _ in 0..=MAX_TOTAL_TASKS {
             text.push_str("[[tasks]]\ntitle = \"t\"\n");
         }
-        assert_eq!(plan(&dir, "many.toml", &text).err().unwrap().code, ErrorCode::Limit);
+        assert_eq!(
+            plan(&dir, "many.toml", &text).err().unwrap().code,
+            ErrorCode::Limit
+        );
 
         // deeply nested values are refused instead of recursing without bound
-        let nested = format!("tasks = []\n[run]\nx = {}1{}", "[".repeat(40), "]".repeat(40));
+        let nested = format!(
+            "tasks = []\n[run]\nx = {}1{}",
+            "[".repeat(40),
+            "]".repeat(40)
+        );
         assert!(plan(&dir, "deep.toml", &nested).is_err());
     }
 }

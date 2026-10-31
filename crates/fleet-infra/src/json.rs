@@ -90,7 +90,10 @@ mod tests {
     fn round_trips_nested_documents() {
         let v = Value::object([
             ("a", Value::int(1)),
-            ("b", Value::array([Value::Null, Value::Bool(true), Value::str("x\"\n\u{e9}")])),
+            (
+                "b",
+                Value::array([Value::Null, Value::Bool(true), Value::str("x\"\n\u{e9}")]),
+            ),
             ("c", Value::object([("d", Value::Float(1.5))])),
         ]);
         let line = to_line(&v);
@@ -100,12 +103,24 @@ mod tests {
 
     #[test]
     fn big_and_negative_numbers_keep_their_value() {
-        assert_eq!(parse("18446744073709551615").unwrap(), Value::Int(i128::from(u64::MAX)));
-        assert_eq!(parse("-9223372036854775808").unwrap(), Value::Int(i128::from(i64::MIN)));
+        assert_eq!(
+            parse("18446744073709551615").unwrap(),
+            Value::Int(i128::from(u64::MAX))
+        );
+        assert_eq!(
+            parse("-9223372036854775808").unwrap(),
+            Value::Int(i128::from(i64::MIN))
+        );
         assert_eq!(parse("-5").unwrap(), Value::Int(-5));
         assert_eq!(parse("2.5").unwrap(), Value::Float(2.5));
-        assert_eq!(to_line(&Value::Int(i128::from(u64::MAX))), "18446744073709551615");
-        assert_eq!(to_line(&Value::Int(i128::from(i64::MIN))), "-9223372036854775808");
+        assert_eq!(
+            to_line(&Value::Int(i128::from(u64::MAX))),
+            "18446744073709551615"
+        );
+        assert_eq!(
+            to_line(&Value::Int(i128::from(i64::MIN))),
+            "-9223372036854775808"
+        );
     }
 
     #[test]

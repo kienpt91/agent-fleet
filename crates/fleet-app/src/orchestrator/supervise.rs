@@ -15,9 +15,17 @@ use crate::ports::{SessionState, Signal, SignalOutcome};
 
 impl Orchestrator {
     pub(crate) fn supervise(&mut self) -> Result<()> {
+        let retry: Vec<Key> = self.pending_ends.keys().cloned().collect();
+        for key in retry {
+            if let Some(end) = self.pending_ends.remove(&key) {
+                self.settle(&key, end);
+            }
+        }
         let keys: Vec<Key> = self.live.keys().cloned().collect();
         for key in keys {
-            let Some(live) = self.live.get(&key) else { continue };
+            let Some(live) = self.live.get(&key) else {
+                continue;
+            };
             match self.ports.sessions.poll(live.session) {
                 SessionState::Exited { code, signal } => {
                     let killed_for = live.kill.as_ref().map(|k| k.reason);
@@ -38,13 +46,18 @@ impl Orchestrator {
         let now = self.now();
         let grace = self.cfg.kill_grace_ms;
         let question_grace = self.cfg.question_grace_ms;
-        let Some(live) = self.live.get(key) else { return };
+        let Some(live) = self.live.get(key) else {
+            return;
+        };
         let reading = self.ports.sessions.reading(live.session);
-        let question_present = live.kill.is_none() && self.ports.contract.question_present(&live.worktree);
-        let Some(live) = self.live.get_mut(key) else { return };
+        let question_present =
+            live.kill.is_none() && self.ports.contract.question_present(&live.worktree);
+        let Some(live) = self.live.get_mut(key) else {
+            return;
+        };
         if live.kill.is_none() {
-            if let Some(kind) = reading
-                .and_then(|r| live.supervision.check(r.elapsed_ms, r.idle_ms).end_kind())
+            if let Some(kind) =
+                reading.and_then(|r| live.supervision.check(r.elapsed_ms, r.idle_ms).end_kind())
             {
                 live.kill = Some(KillEscalation::new(kind, grace));
             } else if question_present {
@@ -92,12 +105,28 @@ impl Orchestrator {
     /// Ends a session: releases it, saves its output, reads the worker's files and lets the
     /// domain decide what the end means.
     pub(crate) fn finish(&mut self, key: &Key, outcome: EndKind, exit_code: Option<i64>) {
-        let Some(live) = self.live.remove(key) else { return };
+        let Some(live) = self.live.remove(key) else {
+            return;
+        };
         let out = self.ports.sessions.release(live.session);
-        if let Err(e) = self.ports.logs.save(&key.0, &key.1, live.attempt, &out.text) {
-            self.warn(format!("{}/{}: could not save output: {}", key.0, key.1, e.message));
+        if let Err(e) = self
+            .ports
+            .logs
+            .save(&key.0, &key.1, live.attempt, &out.text)
+        {
+            self.warn(format!(
+                "{}/{}: could not save output: {}",
+                key.0, key.1, e.message
+            ));
         }
-        let end = self.worker_end(&live.worktree, live.attempt, outcome, exit_code, &out.text, out.stripped);
+        let end = self.worker_end(
+            &live.worktree,
+            live.attempt,
+            outcome,
+            exit_code,
+            &out.text,
+            out.stripped,
+        );
         self.settle(key, end);
     }
 
@@ -157,12 +186,19 @@ impl Orchestrator {
         ) {
             Ok(events) => events,
             Err(e) => {
-                self.warn(format!("{}/{}: could not settle the session: {}", key.0, key.1, e.message));
+                self.warn(format!(
+                    "{}/{}: could not settle the session: {}",
+                    key.0, key.1, e.message
+                ));
                 return;
             }
         };
         if let Err(e) = self.commit(events) {
-            self.warn(format!("{}/{}: could not record the session end: {}", key.0, key.1, e.message));
+            self.warn(format!(
+                "{}/{}: could not record the session end: {}",
+                key.0, key.1, e.message
+            ));
+            self.pending_ends.insert(key.clone(), end);
             return;
         }
         if self.task_status(key) == Some(TaskStatus::Review) {

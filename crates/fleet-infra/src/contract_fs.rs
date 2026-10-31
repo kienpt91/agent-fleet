@@ -72,8 +72,9 @@ impl ContractFiles for FsContractFiles {
                         ".fleet/{name} is a directory; remove it before the task can run"
                     )))
                 }
-                Some(_) => fsx::remove_nofollow(&path)
-                    .map_err(|e| FleetError::io(&format!("cannot remove stale .fleet/{name}"), &e))?,
+                Some(_) => fsx::remove_nofollow(&path).map_err(|e| {
+                    FleetError::io(&format!("cannot remove stale .fleet/{name}"), &e)
+                })?,
             }
         }
 
@@ -107,7 +108,8 @@ mod tests {
     use std::sync::Arc;
 
     const GOOD_RESULT: &str = r#"{"version":1,"status":"done","summary":"all good"}"#;
-    const GOOD_QUESTION: &str = r#"{"version":1,"kind":"question","text":"which db?","choices":["a","b"]}"#;
+    const GOOD_QUESTION: &str =
+        r#"{"version":1,"kind":"question","text":"which db?","choices":["a","b"]}"#;
 
     fn wt(t: &TempDir) -> String {
         t.path().to_str().unwrap().to_string()
@@ -197,7 +199,10 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
             r
         });
-        assert!(wait_until(3000, || done.load(Ordering::SeqCst)), "blocked on a FIFO");
+        assert!(
+            wait_until(3000, || done.load(Ordering::SeqCst)),
+            "blocked on a FIFO"
+        );
         assert!(invalid_text(handle.join().unwrap()).starts_with("result.json: "));
     }
 
@@ -205,7 +210,10 @@ mod tests {
     fn a_symlinked_result_is_not_followed() {
         let t = TempDir::new("contract-link");
         let big = t.join("big");
-        fs::File::create(&big).unwrap().set_len(256 * 1024 * 1024).unwrap();
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
         fs::create_dir(t.join(".fleet")).unwrap();
         symlink(&big, t.join(".fleet/result.json")).unwrap();
         let text = invalid_text(FsContractFiles.read_result(&wt(&t)));
@@ -242,8 +250,14 @@ mod tests {
         let t = TempDir::new("contract-prepare");
         FsContractFiles.prepare(&wt(&t), "# brief\n").unwrap();
         assert_eq!(t.read(".fleet/brief.md"), "# brief\n");
-        assert_eq!(fs::metadata(t.join(".fleet")).unwrap().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(t.join(".fleet/brief.md")).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(t.join(".fleet")).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(t.join(".fleet/brief.md")).unwrap().mode() & 0o777,
+            0o600
+        );
         // Rewriting replaces the brief.
         FsContractFiles.prepare(&wt(&t), "second").unwrap();
         assert_eq!(t.read(".fleet/brief.md"), "second");
@@ -292,12 +306,17 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("result.json"), "outside").unwrap();
         symlink(&outside, work.join(".fleet")).unwrap();
-        FsContractFiles.prepare(work.to_str().unwrap(), "brief").unwrap();
+        FsContractFiles
+            .prepare(work.to_str().unwrap(), "brief")
+            .unwrap();
         assert!(fsx::is_real_dir(&work.join(".fleet")));
         assert!(work.join(".fleet/brief.md").exists());
         // Nothing was written into, or removed from, the link target.
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
-        assert_eq!(fs::read_to_string(outside.join("result.json")).unwrap(), "outside");
+        assert_eq!(
+            fs::read_to_string(outside.join("result.json")).unwrap(),
+            "outside"
+        );
 
         // A plain file named `.fleet` is replaced too.
         let t2 = TempDir::new("contract-fleet-file");

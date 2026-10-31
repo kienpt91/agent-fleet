@@ -825,16 +825,24 @@ fn classify(end: &WorkerEnd) -> Verdict {
                 counts: true,
             },
         },
-        EndKind::Orphaned => {
-            if reported.is_some_and(|r| r.status == ResultStatus::Done) {
-                Verdict::Success(summary())
-            } else {
-                Verdict::Failure {
-                    reason: "the session was interrupted by a daemon restart".to_string(),
-                    counts: false,
-                }
-            }
-        }
+        EndKind::Orphaned => match reported {
+            Some(r) if r.status == ResultStatus::Done => Verdict::Success(summary()),
+            Some(r) => Verdict::Failure {
+                reason: if r.summary.is_empty() {
+                    "worker reported failure before the daemon stopped".to_string()
+                } else {
+                    format!(
+                        "worker reported failure before the daemon stopped: {}",
+                        r.summary
+                    )
+                },
+                counts: true,
+            },
+            None => Verdict::Failure {
+                reason: "the session was interrupted by a daemon restart or shutdown".to_string(),
+                counts: false,
+            },
+        },
         EndKind::Signaled => Verdict::Failure {
             reason: with_summary("worker was killed by a signal".to_string()),
             counts: true,
@@ -1333,6 +1341,24 @@ mod tests {
         });
         let events = run.finish(&tid("a"), &e, POLICY).unwrap();
         assert_eq!(kinds(&events), vec!["session_ended", "task_reviewing"]);
+    }
+
+    #[test]
+    fn orphaned_session_whose_worker_reported_failure_uses_a_retry() {
+        let mut run = started(1, vec![nt("a", &[])]);
+        dispatch(&mut run, "a");
+        let mut e = end(1, EndKind::Orphaned, None);
+        e.result = Some(WorkerResult {
+            status: ResultStatus::Failed,
+            summary: "tests do not compile".into(),
+        });
+        let events = run.finish(&tid("a"), &e, POLICY).unwrap();
+        assert_eq!(
+            kinds(&events),
+            vec!["session_ended", "retry_queued", "note_added"]
+        );
+        apply_all(&mut run, &events);
+        assert_eq!(run.task(&tid("a")).unwrap().retries_used, 1);
     }
 
     #[test]

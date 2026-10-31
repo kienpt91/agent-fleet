@@ -256,11 +256,17 @@ mod tests {
         let mut client = Client::connect(&ts.path).unwrap();
         let args = obj(&[("task", Value::str("r1/t1")), ("n", Value::int(3))]);
         let data = client.call("echo", args.clone()).unwrap();
-        assert_eq!(data.get("schema").and_then(Value::as_str), Some("fleet.echo/1"));
+        assert_eq!(
+            data.get("schema").and_then(Value::as_str),
+            Some("fleet.echo/1")
+        );
         assert_eq!(data.get("args"), Some(&args));
         // several calls on one connection, and a null args value
         let data = client.call("ping", Value::Null).unwrap();
-        assert_eq!(data.get("schema").and_then(Value::as_str), Some("fleet.ping/1"));
+        assert_eq!(
+            data.get("schema").and_then(Value::as_str),
+            Some("fleet.ping/1")
+        );
     }
 
     #[test]
@@ -353,7 +359,11 @@ mod tests {
         let mut client = Client::connect(&path).unwrap();
         let err = client.call("ping", Value::Null).unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
-        assert!(err.message.contains("closed the connection"), "{}", err.message);
+        assert!(
+            err.message.contains("closed the connection"),
+            "{}",
+            err.message
+        );
         acceptor.join().unwrap();
     }
 
@@ -457,7 +467,10 @@ mod tests {
             };
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let _ = read_line_bounded(&mut reader, MAX_MESSAGE_BYTES);
-            let reply = format!("{}\n", crate::protocol::encode_ok(&obj(&[("schema", Value::str("fleet.attach/1"))])));
+            let reply = format!(
+                "{}\n",
+                crate::protocol::encode_ok(&obj(&[("schema", Value::str("fleet.attach/1"))]))
+            );
             let _ = stream.write_all(reply.as_bytes());
             let _ = write_frame(&mut stream, 77, b"future");
             let _ = write_frame(&mut stream, KIND_NOTICE, b"careful");

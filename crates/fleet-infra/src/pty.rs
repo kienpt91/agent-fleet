@@ -8,8 +8,8 @@
 
 use crate::procid;
 use fleet_app::ports::{
-    SessionHost, SessionId, SessionOutput, SessionReading, SessionSpec, SessionState, Signal, SignalOutcome,
-    Spawned,
+    SessionHost, SessionId, SessionOutput, SessionReading, SessionSpec, SessionState, Signal,
+    SignalOutcome, Spawned,
 };
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::ATTACH_QUEUE_CHUNKS;
@@ -58,7 +58,8 @@ impl SessionIo {
 
     /// Called by the reader thread for every chunk read from the terminal.
     fn ingest(&self, raw: &[u8]) {
-        self.last_output_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+        self.last_output_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
         {
             let mut sub = lock(&self.subscriber);
             if let Some(tx) = sub.as_ref() {
@@ -66,7 +67,8 @@ impl SessionIo {
                     Ok(()) => {}
                     // A slow attached client loses output; it never slows the worker down.
                     Err(TrySendError::Full(_)) => {
-                        self.attach_dropped.fetch_add(raw.len() as u64, Ordering::Relaxed);
+                        self.attach_dropped
+                            .fetch_add(raw.len() as u64, Ordering::Relaxed);
                     }
                     Err(TrySendError::Disconnected(_)) => *sub = None,
                 }
@@ -178,7 +180,11 @@ pub struct PtySessionHost {
 }
 
 impl PtySessionHost {
-    pub fn new(ring_bytes: usize, redactor: Arc<Redactor>, registry: SessionRegistry) -> PtySessionHost {
+    pub fn new(
+        ring_bytes: usize,
+        redactor: Arc<Redactor>,
+        registry: SessionRegistry,
+    ) -> PtySessionHost {
         PtySessionHost {
             sessions: BTreeMap::new(),
             registry,
@@ -234,12 +240,13 @@ fn to_nix(signal: Signal) -> NixSignal {
 impl SessionHost for PtySessionHost {
     fn spawn(&mut self, spec: &SessionSpec) -> Result<Spawned> {
         let cwd = std::path::Path::new(&spec.cwd);
-        let program = crate::jobs::resolve_program(&spec.program, cwd, &spec.env).ok_or_else(|| {
-            FleetError::not_found(format!(
-                "worker command {} was not found on the worker's PATH",
-                fleet_domain::ids::show(&spec.program)
-            ))
-        })?;
+        let program =
+            crate::jobs::resolve_program(&spec.program, cwd, &spec.env).ok_or_else(|| {
+                FleetError::not_found(format!(
+                    "worker command {} was not found on the worker's PATH",
+                    fleet_domain::ids::show(&spec.program)
+                ))
+            })?;
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: DEFAULT_ROWS,
@@ -265,7 +272,9 @@ impl SessionHost for PtySessionHost {
         let Some(token) = procid::start_token(pid) else {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(FleetError::internal("could not read the worker's start time"));
+            return Err(FleetError::internal(
+                "could not read the worker's start time",
+            ));
         };
         let reader = pair
             .master
@@ -284,7 +293,10 @@ impl SessionHost for PtySessionHost {
             }
         };
         let io = Arc::new(SessionIo {
-            out: Mutex::new(OutputBuffer::new(self.ring_bytes, Arc::clone(&self.redactor))),
+            out: Mutex::new(OutputBuffer::new(
+                self.ring_bytes,
+                Arc::clone(&self.redactor),
+            )),
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             started: Instant::now(),
@@ -315,7 +327,9 @@ impl SessionHost for PtySessionHost {
         if let Err(e) = spawned_thread {
             let _ = procid::signal_verified(&ProcessIdentity::new(pid, token), NixSignal::SIGKILL);
             let _ = child.wait();
-            return Err(FleetError::internal(format!("could not start the output reader: {e}")));
+            return Err(FleetError::internal(format!(
+                "could not start the output reader: {e}"
+            )));
         }
         self.next_id = self.next_id.saturating_add(1);
         let id = SessionId(self.next_id);
@@ -335,7 +349,10 @@ impl SessionHost for PtySessionHost {
 
     fn poll(&mut self, id: SessionId) -> SessionState {
         let Some(s) = self.sessions.get_mut(&id.0) else {
-            return SessionState::Exited { code: None, signal: None };
+            return SessionState::Exited {
+                code: None,
+                signal: None,
+            };
         };
         if let Some(done) = &s.exited {
             return done.clone();
@@ -350,7 +367,10 @@ impl SessionHost for PtySessionHost {
                 state
             }
             Err(_) => {
-                let state = SessionState::Exited { code: None, signal: None };
+                let state = SessionState::Exited {
+                    code: None,
+                    signal: None,
+                };
                 procid::kill_group_leftovers(s.identity.pid);
                 s.exited = Some(state.clone());
                 state
@@ -380,7 +400,9 @@ impl SessionHost for PtySessionHost {
     }
 
     fn read_since(&self, id: SessionId, offset: u64, max: usize) -> Option<Chunk> {
-        self.sessions.get(&id.0).map(|s| s.io.read_since(offset, max))
+        self.sessions
+            .get(&id.0)
+            .map(|s| s.io.read_since(offset, max))
     }
 
     fn release(&mut self, id: SessionId) -> SessionOutput {
@@ -434,7 +456,11 @@ mod tests {
     use fleet_domain::ids::{RunId, TaskId};
 
     fn host() -> PtySessionHost {
-        PtySessionHost::new(64 * 1024, Arc::new(Redactor::builtin()), SessionRegistry::default())
+        PtySessionHost::new(
+            64 * 1024,
+            Arc::new(Redactor::builtin()),
+            SessionRegistry::default(),
+        )
     }
 
     fn spec(dir: &TempDir, script: &str) -> SessionSpec {
@@ -469,8 +495,19 @@ mod tests {
     fn runs_a_command_and_captures_sanitized_output() {
         let dir = TempDir::new("pty");
         let mut h = host();
-        let s = h.spawn(&spec(&dir, "printf 'hello \\033[31mred\\033[0m\\n'; exit 3")).unwrap();
-        assert_eq!(wait_exit(&mut h, s.id), SessionState::Exited { code: Some(3), signal: None });
+        let s = h
+            .spawn(&spec(
+                &dir,
+                "printf 'hello \\033[31mred\\033[0m\\n'; exit 3",
+            ))
+            .unwrap();
+        assert_eq!(
+            wait_exit(&mut h, s.id),
+            SessionState::Exited {
+                code: Some(3),
+                signal: None
+            }
+        );
         let out = h.release(s.id);
         assert!(out.text.contains("hello red"), "{:?}", out.text);
         assert!(!out.text.contains('\u{1b}'));
@@ -481,12 +518,28 @@ mod tests {
     fn the_worker_runs_in_its_own_session_and_process_group() {
         let dir = TempDir::new("pty");
         let mut h = host();
-        let s = h.spawn(&spec(&dir, "ps -o pid=,pgid=,sid= -p $$ > ids.txt; sleep 1")).unwrap();
-        assert!(wait_until(5000, || dir.exists("ids.txt") && !dir.read("ids.txt").trim().is_empty()));
-        let ids: Vec<u32> = dir.read("ids.txt").split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let s = h
+            .spawn(&spec(
+                &dir,
+                "ps -o pid=,pgid=,sid= -p $$ > ids.txt; sleep 1",
+            ))
+            .unwrap();
+        assert!(wait_until(5000, || dir.exists("ids.txt")
+            && !dir.read("ids.txt").trim().is_empty()));
+        let ids: Vec<u32> = dir
+            .read("ids.txt")
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
         assert_eq!(ids.len(), 3);
-        assert_eq!(ids[0], ids[1], "pgid equals pid: the worker leads its group");
-        assert_eq!(ids[0], ids[2], "sid equals pid: the worker leads its session");
+        assert_eq!(
+            ids[0], ids[1],
+            "pgid equals pid: the worker leads its group"
+        );
+        assert_eq!(
+            ids[0], ids[2],
+            "sid equals pid: the worker leads its session"
+        );
         assert_eq!(ids[0], s.identity.pid);
         assert_ne!(ids[0], std::process::id());
         let _ = h.signal(s.id, Signal::Kill);
@@ -505,8 +558,17 @@ mod tests {
         h.release(s.id);
         let env = dir.read("env.txt");
         assert!(env.contains("ONLY_ME=yes"));
-        for forbidden in ["SENTINEL", "FLEET_SOCKET", "FLEET_STATE", "SSH_AUTH_SOCK", "AWS_"] {
-            assert!(!env.contains(forbidden), "{forbidden} leaked into the worker: {env}");
+        for forbidden in [
+            "SENTINEL",
+            "FLEET_SOCKET",
+            "FLEET_STATE",
+            "SSH_AUTH_SOCK",
+            "AWS_",
+        ] {
+            assert!(
+                !env.contains(forbidden),
+                "{forbidden} leaked into the worker: {env}"
+            );
         }
     }
 
@@ -516,13 +578,20 @@ mod tests {
         let mut h = host();
         let mut sp = spec(&dir, "true");
         sp.program = "definitely-not-installed-xyz".to_string();
-        assert_eq!(h.spawn(&sp).unwrap_err().code, fleet_domain::error::ErrorCode::NotFound);
+        assert_eq!(
+            h.spawn(&sp).unwrap_err().code,
+            fleet_domain::error::ErrorCode::NotFound
+        );
     }
 
     #[test]
     fn output_is_bounded_no_matter_how_much_the_worker_prints() {
         let dir = TempDir::new("pty");
-        let mut h = PtySessionHost::new(4096, Arc::new(Redactor::builtin()), SessionRegistry::default());
+        let mut h = PtySessionHost::new(
+            4096,
+            Arc::new(Redactor::builtin()),
+            SessionRegistry::default(),
+        );
         let s = h
             .spawn(&spec(&dir, "i=0; while [ $i -lt 20000 ]; do echo \"line $i xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"; i=$((i+1)); done"))
             .unwrap();
@@ -530,7 +599,10 @@ mod tests {
         let out = h.release(s.id);
         assert!(out.text.len() <= 4096, "{}", out.text.len());
         assert!(out.text.contains("line 19999"), "the newest output is kept");
-        assert!(!out.text.contains("line 0 "), "the oldest output was dropped");
+        assert!(
+            !out.text.contains("line 0 "),
+            "the oldest output was dropped"
+        );
     }
 
     #[test]
@@ -538,7 +610,9 @@ mod tests {
         let dir = TempDir::new("pty");
         let mut h = host();
         let token = format!("ghp_{}", "a1B2".repeat(10));
-        let s = h.spawn(&spec(&dir, &format!("echo token {token}"))).unwrap();
+        let s = h
+            .spawn(&spec(&dir, &format!("echo token {token}")))
+            .unwrap();
         wait_exit(&mut h, s.id);
         let out = h.release(s.id);
         assert!(!out.text.contains(&token));
@@ -557,7 +631,11 @@ mod tests {
             .unwrap();
         wait_exit(&mut h, s.id);
         let out = h.release(s.id);
-        assert!(!out.text.contains('\u{1b}') && !out.text.contains('\u{202e}'), "{:?}", out.text);
+        assert!(
+            !out.text.contains('\u{1b}') && !out.text.contains('\u{202e}'),
+            "{:?}",
+            out.text
+        );
         assert!(out.text.contains("abc"), "{:?}", out.text);
     }
 
@@ -565,7 +643,9 @@ mod tests {
     fn input_reaches_the_worker_only_through_write_input() {
         let dir = TempDir::new("pty");
         let mut h = host();
-        let s = h.spawn(&spec(&dir, "read answer; echo got:$answer")).unwrap();
+        let s = h
+            .spawn(&spec(&dir, "read answer; echo got:$answer"))
+            .unwrap();
         let io = h.registry().get(s.id).unwrap();
         io.write_input(b"forty-two\r").unwrap();
         wait_exit(&mut h, s.id);
@@ -578,7 +658,10 @@ mod tests {
         let dir = TempDir::new("pty");
         let mut h = host();
         let s = h
-            .spawn(&spec(&dir, "trap '' TERM; sleep 60 & echo $! > child.pid; while :; do sleep 1; done"))
+            .spawn(&spec(
+                &dir,
+                "trap '' TERM; sleep 60 & echo $! > child.pid; while :; do sleep 1; done",
+            ))
             .unwrap();
         assert!(wait_until(5000, || dir.exists("child.pid")));
         assert_eq!(h.signal(s.id, Signal::Term), SignalOutcome::Sent);
@@ -586,12 +669,22 @@ mod tests {
         assert_eq!(h.poll(s.id), SessionState::Running, "TERM is ignored");
         assert_eq!(h.signal(s.id, Signal::Kill), SignalOutcome::Sent);
         let state = wait_exit(&mut h, s.id);
-        assert!(matches!(state, SessionState::Exited { signal: Some(_), .. }), "{state:?}");
+        assert!(
+            matches!(
+                state,
+                SessionState::Exited {
+                    signal: Some(_),
+                    ..
+                }
+            ),
+            "{state:?}"
+        );
         h.release(s.id);
         let child: u32 = dir.read("child.pid").trim().parse().unwrap();
         assert!(
             wait_until(5000, || procid::start_token(child).is_none()
-                || std::fs::read_to_string(format!("/proc/{child}/stat")).map_or(false, |s| s.contains(") Z "))),
+                || std::fs::read_to_string(format!("/proc/{child}/stat"))
+                    .map_or(false, |s| s.contains(") Z "))),
             "the child in the worker's group must be gone"
         );
     }
@@ -605,7 +698,10 @@ mod tests {
         if let Some(sess) = h.sessions.get_mut(&s.id.0) {
             sess.identity.start_token.push('0');
         }
-        assert!(matches!(h.signal(s.id, Signal::Kill), SignalOutcome::Refused(_)));
+        assert!(matches!(
+            h.signal(s.id, Signal::Kill),
+            SignalOutcome::Refused(_)
+        ));
         assert_eq!(h.poll(s.id), SessionState::Running);
         if let Some(sess) = h.sessions.get_mut(&s.id.0) {
             sess.identity.start_token.pop();
@@ -619,11 +715,16 @@ mod tests {
     fn idle_time_resets_with_output() {
         let dir = TempDir::new("pty");
         let mut h = host();
-        let s = h.spawn(&spec(&dir, "sleep 0.3; echo hi; sleep 30")).unwrap();
+        let s = h
+            .spawn(&spec(&dir, "sleep 0.3; echo hi; sleep 30"))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         let early = h.reading(s.id).unwrap();
         assert!(early.idle_ms >= early.elapsed_ms.saturating_sub(50));
-        assert!(wait_until(5000, || h.snapshot(s.id, 100).unwrap_or_default().contains("hi")));
+        assert!(wait_until(5000, || h
+            .snapshot(s.id, 100)
+            .unwrap_or_default()
+            .contains("hi")));
         let r = h.reading(s.id).unwrap();
         assert!(r.idle_ms < r.elapsed_ms);
         let _ = h.signal(s.id, Signal::Kill);
@@ -636,7 +737,13 @@ mod tests {
         let dir = TempDir::new("pty");
         let mut h = host();
         let s = h.spawn(&spec(&dir, "sleep 30")).unwrap();
-        assert_eq!(h.live(), vec![LiveSession { pid: s.identity.pid, pgid: s.identity.pid }]);
+        assert_eq!(
+            h.live(),
+            vec![LiveSession {
+                pid: s.identity.pid,
+                pgid: s.identity.pid
+            }]
+        );
         let _ = h.signal(s.id, Signal::Kill);
         wait_exit(&mut h, s.id);
         assert!(h.live().is_empty());
@@ -648,7 +755,9 @@ mod tests {
     fn attach_subscribers_get_live_output_and_see_the_end() {
         let dir = TempDir::new("pty");
         let mut h = host();
-        let s = h.spawn(&spec(&dir, "sleep 0.3; echo streamed; sleep 0.3")).unwrap();
+        let s = h
+            .spawn(&spec(&dir, "sleep 0.3; echo streamed; sleep 0.3"))
+            .unwrap();
         let rx = h.registry().get(s.id).unwrap().subscribe();
         let mut seen = String::new();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -669,14 +778,20 @@ mod tests {
         let dir = TempDir::new("pty");
         let mut h = host();
         let s = h
-            .spawn(&spec(&dir, "i=0; while [ $i -lt 30000 ]; do echo \"flood $i\"; i=$((i+1)); done"))
+            .spawn(&spec(
+                &dir,
+                "i=0; while [ $i -lt 30000 ]; do echo \"flood $i\"; i=$((i+1)); done",
+            ))
             .unwrap();
         let io = h.registry().get(s.id).unwrap();
         let _rx = io.subscribe(); // never read
         let started = Instant::now();
         wait_exit(&mut h, s.id);
         assert!(started.elapsed() < Duration::from_secs(20));
-        assert!(io.attach_dropped_bytes() > 0, "the unread subscriber lost output instead of blocking the worker");
+        assert!(
+            io.attach_dropped_bytes() > 0,
+            "the unread subscriber lost output instead of blocking the worker"
+        );
         h.release(s.id);
     }
 
@@ -684,7 +799,9 @@ mod tests {
     fn resize_reaches_the_terminal() {
         let dir = TempDir::new("pty");
         let mut h = host();
-        let s = h.spawn(&spec(&dir, "sleep 0.5; stty size > size.txt")).unwrap();
+        let s = h
+            .spawn(&spec(&dir, "sleep 0.5; stty size > size.txt"))
+            .unwrap();
         h.registry().get(s.id).unwrap().resize(100, 30).unwrap();
         wait_exit(&mut h, s.id);
         h.release(s.id);
@@ -697,7 +814,10 @@ mod tests {
         let mut h = host();
         let s = h.spawn(&spec(&dir, "sleep 30")).unwrap();
         let wrong = ProcessIdentity::new(s.identity.pid, "0");
-        assert!(matches!(h.terminate_orphan(&wrong, 100), SignalOutcome::Refused(_)));
+        assert!(matches!(
+            h.terminate_orphan(&wrong, 100),
+            SignalOutcome::Refused(_)
+        ));
         assert_eq!(h.poll(s.id), SessionState::Running);
         assert_eq!(h.terminate_orphan(&s.identity, 500), SignalOutcome::Sent);
         wait_exit(&mut h, s.id);

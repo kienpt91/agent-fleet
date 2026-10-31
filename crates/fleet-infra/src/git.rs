@@ -156,9 +156,7 @@ fn clean_message(message: &str, default: &str) -> String {
 
 fn validate_identity(id: &Identity) -> Result<()> {
     let bad = |s: &str| {
-        s.is_empty()
-            || s.len() > 200
-            || s.chars().any(|c| c.is_control() || c == '<' || c == '>')
+        s.is_empty() || s.len() > 200 || s.chars().any(|c| c.is_control() || c == '<' || c == '>')
     };
     if bad(&id.name) || bad(&id.email) {
         return Err(FleetError::invalid("commit identity is not valid"));
@@ -178,7 +176,13 @@ fn validate_fleet_branch(branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn insert_override(map: &mut BTreeMap<Vec<u8>, Vec<u8>>, section: &str, sub: &[u8], var: &str, val: &str) {
+fn insert_override(
+    map: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    section: &str,
+    sub: &[u8],
+    var: &str,
+    val: &str,
+) {
     let mut key = section.as_bytes().to_vec();
     key.push(b'.');
     key.extend_from_slice(sub);
@@ -237,7 +241,9 @@ fn dynamic_overrides(list: &[u8]) -> Result<Vec<Override>> {
             _ => {}
         }
         if map.len() > MAX_OVERRIDES {
-            return Err(FleetError::limit("the repository config is too large to harden"));
+            return Err(FleetError::limit(
+                "the repository config is too large to harden",
+            ));
         }
     }
     Ok(map.into_iter().collect())
@@ -286,7 +292,8 @@ fn not_found_kind(e: &std::io::Error) -> bool {
 /// someone planted to redirect worktrees elsewhere.
 fn ensure_real_dir(p: &Path) -> Result<()> {
     let check = || -> Result<()> {
-        let meta = fs::symlink_metadata(p).map_err(|e| FleetError::io("cannot stat directory", &e))?;
+        let meta =
+            fs::symlink_metadata(p).map_err(|e| FleetError::io("cannot stat directory", &e))?;
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(FleetError::forbidden(format!(
                 "{} is not a real directory",
@@ -419,7 +426,9 @@ impl GitVcs {
                     let _ = tx.send((is_out, buf));
                 })
         };
-        if let Err(e) = spawn_reader(true, Box::new(so)).and_then(|_| spawn_reader(false, Box::new(se))) {
+        if let Err(e) =
+            spawn_reader(true, Box::new(so)).and_then(|_| spawn_reader(false, Box::new(se)))
+        {
             kill_group(&mut child, pgid);
             return Err(FleetError::io("cannot start a reader thread", &e));
         }
@@ -606,7 +615,12 @@ impl GitVcs {
         let dirs = self.run_ok(
             &dir,
             None,
-            &["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+            ],
         )?;
         let text = dirs.text();
         let mut lines = text.lines();
@@ -637,7 +651,8 @@ impl GitVcs {
                 show(worktree)
             )));
         }
-        let canon = fs::canonicalize(p).map_err(|e| FleetError::io("cannot resolve worktree", &e))?;
+        let canon =
+            fs::canonicalize(p).map_err(|e| FleetError::io("cannot resolve worktree", &e))?;
         if !canon
             .components()
             .any(|c| c.as_os_str() == OsStr::new(WORKTREES))
@@ -667,7 +682,16 @@ impl GitVcs {
     }
 
     fn ref_exists(&self, repo: &Path, full_ref: &str) -> Result<bool> {
-        Ok(self.exit_code(repo, &["rev-parse", "--verify", "--quiet", "--end-of-options", full_ref])? == 0)
+        Ok(self.exit_code(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                full_ref,
+            ],
+        )? == 0)
     }
 
     /// Adds fleet's directories to the shared `info/exclude` (idempotent).
@@ -691,7 +715,8 @@ impl GitVcs {
                         show_path(&file)
                     )));
                 }
-                let f = fs::File::open(&file).map_err(|e| FleetError::io("cannot read info/exclude", &e))?;
+                let f = fs::File::open(&file)
+                    .map_err(|e| FleetError::io("cannot read info/exclude", &e))?;
                 let mut raw = Vec::new();
                 f.take(MAX_EXCLUDE_FILE + 1)
                     .read_to_end(&mut raw)
@@ -750,7 +775,13 @@ impl GitVcs {
 
     /// Creates or reuses the worktree at `path` for `branch`. Returns whether the branch had to
     /// be created (only possible when `base` is given).
-    fn add_worktree(&self, repo: &Path, path: &Path, branch: &str, base: Option<&Sha>) -> Result<bool> {
+    fn add_worktree(
+        &self,
+        repo: &Path,
+        path: &Path,
+        branch: &str,
+        base: Option<&Sha>,
+    ) -> Result<bool> {
         let registered = self.worktree_branches(repo)?;
         let entry = registered.iter().find(|(p, _)| p == path);
         match fs::symlink_metadata(path) {
@@ -797,7 +828,15 @@ impl GitVcs {
         self.run_ok(
             repo,
             None,
-            &["worktree", "add", "--quiet", "-b", branch, path_s, base.as_str()],
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                path_s,
+                base.as_str(),
+            ],
         )?;
         Ok(true)
     }
@@ -825,7 +864,14 @@ impl GitVcs {
         let out = self.run_ok(
             wt,
             None,
-            &["diff", "--name-only", "--diff-filter=U", "-z", "--no-ext-diff", "--no-textconv"],
+            &[
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+            ],
         )?;
         Ok(out
             .stdout
@@ -896,7 +942,13 @@ impl Vcs for GitVcs {
         }
         if self.exit_code(
             &dir,
-            &["rev-parse", "--verify", "--quiet", "--end-of-options", "HEAD^{commit}"],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                "HEAD^{commit}",
+            ],
         )? != 0
         {
             return Err(FleetError::invalid(format!(
@@ -964,7 +1016,12 @@ impl Vcs for GitVcs {
         })
     }
 
-    fn commit_all(&self, worktree: &str, message: &str, identity: &Identity) -> Result<Option<Sha>> {
+    fn commit_all(
+        &self,
+        worktree: &str,
+        message: &str,
+        identity: &Identity,
+    ) -> Result<Option<Sha>> {
         validate_identity(identity)?;
         let wt = self.check_worktree(worktree)?;
         let message = clean_message(message, "fleet: task changes");
@@ -990,7 +1047,11 @@ impl Vcs for GitVcs {
         validate_ref_name(branch)?;
         let dir = self.repo_dir(repo)?;
         let spec = format!("refs/heads/{branch}^{{commit}}");
-        let out = self.run(&dir, None, &["rev-parse", "--verify", "--end-of-options", &spec])?;
+        let out = self.run(
+            &dir,
+            None,
+            &["rev-parse", "--verify", "--end-of-options", &spec],
+        )?;
         if !out.ok() {
             return Err(FleetError::not_found(format!(
                 "branch {} does not exist",
@@ -1061,7 +1122,9 @@ impl Vcs for GitVcs {
                 )?;
             }
             Err(e) if not_found_kind(&e) => {
-                let plain = wt.components().all(|c| !matches!(c, Component::ParentDir | Component::CurDir));
+                let plain = wt
+                    .components()
+                    .all(|c| !matches!(c, Component::ParentDir | Component::CurDir));
                 if !plain || !wt.starts_with(&root) || wt == root {
                     return Err(FleetError::forbidden(format!(
                         "worktree {} is outside {WORKTREES}",
@@ -1091,7 +1154,11 @@ impl Vcs for GitVcs {
         };
         let dir = self.repo_dir(repo)?;
         let source = format!("refs/heads/{branch}");
-        let out = self.run(&dir, None, &["merge-base", "--is-ancestor", &source, &target])?;
+        let out = self.run(
+            &dir,
+            None,
+            &["merge-base", "--is-ancestor", &source, &target],
+        )?;
         match out.code {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -1128,7 +1195,10 @@ mod tests {
     }
 
     fn vcs_with(extra: &[(&str, &str)]) -> GitVcs {
-        let mut env = vec![("PATH".to_string(), std::env::var("PATH").unwrap_or_default())];
+        let mut env = vec![(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        )];
         for (k, v) in extra {
             env.push((k.to_string(), v.to_string()));
         }
@@ -1304,7 +1374,11 @@ mod tests {
             let m = fx.marker.display();
             fs::create_dir_all(dir).unwrap();
             let p = dir.join(h);
-            fs::write(&p, format!("#!/bin/sh\n: > '{m}'\necho \"$SENTINEL_VAR\" > '{m}.env'\nexit 0\n")).unwrap();
+            fs::write(
+                &p,
+                format!("#!/bin/sh\n: > '{m}'\necho \"$SENTINEL_VAR\" > '{m}.env'\nexit 0\n"),
+            )
+            .unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
@@ -1360,7 +1434,9 @@ mod tests {
         vector(
             |fx| {
                 let s = fx.plant_script();
-                fx.append_config(&format!("[filter \"a=b\"]\n\tclean = {s}\n\tsmudge = {s}\n"));
+                fx.append_config(&format!(
+                    "[filter \"a=b\"]\n\tclean = {s}\n\tsmudge = {s}\n"
+                ));
             },
             Some("*.txt filter=a=b\n"),
         );
@@ -1371,7 +1447,9 @@ mod tests {
         vector(
             |fx| {
                 let s = fx.plant_script();
-                fx.append_config(&format!("[merge \"drv\"]\n\tname = x\n\tdriver = {s} %O %A %B\n"));
+                fx.append_config(&format!(
+                    "[merge \"drv\"]\n\tname = x\n\tdriver = {s} %O %A %B\n"
+                ));
             },
             Some("*.txt merge=drv\n"),
         );
@@ -1470,12 +1548,25 @@ mod tests {
         assert_eq!(git(&fx.repo, &["rev-parse", "HEAD"]), head_before);
         assert_eq!(git(&fx.repo, &["symbolic-ref", "HEAD"]), branch_before);
         assert_eq!(git(&fx.repo, &["status", "--porcelain"]), "");
-        assert_eq!(fs::read_to_string(fx.repo.join("README.md")).unwrap(), readme);
-        assert_eq!(fs::read_to_string(fx.repo.join("src/lib.txt")).unwrap(), lib);
-        assert_eq!(git(&fx.repo, &["rev-parse", "refs/heads/main"]), head_before);
+        assert_eq!(
+            fs::read_to_string(fx.repo.join("README.md")).unwrap(),
+            readme
+        );
+        assert_eq!(
+            fs::read_to_string(fx.repo.join("src/lib.txt")).unwrap(),
+            lib
+        );
+        assert_eq!(
+            git(&fx.repo, &["rev-parse", "refs/heads/main"]),
+            head_before
+        );
         let exclude = fs::read_to_string(fx.repo.join(".git/info/exclude")).unwrap();
         for want in [".fleet-worktrees", ".fleet/"] {
-            assert_eq!(exclude.lines().filter(|l| *l == want).count(), 1, "{exclude}");
+            assert_eq!(
+                exclude.lines().filter(|l| *l == want).count(),
+                1,
+                "{exclude}"
+            );
         }
     }
 
@@ -1489,7 +1580,10 @@ mod tests {
             fx.repo.join(".fleet-worktrees/r1/t1").as_path()
         );
         assert!(Path::new(&wt).join("README.md").exists());
-        assert_eq!(git(Path::new(&wt), &["symbolic-ref", "--short", "HEAD"]), "fleet/r1/t1");
+        assert_eq!(
+            git(Path::new(&wt), &["symbolic-ref", "--short", "HEAD"]),
+            "fleet/r1/t1"
+        );
     }
 
     #[test]
@@ -1559,7 +1653,15 @@ mod tests {
         need_git!();
         let fx = Fx::new();
         let base = fx.base();
-        for bad in ["-x", "../x", "a b", "main", "fleet/../x", "fleet/a\u{7}b", "--orphan"] {
+        for bad in [
+            "-x",
+            "../x",
+            "a b",
+            "main",
+            "fleet/../x",
+            "fleet/a\u{7}b",
+            "--orphan",
+        ] {
             let err = fx
                 .vcs
                 .prepare_worktree(fx.repo_s(), &rid("r1"), &tid("t1"), bad, &base)
@@ -1577,7 +1679,11 @@ mod tests {
     fn hostile_integration_branch_names_are_rejected() {
         need_git!();
         let fx = Fx::new();
-        for (integration, task) in [("-x", "fleet/r1/t1"), ("fleet/r1/integration", "../x"), ("main", "fleet/r1/t1")] {
+        for (integration, task) in [
+            ("-x", "fleet/r1/t1"),
+            ("fleet/r1/integration", "../x"),
+            ("main", "fleet/r1/t1"),
+        ] {
             let err = fx
                 .vcs
                 .merge_into_integration(&IntegrationMerge {
@@ -1602,20 +1708,39 @@ mod tests {
         let fx = Fx::new();
         let link = fx.tmp.join("link");
         std::os::unix::fs::symlink(&fx.repo, &link).unwrap();
-        let err = fx.vcs.resolve_base(link.to_str().unwrap(), "HEAD").unwrap_err();
+        let err = fx
+            .vcs
+            .resolve_base(link.to_str().unwrap(), "HEAD")
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);
 
         let sub = fx.repo.join("src");
         assert!(fx.vcs.resolve_base(sub.to_str().unwrap(), "HEAD").is_err());
 
         let linked = fx.tmp.join("linked");
-        git(&fx.repo, &["worktree", "add", "-q", "-b", "other", linked.to_str().unwrap()]);
-        let err = fx.vcs.resolve_base(linked.to_str().unwrap(), "HEAD").unwrap_err();
+        git(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let err = fx
+            .vcs
+            .resolve_base(linked.to_str().unwrap(), "HEAD")
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);
 
         let plain = fx.tmp.join("plain");
         fs::create_dir_all(&plain).unwrap();
-        assert!(fx.vcs.resolve_base(plain.to_str().unwrap(), "HEAD").is_err());
+        assert!(fx
+            .vcs
+            .resolve_base(plain.to_str().unwrap(), "HEAD")
+            .is_err());
 
         let err = fx
             .vcs
@@ -1633,7 +1758,9 @@ mod tests {
         let repo = tmp.join("repo");
         fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
-        let err = vcs_with(&[]).resolve_base(repo.to_str().unwrap(), "HEAD").unwrap_err();
+        let err = vcs_with(&[])
+            .resolve_base(repo.to_str().unwrap(), "HEAD")
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
     }
 
@@ -1646,7 +1773,13 @@ mod tests {
         std::os::unix::fs::symlink(&outside, fx.repo.join(".fleet-worktrees")).unwrap();
         let err = fx
             .vcs
-            .prepare_worktree(fx.repo_s(), &rid("r1"), &tid("t1"), "fleet/r1/t1", &fx.base())
+            .prepare_worktree(
+                fx.repo_s(),
+                &rid("r1"),
+                &tid("t1"),
+                "fleet/r1/t1",
+                &fx.base(),
+            )
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
@@ -1684,7 +1817,10 @@ mod tests {
             panic!("first merge must succeed");
         };
         let integration = fx.repo.join(".fleet-worktrees/r1/_integration");
-        assert_eq!(git(&integration, &["rev-parse", "HEAD"]), after_first.as_str());
+        assert_eq!(
+            git(&integration, &["rev-parse", "HEAD"]),
+            after_first.as_str()
+        );
 
         let second = fx.integrate("r1", "t2");
         assert!(!second.created);
@@ -1694,7 +1830,10 @@ mod tests {
                 files: vec!["src/lib.txt".to_string()]
             }
         );
-        assert_eq!(git(&integration, &["rev-parse", "HEAD"]), after_first.as_str());
+        assert_eq!(
+            git(&integration, &["rev-parse", "HEAD"]),
+            after_first.as_str()
+        );
         assert_eq!(git(&integration, &["status", "--porcelain"]), "");
         assert!(!merge_head_exists(&integration));
         assert_eq!(
@@ -1789,11 +1928,18 @@ mod tests {
         let wt = fx.prepare("r1", "t1");
         assert_eq!(fx.vcs.commit_all(&wt, "nothing", &ident()).unwrap(), None);
         fs::write(Path::new(&wt).join("f.txt"), "x\n").unwrap();
-        let sha = fx.vcs.commit_all(&wt, "add f\u{1}\u{7}", &ident()).unwrap().unwrap();
+        let sha = fx
+            .vcs
+            .commit_all(&wt, "add f\u{1}\u{7}", &ident())
+            .unwrap()
+            .unwrap();
         assert_eq!(fx.vcs.branch_head(fx.repo_s(), "fleet/r1/t1").unwrap(), sha);
         let wtp = Path::new(&wt);
         assert_eq!(git(wtp, &["log", "-1", "--format=%s"]), "add f");
-        assert_eq!(git(wtp, &["log", "-1", "--format=%an <%ae>"]), "Fleet Bot <bot@example.invalid>");
+        assert_eq!(
+            git(wtp, &["log", "-1", "--format=%an <%ae>"]),
+            "Fleet Bot <bot@example.invalid>"
+        );
         assert_eq!(fx.vcs.commit_all(&wt, "again", &ident()).unwrap(), None);
     }
 
@@ -1803,7 +1949,10 @@ mod tests {
         let fx = Fx::new();
         let wt = fx.prepare("r1", "t1");
         fs::write(Path::new(&wt).join("f.txt"), "x\n").unwrap();
-        fx.vcs.commit_all(&wt, &"m".repeat(100_000), &ident()).unwrap().unwrap();
+        fx.vcs
+            .commit_all(&wt, &"m".repeat(100_000), &ident())
+            .unwrap()
+            .unwrap();
         let body = git(Path::new(&wt), &["log", "-1", "--format=%B"]);
         assert!(body.len() <= MAX_MESSAGE, "{}", body.len());
     }
@@ -1816,7 +1965,12 @@ mod tests {
         let wtp = Path::new(&wt);
         fs::create_dir_all(wtp.join(".fleet")).unwrap();
         fs::write(wtp.join(".fleet/result.json"), "{}").unwrap();
-        assert_eq!(fx.vcs.commit_all(&wt, "only fleet files", &ident()).unwrap(), None);
+        assert_eq!(
+            fx.vcs
+                .commit_all(&wt, "only fleet files", &ident())
+                .unwrap(),
+            None
+        );
 
         // Even a worker that force-adds it cannot get it into a commit.
         fs::write(wtp.join(".fleet/other.json"), "{}").unwrap();
@@ -1845,9 +1999,18 @@ mod tests {
         let fx = Fx::new();
         let wt = fx.prepare("r1", "t1");
         for bad in [
-            Identity { name: String::new(), email: "a@b".to_string() },
-            Identity { name: "x\ny".to_string(), email: "a@b".to_string() },
-            Identity { name: "x".to_string(), email: "<a@b>".to_string() },
+            Identity {
+                name: String::new(),
+                email: "a@b".to_string(),
+            },
+            Identity {
+                name: "x\ny".to_string(),
+                email: "a@b".to_string(),
+            },
+            Identity {
+                name: "x".to_string(),
+                email: "<a@b>".to_string(),
+            },
         ] {
             let err = fx.vcs.commit_all(&wt, "m", &bad).unwrap_err();
             assert_eq!(err.code, ErrorCode::Invalid);
@@ -1864,7 +2027,10 @@ mod tests {
         fs::write(Path::new(&a).join("wip.txt"), "wip\n").unwrap();
         let b = fx.prepare("r1", "t1");
         assert_eq!(a, b);
-        assert_eq!(fs::read_to_string(Path::new(&b).join("wip.txt")).unwrap(), "wip\n");
+        assert_eq!(
+            fs::read_to_string(Path::new(&b).join("wip.txt")).unwrap(),
+            "wip\n"
+        );
     }
 
     #[test]
@@ -1876,7 +2042,10 @@ mod tests {
         fs::remove_dir_all(&a).unwrap();
         let b = fx.prepare("r1", "t1");
         assert_eq!(a, b);
-        assert_eq!(fs::read_to_string(Path::new(&b).join("kept.txt")).unwrap(), "kept\n");
+        assert_eq!(
+            fs::read_to_string(Path::new(&b).join("kept.txt")).unwrap(),
+            "kept\n"
+        );
         assert_eq!(git(Path::new(&b), &["rev-parse", "HEAD"]), sha.as_str());
     }
 
@@ -1887,7 +2056,13 @@ mod tests {
         fs::create_dir_all(fx.repo.join(".fleet-worktrees/r1/t1")).unwrap();
         let err = fx
             .vcs
-            .prepare_worktree(fx.repo_s(), &rid("r1"), &tid("t1"), "fleet/r1/t1", &fx.base())
+            .prepare_worktree(
+                fx.repo_s(),
+                &rid("r1"),
+                &tid("t1"),
+                "fleet/r1/t1",
+                &fx.base(),
+            )
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Conflict);
     }
@@ -1897,20 +2072,34 @@ mod tests {
         need_git!();
         let fx = Fx::new();
         let w1 = fx.prepare("r1", "t1");
-        fx.vcs.remove_worktree(fx.repo_s(), &w1, "fleet/r1/t1", true).unwrap();
+        fx.vcs
+            .remove_worktree(fx.repo_s(), &w1, "fleet/r1/t1", true)
+            .unwrap();
         assert!(!Path::new(&w1).exists());
         assert_eq!(git(&fx.repo, &["branch", "--list", "fleet/*"]), "");
         // Idempotent once everything is gone.
-        fx.vcs.remove_worktree(fx.repo_s(), &w1, "fleet/r1/t1", true).unwrap();
+        fx.vcs
+            .remove_worktree(fx.repo_s(), &w1, "fleet/r1/t1", true)
+            .unwrap();
 
         let w2 = fx.prepare("r1", "t2");
-        fx.vcs.remove_worktree(fx.repo_s(), &w2, "main", true).unwrap();
+        fx.vcs
+            .remove_worktree(fx.repo_s(), &w2, "main", true)
+            .unwrap();
         assert!(!Path::new(&w2).exists());
-        assert_eq!(git(&fx.repo, &["rev-parse", "--verify", "refs/heads/main"]), fx.base().as_str());
+        assert_eq!(
+            git(&fx.repo, &["rev-parse", "--verify", "refs/heads/main"]),
+            fx.base().as_str()
+        );
 
         let w3 = fx.prepare("r1", "t3");
-        fx.vcs.remove_worktree(fx.repo_s(), &w3, "fleet/r1/t3", false).unwrap();
-        assert_eq!(git(&fx.repo, &["branch", "--list", "fleet/r1/t3"]).trim(), "fleet/r1/t3");
+        fx.vcs
+            .remove_worktree(fx.repo_s(), &w3, "fleet/r1/t3", false)
+            .unwrap();
+        assert_eq!(
+            git(&fx.repo, &["branch", "--list", "fleet/r1/t3"]).trim(),
+            "fleet/r1/t3"
+        );
     }
 
     #[test]
@@ -1918,7 +2107,17 @@ mod tests {
         need_git!();
         let fx = Fx::new();
         let other = fx.tmp.join("other-wt");
-        git(&fx.repo, &["worktree", "add", "-q", "-b", "side", other.to_str().unwrap()]);
+        git(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                other.to_str().unwrap(),
+            ],
+        );
         let err = fx
             .vcs
             .remove_worktree(fx.repo_s(), other.to_str().unwrap(), "side", true)
@@ -1938,17 +2137,26 @@ mod tests {
 
         let sneaky = format!("{}/.fleet-worktrees/../README.md", fx.repo_s());
         assert_eq!(
-            fx.vcs.remove_worktree(fx.repo_s(), &sneaky, "x", false).unwrap_err().code,
+            fx.vcs
+                .remove_worktree(fx.repo_s(), &sneaky, "x", false)
+                .unwrap_err()
+                .code,
             ErrorCode::Forbidden
         );
         let sneaky = format!("{}/.fleet-worktrees/r1/../../nothing", fx.repo_s());
         assert_eq!(
-            fx.vcs.remove_worktree(fx.repo_s(), &sneaky, "x", false).unwrap_err().code,
+            fx.vcs
+                .remove_worktree(fx.repo_s(), &sneaky, "x", false)
+                .unwrap_err()
+                .code,
             ErrorCode::Forbidden
         );
         let root = fx.repo.join(".fleet-worktrees");
         assert_eq!(
-            fx.vcs.remove_worktree(fx.repo_s(), root.to_str().unwrap(), "x", false).unwrap_err().code,
+            fx.vcs
+                .remove_worktree(fx.repo_s(), root.to_str().unwrap(), "x", false)
+                .unwrap_err()
+                .code,
             ErrorCode::Forbidden
         );
         assert!(fx.repo.join("README.md").exists());
@@ -1965,12 +2173,27 @@ mod tests {
         let fx = Fx::new();
         let w1 = fx.prepare("r1", "t1");
         fx.edit_and_commit(&w1, "a.txt", "a\n");
-        assert!(!fx.vcs.is_merged(fx.repo_s(), "fleet/r1/t1", "main").unwrap());
-        assert!(fx.vcs.is_merged(fx.repo_s(), "main", "fleet/r1/t1").unwrap());
-        assert!(fx.vcs.is_merged(fx.repo_s(), "fleet/r1/t1", "fleet/r1/t1").unwrap());
-        assert!(fx.vcs.is_merged(fx.repo_s(), "fleet/r1/missing", "main").is_err());
+        assert!(!fx
+            .vcs
+            .is_merged(fx.repo_s(), "fleet/r1/t1", "main")
+            .unwrap());
+        assert!(fx
+            .vcs
+            .is_merged(fx.repo_s(), "main", "fleet/r1/t1")
+            .unwrap());
+        assert!(fx
+            .vcs
+            .is_merged(fx.repo_s(), "fleet/r1/t1", "fleet/r1/t1")
+            .unwrap());
+        assert!(fx
+            .vcs
+            .is_merged(fx.repo_s(), "fleet/r1/missing", "main")
+            .is_err());
         assert_eq!(
-            fx.vcs.branch_head(fx.repo_s(), "fleet/r1/missing").unwrap_err().code,
+            fx.vcs
+                .branch_head(fx.repo_s(), "fleet/r1/missing")
+                .unwrap_err()
+                .code,
             ErrorCode::NotFound
         );
     }
@@ -1997,7 +2220,10 @@ mod tests {
         let pids = tmp.join("pids");
         let vcs = fake_git(
             &tmp,
-            &format!("echo $$ > '{p}'\n/bin/sleep 60 &\necho $! >> '{p}'\nwait", p = pids.display()),
+            &format!(
+                "echo $$ > '{p}'\n/bin/sleep 60 &\necho $! >> '{p}'\nwait",
+                p = pids.display()
+            ),
         )
         .with_limits(Duration::from_millis(1500), 1024 * 1024);
         let start = Instant::now();
@@ -2008,7 +2234,10 @@ mod tests {
         let ids: Vec<i32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
         assert_eq!(ids.len(), 2, "{text}");
         for id in ids {
-            assert!(wait_until(3000, || !pid_alive(id)), "process {id} survived the timeout");
+            assert!(
+                wait_until(3000, || !pid_alive(id)),
+                "process {id} survived the timeout"
+            );
         }
     }
 
@@ -2042,9 +2271,18 @@ mod tests {
     fn git_runs_with_an_empty_environment_plus_the_allowlist() {
         let tmp = TempDir::new("git-env");
         let dump = tmp.join("env.txt");
-        fake_git(&tmp, &format!("/usr/bin/env > '{}'\necho 'git version 2.40.0'", dump.display()));
+        fake_git(
+            &tmp,
+            &format!(
+                "/usr/bin/env > '{}'\necho 'git version 2.40.0'",
+                dump.display()
+            ),
+        );
         let mut env = vec![
-            ("PATH".to_string(), tmp.join("bin").to_str().unwrap().to_string()),
+            (
+                "PATH".to_string(),
+                tmp.join("bin").to_str().unwrap().to_string(),
+            ),
             ("SECRET_TOKEN".to_string(), "hunter2".to_string()),
             ("FLEET_SOCKET".to_string(), "/run/x.sock".to_string()),
             ("GIT_DIR".to_string(), "/elsewhere".to_string()),
@@ -2073,7 +2311,10 @@ mod tests {
         let junk = fake_git(&tmp3, "echo 'not git'");
         assert!(junk.version().is_err());
         if git_available() {
-            let env = vec![("PATH".to_string(), std::env::var("PATH").unwrap_or_default())];
+            let env = vec![(
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_default(),
+            )];
             assert!(check_git_version(&env, &EnvPolicy::default_policy())
                 .unwrap()
                 .starts_with("git version"));
@@ -2106,7 +2347,9 @@ mod tests {
         ] {
             assert_eq!(got.get(k).map(String::as_str), Some(v), "{k}");
         }
-        assert!(!got.keys().any(|k| k.starts_with("alias") || k.starts_with("core")));
+        assert!(!got
+            .keys()
+            .any(|k| k.starts_with("alias") || k.starts_with("core")));
     }
 
     #[test]

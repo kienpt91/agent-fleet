@@ -94,7 +94,11 @@ pub fn resolve_program(program: &str, cwd: &Path, env: &[(String, String)]) -> O
         return is_executable_file(&full).then_some(full);
     }
     // The last entry wins, the same as when the entries are applied to the child's environment.
-    let path = env.iter().rev().find(|(k, _)| k == "PATH").map(|(_, v)| v)?;
+    let path = env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v)?;
     path.split(':')
         .filter(|dir| !dir.is_empty())
         .map(|dir| {
@@ -279,7 +283,11 @@ pub fn run_bounded(spec: &RunSpec) -> RunResult {
     };
     let stdout = std::mem::take(&mut *lock(&out.buf));
     let stderr = std::mem::take(&mut *lock(&err.buf));
-    RunResult { exit, stdout, stderr }
+    RunResult {
+        exit,
+        stdout,
+        stderr,
+    }
 }
 
 /// Starts the command, retrying briefly while the executable is still open for writing in another
@@ -470,14 +478,16 @@ impl ThreadJobRunner {
         self.running.fetch_add(1, Ordering::SeqCst);
         let counter = Arc::clone(&self.running);
         let tx = self.tx.clone();
-        let spawned = thread::Builder::new().name("fleet-job".into()).spawn(move || {
-            let guard = RunningGuard(counter);
-            let done = catch_unwind(AssertUnwindSafe(|| exec(&job)))
-                .unwrap_or_else(|_| panic_result(&job));
-            // The result is queued before the job stops counting as running.
-            let _ = tx.send(done);
-            drop(guard);
-        });
+        let spawned = thread::Builder::new()
+            .name("fleet-job".into())
+            .spawn(move || {
+                let guard = RunningGuard(counter);
+                let done = catch_unwind(AssertUnwindSafe(|| exec(&job)))
+                    .unwrap_or_else(|_| panic_result(&job));
+                // The result is queued before the job stops counting as running.
+                let _ = tx.send(done);
+                drop(guard);
+            });
         if let Err(e) = spawned {
             // The closure never ran, so its guard did not decrement.
             self.running.fetch_sub(1, Ordering::SeqCst);
@@ -536,7 +546,9 @@ mod tests {
     /// reaps) is not running.
     fn process_alive(pid: &str) -> bool {
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            return stat.rsplit_once(") ").is_some_and(|(_, rest)| !rest.starts_with('Z'));
+            return stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z'));
         }
         StdCommand::new("kill")
             .args(["-0", pid])
@@ -599,10 +611,7 @@ mod tests {
     #[test]
     fn leftover_group_members_are_killed_after_the_leader_exits() {
         let dir = TempDir::new("job-leftover");
-        let script = dir.script(
-            "s.sh",
-            "#!/bin/sh\nsleep 60 &\necho $! > \"$1\"\nexit 0\n",
-        );
+        let script = dir.script("s.sh", "#!/bin/sh\nsleep 60 &\necho $! > \"$1\"\nexit 0\n");
         let pidfile = dir.join("bg.pid");
         let result = run_bounded(&spec(&script, &[pidfile.to_str().unwrap()], &dir));
         assert_eq!(result.exit, ExitKind::Code(0));
@@ -729,7 +738,11 @@ mod tests {
         );
         assert_eq!(resolve_program("bin/plain", dir.path(), &[]), None);
         assert_eq!(
-            resolve_program(&other.join("tool").display().to_string(), Path::new("/"), &[]),
+            resolve_program(
+                &other.join("tool").display().to_string(),
+                Path::new("/"),
+                &[]
+            ),
             Some(other.join("tool"))
         );
     }
@@ -792,7 +805,10 @@ mod tests {
 
     #[test]
     fn gate_output_is_sanitized() {
-        let o = run_one("printf 'ok\\033]52;c;aGk=\\007 done\\n'; exit 1", GateFormat::Exit);
+        let o = run_one(
+            "printf 'ok\\033]52;c;aGk=\\007 done\\n'; exit 1",
+            GateFormat::Exit,
+        );
         assert!(!o.output.contains('\u{1b}') && !o.output.contains('\u{7}'));
     }
 
@@ -889,8 +905,14 @@ mod tests {
             panic!("expected a gates result");
         };
         assert_eq!((run.as_str(), task.as_str(), attempt), ("r1", "t1", 3));
-        let shape: Vec<(&str, bool)> = outcomes.iter().map(|o| (o.name.as_str(), o.passed)).collect();
-        assert_eq!(shape, [("first", false), ("second", true), ("third", false)]);
+        let shape: Vec<(&str, bool)> = outcomes
+            .iter()
+            .map(|o| (o.name.as_str(), o.passed))
+            .collect();
+        assert_eq!(
+            shape,
+            [("first", false), ("second", true), ("third", false)]
+        );
         assert!(dir.exists("second-ran"));
     }
 
@@ -922,7 +944,11 @@ mod tests {
     #[test]
     fn command_job_reports_exit_code_and_sanitized_output() {
         let dir = TempDir::new("job-cmd");
-        let job = command_job(&dir, "printf 'hello\\033[31m red\\033]0;title\\007\\n'; echo oops >&2; exit 3", 10_000);
+        let job = command_job(
+            &dir,
+            "printf 'hello\\033[31m red\\033]0;title\\007\\n'; echo oops >&2; exit 3",
+            10_000,
+        );
         let JobDone::Command {
             approval,
             exit_code,
@@ -990,7 +1016,10 @@ mod tests {
     #[test]
     fn command_summary_texts() {
         assert_eq!(command_summary(&ExitKind::Code(0)), "exit code 0");
-        assert_eq!(command_summary(&ExitKind::Signal(15)), "killed by signal 15");
+        assert_eq!(
+            command_summary(&ExitKind::Signal(15)),
+            "killed by signal 15"
+        );
         assert_eq!(command_summary(&ExitKind::TimedOut), "timed out");
         assert_eq!(command_summary(&ExitKind::OutputLimit), "output limit");
         let shown = command_summary(&ExitKind::SpawnFailed("no \u{1b}[31msuch".into()));
@@ -1072,7 +1101,10 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(wait_until(5_000, || runner.running() == 0));
         runner
-            .start(gates_job(&dir, vec![gate(&dir, "c", "exit 0", GateFormat::Exit)]))
+            .start(gates_job(
+                &dir,
+                vec![gate(&dir, "c", "exit 0", GateFormat::Exit)],
+            ))
             .unwrap();
         assert_eq!(collect(&mut runner, 1).len(), 1);
     }
@@ -1103,19 +1135,30 @@ mod tests {
         );
         runner.start_with(job, exploding).unwrap();
         let got = collect(&mut runner, 1);
-        let JobDone::Gates { outcomes, attempt, .. } = &got[0] else {
+        let JobDone::Gates {
+            outcomes, attempt, ..
+        } = &got[0]
+        else {
             panic!("expected a gates result");
         };
         assert_eq!(*attempt, 1);
         assert_eq!(outcomes.len(), 2);
-        assert!(outcomes.iter().all(|o| !o.passed && o.summary.contains("panicked")));
+        assert!(outcomes
+            .iter()
+            .all(|o| !o.passed && o.summary.contains("panicked")));
         assert!(wait_until(5_000, || runner.running() == 0));
 
         // A leaked slot would make this fail with a limit error.
         let cmd = command_job(&dir, "exit 0", 5_000);
         runner.start_with(cmd, exploding).unwrap();
         let got = collect(&mut runner, 1);
-        let JobDone::Command { approval, exit_code, summary, .. } = &got[0] else {
+        let JobDone::Command {
+            approval,
+            exit_code,
+            summary,
+            ..
+        } = &got[0]
+        else {
             panic!("expected a command result");
         };
         assert_eq!(approval.as_str(), "a7");
@@ -1128,9 +1171,17 @@ mod tests {
     fn runner_runs_command_jobs() {
         let dir = TempDir::new("job-runner-cmd");
         let mut runner = ThreadJobRunner::new(2);
-        runner.start(command_job(&dir, "echo hi; exit 4", 10_000)).unwrap();
+        runner
+            .start(command_job(&dir, "echo hi; exit 4", 10_000))
+            .unwrap();
         let got = collect(&mut runner, 1);
-        let JobDone::Command { exit_code, summary, output, .. } = &got[0] else {
+        let JobDone::Command {
+            exit_code,
+            summary,
+            output,
+            ..
+        } = &got[0]
+        else {
             panic!("expected a command result");
         };
         assert_eq!(*exit_code, Some(4));

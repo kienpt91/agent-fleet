@@ -284,7 +284,9 @@ mod tests {
         let dir = TempDir::new("undo-cwd");
         let program = fake(&dir, "echo here > cwd-marker; echo '{}'");
         let wt = worktree(&dir);
-        AgentUndo::with_program(program).checkpoint(&wt, "x").unwrap();
+        AgentUndo::with_program(program)
+            .checkpoint(&wt, "x")
+            .unwrap();
         assert!(dir.exists("wt/cwd-marker"));
     }
 
@@ -425,7 +427,9 @@ mod tests {
             "printf '{\"note\":\"'; i=0; while [ $i -lt 300 ]; do printf 'abcd'; i=$((i+1)); done; printf '\"}\\n'",
         );
         let wt = worktree(&dir);
-        let text = AgentUndo::with_program(program).checkpoint(&wt, "x").unwrap();
+        let text = AgentUndo::with_program(program)
+            .checkpoint(&wt, "x")
+            .unwrap();
         assert_eq!(text.chars().count(), 400);
         assert!(text.starts_with(r#"{"note":"abcd"#));
     }
@@ -438,7 +442,9 @@ mod tests {
             "printf 'plain \\033[31mred\\033[0m text '; i=0; while [ $i -lt 200 ]; do printf 'zzzzzz'; i=$((i+1)); done",
         );
         let wt = worktree(&dir);
-        let text = AgentUndo::with_program(program).checkpoint(&wt, "x").unwrap();
+        let text = AgentUndo::with_program(program)
+            .checkpoint(&wt, "x")
+            .unwrap();
         assert!(text.starts_with("plain "), "{text}");
         assert!(!text.contains('\u{1b}'));
         assert!(text.chars().count() <= 400);
@@ -489,7 +495,10 @@ mod tests {
             ("USER".to_string(), "someone".to_string()),
             ("TMPDIR".to_string(), "/tmp".to_string()),
             ("PATH".to_string(), "/daemon/only".to_string()),
-            ("FLEET_SENTINEL_TOKEN".to_string(), "do-not-leak".to_string()),
+            (
+                "FLEET_SENTINEL_TOKEN".to_string(),
+                "do-not-leak".to_string(),
+            ),
             ("SSH_AUTH_SOCK".to_string(), "/tmp/agent.sock".to_string()),
         ];
         let tool = AgentUndo::detect_with_env(Some(&path), daemon_env);

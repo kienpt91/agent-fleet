@@ -101,7 +101,9 @@ pub fn parse_request(line: &str) -> Result<(String, Value)> {
         .ok_or_else(|| bad("request has no command"))?;
     if cmd.is_empty()
         || cmd.len() > MAX_CMD_LEN
-        || !cmd.chars().all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
+        || !cmd
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
     {
         return Err(bad("the command name is not valid"));
     }
@@ -230,7 +232,10 @@ pub fn encode_resize(cols: u16, rows: u16) -> [u8; 4] {
 
 pub fn decode_resize(payload: &[u8]) -> Option<(u16, u16)> {
     let b: [u8; 4] = payload.try_into().ok()?;
-    Some((u16::from_be_bytes([b[0], b[1]]), u16::from_be_bytes([b[2], b[3]])))
+    Some((
+        u16::from_be_bytes([b[0], b[1]]),
+        u16::from_be_bytes([b[2], b[3]]),
+    ))
 }
 
 #[cfg(test)]
@@ -374,20 +379,35 @@ mod tests {
     #[test]
     fn line_reader_strips_newlines_and_signals_eof() {
         let mut r = Cursor::new(b"one\ntwo\r\nthree".to_vec());
-        assert_eq!(read_line_bounded(&mut r, 100).unwrap().as_deref(), Some("one"));
-        assert_eq!(read_line_bounded(&mut r, 100).unwrap().as_deref(), Some("two"));
-        assert_eq!(read_line_bounded(&mut r, 100).unwrap().as_deref(), Some("three"));
+        assert_eq!(
+            read_line_bounded(&mut r, 100).unwrap().as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            read_line_bounded(&mut r, 100).unwrap().as_deref(),
+            Some("two")
+        );
+        assert_eq!(
+            read_line_bounded(&mut r, 100).unwrap().as_deref(),
+            Some("three")
+        );
         assert_eq!(read_line_bounded(&mut r, 100).unwrap(), None);
         let mut empty = Cursor::new(Vec::new());
         assert_eq!(read_line_bounded(&mut empty, 10).unwrap(), None);
         let mut blank = Cursor::new(b"\n".to_vec());
-        assert_eq!(read_line_bounded(&mut blank, 10).unwrap().as_deref(), Some(""));
+        assert_eq!(
+            read_line_bounded(&mut blank, 10).unwrap().as_deref(),
+            Some("")
+        );
     }
 
     #[test]
     fn line_reader_accepts_exactly_max_and_rejects_longer() {
         let mut ok = Cursor::new(b"12345\nrest\n".to_vec());
-        assert_eq!(read_line_bounded(&mut ok, 5).unwrap().as_deref(), Some("12345"));
+        assert_eq!(
+            read_line_bounded(&mut ok, 5).unwrap().as_deref(),
+            Some("12345")
+        );
         let mut long = Cursor::new(b"123456\n".to_vec());
         let err = read_line_bounded(&mut long, 5).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -429,7 +449,10 @@ mod tests {
         let max = vec![7u8; MAX_FRAME_PAYLOAD];
         write_frame(&mut buf, KIND_RESIZE, &max).unwrap();
         let mut r = Cursor::new(buf);
-        assert_eq!(read_frame(&mut r).unwrap(), Some((KIND_INPUT, b"hello".to_vec())));
+        assert_eq!(
+            read_frame(&mut r).unwrap(),
+            Some((KIND_INPUT, b"hello".to_vec()))
+        );
         assert_eq!(read_frame(&mut r).unwrap(), Some((KIND_DETACH, Vec::new())));
         assert_eq!(read_frame(&mut r).unwrap(), Some((KIND_RESIZE, max)));
         assert_eq!(read_frame(&mut r).unwrap(), None);
@@ -438,7 +461,8 @@ mod tests {
     #[test]
     fn oversize_payload_is_refused_when_writing() {
         let mut buf = Vec::new();
-        let err = write_frame(&mut buf, KIND_OUTPUT, &vec![0u8; MAX_FRAME_PAYLOAD + 1]).unwrap_err();
+        let err =
+            write_frame(&mut buf, KIND_OUTPUT, &vec![0u8; MAX_FRAME_PAYLOAD + 1]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(buf.is_empty());
     }
@@ -451,7 +475,10 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let over = u16::try_from(MAX_FRAME_PAYLOAD + 1).unwrap().to_be_bytes();
         let mut r = Cursor::new(vec![KIND_INPUT, over[0], over[1]]);
-        assert_eq!(read_frame(&mut r).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_frame(&mut r).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

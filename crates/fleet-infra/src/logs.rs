@@ -43,7 +43,11 @@ impl FileOutputLogs {
             .filter_map(|entry| {
                 let name = entry.file_name();
                 let name = name.to_str()?;
-                let attempt: u32 = name.strip_prefix(&prefix)?.strip_suffix(".log")?.parse().ok()?;
+                let attempt: u32 = name
+                    .strip_prefix(&prefix)?
+                    .strip_suffix(".log")?
+                    .parse()
+                    .ok()?;
                 Some((attempt, entry.path()))
             })
             .collect()
@@ -60,7 +64,10 @@ impl OutputLogs for FileOutputLogs {
     }
 
     fn tail(&self, run: &RunId, task: &TaskId, max: usize) -> Option<String> {
-        let (_, path) = self.attempts(run, task).into_iter().max_by_key(|(n, _)| *n)?;
+        let (_, path) = self
+            .attempts(run, task)
+            .into_iter()
+            .max_by_key(|(n, _)| *n)?;
         read_tail(&path, max)
     }
 
@@ -90,7 +97,8 @@ fn read_tail(path: &std::path::Path, max: usize) -> Option<String> {
         return None;
     }
     let want = u64::try_from(max).unwrap_or(u64::MAX).min(meta.len());
-    file.seek(SeekFrom::Start(meta.len().saturating_sub(want))).ok()?;
+    file.seek(SeekFrom::Start(meta.len().saturating_sub(want)))
+        .ok()?;
     let mut buf = Vec::with_capacity(usize::try_from(want).unwrap_or(0));
     // `take` keeps the read bounded even if the file grows meanwhile.
     file.take(want).read_to_end(&mut buf).ok()?;
@@ -125,7 +133,10 @@ mod tests {
         assert_eq!(logs.tail(&r, &k, 0).as_deref(), Some(""));
         let file = t.join("logs/r1/t1-1.log");
         assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(t.join("logs/r1")).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(t.join("logs/r1")).unwrap().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

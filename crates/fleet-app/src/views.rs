@@ -39,7 +39,10 @@ fn task_value(t: &Task, live: bool) -> Value {
         ("id", Value::str(t.id.as_str())),
         ("title", Value::str(&t.title)),
         ("status", Value::str(t.status.as_str())),
-        ("deps", Value::array(t.deps.iter().map(|d| Value::str(d.as_str())))),
+        (
+            "deps",
+            Value::array(t.deps.iter().map(|d| Value::str(d.as_str()))),
+        ),
         ("worker", opt_str(t.worker.as_ref().map(|w| w.as_str()))),
         ("attempt", Value::int(t.attempt)),
         ("retries_used", Value::int(t.retries_used)),
@@ -75,7 +78,8 @@ fn task_value(t: &Task, live: bool) -> Value {
 }
 
 fn run_value(run: &Run, live: &BTreeSet<(RunId, TaskId)>) -> Value {
-    let count = |s: TaskStatus| Value::int(run.tasks().iter().filter(|t| t.status == s).count() as u64);
+    let count =
+        |s: TaskStatus| Value::int(run.tasks().iter().filter(|t| t.status == s).count() as u64);
     Value::object([
         ("id", Value::str(run.id.as_str())),
         ("objective", Value::str(&run.objective)),
@@ -178,7 +182,11 @@ pub fn status_value(state: &FleetState, only: Option<&RunId>, ctx: &StatusContex
                 ("max_sessions", Value::int(ctx.max_sessions as u64)),
                 (
                     "undo",
-                    Value::str(if ctx.undo_available { "available" } else { "unavailable" }),
+                    Value::str(if ctx.undo_available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }),
                 ),
                 ("rss_kb", Value::Null),
             ]),
@@ -233,7 +241,10 @@ mod tests {
         s
     }
 
-    fn ctx<'a>(live: &'a BTreeSet<(RunId, TaskId)>, recent: &'a VecDeque<Recent>) -> StatusContext<'a> {
+    fn ctx<'a>(
+        live: &'a BTreeSet<(RunId, TaskId)>,
+        recent: &'a VecDeque<Recent>,
+    ) -> StatusContext<'a> {
         StatusContext {
             now_ms: 5,
             live,
@@ -253,38 +264,89 @@ mod tests {
         let recent = VecDeque::new();
         let v = status_value(&s, None, &ctx(&live, &recent));
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, vec!["approvals", "daemon", "gates", "now_ms", "recent", "runs", "schema"]);
-        assert_eq!(v.get("schema").and_then(Value::as_str), Some("fleet.status/1"));
+        assert_eq!(
+            keys,
+            vec![
+                "approvals",
+                "daemon",
+                "gates",
+                "now_ms",
+                "recent",
+                "runs",
+                "schema"
+            ]
+        );
+        assert_eq!(
+            v.get("schema").and_then(Value::as_str),
+            Some("fleet.status/1")
+        );
         let daemon = v.get("daemon").unwrap();
-        assert_eq!(daemon.get("undo").and_then(Value::as_str), Some("unavailable"));
+        assert_eq!(
+            daemon.get("undo").and_then(Value::as_str),
+            Some("unavailable")
+        );
         assert!(daemon.get("rss_kb").unwrap().is_null());
     }
 
     #[test]
     fn run_and_task_documents_have_stable_fields() {
         let s = state();
-        let live: BTreeSet<_> = [(RunId::parse("r1").unwrap(), TaskId::parse("t1").unwrap())].into_iter().collect();
+        let live: BTreeSet<_> = [(RunId::parse("r1").unwrap(), TaskId::parse("t1").unwrap())]
+            .into_iter()
+            .collect();
         let recent = VecDeque::new();
         let v = status_value(&s, None, &ctx(&live, &recent));
         let run = &v.get("runs").and_then(Value::as_array).unwrap()[0];
-        let run_keys: Vec<&str> = run.as_object().unwrap().keys().map(String::as_str).collect();
+        let run_keys: Vec<&str> = run
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             run_keys,
             vec![
-                "base_ref", "base_sha", "counts", "id", "integration_branch", "max_parallel", "objective",
-                "repo", "status", "tasks"
+                "base_ref",
+                "base_sha",
+                "counts",
+                "id",
+                "integration_branch",
+                "max_parallel",
+                "objective",
+                "repo",
+                "status",
+                "tasks"
             ]
         );
         assert_eq!(run.get("status").and_then(Value::as_str), Some("created"));
         let counts = run.get("counts").unwrap().as_object().unwrap();
         assert_eq!(counts.len(), TaskStatus::ALL.len());
         let task = &run.get("tasks").and_then(Value::as_array).unwrap()[0];
-        let task_keys: Vec<&str> = task.as_object().unwrap().keys().map(String::as_str).collect();
+        let task_keys: Vec<&str> = task
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             task_keys,
             vec![
-                "attempt", "block", "branch", "deps", "failure", "gates", "head", "id", "live", "merged",
-                "retries_used", "status", "summary", "title", "worker", "worktree"
+                "attempt",
+                "block",
+                "branch",
+                "deps",
+                "failure",
+                "gates",
+                "head",
+                "id",
+                "live",
+                "merged",
+                "retries_used",
+                "status",
+                "summary",
+                "title",
+                "worker",
+                "worktree"
             ]
         );
         assert_eq!(task.get("live").and_then(Value::as_bool), Some(true));
@@ -314,7 +376,11 @@ mod tests {
     #[test]
     fn recent_is_limited_to_the_newest_entries() {
         let recent: VecDeque<Recent> = (1..=30)
-            .map(|i| Recent { seq: i, ts_ms: i, line: format!("e{i}") })
+            .map(|i| Recent {
+                seq: i,
+                ts_ms: i,
+                line: format!("e{i}"),
+            })
             .collect();
         let v = recent_value(&recent, 5);
         let items = v.as_array().unwrap();
@@ -327,9 +393,15 @@ mod tests {
         let mut s = state();
         let run_id = RunId::parse("r1").unwrap();
         assert_eq!(run_phase(s.run(&run_id).unwrap()), "created");
-        s.apply(&DomainEvent::RunStarted { run: run_id.clone(), max_parallel: 2 });
+        s.apply(&DomainEvent::RunStarted {
+            run: run_id.clone(),
+            max_parallel: 2,
+        });
         assert_eq!(run_phase(s.run(&run_id).unwrap()), "active");
-        s.apply(&DomainEvent::TaskCompleted { run: run_id.clone(), task: TaskId::parse("t1").unwrap() });
+        s.apply(&DomainEvent::TaskCompleted {
+            run: run_id.clone(),
+            task: TaskId::parse("t1").unwrap(),
+        });
         assert_eq!(run_phase(s.run(&run_id).unwrap()), "finished");
     }
 }

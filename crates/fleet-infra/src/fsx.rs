@@ -149,7 +149,9 @@ pub fn read_regular_in(dir: &Path, name: &str, max: u64) -> Result<Vec<u8>, Read
 /// Re-checks the open descriptor (the path may have changed since it was examined) and reads
 /// with a hard byte cap, so a file that grows during the read stays bounded.
 fn read_open(file: File, max: u64) -> Result<Vec<u8>, ReadError> {
-    let meta = file.metadata().map_err(|e| ReadError::Io(e.kind().to_string()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| ReadError::Io(e.kind().to_string()))?;
     if !meta.file_type().is_file() {
         return Err(ReadError::NotRegular("is not a regular file"));
     }
@@ -191,10 +193,16 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
             if check_existing_dir(path)? {
                 Ok(())
             } else {
-                Err(FleetError::io(&format!("cannot create {}", path.display()), &e))
+                Err(FleetError::io(
+                    &format!("cannot create {}", path.display()),
+                    &e,
+                ))
             }
         }
-        Err(e) => Err(FleetError::io(&format!("cannot create {}", path.display()), &e)),
+        Err(e) => Err(FleetError::io(
+            &format!("cannot create {}", path.display()),
+            &e,
+        )),
     }
 }
 
@@ -215,7 +223,12 @@ fn check_existing_dir(path: &Path) -> Result<bool> {
         }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(FleetError::io(&format!("cannot examine {}", path.display()), &e)),
+        Err(e) => {
+            return Err(FleetError::io(
+                &format!("cannot examine {}", path.display()),
+                &e,
+            ))
+        }
     }
     // Work on the opened descriptor so a swap after the lstat cannot change what is chmod-ed.
     let fd = nix::fcntl::open(
@@ -268,7 +281,10 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     })();
     if let Err(e) = result {
         let _ = fs::remove_file(&tmp);
-        return Err(FleetError::io(&format!("cannot write {}", path.display()), &e));
+        return Err(FleetError::io(
+            &format!("cannot write {}", path.display()),
+            &e,
+        ));
     }
     Ok(())
 }
@@ -316,7 +332,10 @@ mod tests {
     fn missing_files_are_reported_as_missing() {
         let t = TempDir::new("fsx-missing");
         assert_eq!(read_regular(&t.join("nope"), 10), Err(ReadError::Missing));
-        assert_eq!(read_regular_in(t.path(), "nope", 10), Err(ReadError::Missing));
+        assert_eq!(
+            read_regular_in(t.path(), "nope", 10),
+            Err(ReadError::Missing)
+        );
         assert_eq!(
             read_regular_in(&t.join("nodir"), "nope", 10),
             Err(ReadError::Missing)
@@ -383,8 +402,14 @@ mod tests {
                 flag.store(true, Ordering::SeqCst);
                 r
             });
-            assert!(wait_until(3000, || done.load(Ordering::SeqCst)), "blocked on a FIFO");
-            assert!(matches!(handle.join().unwrap(), Err(ReadError::NotRegular(_))));
+            assert!(
+                wait_until(3000, || done.load(Ordering::SeqCst)),
+                "blocked on a FIFO"
+            );
+            assert!(matches!(
+                handle.join().unwrap(),
+                Err(ReadError::NotRegular(_))
+            ));
         }
     }
 
@@ -401,14 +426,20 @@ mod tests {
         // A real directory is read normally.
         let t2 = TempDir::new("fsx-swap-ok");
         t2.write(".fleet/result.json", "ok");
-        assert_eq!(read_regular_in(&t2.join(".fleet"), "result.json", 100).unwrap(), b"ok");
+        assert_eq!(
+            read_regular_in(&t2.join(".fleet"), "result.json", 100).unwrap(),
+            b"ok"
+        );
     }
 
     #[test]
     fn bad_names_are_rejected() {
         let t = TempDir::new("fsx-names");
         for name in ["", ".", "..", "a/b", "../x"] {
-            assert!(matches!(read_regular_in(t.path(), name, 10), Err(ReadError::Io(_))));
+            assert!(matches!(
+                read_regular_in(t.path(), name, 10),
+                Err(ReadError::Io(_))
+            ));
         }
     }
 

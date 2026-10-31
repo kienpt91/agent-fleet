@@ -108,7 +108,10 @@ fn canonical_lenient(path: &Path) -> PathBuf {
             out.extend(rest.iter().rev());
             return out;
         }
-        match (existing.file_name().map(|n| n.to_os_string()), existing.parent()) {
+        match (
+            existing.file_name().map(|n| n.to_os_string()),
+            existing.parent(),
+        ) {
             (Some(name), Some(parent)) => {
                 rest.push(name);
                 existing = parent.to_path_buf();
@@ -293,8 +296,12 @@ mod tests {
         let forbidden = vec![repo.clone()];
 
         // Equal, nested (existing or not yet created) and via a `..` or symlink detour.
-        assert!(StateLayout::new(repo.clone()).reject_inside(&forbidden).is_err());
-        assert!(StateLayout::new(repo.join("a/b")).reject_inside(&forbidden).is_err());
+        assert!(StateLayout::new(repo.clone())
+            .reject_inside(&forbidden)
+            .is_err());
+        assert!(StateLayout::new(repo.join("a/b"))
+            .reject_inside(&forbidden)
+            .is_err());
         assert!(StateLayout::new(outside.join("../repo/.state"))
             .reject_inside(&forbidden)
             .is_err());
@@ -304,8 +311,14 @@ mod tests {
             .is_err());
 
         // A sibling whose name merely starts with the same text is fine.
-        assert!(StateLayout::new(t.join("repo-state")).reject_inside(&forbidden).is_ok());
-        assert!(StateLayout::new(outside.join("state")).reject_inside(&forbidden).is_ok());
-        assert!(StateLayout::new(outside.join("state")).reject_inside(&[]).is_ok());
+        assert!(StateLayout::new(t.join("repo-state"))
+            .reject_inside(&forbidden)
+            .is_ok());
+        assert!(StateLayout::new(outside.join("state"))
+            .reject_inside(&forbidden)
+            .is_ok());
+        assert!(StateLayout::new(outside.join("state"))
+            .reject_inside(&[])
+            .is_ok());
     }
 }

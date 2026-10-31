@@ -7,24 +7,24 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
-pub mod json;
-pub mod digest;
+pub mod client;
 pub mod clock;
-pub mod fsx;
-pub mod statedir;
-pub mod procid;
-pub mod eventlog;
-pub mod logs;
+pub mod config_file;
 pub mod contract_fs;
+pub mod digest;
+pub mod eventlog;
+pub mod fsx;
 pub mod git;
 pub mod jobs;
-pub mod undo;
-pub mod protocol;
-pub mod server;
-pub mod client;
-pub mod config_file;
+pub mod json;
+pub mod logs;
 pub mod memory;
+pub mod procid;
+pub mod protocol;
 pub mod pty;
+pub mod server;
+pub mod statedir;
+pub mod undo;
 
 #[doc(hidden)]
 pub mod testutil;
