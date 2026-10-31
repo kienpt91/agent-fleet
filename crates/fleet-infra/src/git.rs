@@ -398,8 +398,9 @@ impl GitVcs {
             .stderr(Stdio::piped())
             .process_group(0);
 
-        let mut child = cmd
-            .spawn()
+        // A script that was just written can still be open for writing in a concurrent fork
+        // (ETXTBSY); starting is retried briefly, as for every other child the daemon starts.
+        let mut child = crate::jobs::spawn_retrying_busy(&mut cmd)
             .map_err(|e| FleetError::io("cannot start git", &e))?;
         let _group = crate::jobs::GroupGuard::register(child.id());
         let pgid = match i32::try_from(child.id()) {

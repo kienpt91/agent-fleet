@@ -379,7 +379,7 @@ pub fn run_bounded(spec: &RunSpec) -> RunResult {
 
 /// Starts the command, retrying briefly while the executable is still open for writing in another
 /// thread (`ETXTBSY`): a script that was just written can briefly be held open by a concurrent fork.
-fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<std::process::Child> {
+pub(crate) fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<std::process::Child> {
     let mut attempts = 0;
     loop {
         match command.spawn() {
