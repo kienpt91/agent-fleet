@@ -53,6 +53,15 @@ pub trait WebBackend: Send + Sync {
     fn log_status(&self) -> Result<VerifyReport>;
     /// The `fleet doctor` checklist as a `fleet.doctor/1` document.
     fn health(&self) -> Value;
+    /// The bytes of an image of a task's repository (`repo.blob`): only images of the kinds
+    /// the page may show are ever returned, with the content type that goes with them.
+    fn image(&self, args: Value) -> Result<WebImage>;
+}
+
+/// An image the dashboard may send: png, jpeg, gif or webp, recognized by its first bytes.
+pub struct WebImage {
+    pub content_type: &'static str,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -782,6 +791,9 @@ mod tests {
             }
             fn health(&self) -> Value {
                 Value::Null
+            }
+            fn image(&self, _: Value) -> Result<WebImage> {
+                Err(FleetError::not_found("none"))
             }
         }
         let s = WebServer::bind(&WebOptions::new(sa("127.0.0.1:0"), false), Arc::new(Nop)).unwrap();

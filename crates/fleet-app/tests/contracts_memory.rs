@@ -32,3 +32,10 @@ fn memory_verify_jobs_satisfy_the_contract() {
     let mut harness = MemoryVerifyHarness::new(World::new());
     verify_jobs_contract(&mut harness);
 }
+
+#[test]
+fn memory_repo_reader_satisfies_the_contract() {
+    fleet_app::testing::repo::repo_reader_contract(
+        &mut fleet_app::testing::repo::MemoryRepoHarness,
+    );
+}

@@ -11,6 +11,7 @@
 )]
 
 pub mod api;
+pub mod browse;
 pub mod config;
 pub mod neo;
 pub mod orchestrator;

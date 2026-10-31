@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod contracts;
+pub mod repo;
 
 use crate::config::{AppConfig, WorkerDef};
 use crate::orchestrator::Orchestrator;

@@ -3,10 +3,12 @@
 //! Requests arrive as neutral [`Value`] documents (the transport adapter turns JSON text into
 //! them) and are parsed here, so every adapter shares one definition of what a request is.
 
+use crate::browse::{CommitSel, RepoQuery, RepoRequest};
 use crate::ports::SessionId;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, RunId, TaskId, WorkerName};
 use fleet_domain::limits::MAX_SEND_BYTES;
+use fleet_domain::repo::RepoPath;
 use fleet_domain::run::NewTask;
 use fleet_domain::status::GoalStatus;
 use fleet_domain::value::{Document, Value};
@@ -130,6 +132,8 @@ pub enum Command {
         /// The ticket `verify` returned: report on that run.
         ticket: Option<u64>,
     },
+    /// A read-only question about the repository at a task's recorded commits.
+    Repo(RepoQuery),
     Shutdown,
 }
 
@@ -148,13 +152,21 @@ pub enum Reply {
         session: SessionId,
         data: Value,
     },
+    /// The transport must read the repository for this request (off the engine thread) and reply
+    /// with the document it produces; see `browse::RepoBrowser`.
+    Repo(Box<RepoRequest>),
 }
 
+/// What `Reply::data` returns for a reply that has no document of its own yet.
+static NO_DATA: Value = Value::Null;
+
 impl Reply {
+    /// The document of the reply; a repository request has none until the transport answers it.
     pub fn data(&self) -> &Value {
         match self {
             Reply::Data(v) => v,
             Reply::Input { data, .. } | Reply::Attach { data, .. } => data,
+            Reply::Repo(_) => &NO_DATA,
         }
     }
 }
@@ -285,6 +297,44 @@ fn parse_new_run(v: &Value) -> Result<NewRunArgs> {
     })
 }
 
+/// The questions about a task's repository: `task` (required), `commit` (`head`, `base` or a
+/// commit id; default `head`), `path` (default the root); for a diff `base` (default `base`),
+/// `head` (default `head`) and `context`.
+fn parse_repo_query(name: &str, a: &Args<'_>) -> Result<RepoQuery> {
+    let task = a.req_str("task")?.to_string();
+    let sel = |key: &str, default: CommitSel| -> Result<CommitSel> {
+        a.opt_str(key)?.map_or(Ok(default), CommitSel::parse)
+    };
+    let path = || -> Result<RepoPath> { RepoPath::parse(a.opt_str("path")?.unwrap_or("")) };
+    Ok(match name {
+        "repo.tree" => RepoQuery::Tree {
+            task,
+            at: sel("commit", CommitSel::Head)?,
+            path: path()?,
+        },
+        "repo.file" => RepoQuery::File {
+            task,
+            at: sel("commit", CommitSel::Head)?,
+            path: path()?,
+        },
+        "repo.blob" => RepoQuery::Blob {
+            task,
+            at: sel("commit", CommitSel::Head)?,
+            path: path()?,
+        },
+        "repo.markdown" => RepoQuery::Markdown {
+            task,
+            at: sel("commit", CommitSel::Head)?,
+            path: path()?,
+        },
+        _ => RepoQuery::Diff {
+            task,
+            base: sel("base", CommitSel::Base)?,
+            head: sel("head", CommitSel::Head)?,
+            context: RepoQuery::clamp_context(a.opt_u64("context")?),
+        },
+    })
+}
 /// Parses a request: its command name and its arguments object.
 pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
     let empty = Value::Object(Default::default());
@@ -411,6 +461,9 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
             task: a.opt_str("task")?.map(str::to_string),
             ticket: a.opt_u64("ticket")?,
         },
+        "repo.tree" | "repo.file" | "repo.blob" | "repo.markdown" | "repo.diff" => {
+            Command::Repo(parse_repo_query(name, &a)?)
+        }
         "shutdown" => Command::Shutdown,
         other => {
             return Err(FleetError::invalid(format!(
@@ -436,6 +489,7 @@ pub fn is_read_only(cmd: &Command) -> bool {
             | Command::GoalShow { .. }
             | Command::GoalRemaining
             | Command::VerifyStatus { .. }
+            | Command::Repo(_)
     )
 }
 

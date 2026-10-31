@@ -2,6 +2,7 @@
 
 use super::{Key, Orchestrator};
 use crate::api::{Command, NewRunArgs, Reply};
+use crate::browse::{RepoQuery, RepoRequest, RepoTarget};
 use crate::ports::{IntegrationMerge, MergeOutcome};
 use crate::views::{self, StatusContext};
 use fleet_domain::error::{ErrorCode, FleetError, Result};
@@ -46,6 +47,7 @@ impl Orchestrator {
             Command::Retry { task } => self.retry(&task),
             Command::Cancel { task } => self.cancel(&task),
             Command::Tail { task, since, max } => self.tail(&task, since, max),
+            Command::Repo(query) => self.repo_request(query),
             Command::Send {
                 task,
                 text,
@@ -353,6 +355,25 @@ impl Orchestrator {
                 ("status", Value::str("failed")),
             ],
         ))
+    }
+
+    /// Resolves a repository question to the commits recorded for its task. Nothing is read from
+    /// the repository here: the transport does that on its own thread (`browse::RepoBrowser`), so
+    /// a slow git can never stall supervision.
+    fn repo_request(&self, query: RepoQuery) -> Result<Reply> {
+        let key = self.resolve(query.task())?;
+        let run = self.state.run(&key.0)?;
+        let task = run.task(&key.1).ok_or_else(|| {
+            FleetError::not_found(format!("task {} does not exist", qualified(&key.0, &key.1)))
+        })?;
+        let target = RepoTarget {
+            task: qualified(&key.0, &key.1),
+            repo: run.repo.clone(),
+            base: run.base_sha.clone(),
+            head: task.head.clone(),
+            merged: task.merged.clone(),
+        };
+        Ok(Reply::Repo(Box::new(RepoRequest { target, query })))
     }
 
     fn tail(&self, reference: &str, since: Option<u64>, max: usize) -> Result<Reply> {

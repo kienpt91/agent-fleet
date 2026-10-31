@@ -12,7 +12,7 @@ use fleet_infra::json;
 use fleet_infra::server::PeerInfo;
 use fleet_infra::web::auth::AuthLimits;
 use fleet_infra::web::http::Limits;
-use fleet_infra::web::{WebBackend, WebLimits, WebOptions, WebServer};
+use fleet_infra::web::{WebBackend, WebImage, WebLimits, WebOptions, WebServer};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -25,12 +25,15 @@ use std::time::{Duration, Instant};
 
 type Handler = Box<dyn FnMut(&str, &Value) -> Result<Value> + Send>;
 
+type ImageHandler = Box<dyn FnMut(&Value) -> Result<WebImage> + Send>;
+
 struct Fake {
     calls: Mutex<Vec<(String, Value)>>,
     handler: Mutex<Handler>,
     deny: AtomicBool,
     admitted_pids: Mutex<Vec<u32>>,
     health_computed: AtomicUsize,
+    image_handler: Mutex<ImageHandler>,
     log: Mutex<Result<VerifyReport>>,
 }
 
@@ -47,6 +50,7 @@ impl Fake {
             deny: AtomicBool::new(false),
             admitted_pids: Mutex::new(Vec::new()),
             health_computed: AtomicUsize::new(0),
+            image_handler: Mutex::new(Box::new(|_| Err(FleetError::not_found("no image")))),
             log: Mutex::new(Ok(VerifyReport {
                 records: 7,
                 head_hash: "ab".repeat(32),
@@ -95,6 +99,14 @@ impl WebBackend for Fake {
 
     fn log_status(&self) -> Result<VerifyReport> {
         self.log.lock().unwrap().clone()
+    }
+
+    fn image(&self, args: Value) -> Result<WebImage> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("repo.blob".to_string(), args.clone()));
+        (self.image_handler.lock().unwrap())(&args)
     }
 
     fn health(&self) -> Value {
