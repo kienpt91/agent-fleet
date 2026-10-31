@@ -7,6 +7,7 @@
 
 use crate::args::Parsed;
 use crate::render;
+use crate::render_msg;
 use crate::render_neo;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::show;
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Every subcommand, as typed. The help text must mention each (a test enforces it).
-pub const SUBCOMMANDS: [&str; 32] = [
+pub const SUBCOMMANDS: [&str; 37] = [
     "daemon",
     "run create",
     "task add",
@@ -58,6 +59,11 @@ pub const SUBCOMMANDS: [&str; 32] = [
     "goals show",
     "goals remaining",
     "verify",
+    "msg list",
+    "msg show",
+    "msg mute",
+    "msg unmute",
+    "msg send",
 ];
 
 pub const HELP: &str = "\
@@ -127,6 +133,16 @@ goals and verification (NEO):
                                      run the contracts independently of the worker and record
                                      evidence; exit 6 when a mandatory check did not pass
 
+messages between agents (declared by the operator in a plan; workers cannot use these):
+  msg list [--task <task>] [--channel <channel>] [--limit N]
+                                     channels, their state and the newest messages (peer text is
+                                     labelled unverified)
+  msg show <id>                      one message with its body, digest and deliveries
+  msg mute <channel|task>            stop a channel (or one task) from sending or receiving
+  msg unmute <channel|task>          let it speak again (channel:<ref> or task:<ref> if a name is both)
+  msg send --channel <c> --subject <s> --body <b> [--to <task>] [--kind <k>] [--in-reply-to <id>]
+                                     a message from the operator, labelled `from operator`
+
 dashboard:
   tui                                terminal dashboard
 
@@ -182,6 +198,10 @@ pub enum View {
     GoalList,
     GoalShow,
     GoalRemaining,
+    MsgList,
+    MsgShow,
+    MsgMute,
+    MsgSent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -659,6 +679,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
             Command::VerifyLog
         }
         "goals" => parse_goals(p, stdin)?,
+        "msg" => parse_msg(p)?,
         "verify" => {
             let task = p.opt("--task")?;
             let timeout = opt_uint(&mut p, "--timeout")?;
@@ -821,7 +842,76 @@ fn render_view(view: &View, data: &Value) -> String {
         View::GoalList => render_neo::render_goal_list(data),
         View::GoalShow => render_neo::render_goal_show(data),
         View::GoalRemaining => render_neo::render_goal_remaining(data),
+        View::MsgList => render_msg::render_msg_list(data),
+        View::MsgShow => render_msg::render_msg_show(data),
+        View::MsgMute => render_msg::render_msg_mute(data),
+        View::MsgSent => render_msg::render_msg_sent(data),
     }
+}
+
+/// `fleet msg list|show|mute|unmute|send`: the operator's side of the message channels. Workers
+/// are refused by the daemon like for every other command.
+fn parse_msg(mut p: Parsed) -> Result<Command> {
+    let sub = p.take_word();
+    Ok(match sub.as_deref() {
+        Some("list") => {
+            let task = p.opt("--task")?;
+            let channel = p.opt("--channel")?;
+            let limit = opt_uint(&mut p, "--limit")?;
+            no_args(p)?;
+            request(
+                "msg.list",
+                obj(vec![
+                    ("task", task.and_then(st)),
+                    ("channel", channel.and_then(st)),
+                    ("limit", limit.map(Value::int)),
+                ]),
+                View::MsgList,
+            )
+        }
+        Some("show") => request(
+            "msg.show",
+            obj(vec![("id", st(one_arg(p, "<message id>")?))]),
+            View::MsgShow,
+        ),
+        Some(word @ ("mute" | "unmute")) => request(
+            if word == "mute" {
+                "msg.mute"
+            } else {
+                "msg.unmute"
+            },
+            obj(vec![("target", st(one_arg(p, "<channel|task>")?))]),
+            View::MsgMute,
+        ),
+        Some("send") => {
+            let channel = required(&mut p, "--channel")?;
+            let to = p.opt("--to")?;
+            let subject = required(&mut p, "--subject")?;
+            let body = required(&mut p, "--body")?;
+            let kind = p.opt("--kind")?;
+            let reply = p.opt("--in-reply-to")?;
+            no_args(p)?;
+            request(
+                "msg.send",
+                obj(vec![
+                    ("channel", st(channel)),
+                    ("to", to.and_then(st)),
+                    ("subject", st(subject)),
+                    ("body", st(body)),
+                    ("kind", kind.and_then(st)),
+                    ("in_reply_to", reply.and_then(st)),
+                ]),
+                View::MsgSent,
+            )
+        }
+        other => {
+            return Err(subcommand_error(
+                "msg",
+                other,
+                "list, show, mute, unmute or send",
+            ))
+        }
+    })
 }
 
 /// Sends one request and prints the reply: the data document in JSON mode, the human view
