@@ -6,6 +6,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+pub mod contracts;
+
 use crate::config::{AppConfig, WorkerDef};
 use crate::orchestrator::Orchestrator;
 use crate::ports::*;
@@ -178,6 +180,10 @@ impl World {
     }
     pub fn mark_merged(&self, branch: &str) {
         self.lock().merged_branches.insert(branch.to_string());
+    }
+    /// Makes `is_merged` answer false again for a branch (for example after a force-push).
+    pub fn unmark_merged(&self, branch: &str) {
+        self.lock().merged_branches.remove(branch);
     }
 
     // ---- sessions ----
