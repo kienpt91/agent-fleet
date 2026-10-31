@@ -20,3 +20,5 @@ contents are not part of the digest (documented limitation).
 ## Consequences
 A worker can ask but cannot grant (see ADR 0009 for how the control plane keeps workers out). The outcome of a
 command that was running while the daemon died is unknown and is never retried automatically.
+
+Amendment (ADR 14): deciding an approval requires the digest of the action it covers; it is no longer optional.

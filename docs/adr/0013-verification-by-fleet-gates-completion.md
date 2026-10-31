@@ -1,6 +1,6 @@
 # 13. Fleet runs the contract itself, and completion depends on it
 
-Status: accepted
+Status: accepted (where checks run and how evidence counts: amended by ADR 14)
 
 ## Context
 A worker that says "done, all tests pass" has said nothing fleet can rely on. The design requires that
@@ -8,7 +8,7 @@ no goal becomes verified, and no task with acceptance criteria completes, on an 
 
 ## Decision
 - **The rule.** A task that a goal (not abandoned) with a contract names is *governed*. In review, after
-  the worker's output is committed, fleet runs every such contract in the task's worktree *before* the
+  the worker's output is committed, fleet runs every such contract (since ADR 14: on a clean export of the committed work, not in the worktree) *before* the
   quality gates. Only if every mandatory check passed does the review go on to the gates and then
   complete. A failure is a failed gate: it uses the retry budget and its failing checks, quoted line
   by line, go into the next brief (the existing failure loop). What the worker reported plays no part.
