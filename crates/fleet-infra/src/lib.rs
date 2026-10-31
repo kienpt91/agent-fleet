@@ -7,10 +7,11 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
-pub mod client;
 pub mod clock;
+pub mod client;
 pub mod config_file;
 pub mod contract_fs;
+pub mod daemon;
 pub mod digest;
 pub mod eventlog;
 pub mod fsx;

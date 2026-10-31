@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fleet-domain", "crates/fleet-app", "crates/fleet-infra"]
+members = ["crates/fleet-domain", "crates/fleet-app", "crates/fleet-infra", "crates/fleet-cli"]
 
 [workspace.package]
 version = "0.1.0"
