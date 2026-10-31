@@ -120,7 +120,7 @@ pub fn sort_entries(entries: &mut [TreeEntry]) {
 }
 
 /// A name or path from git, made safe to show: invalid UTF-8 becomes `\xNN` per byte, control,
-/// invisible and bidirectional characters become `\u{..}`, and the result is cut at `max` characters
+/// invisible and bidirectional characters become `\u{..}`, a backslash is doubled, and the result is cut at `max` characters
 /// (with an ellipsis).
 pub fn display_text(bytes: &[u8], max: usize) -> String {
     let mut out = String::new();
@@ -134,6 +134,10 @@ pub fn display_text(bytes: &[u8], max: usize) -> String {
             chars += 1;
             if c.is_control() || is_invisible(c) {
                 let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            } else if c == '\\' {
+                // the escapes below start with a backslash, so a real one is doubled: a name
+                // that spells `\u{202e}` must not look like one that holds U+202E
+                out.push_str("\\\\");
             } else {
                 out.push(c);
             }
@@ -285,5 +289,36 @@ mod tests {
         sort_entries(&mut v);
         let names: Vec<&str> = v.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Z", "a", "B.txt", "b.txt", "link", "mod"]);
+    }
+
+    #[test]
+    fn a_literal_escape_looks_different_from_the_character_it_spells() {
+        // a name that contains the six characters \u{202e} and one that contains U+202E must differ
+        let literal = display_name(br"x\u{202e}y");
+        let real = display_name("x\u{202e}y".as_bytes());
+        assert_ne!(literal, real);
+        assert_eq!(real, r"x\u{202e}y");
+        assert_eq!(literal, r"x\\u{202e}y");
+        // and a literal \xff differs from the byte 0xff
+        assert_ne!(display_name(br"x\xffy"), display_name(b"x\xffy"));
+        assert_eq!(display_name(b"a\\b"), r"a\\b");
+        // names that spell the same thing once escaped cannot be told apart only if they are equal
+        let mut seen = std::collections::HashSet::new();
+        for name in [
+            &b"\\"[..],
+            b"\\\\",
+            b"\x1b",
+            br"\u{1b}",
+            br"\\u{1b}",
+            b"\xff",
+            br"\xff",
+            "\u{202e}".as_bytes(),
+            br"\u{202e}",
+        ] {
+            assert!(
+                seen.insert(display_name(name)),
+                "{name:?} collides with another name"
+            );
+        }
     }
 }

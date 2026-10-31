@@ -480,7 +480,7 @@ fn hostile_names_are_listed_safely_and_cannot_be_requested() {
         "esc\\u{1b}",
         "bidi\\u{202e}",
         "\\xff\\xfe",
-        "back\\slash",
+        "back\\\\slash",
         ".GIT",
         "tab\\u{9}here",
     ] {

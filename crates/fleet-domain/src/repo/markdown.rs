@@ -1280,8 +1280,12 @@ fn url_ok(u: &str) -> bool {
     };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = sl(rest, 0, end);
-    let host = authority.rsplit('@').next().unwrap_or("");
-    !host.is_empty() && !host.starts_with(':')
+    // user information (`https://github.com@evil.example/`) lets a link name one host and go to
+    // another, and a host outside ASCII can pass for a familiar one: neither is a link here
+    if authority.contains('@') || !authority.is_ascii() {
+        return false;
+    }
+    !authority.is_empty() && !authority.starts_with(':')
 }
 
 /// What a link target is, or `None` when it is not a link.
@@ -4155,6 +4159,36 @@ mod tests {
                 (None, Some(_)) => {}
                 other => panic!("an image has a path or a note: {other:?} for {t:?}"),
             }
+        }
+    }
+
+    /// A link that names one host must not hide another: user information before the host
+    /// (`https://github.com@evil.example/`) and hosts in a script other than ASCII (homographs) are
+    /// not links.
+    #[test]
+    fn links_cannot_disguise_their_host() {
+        for bad in [
+            "https://github.com@evil.example/",
+            "http://user:pass@host.example/x",
+            "https://a@b@c.example/",
+            "https://b\u{fc}cher.example/",
+            "https://\u{430}pple.example/",
+            "http://exa\u{3bc}ple.org",
+            "https://host.example\u{ff0f}evil",
+        ] {
+            assert!(!url_ok(bad), "{bad}");
+            let md = format!("[x]({bad}) and <{bad}>");
+            let v = parse(&md, &RepoPath::root()).to_value().canonical();
+            assert!(!v.contains("\"kind\":\"external\""), "{bad}: {v}");
+        }
+        // a plain URL, and a non-ASCII path or query (not the host), still work
+        for good in [
+            "https://github.com/a@b",
+            "http://example.org/caf\u{e9}?q=\u{e9}",
+            "https://example.org:8080/x#y@z",
+            "https://sub.example.org/",
+        ] {
+            assert!(url_ok(good), "{good}");
         }
     }
 }
