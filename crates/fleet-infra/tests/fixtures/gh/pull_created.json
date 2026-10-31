@@ -1,0 +1,10 @@
+{
+  "number": 12,
+  "state": "open",
+  "title": "Add the thing",
+  "html_url": "https://github.com/o/r/pull/12",
+  "draft": true,
+  "head": {"ref": "fleet/r1/a", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "base": {"ref": "main"},
+  "user": {"login": "octocat"}
+}

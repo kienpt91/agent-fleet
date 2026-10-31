@@ -1,0 +1,16 @@
+{
+  "number": 9,
+  "title": "Fix it",
+  "state": "open",
+  "draft": true,
+  "merged": false,
+  "labels": [],
+  "user": {"login": "octocat"},
+  "head": {"ref": "fleet/r1/a", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "base": {"ref": "main"},
+  "comments": 2,
+  "review_comments": 1,
+  "updated_at": "2026-10-30T10:00:00Z",
+  "html_url": "https://github.com/o/r/pull/9",
+  "body": "Fixes the crash."
+}

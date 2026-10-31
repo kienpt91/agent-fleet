@@ -35,6 +35,9 @@ use neo_verify::limits::MAX_CHANGED_PATHS;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 
+mod push;
+pub use push::GitPublisher;
+
 /// Hard cap per captured stream of one git call.
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -417,6 +420,12 @@ impl GitVcs {
     /// refuse them (and what they start) like the children of every other job.
     pub fn with_tracker(mut self, tracker: JobTracker) -> GitVcs {
         self.tracker = tracker;
+        self
+    }
+
+    /// How long one git call may take (the default is two minutes).
+    pub fn with_timeout(mut self, timeout: Duration) -> GitVcs {
+        self.timeout = timeout;
         self
     }
 

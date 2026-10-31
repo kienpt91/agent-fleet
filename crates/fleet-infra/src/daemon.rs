@@ -206,6 +206,11 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         None => None,
     };
 
+    // The forge integration (off by default): `gh` is resolved once, here. Its children are listed
+    // in the same tracker as every other child the daemon starts.
+    let forge_jobs = app.forge.enabled.then(|| {
+        crate::forge_jobs::build(&app.forge, &env, Arc::clone(&redactor), tracker.clone())
+    });
     let ports = Ports {
         clock: Box::new(SystemClock),
         store: Box::new(FileEventStore::open(
@@ -236,6 +241,9 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     };
     let kill_grace_ms = app.kill_grace_ms;
     let mut orch = Orchestrator::new(app, ports)?;
+    if let Some(jobs) = forge_jobs {
+        orch.attach_forge(jobs);
+    }
     orch.startup(u64::from(std::process::id()), VERSION)?;
 
     let stop = Arc::new(AtomicBool::new(false));

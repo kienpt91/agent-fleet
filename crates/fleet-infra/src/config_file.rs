@@ -20,6 +20,8 @@ use fleet_domain::quality::GateFormat;
 use fleet_domain::redact::{Charset, Redactor, Rule};
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::value::Value;
+use fleet_forge::config::{ForgeConfig, PushCredentials};
+use fleet_forge::repo::RepoRef;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -48,6 +50,7 @@ struct FileConfig {
     redact: RedactSection,
     workers: BTreeMap<String, WorkerSection>,
     gates: Vec<GateSection>,
+    github: GithubSection,
 }
 
 #[derive(Deserialize, Default)]
@@ -116,6 +119,111 @@ struct GateSection {
     env_set: BTreeMap<String, String>,
     format: Option<String>,
     timeout_secs: Option<u64>,
+}
+
+/// The forge integration. Off unless `enabled = true`; no token appears here, ever: signing in is
+/// `gh`'s own business.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct GithubSection {
+    enabled: Option<bool>,
+    host: Option<String>,
+    repo: Option<String>,
+    remote: Option<String>,
+    allowed_hosts: Option<Vec<String>>,
+    base: Option<String>,
+    rate_budget_per_hour: Option<u32>,
+    rate_reserve: Option<u32>,
+    rate_backoff_secs: Option<u64>,
+    rate_backoff_max_secs: Option<u64>,
+    gh: Option<String>,
+    env_pass: Option<Vec<String>>,
+    push_credentials: Option<String>,
+    push_credential_helper: Option<String>,
+    push_url: Option<String>,
+    allow_local_remote: Option<bool>,
+    timeout_secs: Option<u64>,
+    push_timeout_secs: Option<u64>,
+}
+
+fn apply_github(forge: &mut ForgeConfig, g: GithubSection) -> Result<()> {
+    if let Some(v) = g.enabled {
+        forge.enabled = v;
+    }
+    if let Some(v) = g.host {
+        forge.host = v.to_ascii_lowercase();
+        if g.allowed_hosts.is_none() {
+            forge.allowed_hosts = vec![forge.host.clone()];
+        }
+    }
+    if let Some(v) = g.allowed_hosts {
+        forge.allowed_hosts = v.iter().map(|h| h.to_ascii_lowercase()).collect();
+    }
+    if let Some(slug) = g.repo {
+        forge.repo = Some(
+            RepoRef::from_slug(&forge.host, &slug)
+                .map_err(|e| invalid(format!("[github] repo: {}", e.message)))?,
+        );
+    }
+    if let Some(v) = g.remote {
+        forge.remote = v;
+    }
+    if let Some(v) = g.base {
+        forge.base = v;
+    }
+    if let Some(v) = g.rate_budget_per_hour {
+        forge.rate.budget_per_hour = v;
+    }
+    if let Some(v) = g.rate_reserve {
+        forge.rate.reserve = v;
+    }
+    if let Some(s) = g.rate_backoff_secs {
+        forge.rate.base_backoff_ms = secs_to_ms("rate_backoff_secs", s)?;
+    }
+    if let Some(s) = g.rate_backoff_max_secs {
+        forge.rate.max_backoff_ms = secs_to_ms("rate_backoff_max_secs", s)?;
+    }
+    if forge.rate.base_backoff_ms == 0 || forge.rate.max_backoff_ms < forge.rate.base_backoff_ms {
+        return Err(invalid(
+            "[github] rate_backoff_secs must be positive and at most rate_backoff_max_secs",
+        ));
+    }
+    forge.gh = g.gh;
+    if let Some(v) = g.env_pass {
+        forge.env_pass = v;
+    }
+    forge.push_credentials = match (g.push_credentials.as_deref(), g.push_credential_helper) {
+        (None | Some("none"), None) => PushCredentials::None,
+        (Some("gh"), None) => PushCredentials::Gh,
+        (Some("helper"), Some(path)) => PushCredentials::Helper(path),
+        (Some("helper"), None) => {
+            return Err(invalid(
+                "[github] push_credentials = \"helper\" needs push_credential_helper (an absolute path)",
+            ))
+        }
+        (_, Some(_)) => {
+            return Err(invalid(
+                "[github] push_credential_helper is used only with push_credentials = \"helper\"",
+            ))
+        }
+        (Some(other), None) => {
+            return Err(invalid(format!(
+                "[github] push_credentials {} is not known (use \"none\", \"gh\" or \"helper\")",
+                show(other)
+            )))
+        }
+    };
+    forge.push_url = g.push_url;
+    if let Some(v) = g.allow_local_remote {
+        forge.allow_local_remote = v;
+    }
+    if let Some(s) = g.timeout_secs {
+        forge.timeout_ms = secs_to_ms("timeout_secs", s)?;
+    }
+    if let Some(s) = g.push_timeout_secs {
+        forge.push_timeout_ms = secs_to_ms("push_timeout_secs", s)?;
+    }
+    Ok(())
 }
 
 // ---- helpers ------------------------------------------------------------------------------------
@@ -314,6 +422,7 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
         });
     }
 
+    apply_github(&mut app.forge, file.github)?;
     app.validate()?;
 
     if file.redact.rules.len() > MAX_REDACT_RULES {
@@ -1187,5 +1296,104 @@ after = ["a"]
             "]".repeat(40)
         );
         assert!(plan(&dir, "deep.toml", &nested).is_err());
+    }
+
+    #[test]
+    fn the_github_section_is_off_by_default_and_reads_every_setting() {
+        let off = parse("").unwrap();
+        assert!(!off.app.forge.enabled);
+        assert_eq!(off.app.forge, fleet_forge::config::ForgeConfig::disabled());
+        let loaded = parse(
+            r#"
+[github]
+enabled = true
+host = "GHE.example.org"
+repo = "octo/repo"
+remote = "upstream"
+base = "develop"
+rate_budget_per_hour = 120
+rate_reserve = 20
+rate_backoff_secs = 10
+rate_backoff_max_secs = 300
+gh = "/opt/homebrew/bin/gh"
+env_pass = ["DBUS_SESSION_BUS_ADDRESS"]
+push_credentials = "helper"
+push_credential_helper = "/usr/local/bin/git-credential-osxkeychain"
+push_url = "https://ghe.example.org/octo/repo.git"
+allow_local_remote = true
+timeout_secs = 15
+push_timeout_secs = 90
+"#,
+        )
+        .unwrap();
+        let f = &loaded.app.forge;
+        assert!(f.enabled && f.allow_local_remote);
+        assert_eq!(f.host, "ghe.example.org");
+        assert_eq!(f.allowed_hosts, ["ghe.example.org"]);
+        assert_eq!(
+            f.repo.as_ref().map(|r| r.full()),
+            Some("ghe.example.org/octo/repo".to_string())
+        );
+        assert_eq!(
+            (f.remote.as_str(), f.base.as_str()),
+            ("upstream", "develop")
+        );
+        assert_eq!((f.rate.budget_per_hour, f.rate.reserve), (120, 20));
+        assert_eq!(
+            (f.rate.base_backoff_ms, f.rate.max_backoff_ms),
+            (10_000, 300_000)
+        );
+        assert_eq!(f.gh.as_deref(), Some("/opt/homebrew/bin/gh"));
+        assert_eq!(f.env_pass, ["DBUS_SESSION_BUS_ADDRESS"]);
+        assert_eq!(
+            f.push_credentials,
+            fleet_forge::config::PushCredentials::Helper(
+                "/usr/local/bin/git-credential-osxkeychain".into()
+            )
+        );
+        assert_eq!((f.timeout_ms, f.push_timeout_ms), (15_000, 90_000));
+        let gh = parse("[github]\nenabled = true\npush_credentials = \"gh\"").unwrap();
+        assert_eq!(
+            gh.app.forge.push_credentials,
+            fleet_forge::config::PushCredentials::Gh
+        );
+        assert!(parse("[github]\nallowed_hosts = [\"github.com\", \"ghe.example.org\"]\nhost = \"ghe.example.org\"").is_ok());
+    }
+
+    #[test]
+    fn the_github_section_refuses_what_could_carry_a_token_or_widen_the_reach() {
+        for text in [
+            "[github]\ntoken = \"x\"",
+            "[github]\ngh_token = \"x\"",
+            "[github]\nenabled = \"yes\"",
+            "[github]\nrepo = \"not-a-repo\"",
+            "[github]\nrepo = \"a/b/c\"",
+            "[github]\nhost = \"bad host\"",
+            "[github]\nhost = \"ghe.example.org\"\nallowed_hosts = [\"github.com\"]",
+            "[github]\nremote = \"-evil\"",
+            "[github]\nbase = \"a..b\"",
+            "[github]\ngh = \"gh\"",
+            "[github]\nenv_pass = [\"GH_TOKEN\"]",
+            "[github]\nenv_pass = [\"MY_SECRET\"]",
+            "[github]\npush_credentials = \"password\"",
+            "[github]\npush_credentials = \"helper\"",
+            "[github]\npush_credentials = \"gh\"\npush_credential_helper = \"/bin/x\"",
+            "[github]\npush_credentials = \"helper\"\npush_credential_helper = \"relative\"",
+            "[github]\npush_credentials = \"helper\"\npush_credential_helper = \"/a b/c\"",
+            "[github]\npush_url = \"https://user:pw@github.com/o/r\"",
+            "[github]\nrate_budget_per_hour = 0",
+            "[github]\nrate_backoff_secs = 0",
+            "[github]\nrate_backoff_secs = 100\nrate_backoff_max_secs = 10",
+            "[github]\ntimeout_secs = 0",
+            "[github]\npush_timeout_secs = 100000",
+        ] {
+            let err = parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {text}"));
+            assert!(
+                matches!(err.code, ErrorCode::Invalid | ErrorCode::Limit),
+                "{text}: {err:?}"
+            );
+        }
     }
 }
