@@ -591,10 +591,27 @@ impl FleetState {
     ) -> Result<MergeGate> {
         let run = self.run(run_id)?;
         let task = run.check_mergeable(task_id)?;
+        let action = Action::merge(&run.integration_branch(), &task.branch, head);
+        self.request_merge_action(run_id, task_id, &action, policy, now_ms, hasher)
+    }
+
+    /// [`FleetState::request_merge`] for a merge that is approved as another exact action than
+    /// the plain one: a fan-out pick puts its group and the state of the evidence into the action,
+    /// so an approval for it covers that pick and no other merge of the same branch.
+    pub fn request_merge_action(
+        &self,
+        run_id: &RunId,
+        task_id: &TaskId,
+        action: &Action,
+        policy: &Policy,
+        now_ms: u64,
+        hasher: &dyn Digest,
+    ) -> Result<MergeGate> {
+        let run = self.run(run_id)?;
+        run.check_mergeable(task_id)?;
         if !policy.merge_needs_approval {
             return Ok(MergeGate::Proceed(Vec::new()));
         }
-        let action = Action::merge(&run.integration_branch(), &task.branch, head);
         let digest = action.digest(task_id, hasher);
         let mut pending: Option<ApprovalId> = None;
         for a in self.approvals.values() {
@@ -607,9 +624,7 @@ impl FleetState {
             }
             match a.status_at(now_ms) {
                 ApprovalStatus::Approved => {
-                    return Ok(MergeGate::Proceed(
-                        vec![a.consume(&action, now_ms, hasher)?],
-                    ));
+                    return Ok(MergeGate::Proceed(vec![a.consume(action, now_ms, hasher)?]));
                 }
                 ApprovalStatus::Pending => pending = Some(a.id.clone()),
                 _ => {}
@@ -632,7 +647,7 @@ impl FleetState {
             run_id.clone(),
             task_id.clone(),
             Purpose::Merge,
-            &action,
+            action,
             Window {
                 now_ms,
                 ttl_ms: policy.approval_ttl_ms,
@@ -1639,6 +1654,62 @@ mod tests {
         };
         assert_ne!(new_id, approval);
         assert_eq!(kinds(&events), vec!["approval_requested"]);
+    }
+
+    #[test]
+    fn an_approval_for_another_exact_action_covers_that_action_only() {
+        let (mut s, run) = completed_fleet();
+        let (integration, branch) = {
+            let r = s.run(&run).unwrap();
+            (
+                r.integration_branch(),
+                r.task(&tid("a")).unwrap().branch.clone(),
+            )
+        };
+        let plain = Action::merge(&integration, &branch, &sha('c'));
+        let mut pick = plain.clone();
+        pick.args.push("fan-out pick".to_string());
+        pick.args.push("verification: UNVERIFIED".to_string());
+        let MergeGate::Pending { approval, events } = s
+            .request_merge_action(&run, &tid("a"), &pick, &POLICY, 1000, &FakeDigest)
+            .unwrap()
+        else {
+            panic!("expected pending")
+        };
+        apply_all(&mut s, &events);
+        let events = s.decide_seen(&approval, true, 1100, &FakeDigest).unwrap();
+        apply_all(&mut s, &events);
+        // the plain merge of the same branch and commit is another action: it needs its own approval
+        let MergeGate::Pending {
+            approval: other, ..
+        } = s
+            .request_merge(&run, &tid("a"), &sha('c'), &POLICY, 1200, &FakeDigest)
+            .unwrap()
+        else {
+            panic!("expected pending")
+        };
+        assert_ne!(other, approval);
+        // the pick, asked for again, proceeds on its own approval, which is used up by it
+        let MergeGate::Proceed(events) = s
+            .request_merge_action(&run, &tid("a"), &pick, &POLICY, 1300, &FakeDigest)
+            .unwrap()
+        else {
+            panic!("expected proceed")
+        };
+        assert_eq!(kinds(&events), vec!["approval_consumed"]);
+        // a pick that states the evidence otherwise is a different action again
+        let mut verified = plain.clone();
+        verified.args.push("fan-out pick".to_string());
+        verified.args.push("verification: verified".to_string());
+        let MergeGate::Pending {
+            approval: third, ..
+        } = s
+            .request_merge_action(&run, &tid("a"), &verified, &POLICY, 1400, &FakeDigest)
+            .unwrap()
+        else {
+            panic!("expected pending")
+        };
+        assert_ne!(third, approval);
     }
 
     #[test]
