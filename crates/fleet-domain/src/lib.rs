@@ -21,3 +21,5 @@ pub mod status;
 pub mod value;
 pub mod dag;
 pub mod quality;
+pub mod supervision;
+pub mod contract;
