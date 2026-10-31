@@ -32,3 +32,18 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # pinned to a full commit SHA; full history so the whole history can be scanned
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan the tree
+        run: sh scripts/secret-scan.sh --tree
+      - name: Scan the history
+        run: sh scripts/secret-scan.sh --history
