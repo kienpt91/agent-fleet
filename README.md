@@ -1045,7 +1045,7 @@ What was run for this repository, all inside containers (the official Rust 1.95 
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
 `scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
-`node scripts/web-smoke.mjs` (834 checks), `node scripts/web-smoke-panes.mjs` (521 checks), `scripts/workbench-demo.sh` (headless Chromium) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
+`node scripts/web-smoke.mjs` (841 checks), `node scripts/web-smoke-panes.mjs` (521 checks), `scripts/workbench-demo.sh` (headless Chromium) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
 

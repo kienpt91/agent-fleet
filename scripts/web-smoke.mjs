@@ -1221,7 +1221,9 @@ async function nextRoute() {
   check(env.statusCalls()[0].url === '/api/status?run=r1', 'the first status request is for the requested run');
   const env2 = await boot({ hash: '#next=/events&token=' + TOKEN });
   check(env2.location.hash === '#/events' && find(env2, (n) => n.hasClass('events')).length === 1, 'next may come before the token');
-  const bad = ['//evil', '/a<b', '/a:b', '/a%2Fb', '/a?b', '/' + 'a'.repeat(201), 'run/r1', '', '/a b', '//'];
+  const encoded = await boot({ hash: '#token=' + TOKEN + '&next=%2Fwork%2Fr1%2Fa%3Fopen%3Ddiff%26mode%3Dsplit' });
+  check(encoded.replaced[0][2] === '/#/work/r1/a?open=diff&mode=split', 'an encoded workbench deep link is decoded once and kept');
+  const bad = ['//evil', '/a<b', '/a:b', '/a?b', '%2F%2Fevil', '%2Fa%3Cb', '%2Fa%00', '%252Fa', '/' + 'a'.repeat(601), 'run/r1', '', '/a b', '//'];
   for (const n of bad) {
     const e = await boot({ hash: '#token=' + TOKEN + '&next=' + n });
     check(e.replaced.length === 1 && e.replaced[0][2] === '/#/runs', 'invalid next ' + JSON.stringify(n.slice(0, 12)) + ' falls back to /runs');
