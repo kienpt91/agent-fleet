@@ -63,7 +63,7 @@ pub fn build_brief(input: &BriefInput<'_>) -> String {
         }
         out.push('\n');
     }
-    out.push_str(CONTRACT);
+    out.push_str(REPORT_CONTRACT);
     head_str(&out, MAX_BRIEF_FILE_BYTES).to_string()
 }
 
@@ -83,7 +83,9 @@ fn push_note(out: &mut String, note: &str) {
     }
 }
 
-const CONTRACT: &str = "## How to report back\n\n\
+/// How a worker reports back. One text for the plain brief and for layer 1 of a compiled context
+/// pack (`neo-context`), so the two never disagree about the files fleet reads.
+pub const REPORT_CONTRACT: &str = "## How to report back\n\n\
 Work only inside the current directory; it is your own git worktree. Commit your work (or leave it \
 uncommitted: it will be committed for you). Then, before you exit:\n\n\
 - Write `.fleet/result.json`: `{\"version\":1,\"status\":\"done\",\"summary\":\"what you did\"}` \
