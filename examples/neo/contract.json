@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "id": "answer",
+      "kind": "file",
+      "path": "answer.txt",
+      "assert": "contains",
+      "value": "ready"
+    },
+    {
+      "id": "tests",
+      "kind": "command",
+      "program": "/bin/sh",
+      "args": ["-c", "test -s answer.txt"],
+      "timeout_ms": 30000
+    },
+    {
+      "id": "scope",
+      "kind": "diff",
+      "allow": ["answer.txt"]
+    }
+  ]
+}
