@@ -241,6 +241,9 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         )),
     };
     let kill_grace_ms = app.kill_grace_ms;
+    // Context packs are redacted with the same rules as everything else the daemon stores.
+    let mut app = app;
+    app.redactor = Arc::clone(&redactor);
     let mut orch = Orchestrator::new(app, ports)?;
     orch.startup(u64::from(std::process::id()), VERSION)?;
 

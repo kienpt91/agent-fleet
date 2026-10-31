@@ -202,3 +202,40 @@ isolation, as for workers. A weak check passes a weak result.
 See the decisions in [docs/adr/0011](adr/0011-neo-domain-crates-and-application-module.md),
 [0012](adr/0012-goals-and-evidence-are-event-sourced.md), [0013](adr/0013-verification-by-fleet-gates-completion.md) and [0014](adr/0014-checks-run-on-an-export-and-their-processes-are-untrusted.md),
 and the vocabulary in [domain.md](domain.md).
+
+# Milestone N2 (in progress): the context compiler and handoff packets
+
+This section states what exists after the N2 work so far, and what does not. It is not the final N2 write-up.
+
+## What exists
+
+- **`neo-context`**, a pure std-only domain crate: a deterministic compiler (no model, clock or randomness) that turns fleet's own
+  state into a **context pack** of eight layers in a fixed order: invariants, charter, plan position, task and acceptance
+  contract, verified knowledge, working set, recent events, scratch. Each layer has a hard token budget (a share of the
+  profile's `max_tokens`); the estimate is `ceil(bytes x safety% / (chars_per_token x 100))` over UTF-8 bytes. When the pack
+  is too large, layers 7, 6 and 5 give way in that order, then sections of the charter; layers 1, 3 and 4 are never cut and
+  an overflow is an error, never a silent cut. The pack renders to a canonical text with length-prefixed, escaped framing,
+  plus a canonical JSON manifest (tokens, SHA-256 digest, what was dropped per layer); the pack digest covers both.
+- **Trust.** Text an agent or a program wrote (notes, worker summaries, output of checks, the worker's committed files) appears
+  in layer 7 only, labelled `UNVERIFIED` and quoted line by line, or is left out by `[context] unverified = "exclude"`.
+  Every input is sanitized and redacted; files whose name or content matches the secret scanner's rules are named, not shown.
+  Repository files are read from the real repository at commits fleet recorded, never from the worktree.
+- **Handoff packets** (`HandoffCreated`): made when a task completes or fails, when it goes back in line (retry), when the
+  daemon finds it running after a crash, and on demand (`fleet handoff <task>`). The next pack is compiled from fleet's state
+  plus the handoff; a worker's `.fleet/handoff.json` summary is stored and shown only as UNVERIFIED.
+- **Opt-in per run**: `context = "compiled"` in the plan's `[run]` table (or `fleet run create --context compiled`). Runs
+  without it are briefed exactly as before. A compiled run's worker gets `.fleet/context.md` and `.fleet/context.json`
+  and a short brief that points at them; `ContextCompiled` is appended to the hash-chained log. Fleet never reads those
+  two files back.
+- Commands: `fleet context show|diff|verify|explain` and `fleet handoff`.
+- Configuration: `[context]` (`default_profile`, `unverified`, `knowledge`, `constraints`, `[context.glossary]`) and
+  `[context.profile.<name>]` (`max_tokens`, `chars_per_token`, `safety_percent`); `[workers.<name>] profile`.
+
+## What does not exist
+
+- The **knowledge store** (N3): layer 5 is fed only from a static, human-written file with explicit sources.
+- The **token governor** (N4) and the **credential broker** (N5). Token counts are estimates, not provider usage.
+- The compiler makes the input identical and checkable; it does not make a model obey it, and no claim is made about
+  hallucination. What is tested: determinism, layer order, budgets, verified-only layers 1-6 and labelled UNVERIFIED text.
+- Not yet written up or exercised end to end with the real binary: ADRs, glossary entries, SECURITY.md and README
+  sections, an N2 demo script and the coverage numbers.
