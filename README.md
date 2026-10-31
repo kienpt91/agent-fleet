@@ -421,7 +421,8 @@ file of its worktree to point at a repository of its own (alternates, a replace 
 
 ## Messages between agents
 
-Agents can exchange short messages, **mediated by the daemon**: nothing is typed into a terminal, everything is
+Agents can exchange short messages, **mediated by the daemon**: nothing is typed into a terminal (unless the operator
+turns `notify_input` on), everything is
 declared by the operator, bounded, rate limited, checked for loops and secrets, and recorded in the audit log. A worker
 cannot call the daemon (it is refused on the socket and the web port), so the worker-to-daemon channel is files, as for
 questions. Decisions: [ADR 17](docs/adr/0017-messages-are-mediated-files-not-terminal-input.md),
@@ -455,7 +456,8 @@ keystrokes in a terminal program).
 and never part of a contract, an approval, a gate or acceptance criteria. A body that matches a secret shape (the rules
 of `scripts/secret-scan.sh`) is refused and not stored. A ping-pong (also without `in_reply_to`), a pair that exceeds its
 budget or a task that floods mutes the channel (or the task) and opens a decision gate; `fleet msg mute|unmute` is the
-kill switch; a channel is muted when fewer than two members can still take part.
+kill switch; a channel is muted when fewer than two members can still take part (messages it accepted before still
+arrive: a worker's last message before it exits is not lost).
 
 ```text
 fleet msg list [--task T] [--channel C] [--limit N]    channels, badges (MUTED, BLOCKED), newest messages
@@ -521,9 +523,14 @@ $ /target/release/fleet events --limit 12
 
 </details>
 
-What is **not** done: the terminal dashboard and the web dashboard have no Messages pane yet (the read-only
-`msg.list`/`msg.show` commands are on the web allowlist, no page or route uses them), and the model-level behaviour of
-real agents reading injected messages is not verified.
+**Where to look.** `fleet msg list|show` (CLI), the terminal dashboard (`fleet tui`: a Messages pane that appears once a
+channel exists, in the `Tab` cycle, with MUTED and BLOCKED badges) and the web dashboard (a read-only Messages panel
+behind `GET /api/messages` and `GET /api/message?id=`) show channels and messages, always under their label, as text.
+Sending, muting and unmuting exist only on the control socket (`fleet msg send|mute|unmute`); the web dashboard has no
+route for them.
+
+What is not verified: how real agents behave when they read injected messages (only scripted agents were run), and the
+macOS paths.
 
 ## Concepts
 

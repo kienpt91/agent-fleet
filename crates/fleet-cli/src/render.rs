@@ -477,6 +477,11 @@ pub fn render_plan(v: &Value) -> String {
     if let Some(n) = count {
         let _ = write!(line, " ({n} tasks)");
     }
+    if let Some(Value::Array(channels)) = v.get("channels") {
+        if !channels.is_empty() {
+            let _ = write!(line, " and {} message channel(s)", channels.len());
+        }
+    }
     with_note(line, v)
 }
 
@@ -876,6 +881,15 @@ recent
         assert_eq!(render_run_created(&Value::Null, None), "run created\n");
         let plan = Value::object([("run", s("r1")), ("tasks", Value::array([s("a"), s("b")]))]);
         assert_eq!(render_plan(&plan), "plan loaded into run r1 (2 tasks)\n");
+        let with_channels = Value::object([
+            ("run", s("r1")),
+            ("tasks", Value::array([s("a"), s("b")])),
+            ("channels", Value::array([s("talk")])),
+        ]);
+        assert_eq!(
+            render_plan(&with_channels),
+            "plan loaded into run r1 (2 tasks) and 1 message channel(s)\n"
+        );
         let merge = Value::object([
             ("task", s("r1/t1")),
             ("merge_sha", s("0123456789abcdef0123456789")),
