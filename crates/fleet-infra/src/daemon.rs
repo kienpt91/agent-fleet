@@ -18,6 +18,7 @@ use crate::pty::{PtySessionHost, SessionIo, SessionRegistry};
 use crate::server::{AttachSession, HandlerReply, PeerInfo, RequestHandler, Server};
 use crate::statedir::{DaemonLock, StateLayout};
 use crate::undo::AgentUndo;
+use crate::web::{WebBackend, WebOptions, WebServer};
 use fleet_app::api::{parse_command, Command, Reply};
 use fleet_app::config::AppConfig;
 use fleet_app::orchestrator::Orchestrator;
@@ -26,6 +27,7 @@ use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::MAX_CONCURRENT_JOBS;
 use fleet_domain::supervision::{is_worker_origin, LiveSession, ProcInfo};
 use fleet_domain::value::Value;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -45,6 +47,27 @@ const SHUTDOWN_EXTRA: Duration = Duration::from_secs(5);
 pub struct DaemonOptions {
     pub state_dir: PathBuf,
     pub config_path: Option<PathBuf>,
+    /// The local web dashboard; off when `None`.
+    pub web: Option<WebOptions>,
+}
+
+/// Where the dashboard listens and the secret that opens it. The token lives in memory only: it
+/// is printed once by [`run_daemon`] and never stored.
+#[derive(Clone)]
+pub struct WebInfo {
+    pub addr: SocketAddr,
+    pub token: String,
+    pub login_url: String,
+    pub allow_remote: bool,
+}
+
+impl std::fmt::Debug for WebInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebInfo")
+            .field("addr", &self.addr)
+            .field("token", &"<hidden>")
+            .finish()
+    }
 }
 
 enum EngineMsg {
@@ -68,12 +91,19 @@ pub struct DaemonHandle {
     stop: Arc<AtomicBool>,
     engine: Option<std::thread::JoinHandle<()>>,
     server: Option<std::thread::JoinHandle<()>>,
+    web_thread: Option<std::thread::JoinHandle<()>>,
+    web: Option<WebInfo>,
     _lock: DaemonLock,
 }
 
 impl DaemonHandle {
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// The dashboard's address and token, when it is on.
+    pub fn web(&self) -> Option<&WebInfo> {
+        self.web.as_ref()
     }
 
     /// Asks the daemon to stop (same effect as the `shutdown` command, but immediate for tests).
@@ -89,6 +119,9 @@ impl DaemonHandle {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(s) = self.server.take() {
             let _ = s.join();
+        }
+        if let Some(w) = self.web_thread.take() {
+            let _ = w.join();
         }
         crate::server::remove_socket(&self.socket);
         crate::statedir::remove_token_file(&crate::statedir::token_path(&self.socket));
@@ -143,6 +176,30 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     // output, and what workers write into their result and question files.
     let redactor = Arc::new(loaded.redactor);
     let registry = SessionRegistry::default();
+
+    // The handler is shared by the control socket and the dashboard, so both apply the same
+    // admission rule and the same command validation. The dashboard is bound before anything
+    // irreversible happens, so a port that is taken or a refused address stops the start cleanly.
+    let (tx, rx) = channel::<EngineMsg>();
+    let handler = Arc::new(DaemonHandler {
+        tx,
+        registry: registry.clone(),
+        layout: layout.clone(),
+        started: Instant::now(),
+    });
+    let web = match &opts.web {
+        Some(web_opts) => Some(WebServer::bind(
+            web_opts,
+            Arc::new(DaemonWeb {
+                handler: Arc::clone(&handler),
+                layout: layout.clone(),
+                config: opts.config_path.clone(),
+                env: env.clone(),
+            }),
+        )?),
+        None => None,
+    };
+
     let ports = Ports {
         clock: Box::new(SystemClock),
         store: Box::new(FileEventStore::open(
@@ -169,14 +226,7 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     let mut orch = Orchestrator::new(app, ports)?;
     orch.startup(u64::from(std::process::id()), VERSION)?;
 
-    let (tx, rx) = channel::<EngineMsg>();
     let stop = Arc::new(AtomicBool::new(false));
-    let handler = Arc::new(DaemonHandler {
-        tx,
-        registry,
-        layout: layout.clone(),
-        started: Instant::now(),
-    });
     let server = Server::bind(&layout.socket, handler)?;
     let socket = layout.socket.clone();
 
@@ -194,11 +244,33 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         })
         .map_err(|e| FleetError::internal(format!("could not start the server thread: {e}")))?;
 
+    let (web_thread, web_info) = match (web, &opts.web) {
+        (Some(web), Some(web_opts)) => {
+            let info = WebInfo {
+                addr: web.local_addr(),
+                token: web.token().to_string(),
+                login_url: web.login_url(),
+                allow_remote: web_opts.allow_remote,
+            };
+            let web_stop = Arc::clone(&stop);
+            let thread = std::thread::Builder::new()
+                .name("fleet-web-server".to_string())
+                .spawn(move || web.serve(&web_stop))
+                .map_err(|e| {
+                    FleetError::internal(format!("could not start the web server thread: {e}"))
+                })?;
+            (Some(thread), Some(info))
+        }
+        _ => (None, None),
+    };
+
     Ok(DaemonHandle {
         socket,
         stop,
         engine: Some(engine),
         server: Some(server_thread),
+        web_thread,
+        web: web_info,
         _lock: lock,
     })
 }
@@ -211,6 +283,21 @@ pub fn run_daemon(opts: DaemonOptions) -> Result<()> {
         std::process::id(),
         handle.socket().display()
     );
+    if let Some(web) = handle.web() {
+        // Printed to the operator's terminal only, once. The token is not written to any file,
+        // log or event, and workers never see it.
+        eprintln!(
+            "fleet web: dashboard on http://{}/",
+            crate::web::url_host(web.addr)
+        );
+        if web.allow_remote && !web.addr.ip().to_canonical().is_loopback() {
+            eprintln!("fleet web: {}", crate::web::remote_warning(web.addr));
+        }
+        eprintln!(
+            "fleet web: login URL (shown only now, valid until the daemon stops): {}",
+            web.login_url
+        );
+    }
     handle.wait();
     Ok(())
 }
@@ -408,6 +495,13 @@ impl RequestHandler for DaemonHandler {
         // that a peer which has since turned out to be (or to be started by) a worker, or has
         // vanished, gets nothing more.
         self.check_origin(peer)?;
+        self.execute(cmd, args)
+    }
+}
+
+impl DaemonHandler {
+    /// Validates and runs one command. The caller has already decided that its peer is admitted.
+    fn execute(&self, cmd: &str, args: Value) -> Result<HandlerReply> {
         let command = parse_command(cmd, &args)?;
         self.check_repo(&command)?;
         let size = if matches!(command, Command::Attach { .. }) {
@@ -420,6 +514,61 @@ impl RequestHandler for DaemonHandler {
             reply,
         })??;
         self.convert(reply, size)
+    }
+}
+
+/// The commands the dashboard may run. Everything else (starting runs, stopping or cancelling
+/// tasks, attaching, shutting the daemon down) stays on the control socket.
+pub const WEB_COMMANDS: &[&str] = &[
+    "status",
+    "events",
+    "task.tail",
+    "task.send",
+    "gate.resolve",
+    "approval.decide",
+    "merge",
+];
+
+/// The dashboard's view of the daemon: the same handler as the control socket, restricted to
+/// [`WEB_COMMANDS`].
+struct DaemonWeb {
+    handler: Arc<DaemonHandler>,
+    layout: StateLayout,
+    config: Option<PathBuf>,
+    env: Vec<(String, String)>,
+}
+
+impl WebBackend for DaemonWeb {
+    fn admit(&self, peer: &PeerInfo) -> Result<()> {
+        self.handler.check_origin(peer)
+    }
+
+    fn call(&self, cmd: &str, args: Value) -> Result<Value> {
+        if !WEB_COMMANDS.contains(&cmd) {
+            return Err(FleetError::forbidden(format!(
+                "the dashboard does not run {}",
+                fleet_domain::ids::show(cmd)
+            )));
+        }
+        match self.handler.execute(cmd, args)? {
+            HandlerReply::Data(v) => Ok(v),
+            HandlerReply::Attach { .. } => Err(FleetError::forbidden(
+                "the dashboard cannot attach to a terminal",
+            )),
+        }
+    }
+
+    fn log_status(&self) -> Result<crate::eventlog::VerifyReport> {
+        crate::eventlog::verify_file(&self.layout.events)
+    }
+
+    fn health(&self) -> Value {
+        let checks = crate::doctor::run_checks(&crate::doctor::DoctorInput {
+            layout: self.layout.clone(),
+            config: self.config.clone(),
+            env: self.env.clone(),
+        });
+        crate::doctor::to_value(&checks)
     }
 }
 

@@ -56,6 +56,7 @@ fn memory_stays_flat_while_chatty_workers_flood_their_terminals() {
     let daemon = start_daemon(DaemonOptions {
         state_dir: state,
         config_path: Some(config),
+        web: None,
     })
     .unwrap();
     let mut client = Client::connect(daemon.socket()).unwrap();
