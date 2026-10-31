@@ -119,7 +119,7 @@ pub fn parse_request(line: &str) -> Result<Request> {
         || cmd.len() > MAX_CMD_LEN
         || !cmd
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
+            .all(|c| c.is_ascii_lowercase() || matches!(c, '.' | '_' | '-'))
     {
         return Err(bad("the command name is not valid"));
     }
@@ -300,6 +300,16 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Invalid);
         let req = parse_request(r#"{"v":1,"cmd":"ping","token":null}"#).unwrap();
         assert_eq!(req.token, None);
+    }
+
+    #[test]
+    fn a_command_name_may_hold_a_hyphen_like_issue_to_task() {
+        let line = encode_request("issue.to-task", &Value::Null, None);
+        assert_eq!(parse_request(&line).unwrap().cmd, "issue.to-task");
+        for bad in ["Issue.to-task", "issue to-task", "issue.to+task"] {
+            let line = encode_request(bad, &Value::Null, None);
+            assert!(parse_request(&line).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
