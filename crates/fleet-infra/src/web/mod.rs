@@ -333,20 +333,43 @@ impl WebServer {
         if stream.set_nonblocking(false).is_err() {
             return;
         }
-        match stream.try_clone() {
-            Ok(clone) => {
-                lock(&self.shared.open).insert(guard.id, clone);
-            }
-            Err(_) => return,
-        }
-        // If the thread cannot start, the closure (and with it the guard) is dropped and the
-        // connection closes.
-        let _ = thread::Builder::new()
+        // One handle stays in the open-connection table (shutdown closes through it), one is kept
+        // here to answer with when the connection thread cannot be started.
+        let (Ok(table_handle), Ok(fallback)) = (stream.try_clone(), stream.try_clone()) else {
+            refuse_quickly(
+                stream,
+                503,
+                ErrorCode::Unavailable,
+                "the connection could not be set up",
+            );
+            return;
+        };
+        lock(&self.shared.open).insert(guard.id, table_handle);
+        let spawned = thread::Builder::new()
             .name("fleet-web".to_string())
             .spawn(move || {
-                let outcome = catch_unwind(AssertUnwindSafe(|| serve_connection(stream, &guard)));
-                drop(outcome);
+                let mut stream = stream;
+                let outcome =
+                    catch_unwind(AssertUnwindSafe(|| serve_connection(&mut stream, &guard)));
+                if outcome.is_err() {
+                    // A bug must not look like a silent hang-up.
+                    let r = routes::error_response(
+                        500,
+                        ErrorCode::Internal,
+                        "the dashboard failed while handling the request",
+                    );
+                    let _ = r.write_to(&mut stream);
+                    finish(&mut stream);
+                }
             });
+        if spawned.is_err() {
+            refuse_quickly(
+                fallback,
+                503,
+                ErrorCode::Unavailable,
+                "the server has no thread for this connection",
+            );
+        }
     }
 }
 
@@ -374,19 +397,46 @@ fn admit(shared: &Shared, peer: SocketAddr, local: SocketAddr) -> Result<()> {
         PeerIdentity::Unknown => Err(FleetError::forbidden(
             "the connecting process could not be identified; refusing the connection",
         )),
-        PeerIdentity::Local(pids) => {
-            for pid in pids {
+        PeerIdentity::Local(pids) => judge_holders(
+            &pids,
+            |pid| {
                 shared.backend.admit(&PeerInfo {
                     uid: None,
                     pid: Some(pid),
-                })?;
-            }
-            Ok(())
-        }
+                })
+            },
+            |pid| crate::procid::proc_info(pid).is_some(),
+        ),
     }
 }
 
-fn serve_connection(mut stream: TcpStream, guard: &ConnGuard) {
+/// Every process that holds the client's end of a connection must pass `judge`. A holder that has
+/// vanished by the time it is judged (a child that was forked and exec'd while the socket was
+/// open, or a client that exited) is skipped, but only when another holder is there and passes:
+/// nothing left to judge is a refusal, as for an unknown peer. A holder that is alive and refused
+/// (a worker) refuses the connection whatever the others are.
+fn judge_holders(
+    pids: &[u32],
+    mut judge: impl FnMut(u32) -> Result<()>,
+    alive: impl Fn(u32) -> bool,
+) -> Result<()> {
+    let mut admitted = 0usize;
+    for pid in pids {
+        match judge(*pid) {
+            Ok(()) => admitted += 1,
+            Err(e) if alive(*pid) => return Err(e),
+            Err(_) => {}
+        }
+    }
+    if admitted == 0 {
+        return Err(FleetError::forbidden(
+            "the connecting process has exited or cannot be inspected; refusing the connection",
+        ));
+    }
+    Ok(())
+}
+
+fn serve_connection(stream: &mut TcpStream, guard: &ConnGuard) {
     let shared = &guard.shared;
     let accepted = Instant::now();
     let _ = stream.set_write_timeout(Some(shared.limits.http.write_timeout));
@@ -396,26 +446,26 @@ fn serve_connection(mut stream: TcpStream, guard: &ConnGuard) {
     };
     if let Err(e) = admit(shared, peer, local) {
         let r = routes::error_response(403, e.code, &e.message);
-        let _ = r.write_to(&mut stream);
-        finish(&mut stream);
+        let _ = r.write_to(stream);
+        finish(stream);
         return;
     }
     let deadline = accepted + shared.limits.http.request_deadline;
-    let request = match read_request(&mut stream, &shared.limits.http, deadline) {
+    let request = match read_request(stream, &shared.limits.http, deadline) {
         Ok(r) => r,
         Err(e) => {
-            let _ = http_error_response(&e).write_to(&mut stream);
-            finish(&mut stream);
+            let _ = http_error_response(&e).write_to(stream);
+            finish(stream);
             return;
         }
     };
     match routes::handle(shared, &request, Instant::now()) {
         routes::Outcome::Reply(r) => {
-            let _ = r.write_to(&mut stream);
-            finish(&mut stream);
+            let _ = r.write_to(stream);
+            finish(stream);
         }
         routes::Outcome::Stream(plan) => {
-            routes::stream_task(shared, &mut stream, &plan);
+            routes::stream_task(shared, stream, &plan);
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
@@ -588,6 +638,44 @@ mod tests {
         assert!(host_allowed("192.168.1.9:7878", lan, true));
         assert!(!host_allowed("192.168.1.10:7878", lan, true));
         assert!(!host_allowed("localhost:7878", lan, true));
+    }
+
+    #[test]
+    fn a_vanished_holder_is_skipped_only_when_another_holder_passes() {
+        let ok = |_pid: u32| -> Result<()> { Ok(()) };
+        let refuse = |pid: u32| -> Result<()> {
+            if pid == 1 {
+                Err(FleetError::forbidden("worker"))
+            } else {
+                Ok(())
+            }
+        };
+        let alive = |_pid: u32| true;
+        let gone = |pid: u32| pid != 2;
+        // everyone passes
+        assert!(judge_holders(&[5, 6], ok, alive).is_ok());
+        // a living holder that is refused refuses the connection, whatever the others are
+        assert_eq!(
+            judge_holders(&[5, 1], refuse, alive).unwrap_err().message,
+            "worker"
+        );
+        assert_eq!(
+            judge_holders(&[1, 5], refuse, alive).unwrap_err().message,
+            "worker"
+        );
+        // a holder that is refused and gone is skipped when another one passes ...
+        let judge = |pid: u32| -> Result<()> {
+            if pid == 2 {
+                Err(FleetError::forbidden("exited"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(judge_holders(&[2, 5], judge, gone).is_ok());
+        // ... but not when nobody is left
+        let e = judge_holders(&[2], judge, gone).unwrap_err();
+        assert!(e.message.contains("exited"), "{}", e.message);
+        assert!(judge_holders(&[], ok, alive).is_err());
     }
 
     #[test]

@@ -722,7 +722,9 @@ fn client_gone(stream: &mut TcpStream) -> bool {
         Ok(0) | Ok(1..) => true,
         Err(e) => !matches!(
             e.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::Interrupted
         ),
     }
 }

@@ -93,7 +93,9 @@ What the design tries to guarantee, and where it is tested:
   and pass admission can keep the operator out of the dashboard; the control socket is unaffected.
 - **Admission looks at processes, not at intent.** On Linux it needs `/proc/net/tcp*` and the readable `/proc/<pid>/fd` of
   the client (same user: readable); where that is hidden every loopback client is refused. On macOS it runs `lsof` and has
-  not been run there. A client that exits before the lookup is refused (fail closed).
+  not been run there. A client that exits before the lookup is refused (fail closed). Every process that holds the client's end
+  of the connection is judged; one that has vanished by then (a child forked and exec'd while the socket was open) is skipped
+  only if another holder is there and passes, and one that is alive and refused refuses the connection.
 - **The page shows what workers wrote.** Text is sanitized by the domain and rendered as text, so it cannot run or break
   the layout, but an operator reading a summary or a question can still be misled by its content (prompt injection
   reaches people too). The exact action and digest of an approval are shown as the daemon holds them.
