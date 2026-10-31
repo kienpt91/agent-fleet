@@ -5,6 +5,7 @@
 //! validated, bounded and escaped here, and shown as text by every front end.
 
 pub mod limits;
+pub mod markdown;
 pub mod path;
 
 pub use path::RepoPath;
