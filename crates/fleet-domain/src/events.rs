@@ -287,7 +287,10 @@ impl DomainEvent {
                 check,
                 verdict,
                 ..
-            } => format!("evidence {id}: goal {goal} check {} {verdict}", crate::ids::show(check)),
+            } => format!(
+                "evidence {id}: goal {goal} check {} {verdict}",
+                crate::ids::show(check)
+            ),
         }
     }
 }

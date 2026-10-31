@@ -1,0 +1,19 @@
+[package]
+name = "neo-verify"
+description = "Verification contexts of NEO: verification contracts, checks, evidence and verdicts. Pure; depends on fleet-domain and std only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "neo_verify"
+path = "src/lib.rs"
+
+[dependencies]
+fleet-domain = { path = "../fleet-domain" }
+
+[lints]
+workspace = true
