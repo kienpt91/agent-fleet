@@ -12,6 +12,10 @@ pub mod digest;
 pub mod clock;
 pub mod fsx;
 pub mod statedir;
+pub mod procid;
+pub mod eventlog;
+pub mod logs;
+pub mod contract_fs;
 
 #[doc(hidden)]
 pub mod testutil;
