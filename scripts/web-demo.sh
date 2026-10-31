@@ -52,6 +52,11 @@ args = ["{task}"]
 timeout_secs = 60
 idle_timeout_secs = 30
 
+[workers.neo]
+command = "$HERE/examples/agents/neo-agent.sh"
+timeout_secs = 60
+idle_timeout_secs = 30
+
 [workers.slow]
 command = "$HERE/examples/agents/slow-agent.sh"
 timeout_secs = 120
@@ -95,6 +100,17 @@ wait_for '"kind":"question"'
 "$FLEET" task add --run r2 --id slow --title "A worker that talks for a while" --worker slow >/dev/null
 "$FLEET" start --run r2 >/dev/null
 wait_for '"live":true'
+# a third run with a governed task: the goal's contract is run by fleet itself; the agent's first attempt
+# is wrong, so there is failed evidence and then passing evidence
+"$FLEET" run create --objective "A task whose result fleet checks itself" --repo "$REPO" --id r3 >/dev/null
+"$FLEET" task add --run r3 --id answer --title "Write the answer file" --worker neo >/dev/null
+"$FLEET" goals add --id feature --title "The answer file says ready" \
+  --intent "answer.txt exists, says ready, and nothing else changed" \
+  --task r3/answer --contract "$HERE/examples/neo/contract.json" >/dev/null
+"$FLEET" start --run r3 >/dev/null
+i=0; until "$FLEET" goals show feature --json | grep -q '"status":"verified"'; do
+  i=$((i + 1)); [ "$i" -lt 600 ] || { echo "the goal was never verified" >&2; exit 1; }; sleep 0.1
+done
 
 web() { say "curl $*"; curl -sS -i --max-time 20 "$@" | mask; echo; }
 
@@ -185,6 +201,22 @@ if [ -n "${BROWSER:-}" ]; then
   shoot events "/events" 'Events' 'merged'
   shoot health "/health" 'event log' 'hash chain intact'
 fi
+# a goal added after the fact for a task that finished without any evidence: it is shown as unverified
+printf '{"version":1,"checks":[{"id":"docs","kind":"file","path":"docs.md","assert":"exists"}]}\n' > "$WORK/docs-contract.json"
+"$FLEET" goals add --id docs-written --title "The docs exist" --task r1/docs --contract "$WORK/docs-contract.json" >/dev/null
+say "# the goal ledger over http: read only (a POST finds no route), newest evidence with commit and tree digests"
+curl -sS --max-time 20 -H @"$WORK/session.hdr" "$BASE/api/goals" | sed 's/},{/}\n{/g' | sed -n '1,3p' | cut -c1-420 | mask
+curl -sS -i --max-time 20 -H @"$WORK/session.hdr" -H @"$WORK/csrf.hdr" -H "Origin: $BASE" -H 'Content-Type: application/json' \
+  -d '{"title":"x"}' "$BASE/api/goals" | sed -n '1p' | mask
+curl -sS --max-time 20 -H @"$WORK/session.hdr" "$BASE/api/goal?id=feature" | sed 's/},{/}\n{/g' | grep -m1 '"verdict":"passed"' | cut -c1-420 | mask
+if [ -n "${BROWSER:-}" ]; then
+  say "# the goals pages in the browser: remaining work, verified and unverified badges, evidence with commit and tree"
+  shoot goals "/goals" 'The answer file says ready' 'The docs exist' 'unverified' 'verified'
+  SHOT_HEIGHT=1500
+  shoot goal "/goal/feature" 'answer.txt contains' 'failed' 'passed' 'Evidence'
+  SHOT_HEIGHT=800
+fi
+
 say "# logging out ends the session: the same id is refused afterwards"
 post /api/logout '{}' | sed -n '1p' | mask
 curl -sS -i --max-time 20 -H @"$WORK/session.hdr" "$BASE/api/status" | sed -n '1p' | mask; echo
