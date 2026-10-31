@@ -148,9 +148,10 @@ pub fn validate_text(kind: &str, text: &str, max: usize) -> Result<()> {
 /// Characters that change how text is displayed without being visible themselves.
 pub fn is_invisible(c: char) -> bool {
     matches!(c as u32,
-        0x061C | 0x200B | 0x200E | 0x200F | 0x2028 | 0x2029 | 0x202A..=0x202E
-        | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF | 0xFFF9..=0xFFFB
-        | 0xE0000..=0xE007F)
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F
+        | 0x200B | 0x200E | 0x200F | 0x2028 | 0x2029 | 0x202A..=0x202E
+        | 0x2060..=0x2064 | 0x2066..=0x2069 | 0x2800 | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF
+        | 0xFFA0 | 0xFFF9..=0xFFFB | 0xE0000..=0xE007F | 0xE0100..=0xE01EF)
 }
 
 /// Shows a possibly hostile name in an error message without letting it break the terminal.
@@ -369,6 +370,39 @@ mod tests {
     #[test]
     fn show_escapes_controls() {
         assert_eq!(show("a\u{1b}[31m"), "\"a\\u{1b}[31m\"");
+    }
+
+    #[test]
+    fn invisible_characters_are_recognised() {
+        let invisible = [
+            0x00ad, 0x034f, 0x061c, 0x115f, 0x1160, 0x17b4, 0x17b5, 0x180b, 0x180c, 0x180d, 0x180e,
+            0x180f, 0x200b, 0x200e, 0x200f, 0x2028, 0x2029, 0x202a, 0x202e, 0x2060, 0x2064, 0x2066,
+            0x2069, 0x2800, 0x3164, 0xfe00, 0xfe0f, 0xfeff, 0xffa0, 0xfff9, 0xfffb, 0xe0000,
+            0xe007f, 0xe0100, 0xe01ef,
+        ];
+        for cp in invisible {
+            let c = char::from_u32(cp).unwrap();
+            assert!(is_invisible(c), "U+{cp:04X} must be invisible");
+            assert!(
+                validate_line("title", &format!("a{c}b"), 20).is_err(),
+                "U+{cp:04X}"
+            );
+        }
+        // Neighbours and ordinary text stay visible.
+        for c in [
+            'a',
+            ' ',
+            'é',
+            '\u{ac}',
+            '\u{ae}',
+            '\u{2801}',
+            '\u{3165}',
+            '\u{fe10}',
+            '\u{e01f0}',
+            '日',
+        ] {
+            assert!(!is_invisible(c), "{c:?} must stay visible");
+        }
     }
 
     #[test]
