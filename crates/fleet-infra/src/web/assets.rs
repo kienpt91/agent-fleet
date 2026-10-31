@@ -94,6 +94,28 @@ mod tests {
         assert!(APP_JS.contains("digest"));
     }
 
+    /// The Messages page only reads. Sending, muting and unmuting have no web route, so the
+    /// script must not even name one.
+    #[test]
+    fn the_script_can_read_messages_and_has_no_way_to_send_mute_or_unmute_them() {
+        assert!(APP_JS.contains("'/api/messages?limit='"));
+        assert!(APP_JS.contains("'/api/message?id='"));
+        for bad in [
+            "/api/msg",
+            "msg.send",
+            "msg.mute",
+            "msg.unmute",
+            "/api/messages/",
+            "/api/message/",
+        ] {
+            assert!(!APP_JS.contains(bad), "app.js contains {bad:?}");
+        }
+        // every api() call that names a message route is a GET
+        for line in APP_JS.lines().filter(|l| l.contains("/api/message")) {
+            assert!(line.contains("api('GET'"), "{line}");
+        }
+    }
+
     /// The credential is a header held in the page, never a cookie: cookies are not isolated by
     /// port and would travel to every other server on the host.
     #[test]

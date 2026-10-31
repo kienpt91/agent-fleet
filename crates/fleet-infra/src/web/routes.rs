@@ -153,6 +153,8 @@ enum Route {
     Tail,
     Goals,
     Goal,
+    Messages,
+    Message,
     Remaining,
     VerifyStatus,
     Stream,
@@ -174,6 +176,8 @@ fn route_for(path: &str) -> Option<(Route, Method)> {
         "/api/tail" => (Route::Tail, Method::Get),
         "/api/goals" => (Route::Goals, Method::Get),
         "/api/goal" => (Route::Goal, Method::Get),
+        "/api/messages" => (Route::Messages, Method::Get),
+        "/api/message" => (Route::Message, Method::Get),
         "/api/remaining" => (Route::Remaining, Method::Get),
         "/api/verify" => (Route::VerifyStatus, Method::Get),
         "/api/stream" => (Route::Stream, Method::Get),
@@ -629,6 +633,39 @@ fn run_route(
                 shared,
                 "goal.show",
                 pass(vec![("goal", Value::str(id))]),
+            )?)
+        }
+        // Mediated agent messages, read only. Sending, muting and unmuting stay on the
+        // control socket: they have no web route.
+        Route::Messages => {
+            let q = parse_query(&req.query, &["channel", "task", "limit"])?;
+            let mut args = Vec::new();
+            if let Some(channel) = q.get("channel").filter(|t| !t.is_empty()) {
+                args.push(("channel", Value::str(channel)));
+            }
+            if let Some(task) = q.get("task").filter(|t| !t.is_empty()) {
+                args.push(("task", Value::str(task)));
+            }
+            if let Some(n) = query_u64(&q, "limit")? {
+                args.push(("limit", Value::int(n)));
+            }
+            let args = if args.is_empty() {
+                Value::Null
+            } else {
+                pass(args)
+            };
+            respond(call(shared, "msg.list", args)?)
+        }
+        Route::Message => {
+            let q = parse_query(&req.query, &["id"])?;
+            let id = q
+                .get("id")
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| error_response(400, ErrorCode::Invalid, "`id` is required"))?;
+            respond(call(
+                shared,
+                "msg.show",
+                pass(vec![("id", Value::str(id))]),
             )?)
         }
         Route::Remaining => {

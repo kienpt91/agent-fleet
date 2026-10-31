@@ -224,7 +224,8 @@ function buildEnv(opts) {
         streamStatus: 200,
         streamThrow: 0,
         goalsStatus: 200,
-        goalCount: 4
+        goalCount: 4,
+        messagesStatus: 200
       },
       opts.server || {}
     )
@@ -516,6 +517,11 @@ function buildEnv(opts) {
       else body = goalsDoc(S.goalCount);
     } else if (path === '/api/remaining') {
       body = remainingDoc();
+    } else if (path === '/api/messages') {
+      if (S.messagesStatus !== 200) err(S.messagesStatus, { code: 'msgs', message: 'msgs unavailable' });
+      else body = msgListDoc();
+    } else if (path === '/api/message') {
+      body = msgShowDoc(query.get('id'));
     } else if (path === '/api/goal') {
       const gid = query.get('id');
       env.goalFetches.push(gid);
@@ -629,6 +635,48 @@ function remainingDoc() {
     ],
     next_ready: [{ task: 'r1/ui', goal: 'g2', title: 'Do ' + BIDI }]
   };
+}
+
+function msgRow(id, label, kind, status, extra) {
+  return Object.assign({
+    id, run: 'r1', channel: 'dev ' + IMG, from: 'api', label, kind, subject: 'subject ' + id, status, reason: '', detail: '', bytes: 10,
+    in_reply_to: null, depth: 0, at_ms: 1700000000000, expires_ms: 1700000600000, approval: null,
+    to: [{ task: 'web', state: status === 'delivered' ? 'delivered' : 'queued', at_ms: null, reason: '' }]
+  }, extra || {});
+}
+
+function msgRows() {
+  return [
+    msgRow('m3', LABEL_PEER, 'note', 'blocked', { subject: MSG_HOSTILE, reason: 'secret-detected', detail: 'matched a key shape' }),
+    msgRow('m2', LABEL_OP, 'request', 'delivered', { from: 'operator' }),
+    msgRow('m1', LABEL_PEER, 'reply', 'awaiting-approval'),
+    msgRow(ODD_ID, LABEL_PEER, 'note', 'queued')
+  ];
+}
+
+function msgListDoc() {
+  const channel = (name, muted, counts) => ({
+    run: 'r1', name, members: ['api', 'web'], lead: 'api', mode: 'peer', direction: 'both', requires_approval: false,
+    max_message_bytes: 4096, max_messages_per_task: 20, max_messages_per_minute: 10, ttl_secs: 600,
+    muted, mute_reason: muted ? 'endpoint-ended ' + SCRIPT : null, mute_by: muted ? 'operator' : null, mute_gate: null, messages: counts
+  });
+  return {
+    schema: 'fleet.msg.list/1',
+    channels: [
+      channel('dev ' + IMG, true, { queued: 1, awaiting_approval: 2, delivered: 3, expired: 0, blocked: 1 }),
+      channel('ops', false, { queued: 0, awaiting_approval: 0, delivered: 0, expired: 0, blocked: 0 })
+    ],
+    muted_tasks: [{ run: 'r1', task: 'web', reason: 'looping ' + ESC, by: 'operator', gate: null }],
+    messages: msgRows().map((m) => Object.assign({}, m)),
+    total: 4,
+    truncated: false
+  };
+}
+
+function msgShowDoc(id) {
+  const m = msgRows().find((x) => x.id === id) || msgRows()[0];
+  const body = m.id === 'm3' ? 'body ' + SCRIPT + '\n' + ESC : m.id === 'm2' ? 'Z'.repeat(30000) : 'plain body';
+  return { schema: 'fleet.msg.show/1', message: Object.assign({}, m, { body, digest: 'ab'.repeat(32), source: 'worker' }) };
 }
 
 function evidence(id, check, verdict, task, extra) {
@@ -782,6 +830,8 @@ function staticChecks() {
     'localStorage', 'EventSource', 'cookie', '.href', '.src ='
   ];
   banned.forEach((b) => check(!APP.includes(b), 'app.js does not contain ' + b));
+  ['/api/msg', 'msg.send', 'msg.mute', 'msg.unmute', '/api/messages/', '/api/message/'].forEach((b) => check(!APP.includes(b), 'app.js has no way to send, mute or unmute: ' + b));
+  check(APP.includes("'/api/messages?limit='") && APP.includes("'/api/message?id='"), 'app.js reads /api/messages and /api/message');
   check(APP.includes('X-Fleet-Session') && APP.includes('X-CSRF-Token'), 'app.js sends the session and CSRF headers');
   const storageLines = APP.split('\n').filter((l) => l.includes('sessionStorage'));
   check(storageLines.length > 0 && storageLines.every((l) => l.includes("'fleet.session'")), 'sessionStorage is only used with the key fleet.session');
@@ -797,7 +847,7 @@ function staticChecks() {
   check(!/<style/i.test(HTML), 'no style element');
   check(!/@import/.test(CSS) && !/url\(/i.test(CSS), 'css has no @import or url()');
   check(CSS.includes('prefers-color-scheme: dark'), 'css supports dark mode');
-  ['view', 'statusline', 'hdr-version', 'hdr-sessions', 'hdr-rss', 'hdr-approvals', 'hdr-goals', 'logout', 'nav-runs', 'nav-goals', 'nav-decisions', 'nav-events', 'nav-health'].forEach(
+  ['view', 'statusline', 'hdr-version', 'hdr-sessions', 'hdr-rss', 'hdr-approvals', 'hdr-goals', 'logout', 'nav-runs', 'nav-goals', 'nav-messages', 'nav-decisions', 'nav-events', 'nav-health'].forEach(
     (id) => check(HTML.includes('id="' + id + '"'), 'index.html has #' + id)
   );
 }
@@ -1322,6 +1372,85 @@ async function goalsUnavailable() {
   check(allText(env2) === NOT_LOGGED_IN && env2.storage.data.size === 0, 'a 401 on the goals request logs out and clears the session');
 }
 
+const LABEL_PEER = 'from task api (unverified peer message)';
+const LABEL_OP = 'from operator';
+const MSG_HOSTILE = IMG + ' ' + ESC + ' ' + BIDI;
+const MSG_HOSTILE_SEEN = IMG + ' [U+001B][31mred[U+001B][0m safe[U+202E]gnp.exe';
+const ODD_ID = 'x y&z=1';
+
+async function messagesFlow() {
+  const env = await boot({ hash: '#/messages', stored: true });
+  await env.advance(100);
+  check(env.registry.get('nav-messages').hasClass('active') && !env.registry.get('nav-goals').hasClass('active'), 'messages nav active');
+  check(env.calls.some((c) => c.url === '/api/messages?limit=100'), 'the newest messages are requested with a limit');
+  check(find(env, (n) => n.hasClass('goalsum'))[0].textContent === '4 messages, 2 channels', 'messages summary line');
+  // channels: counts, MUTED badge with the reason
+  const cards = find(env, (n) => n.hasClass('goalrow'));
+  check(cards.length === 3, 'two channel cards and one muted task row');
+  check(hasTextNode(env, 'dev ' + IMG) && hasTextNode(env, 'ops'), 'channel names are text nodes');
+  const mutedBadges = find(env, (n) => n.hasClass('ms-muted'));
+  check(mutedBadges.length === 2 && mutedBadges.every((b) => b.textContent === 'MUTED'), 'MUTED badges: one for the channel, one for the task');
+  check(allText(env).includes('Muted: endpoint-ended ' + SCRIPT + ' (by operator)'), 'the mute reason and who muted are shown, as text');
+  check(allText(env).includes('looping [U+001B][31mred[U+001B][0m (by operator)'), 'the muted task shows its reason');
+  check(allText(env).includes('queued 1') && allText(env).includes('awaiting approval 2') && allText(env).includes('delivered 3') && allText(env).includes('blocked 1'), 'channel message counts');
+  check(find(env, (n) => n.hasClass('ms-awaiting-approval')).length >= 2, 'awaiting-approval badges keep their own class');
+  // messages: label next to every row, BLOCKED badge with the reason
+  const rows = find(env, (n) => n.hasClass('msgrow'));
+  check(rows.length === 4, 'one row per message');
+  check(hasTextNode(env, LABEL_PEER) && hasTextNode(env, LABEL_OP), 'the label of every message is shown');
+  check(rows.every((r) => r.textContent.includes(LABEL_PEER) || r.textContent.includes(LABEL_OP)), 'each row carries its label');
+  const blocked = find(env, (n) => n.hasClass('ms-blocked') && n.textContent === 'BLOCKED');
+  check(blocked.length === 1, 'exactly one BLOCKED badge');
+  check(rows[0].textContent.includes('BLOCKED') && rows[0].textContent.includes('secret-detected'), 'the BLOCKED row shows the reason');
+  check(hasTextNode(env, MSG_HOSTILE_SEEN), 'a hostile subject is inert text with control characters made visible');
+  check(!/[\u001b\u202e]/.test(allText(env)), 'no raw ESC or bidi control reaches the page');
+  assertSafe(env, 'messages');
+  check(find(env, (n) => n.tagName === 'a' && n.hasClass('rlink')).every((a) => HREF_OK.test(a.getAttribute('href'))), 'links are validated hash routes');
+  check(find(env, (n) => n.tagName === 'button').length === 0, 'no button on the messages page');
+  check(allText(env).includes('unverified peer content'), 'the page says peer content is unverified');
+
+  // one message, with its label above the body and the warning between them
+  rows[0].dispatch('click');
+  await env.advance(100);
+  check(env.calls.some((c) => c.url === '/api/message?id=m3'), 'a click asks for the message by id');
+  const label = find(env, (n) => n.hasClass('msglabel'));
+  check(label.length === 1 && label[0].textContent === LABEL_PEER, 'the label is shown above the body');
+  const body = find(env, (n) => n.tagName === 'pre' && n.hasClass('msgbody'));
+  check(body.length === 1 && body[0].textContent === 'body ' + SCRIPT + '\n[U+001B][31mred[U+001B][0m', 'the body is text, with controls made visible');
+  const text = allText(env);
+  const at = (s) => text.lastIndexOf(s);
+  check(at(LABEL_PEER) < at('Unverified peer content') && at('Unverified peer content') < at('body ' + SCRIPT), 'label, then the unverified note, then the body');
+  check(text.includes('Reason: secret-detected - matched a key shape'), 'the block reason and detail are shown in the message');
+  assertSafe(env, 'one message');
+  // a large body is cut and says so; an odd id is encoded
+  rows[1].dispatch('click');
+  await env.advance(100);
+  const big = find(env, (n) => n.tagName === 'pre' && n.hasClass('msgbody'));
+  check(big.length === 1 && big[0].textContent.length === 20000 && allText(env).includes('Body cut: showing the first 20000 of 30000 characters.'), 'a long body is cut and says so');
+  rows[3].dispatch('click');
+  await env.advance(100);
+  check(env.calls.some((c) => c.url === '/api/message?id=' + encodeURIComponent(ODD_ID)), 'message ids are URL-encoded');
+  // read only: the page only ever reads
+  const msgCalls = env.calls.filter((c) => /^\/api\/messages?(\?|$)/.test(c.url));
+  check(msgCalls.length > 0 && msgCalls.every((c) => c.method === 'GET' && c.body === null), 'only GET requests are made for messages');
+  check(!env.calls.some((c) => /msg|message/.test(c.url) && c.method !== 'GET'), 'nothing is posted to a message route');
+  check(!env.calls.some((c) => /\/api\/msg/.test(c.url)), 'no send, mute or unmute route is called');
+  check(!buttons(env, 'Send').length && !buttons(env, 'Mute').length && !buttons(env, 'Unmute').length, 'no send, mute or unmute button');
+  await env.setVisible('hidden');
+  const before = env.calls.length;
+  await env.advance(10000);
+  check(env.calls.length === before, 'no message requests while the tab is hidden');
+}
+
+async function messagesUnavailable() {
+  const env = await boot({ hash: '#/messages', stored: true, server: { messagesStatus: 404 } });
+  await env.advance(300);
+  check(allText(env).includes('Messages are not available: msgs unavailable'), 'a missing messages endpoint is explained');
+  const env2 = await boot({ hash: '#/messages', stored: true, server: { messagesStatus: 401 } });
+  await env2.advance(300);
+  check(allText(env2) === NOT_LOGGED_IN && env2.storage.data.size === 0, 'a 401 on the messages request logs out and clears the session');
+}
+
 async function streamRetries() {
   const env = await boot({ hash: '#/task/r1/web', stored: true, server: { streamThrow: 1000 } });
   await env.advance(40000);
@@ -1363,6 +1492,8 @@ await nextRoute();
 await goalsFlow();
 await goalsBounds();
 await goalsUnavailable();
+await messagesFlow();
+await messagesUnavailable();
 await streamRetries();
 await streamOverflow();
 await streamAuth();

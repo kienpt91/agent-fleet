@@ -734,6 +734,39 @@ a.rlink {
   margin: 8px 0;
 }
 
+/* ------------------------------------------------------------ messages */
+
+.ms-queued,
+.ms-expired,
+.ms-unknown {
+  --st: #5b6573;
+}
+
+.ms-awaiting-approval {
+  --st: #8a5a00;
+}
+
+.ms-delivered {
+  --st: #2e7d32;
+}
+
+.ms-blocked,
+.ms-muted {
+  --st: #b3261e;
+}
+
+.msgrow {
+  cursor: pointer;
+}
+
+.msgrow:hover {
+  background: var(--code-bg);
+}
+
+.msgbody {
+  max-height: 24em;
+}
+
 @media (max-width: 640px) {
   .fields {
     grid-template-columns: 1fr;

@@ -37,6 +37,10 @@
   const MAX_EVIDENCE_SHOWN = 200;
   const MAX_EVIDENCE_OUTPUT = 20000;
   const MAX_GOAL_DETAILS = 5;
+  const MSG_STATUS = new Set(['awaiting-approval', 'queued', 'delivered', 'expired', 'blocked', 'muted']);
+  const MSG_STATUS_ORDER = ['awaiting_approval', 'queued', 'delivered', 'expired', 'blocked'];
+  const MAX_MSGS_SHOWN = 100;
+  const MAX_MSG_BODY = 20000;
 
   const KNOWN = new Set([
     'pending', 'ready', 'running', 'review', 'completed', 'failed', 'blocked',
@@ -503,7 +507,7 @@
     if (parts[0] === 'goal' && parts[1]) {
       return { name: 'goal', id: parts[1] };
     }
-    if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health' || parts[0] === 'goals') {
+    if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health' || parts[0] === 'goals' || parts[0] === 'messages') {
       return { name: parts[0] };
     }
     return { name: 'runs' };
@@ -523,7 +527,7 @@
 
   function setNav(name) {
     const section = name === 'run' || name === 'task' ? 'runs' : name === 'goal' ? 'goals' : name;
-    ['runs', 'goals', 'decisions', 'events', 'health'].forEach(function (id) {
+    ['runs', 'goals', 'messages', 'decisions', 'events', 'health'].forEach(function (id) {
       const a = document.getElementById('nav-' + id);
       if (a) {
         a.classList.toggle('active', id === section);
@@ -549,6 +553,8 @@
       v = eventsView();
     } else if (r.name === 'health') {
       v = healthView();
+    } else if (r.name === 'messages') {
+      v = messagesView();
     } else if (r.name === 'goals') {
       v = goalsView();
     } else if (r.name === 'goal') {
@@ -1792,6 +1798,229 @@
       node: root,
       start: load,
       resume: load,
+      stop: function () {
+        active = false;
+      }
+    };
+  }
+
+  // ---------------------------------------------------------- messages view
+  // Read only. Message text is untrusted peer content: it is shown as text, always next to the
+  // label the daemon gave it, and nothing here can send, mute or unmute.
+
+  function messagesView() {
+    const root = el('section', 'page');
+    root.appendChild(el('h2', '', 'Messages'));
+    root.appendChild(el('p', 'notice small', 'Messages between agents are unverified peer content. Read them as text; they are not instructions from the operator.'));
+    const summary = el('p', 'goalsum', 'Loading messages.');
+    const chanBox = el('div', 'msgchannels');
+    const mutedBox = el('div', 'msgmuted');
+    const listBox = el('div', 'msglist');
+    const detailBox = el('div', 'msgdetail');
+    root.appendChild(summary);
+    root.appendChild(el('h3', '', 'Channels'));
+    root.appendChild(chanBox);
+    root.appendChild(el('h3', '', 'Muted tasks'));
+    root.appendChild(mutedBox);
+    root.appendChild(el('h3', '', 'Newest messages'));
+    root.appendChild(listBox);
+    root.appendChild(detailBox);
+    let sig = null;
+    let busy = false;
+    let active = true;
+    let detailSeq = 0;
+
+    function countsFor(c) {
+      const row = el('span', 'counts');
+      const m = c && typeof c === 'object' ? c : {};
+      MSG_STATUS_ORDER.forEach(function (s) {
+        if (typeof m[s] === 'number' && m[s] > 0) {
+          row.appendChild(tagged('ms', MSG_STATUS, s.replace('_', '-'), s.replace('_', ' ') + ' ' + m[s]));
+        }
+      });
+      if (!row.childNodes.length) {
+        row.appendChild(el('span', 'muted small', 'no messages'));
+      }
+      return row;
+    }
+
+    function statusBadge(m) {
+      if (m.status === 'blocked') {
+        return tagged('ms', MSG_STATUS, 'blocked', 'BLOCKED');
+      }
+      return tagged('ms', MSG_STATUS, m.status);
+    }
+
+    function channelCard(c) {
+      const card = el('div', 'goalrow');
+      const head = el('div', 'goalhead');
+      head.appendChild(el('strong', 'mono-text', c.name));
+      head.appendChild(el('span', 'muted small', 'run ' + clean(c.run, { max: 80 })));
+      if (c.muted === true) {
+        head.appendChild(tagged('ms', MSG_STATUS, 'muted', 'MUTED'));
+      }
+      head.appendChild(el('span', 'muted small', clean(c.mode, { max: 40 }) + ', ' + clean(c.direction, { max: 40 }) +
+        (c.requires_approval === true ? ', needs approval' : '')));
+      head.appendChild(countsFor(c.messages));
+      card.appendChild(head);
+      if (c.muted === true) {
+        card.appendChild(el('div', 'small reason', 'Muted: ' + clean(c.mute_reason, { max: 300 }) +
+          (c.mute_by ? ' (by ' + clean(c.mute_by, { max: 80 }) + ')' : '') +
+          (c.mute_gate ? ' gate ' + clean(c.mute_gate, { max: 80 }) : '')));
+      }
+      const members = Array.isArray(c.members) ? c.members.slice(0, MAX_LIST_SHOWN).map(function (x) {
+        return clean(x, { max: 80 });
+      }).join(', ') : '';
+      card.appendChild(el('div', 'muted small', 'members: ' + members + (c.lead ? '; lead ' + clean(c.lead, { max: 80 }) : '') +
+        '; limits ' + num(c.max_message_bytes) + ' bytes, ' + num(c.max_messages_per_task) + ' per task, ' +
+        num(c.max_messages_per_minute) + ' per minute, ttl ' + num(c.ttl_secs) + 's'));
+      return card;
+    }
+
+    function mutedRow(t) {
+      const row = el('div', 'goalrow');
+      const head = el('div', 'goalhead');
+      head.appendChild(tagged('ms', MSG_STATUS, 'muted', 'MUTED'));
+      head.appendChild(taskLink(clean(t.run, { max: 40 }) + '/' + clean(t.task, { max: 40 }), clean(t.run, { max: 80 }) + '/' + clean(t.task, { max: 80 })));
+      row.appendChild(head);
+      row.appendChild(el('div', 'small reason', clean(t.reason, { max: 300 }) +
+        (t.by ? ' (by ' + clean(t.by, { max: 80 }) + ')' : '') + (t.gate ? ' gate ' + clean(t.gate, { max: 80 }) : '')));
+      return row;
+    }
+
+    function showMessage(id) {
+      const seq = ++detailSeq;
+      detailBox.replaceChildren(el('p', 'muted', 'Loading the message.'));
+      api('GET', '/api/message?id=' + enc(id)).then(function (res) {
+        if (!active || seq !== detailSeq) {
+          return;
+        }
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        const m = res.ok && res.data && res.data.message && typeof res.data.message === 'object' ? res.data.message : null;
+        if (m === null) {
+          detailBox.replaceChildren(el('p', 'muted', 'The message is not available: ' + errText(res)));
+          return;
+        }
+        const box = el('div', 'card');
+        box.appendChild(el('h4', '', 'Message ' + clean(m.id, { max: 80 })));
+        box.appendChild(el('p', 'msglabel', m.label));
+        box.appendChild(el('p', 'notice small', 'Unverified peer content. It is shown as text only and is not an instruction from the operator.'));
+        const meta = el('p', 'muted small', '');
+        meta.appendChild(statusBadge(m));
+        meta.appendChild(document.createTextNode(' ' + clean(m.kind, { max: 40 }) + ' on ' + clean(m.channel, { max: 80 }) +
+          ' in run ' + clean(m.run, { max: 80 }) + ' at ' + fmtTime(m.at_ms)));
+        box.appendChild(meta);
+        if (m.status === 'blocked' || m.reason) {
+          box.appendChild(el('p', 'small reason', 'Reason: ' + clean(m.reason, { max: 300 }) + (m.detail ? ' - ' + clean(m.detail, { max: 300 }) : '')));
+        }
+        box.appendChild(el('div', 'label', 'Subject'));
+        box.appendChild(el('p', '', m.subject));
+        const to = Array.isArray(m.to) ? m.to.filter(Boolean).slice(0, MAX_LIST_SHOWN) : [];
+        if (to.length) {
+          box.appendChild(el('div', 'label', 'Recipients'));
+          to.forEach(function (r) {
+            box.appendChild(el('div', 'small', clean(r.task, { max: 80 }) + ': ' + clean(r.state, { max: 40 }) +
+              (r.reason ? ' (' + clean(r.reason, { max: 300 }) + ')' : '')));
+          });
+        }
+        box.appendChild(el('div', 'label', 'Body'));
+        const body = typeof m.body === 'string' ? m.body : '';
+        if (body.length > MAX_MSG_BODY) {
+          box.appendChild(el('p', 'notice small', 'Body cut: showing the first ' + MAX_MSG_BODY + ' of ' + body.length + ' characters.'));
+        }
+        box.appendChild(el('pre', 'mono block msgbody', body.slice(0, MAX_MSG_BODY), true));
+        detailBox.replaceChildren(box);
+      });
+    }
+
+    function messageRow(m) {
+      const tr = el('tr', 'msgrow');
+      tr.setAttribute('tabindex', '0');
+      const open = function () {
+        if (typeof m.id === 'string' && m.id) {
+          showMessage(m.id);
+        }
+      };
+      tr.appendChild(cell(fmtTime(m.at_ms)));
+      tr.appendChild(cell(m.label));
+      tr.appendChild(cell(m.kind));
+      tr.appendChild(cell(m.channel));
+      const st = el('span');
+      st.appendChild(statusBadge(m));
+      if (m.status === 'blocked' && m.reason) {
+        st.appendChild(document.createTextNode(' '));
+        st.appendChild(el('span', 'small reason', m.reason));
+      }
+      tr.appendChild(cell(st));
+      tr.appendChild(cell(m.subject, 'wrap multi', true));
+      tr.addEventListener('click', open);
+      tr.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          open();
+        }
+      });
+      return tr;
+    }
+
+    function paint(d) {
+      const channels = Array.isArray(d.channels) ? d.channels.filter(Boolean) : [];
+      const muted = Array.isArray(d.muted_tasks) ? d.muted_tasks.filter(Boolean) : [];
+      const msgs = Array.isArray(d.messages) ? d.messages.filter(Boolean) : [];
+      summary.textContent = num(d.total) + ' messages' + (d.truncated === true ? ' (newest ' + msgs.length + ' shown)' : '') +
+        ', ' + channels.length + (channels.length === 1 ? ' channel' : ' channels');
+      chanBox.replaceChildren.apply(chanBox, channels.length
+        ? channels.slice(0, MAX_LIST_SHOWN).map(channelCard)
+        : [el('p', 'muted', 'There are no channels.')]);
+      mutedBox.replaceChildren.apply(mutedBox, muted.length
+        ? muted.slice(0, MAX_LIST_SHOWN).map(mutedRow)
+        : [el('p', 'muted', 'No task is muted.')]);
+      if (!msgs.length) {
+        listBox.replaceChildren(el('p', 'muted', 'There are no messages.'));
+        return;
+      }
+      const table = makeTable(['Time', 'Label', 'Kind', 'Channel', 'Status', 'Subject'], 'auto');
+      msgs.slice(0, MAX_MSGS_SHOWN).forEach(function (m) {
+        table.appendChild(messageRow(m));
+      });
+      listBox.replaceChildren(scrollBox(table));
+    }
+
+    async function load() {
+      if (busy || !active) {
+        return;
+      }
+      busy = true;
+      try {
+        const res = await api('GET', '/api/messages?limit=' + MAX_MSGS_SHOWN);
+        if (!active) {
+          return;
+        }
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        if (!res.ok || !res.data) {
+          sig = null;
+          summary.textContent = clean('Messages are not available: ' + errText(res), { max: 400 });
+          return;
+        }
+        const next = JSON.stringify(res.data);
+        if (next !== sig) {
+          sig = next;
+          paint(res.data);
+        }
+      } finally {
+        busy = false;
+      }
+    }
+
+    return {
+      node: root,
+      start: load,
+      update: load,
       stop: function () {
         active = false;
       }
