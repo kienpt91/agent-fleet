@@ -490,25 +490,25 @@ pub(crate) fn events_layer(
         .map(|(i, e)| {
             let c = h.block(&e.output, MAX_EVIDENCE_OUTPUT);
             d.clipped |= c.clipped;
+            // the source line holds only what fleet wrote (ids and the verdict); the summary a
+            // check produced can carry names from the checked tree, so it is quoted with the output
             let source = format!(
-                "output of evidence {}: goal {}, check {}, verdict {}: {}",
+                "output of evidence {}: goal {}, check {}, verdict {}",
                 h.line(&e.id, MAX_ID),
                 h.line(&e.goal, MAX_ID),
                 h.line(&e.check, MAX_ID),
-                h.line(&e.verdict, 20),
-                h.line(&e.summary, MAX_CHECK_TEXT)
+                h.line(&e.verdict, 20)
             );
+            let summary = h.line(&e.summary, MAX_CHECK_TEXT);
+            let body = if c.text.is_empty() {
+                format!("summary: {summary}\n(no output)")
+            } else {
+                format!("summary: {summary}\n{}", c.text)
+            };
             unverified_item(
                 format!("evidence {}", h.line(&e.id, MAX_ID)),
                 800 + u32::try_from(i).unwrap_or(0),
-                unverified_text(
-                    &source,
-                    if c.text.is_empty() {
-                        "(no output)"
-                    } else {
-                        &c.text
-                    },
-                ),
+                unverified_text(&source, &body),
             )
         })
         .collect();

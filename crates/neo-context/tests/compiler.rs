@@ -997,3 +997,70 @@ fn many_goals_tasks_checks_and_paths_are_capped_with_a_count() {
     assert!(body(&p, LayerId::RecentEvents).contains("- and 460 more"));
     assert!(p.manifest().layers[2].clipped && p.manifest().layers[3].clipped);
 }
+
+#[test]
+fn what_a_check_wrote_is_quoted_and_the_unquoted_source_line_holds_only_fleets_words() {
+    let mut i = sample_input();
+    i.unverified.evidence = vec![EvidenceExcerpt {
+        id: "e1".to_string(),
+        goal: "billing".to_string(),
+        check: "scope".to_string(),
+        verdict: "failed".to_string(),
+        summary: "changed paths outside the allowed set: FORGED-PATH-NAME.rs".to_string(),
+        output: "FORGED-OUTPUT".to_string(),
+    }];
+    let p = ok(&i, SMALL);
+    let seven = body(&p, LayerId::RecentEvents);
+    let source = seven
+        .lines()
+        .find(|l| l.starts_with("UNVERIFIED (output of evidence"))
+        .unwrap();
+    assert_eq!(
+        source,
+        "UNVERIFIED (output of evidence e1: goal billing, check scope, verdict failed):"
+    );
+    assert!(seven.contains("> summary: changed paths outside the allowed set: FORGED-PATH-NAME.rs"));
+    assert!(seven.contains("> FORGED-OUTPUT"));
+    for line in seven.lines().filter(|l| l.contains("FORGED")) {
+        assert!(line.starts_with("> "), "{line}");
+    }
+}
+
+#[test]
+fn text_that_matches_a_secret_rule_is_replaced_in_every_layer_that_takes_text() {
+    let url = format!(
+        "{}://admin:{}@db.internal/app",
+        "postgres", "hunter2hunter2"
+    );
+    let assign = format!("API_KEY = \"{}\"", "z".repeat(30));
+    let mut i = sample_input();
+    i.charter.constraints = vec![format!("connect with {url}")];
+    i.task.spec = format!("setup\n{assign}\nend");
+    i.events[0].text = format!("saw {url}");
+    i.unverified.notes[0].text = format!("worker says {assign}");
+    i.knowledge[0].claim = format!("the dsn is {url}");
+    let p = ok(&i, SMALL);
+    assert!(
+        !p.text().contains("hunter2") && !p.text().contains("zzzzzz"),
+        "{}",
+        p.text()
+    );
+    assert!(p.text().contains("the line matches the secret rule"));
+}
+
+#[test]
+fn layers_one_to_five_are_the_same_for_the_same_plan_whatever_the_workers_paths_or_files_are() {
+    let base = ok(&sample_input(), SMALL);
+    let mut i = sample_input();
+    i.working_set.files.clear();
+    i.unverified.changed = (0..30)
+        .map(|n| ChangedPath {
+            path: format!("anything/{n}.rs"),
+        })
+        .collect();
+    i.unverified.changed_total = 30;
+    i.unverified.work = vec![];
+    let moved = ok(&i, SMALL);
+    assert_eq!(base.stable_digest(), moved.stable_digest());
+    assert_eq!(&digests(&base)[..5], &digests(&moved)[..5]);
+}

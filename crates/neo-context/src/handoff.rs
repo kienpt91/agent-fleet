@@ -257,10 +257,12 @@ impl HandoffPacket {
 
     /// The packet for people: plain text, with the worker's summary quoted and labelled.
     pub fn render(&self) -> String {
+        // everything printed here came out of a stored document: shown on one line, controls visible
+        let plain = |s: &str| fleet_domain::sanitize::flatten_line(s, 120);
         let mut out = format!(
             "Handoff of {}/{}, attempt {}, trigger {}\ndigest: {}\npack: {} (profile {})\nlayers 1-5 digest: {}\n",
-            self.run,
-            self.task,
+            plain(&self.run),
+            plain(&self.task),
             self.attempt,
             self.trigger.as_str(),
             self.digest,
@@ -285,16 +287,16 @@ impl HandoffPacket {
         for v in &self.verification {
             out.push_str(&format!(
                 "  goal {} check {} ({}): {}{}{}\n",
-                v.goal,
-                v.check,
+                plain(&v.goal),
+                plain(&v.check),
                 if v.mandatory { "mandatory" } else { "optional" },
                 v.state.as_str(),
                 v.commit
                     .as_ref()
-                    .map_or(String::new(), |c| format!(" on {c}")),
+                    .map_or(String::new(), |c| format!(" on {}", plain(c))),
                 v.evidence
                     .as_ref()
-                    .map_or(String::new(), |e| format!(" (evidence {e})")),
+                    .map_or(String::new(), |e| format!(" (evidence {})", plain(e))),
             ));
         }
         out.push_str(&format!(
@@ -302,7 +304,11 @@ impl HandoffPacket {
             if self.evidence.is_empty() {
                 "none".to_string()
             } else {
-                self.evidence.join(", ")
+                self.evidence
+                    .iter()
+                    .map(|e| plain(e))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         ));
         match &self.summary {

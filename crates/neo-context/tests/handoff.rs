@@ -198,3 +198,40 @@ fn bounded_lists_are_cut() {
     assert_eq!(many.verification.len(), 64);
     assert_eq!(many.evidence.len(), 32);
 }
+
+#[test]
+fn rendering_shows_stored_strings_as_plain_one_line_text() {
+    let c = c();
+    let pack = c.compile(&sample_input(), &Sha256Ref).unwrap();
+    let hostile = "g\u{1b}[31m\nfake line\u{202e}";
+    let p = HandoffPacket::new(
+        HandoffParts {
+            run: "r".to_string(),
+            task: "t".to_string(),
+            attempt: 1,
+            trigger: HandoffTrigger::OnDemand,
+            verification: vec![VerificationLine {
+                goal: hostile.to_string(),
+                check: hostile.to_string(),
+                mandatory: true,
+                state: CheckState::Failed,
+                commit: Some(hostile.to_string()),
+                evidence: Some(hostile.to_string()),
+            }],
+            evidence: vec![hostile.to_string()],
+            summary: None,
+        },
+        &pack,
+        c.hygiene(),
+        &Sha256Ref,
+    );
+    let text = p.render();
+    assert!(
+        !text.contains('\u{1b}') && !text.contains('\u{202e}'),
+        "{text:?}"
+    );
+    assert!(
+        !text.lines().any(|l| l.starts_with("fake line")),
+        "a stored string cannot start a line of its own: {text}"
+    );
+}

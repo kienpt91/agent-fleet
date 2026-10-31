@@ -1,6 +1,7 @@
 //! Making untrusted text safe to put into a pack: sanitized with the domain's sanitizer, redacted
 //! with the daemon's redactor, clipped, and shaped so that it cannot start a line of its own.
 
+use crate::secret;
 use fleet_domain::redact::{Redactor, StreamRedactor};
 use fleet_domain::sanitize::{flatten_line, head_str, sanitize_text, QUOTE_PREFIX};
 use std::sync::Arc;
@@ -18,6 +19,16 @@ pub struct Hygiene {
     redactor: Arc<Redactor>,
 }
 
+/// A line that matches one of the secret rules is replaced whole: the redactor knows key prefixes and
+/// the daemon's secret values, the rules know shapes it does not (a password in a URL, a quoted
+/// `api_key = "..."` assignment, a JWT, in any case).
+fn scrub(line: String) -> String {
+    match secret::scan_line(&line) {
+        Some(rule) => format!("[REDACTED: the line matches the secret rule {rule}]"),
+        None => line,
+    }
+}
+
 impl Hygiene {
     pub fn new(redactor: Arc<Redactor>) -> Hygiene {
         Hygiene { redactor }
@@ -32,7 +43,7 @@ impl Hygiene {
         let mut stream = StreamRedactor::new(Arc::clone(&self.redactor));
         let kept: Vec<String> = sanitized
             .split('\n')
-            .filter_map(|line| stream.line(line).map(|l| l.trim_end().to_string()))
+            .filter_map(|line| stream.line(line).map(|l| scrub(l.trim_end().to_string())))
             .collect();
         let joined = kept.join("\n");
         let trimmed = joined.trim_matches('\n');
@@ -50,7 +61,7 @@ impl Hygiene {
         let bounded = head_str(raw, max.saturating_mul(4));
         let sanitized = sanitize_text(bounded.as_bytes());
         let flat = flatten_line(&sanitized, usize::MAX / 4);
-        let redacted = self.redactor.redact(&flat).into_owned();
+        let redacted = scrub(self.redactor.redact(&flat).into_owned());
         flatten_line(&redacted, max)
     }
 }
@@ -142,5 +153,35 @@ mod tests {
         }
         assert_eq!(quote("a\n\nb"), "> a\n>\n> b");
         assert_eq!(indent("a\n\nb"), "  a\n\n  b");
+    }
+
+    #[test]
+    fn a_line_with_a_secret_shape_the_redactor_does_not_know_is_replaced_whole() {
+        let h = hygiene();
+        let url = format!(
+            "{}://admin:{}@db.internal/app",
+            "postgres", "hunter2hunter2"
+        );
+        let assign = format!("API_KEY = \"{}\"", "z".repeat(30));
+        let text = format!("fine line\nconnect to {url}\n{assign}\nlast line");
+        let c = h.block(&text, 1000);
+        assert_eq!(c.text.lines().count(), 4);
+        assert_eq!(c.text.lines().next(), Some("fine line"));
+        assert_eq!(c.text.lines().last(), Some("last line"));
+        assert!(
+            c.text.contains("matches the secret rule url-with-password"),
+            "{}",
+            c.text
+        );
+        assert!(c
+            .text
+            .contains("matches the secret rule quoted-secret-assignment"));
+        assert!(!c.text.contains("hunter2") && !c.text.contains("zzzz"));
+        let one = h.line(&format!("see {url} please"), 200);
+        assert!(
+            one.contains("secret rule") && !one.contains("hunter2"),
+            "{one}"
+        );
+        assert_eq!(h.line("plain words", 50), "plain words");
     }
 }

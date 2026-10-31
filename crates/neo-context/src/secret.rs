@@ -46,6 +46,12 @@ fn starts_with_at(s: &[u8], at: usize, lit: &[u8]) -> bool {
     s.get(at..at + lit.len()) == Some(lit)
 }
 
+/// Like [`starts_with_at`], ignoring ASCII case.
+fn starts_with_at_ci(s: &[u8], at: usize, lit: &[u8]) -> bool {
+    s.get(at..at + lit.len())
+        .is_some_and(|part| part.eq_ignore_ascii_case(lit))
+}
+
 /// `prefix` followed by at least `min` characters of the class.
 fn prefixed(line: &[u8], prefix: &[u8], class: fn(u8) -> bool, min: usize) -> bool {
     occurrences(line, prefix).any(|i| run(line, i + prefix.len(), class) >= min)
@@ -66,9 +72,16 @@ fn aws_access_key_id(line: &[u8]) -> bool {
             let before_ok = i == 0 || line.get(i - 1).is_some_and(|b| !is_alnum(*b));
             let body = i + 4;
             let upper_digit = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit();
-            let n = run(line, body, upper_digit);
+            // exactly 16 characters follow, so looking at 17 is enough: the work per occurrence
+            // is constant, however long the run of capitals and digits is
+            let n = line.get(body..).map_or(0, |rest| {
+                rest.iter()
+                    .take(17)
+                    .take_while(|b| upper_digit(**b))
+                    .count()
+            });
             let after_ok = line.get(body + 16).is_none_or(|b| !is_alnum(*b));
-            before_ok && n >= 16 && after_ok
+            before_ok && n == 16 && after_ok
         })
     })
 }
@@ -93,22 +106,34 @@ fn slack_token(line: &[u8]) -> bool {
 }
 
 fn jwt(line: &[u8]) -> bool {
-    occurrences(line, b"eyJ").any(|i| {
+    // Every occurrence of the prefix inside one run of token characters has the same run end, and so
+    // the same answer for everything after it (a shorter first part can only fail where a longer one
+    // failed): after an occurrence is judged, the rest of its run is skipped, which keeps the scan
+    // linear on lines made of nothing but the prefix.
+    let mut skip_until = 0;
+    for i in occurrences(line, b"eyJ") {
+        if i < skip_until {
+            continue;
+        }
         let first = i + 3;
         let n1 = run(line, first, is_token);
+        skip_until = first + n1;
         if n1 < 15 || line.get(first + n1) != Some(&b'.') {
-            return false;
+            continue;
         }
         let second = first + n1 + 1;
         if !starts_with_at(line, second, b"eyJ") {
-            return false;
+            continue;
         }
         let n2 = run(line, second + 3, is_token);
         if n2 < 15 || line.get(second + 3 + n2) != Some(&b'.') {
-            return false;
+            continue;
         }
-        run(line, second + 3 + n2 + 1, is_token) >= 10
-    })
+        if run(line, second + 3 + n2 + 1, is_token) >= 10 {
+            return true;
+        }
+    }
+    false
 }
 
 fn url_with_password(line: &[u8]) -> bool {
@@ -121,10 +146,8 @@ fn url_with_password(line: &[u8]) -> bool {
             .unwrap_or_default()
             .iter()
             .rev()
-            .take_while(|b| {
-                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(**b, b'+' | b'.' | b'-')
-            })
-            .any(|b| b.is_ascii_lowercase());
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(**b, b'+' | b'.' | b'-'))
+            .any(|b| b.is_ascii_alphabetic());
         if !scheme_has_letter {
             return false;
         }
@@ -143,22 +166,23 @@ fn url_with_password(line: &[u8]) -> bool {
 }
 
 /// The names of the scanner's `quoted-secret-assignment` rule, each as the possible lengths of
-/// the text it matches at a position.
+/// the text it matches at a position. Names match in any case (`API_KEY = "..."` is as much a
+/// secret as `api_key`): the commit gate is case-sensitive, a file that goes to a model should not be.
 fn assignment_name_lengths(line: &[u8], at: usize) -> Vec<usize> {
     let mut out = Vec::new();
     for lit in [&b"secret"[..], b"token", b"passwd", b"password"] {
-        if starts_with_at(line, at, lit) {
+        if starts_with_at_ci(line, at, lit) {
             out.push(lit.len());
         }
     }
     for (head, tail) in [(&b"api"[..], &b"key"[..]), (b"private", b"key")] {
-        if starts_with_at(line, at, head) {
+        if starts_with_at_ci(line, at, head) {
             let after = at + head.len();
-            if starts_with_at(line, after, tail) {
+            if starts_with_at_ci(line, after, tail) {
                 out.push(head.len() + tail.len());
             }
             if matches!(line.get(after), Some(b'_') | Some(b'-'))
-                && starts_with_at(line, after + 1, tail)
+                && starts_with_at_ci(line, after + 1, tail)
             {
                 out.push(head.len() + 1 + tail.len());
             }
@@ -250,15 +274,20 @@ pub fn rule_names() -> Vec<&'static str> {
     RULES.iter().map(|(n, _)| *n).collect()
 }
 
-/// True for a file name (the last path component) the scanner refuses to see in a repository.
+/// True for a file name (the last path component) the repository's secret scanner refuses to see in
+/// a commit, and for a few more that hold credentials by convention (`.npmrc`, `.pgpass`,
+/// `.git-credentials`, ...): a file that is about to go to a model is held to a stricter list than a
+/// commit. Names are compared in lower case.
 pub fn forbidden_name(base: &str) -> bool {
+    let base = base.to_ascii_lowercase();
+    let base = base.as_str();
     let env_like = base == ".env" || base.starts_with(".env.") || base.ends_with(".env");
     if env_like {
         let template = matches!(base, ".env.example" | ".env.sample" | ".env.template")
             || base.ends_with(".env.example");
         return !template;
     }
-    const SUFFIXES: [&str; 7] = [
+    const SUFFIXES: [&str; 8] = [
         ".pem",
         ".key",
         ".p12",
@@ -266,6 +295,7 @@ pub fn forbidden_name(base: &str) -> bool {
         ".jks",
         ".keystore",
         ".tfstate",
+        ".p8",
     ];
     if SUFFIXES.iter().any(|s| base.ends_with(s)) {
         return true;
@@ -273,7 +303,7 @@ pub fn forbidden_name(base: &str) -> bool {
     if base.contains(".tfstate.") {
         return true;
     }
-    for stem in ["id_rsa", "id_ed25519", "id_ecdsa"] {
+    for stem in ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"] {
         if base == stem || base.starts_with(&format!("{stem}.")) {
             return true;
         }
@@ -284,11 +314,27 @@ pub fn forbidden_name(base: &str) -> bool {
     matches!(
         base,
         ".netrc"
+            | "_netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | ".pgpass"
+            | ".htpasswd"
+            | ".git-credentials"
+            | ".dockercfg"
+            | "kubeconfig"
             | "credentials.json"
             | "secrets.json"
             | "secrets.yml"
             | "secrets.yaml"
             | "secrets.toml"
+    )
+}
+
+/// Directories whose contents are credentials by convention, whatever the file is called.
+pub fn forbidden_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".aws" | ".ssh" | ".gnupg" | ".kube" | ".docker"
     )
 }
 
@@ -299,7 +345,10 @@ pub fn base_name(path: &str) -> &str {
 
 /// Why a file must not be shown, if it must not: its name, or something in its content.
 pub fn refusal(path: &str, content: &[u8]) -> Option<String> {
-    if path.split('/').any(forbidden_name) {
+    if path
+        .split('/')
+        .any(|part| forbidden_name(part) || forbidden_dir(part))
+    {
         return Some("forbidden file name".to_string());
     }
     scan_bytes(content).map(|rule| format!("matches secret rule {rule}"))
@@ -507,5 +556,158 @@ mod tests {
         assert!(refusal("src/a.rs", &bytes).is_some());
         assert_eq!(base_name("a/b/c.rs"), "c.rs");
         assert_eq!(base_name("c.rs"), "c.rs");
+    }
+
+    // ---- bounded work on hostile lines --------------------------------------------------------
+
+    /// Runs `scan` on a one-line input of `len` bytes made of `unit` repeated, and fails if it takes
+    /// more than a few seconds: a quadratic matcher needs minutes on a megabyte.
+    fn bounded(unit: &str, len: usize) {
+        let line = unit.repeat(len / unit.len());
+        let start = std::time::Instant::now();
+        let hit = scan_line(&line);
+        let took = start.elapsed();
+        assert!(
+            took.as_secs() < 5,
+            "{unit:?} x {}: {took:?}",
+            len / unit.len()
+        );
+        // none of these is a secret (the long ones that are, are found at once)
+        let _ = hit;
+    }
+
+    #[test]
+    fn worst_case_lines_are_scanned_in_linear_time() {
+        let mb = 256 * 1024;
+        for unit in [
+            "AKIA",
+            "ASIA",
+            "AKIAA",
+            "eyJ",
+            "eyJa.",
+            "eyJeyJ.",
+            "://",
+            "a://",
+            "a://b:",
+            "ghp_",
+            "sk-",
+            "sk_live_",
+            "npm_",
+            "0x",
+            "-----BEGIN ",
+            "secret",
+            "secret ",
+            "token=\"",
+            "api_",
+            "xoxb-",
+            "AIza",
+            "whsec_",
+            "x.eyJ",
+            "A",
+            "eyJ.eyJ.",
+        ] {
+            bounded(unit, mb);
+        }
+    }
+
+    #[test]
+    fn the_skipping_in_the_jwt_rule_changes_no_answer() {
+        let head = format!("eyJ{}", "a".repeat(20));
+        let body = format!("eyJ{}", "b".repeat(20));
+        let sig = "c".repeat(12);
+        // a real shape after many false starts is still found
+        let noise = "eyJ".repeat(5000);
+        assert_eq!(
+            scan_line(&format!("{noise} {head}.{body}.{sig}")),
+            Some("jwt")
+        );
+        assert_eq!(
+            scan_line(&format!("{noise}{head}.{body}.{sig}")),
+            Some("jwt")
+        );
+        // the same shape with a short signature is not
+        assert_eq!(
+            scan_line(&format!("{noise} {head}.{body}.{}", "c".repeat(9))),
+            None
+        );
+        // a prefix that starts inside the first part of another does not hide the real one
+        assert_eq!(
+            scan_line(&format!("eyJeyJ{}.{body}.{sig}", "a".repeat(20))),
+            Some("jwt")
+        );
+    }
+
+    #[test]
+    fn the_aws_rule_still_wants_exactly_sixteen_after_the_prefix() {
+        let id = |n: usize| format!("x AKIA{} y", "Q".repeat(n));
+        assert_eq!(scan_line(&id(16)), Some("aws-access-key-id"));
+        for n in [0, 15, 17, 40] {
+            assert_eq!(scan_line(&id(n)), None, "{n}");
+        }
+        assert_eq!(
+            scan_line(&format!("AKIA{}a", "Q".repeat(16))),
+            None,
+            "a lowercase letter continues the word"
+        );
+        assert_eq!(
+            scan_line(&format!("ASIA{}", "7".repeat(16))),
+            Some("aws-access-key-id")
+        );
+    }
+
+    // ---- stricter than the commit gate, on purpose ---------------------------------------------
+
+    #[test]
+    fn names_and_schemes_match_in_any_case() {
+        let value = "a".repeat(30);
+        for line in [
+            format!("API_KEY = \"{value}\""),
+            format!("Password: '{value}'"),
+            format!("PRIVATE-KEY=\"{value}\""),
+            format!("Secret=\"{value}\""),
+            format!("{}://user:{}@host", "POSTGRES", "p".repeat(8)),
+            format!("{}://user:{}@host", "Https", "p".repeat(8)),
+        ] {
+            assert!(scan_line(&line).is_some(), "{line}");
+        }
+        assert_eq!(scan_line("API_KEY = \"short\""), None);
+        assert_eq!(scan_line("// the PASSWORD field is optional"), None);
+    }
+
+    #[test]
+    fn more_credential_files_and_directories_are_refused() {
+        for bad in [
+            ".ENV",
+            "ID_RSA",
+            "Credentials.JSON",
+            ".npmrc",
+            ".pgpass",
+            ".htpasswd",
+            ".git-credentials",
+            ".pypirc",
+            "AuthKey_ABC.p8",
+            "kubeconfig",
+            "id_dsa",
+        ] {
+            assert!(forbidden_name(bad), "{bad}");
+        }
+        for fine in [
+            ".env.example",
+            ".ENV.EXAMPLE",
+            "npmrc.md",
+            "key.rs",
+            "kubectl.md",
+        ] {
+            assert!(!forbidden_name(fine), "{fine}");
+        }
+        for dir in [".aws", ".SSH", ".gnupg", ".kube", ".docker"] {
+            assert!(forbidden_dir(dir), "{dir}");
+            assert!(
+                refusal(&format!("home/{dir}/anything"), b"harmless").is_some(),
+                "{dir}"
+            );
+        }
+        assert!(!forbidden_dir("aws") && !forbidden_dir("src"));
+        assert!(refusal("src/.Env", b"A=1").is_some());
     }
 }

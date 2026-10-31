@@ -38,7 +38,9 @@ impl LayerId {
     ];
 
     /// Layers 1 to 5 hold nothing an agent or a tool wrote. Their digests are the stable part of a
-    /// pack: the same state always gives the same ones.
+    /// pack: for the same plan, goal ledger, results of fleet's own checks and configuration they
+    /// are the same whatever the attempt, the events, the working set or the handoff. They change
+    /// when that state does (layer 3 lists the plan, layer 4 what fleet's own runs said).
     pub const STABLE: [LayerId; 5] = [
         LayerId::Invariants,
         LayerId::Charter,

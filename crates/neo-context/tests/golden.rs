@@ -12,24 +12,24 @@ use neo_context::layer::UnverifiedPolicy;
 use neo_context::pack::{read_document, Manifest};
 use neo_context::testing::{compiler, sample_handoff, sample_input, Sha256Ref};
 
-pub const SAMPLE_PACK: &str = "7a46e27d834b4402df690b7a17fdc0275159cb849725bed49db82d6d71776a0c";
-pub const SAMPLE_STABLE: &str = "95caec77bf88dbcfc2de12602522db60a49ed2689cd4b5e5f4d9fcdcedf43c26";
+pub const SAMPLE_PACK: &str = "edc8af0fd4eadee87af23aa25f836ab092437c643984897bedd78399189fb612";
+pub const SAMPLE_STABLE: &str = "460042244d8c1a5e5ca60d77e9e33a766c33349e4212837122a94651ca1a4a7e";
 pub const SAMPLE_LAYERS: [&str; 8] = [
-    "ccd7c687028af53a9505cf07cf9f36573b06168ed3314db42c7c978a3b9a52bf",
+    "61ddecdb95efe2693057d1e9827969680c6c3eddcd493f80114b493d461f2cc2",
     "a668c44bd1640ca6c35ac9549ce6b4439d1952cd993226fa80f97431da2b6590",
     "311df98459c38973cc527caaf0aa11a8d4bc9ffb6aaafc227279d03d8355f5f7",
     "05cbe0bbe3306b15d7149f8341cb57fcbbeff3139b990db22787c46f1e5ccfed",
     "b929985f453f9cd4cf2e8abf1f487e0f02fa65c1dd0ea377fff887dd85769231",
     "787237f6eb2df38a674bc262a3a06ace971e66fc85d2f379730af622c2cf5e2b",
     "341ed30f8c8c3e3566dd4dea7985596dc7e49e0b4e8b8facfa8502feee9f02a6",
-    "0720b63350ce2c84cabbb5ef98b63719836bacb576c679af2f64fa333f089322",
+    "f704b5213d0529f9eaaa6424cccc49eef41a6a5832f7f45692de0604d0b03a29",
 ];
 pub const SAMPLE_MANIFEST_BYTES: usize = 2244;
-pub const SAMPLE_HANDOFF: &str = "3354fb1fffe6fe0f5fe4b6638ab99ea1d7fadf05819c6995ad8827d4b18144d6";
+pub const SAMPLE_HANDOFF: &str = "06866e5d219d97c68b93ece51e5803061b6f802480e3d2250c3390c551dba622";
 pub const SAMPLE_WITH_HANDOFF: &str =
-    "a901528edc1ceb6a59cbebaddfde87dd71fdc48d26b7cb3316502aafebd2a2b8";
+    "e021fa86276a41cf0bf7bacdee77130cd5e86a0a76e9c7fbf212c9d92d310bc1";
 pub const SAMPLE_EXCLUDED: &str =
-    "477b282a8ec93c7d01ecf8800c1d8e0e4df80fda415155c155c0a2c0a69ac5e8";
+    "d7343809c467b85d57b49892002eebd3215fb2485811107ca541496d0c816db6";
 
 #[test]
 fn the_sample_pack_has_the_digests_written_down() {
@@ -101,7 +101,7 @@ fn the_stored_document_reads_back_to_the_same_manifest() {
     let p = c.compile(&sample_input(), &Sha256Ref).unwrap();
     let json = p.document().canonical();
     // the document is canonical JSON: a stable text of its own
-    assert!(json.starts_with("{\"digest\":\"7a46e27d"));
+    assert!(json.starts_with("{\"digest\":\"edc8af0f"));
     assert!(json.contains("\"schema\":\"neo-context/1\""));
     let (digest, manifest) = read_document(&p.document()).unwrap();
     assert_eq!(digest, SAMPLE_PACK);

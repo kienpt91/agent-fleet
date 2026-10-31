@@ -96,6 +96,14 @@ impl Redactor {
                 r("api-key", "sk-", Charset::Token, 20),
                 r("google-api-key", "AIza", Charset::Token, 35),
                 r("bearer-token", "Bearer ", Charset::Token, 16),
+                r("stripe-key", "sk_live_", Charset::Alnum, 16),
+                r("stripe-key", "sk_test_", Charset::Alnum, 16),
+                r("stripe-key", "rk_live_", Charset::Alnum, 16),
+                r("stripe-key", "rk_test_", Charset::Alnum, 16),
+                r("stripe-webhook", "whsec_", Charset::Alnum, 16),
+                r("npm-token", "npm_", Charset::Alnum, 36),
+                // a JSON web token: the token charset includes the dots, so all three parts go
+                r("jwt", "eyJ", Charset::Token, 15),
             ],
         }
     }
@@ -107,7 +115,8 @@ impl Redactor {
                 "more than {MAX_REDACT_LITERALS} redaction literals"
             )));
         }
-        if self.rules.len() + rules.len() > MAX_REDACT_RULES + 16 {
+        // the built-in rules count too: room for them and for every rule an operator may add
+        if self.rules.len() + rules.len() > MAX_REDACT_RULES + 32 {
             return Err(FleetError::limit(format!(
                 "more than {MAX_REDACT_RULES} redaction rules"
             )));
@@ -276,6 +285,50 @@ mod tests {
         assert_eq!(r.redact("ghp_short and sk-abc"), "ghp_short and sk-abc");
     }
 
+    #[test]
+    fn stripe_npm_and_jwt_shapes_are_built_in() {
+        let r = Redactor::builtin();
+        let stripe = format!("{}{}", "sk_live_", "a1B2".repeat(6));
+        let hook = format!("{}{}", "whsec_", "a1B2".repeat(6));
+        let npm = format!("{}{}", "npm_", "a1B2".repeat(10));
+        let jwt = [
+            "eyJhbGciOiJIUzI1NiJ9",
+            "eyJzdWIiOiIxMjM0NTY3",
+            "c2lnbmF0dXJlLXZhbHVl",
+        ]
+        .join(".");
+        for (name, secret) in [
+            ("stripe-key", &stripe),
+            ("stripe-webhook", &hook),
+            ("npm-token", &npm),
+            ("jwt", &jwt),
+        ] {
+            let line = format!("value: {secret} end");
+            let out = r.redact(&line);
+            assert!(out.contains(&format!("[REDACTED:{name}]")), "{name}: {out}");
+            assert!(
+                !out.contains(secret.as_str()) && out.ends_with(" end"),
+                "{name}: {out}"
+            );
+        }
+        // a short word that starts like one is left alone
+        assert_eq!(r.redact("eyJ is a prefix"), "eyJ is a prefix");
+        assert_eq!(r.redact("npm_run_build"), "npm_run_build");
+    }
+
+    #[test]
+    fn operators_keep_room_for_their_own_rules_beside_the_built_in_ones() {
+        let mut r = Redactor::builtin();
+        let rules: Vec<Rule> = (0..MAX_REDACT_RULES)
+            .map(|i| Rule {
+                name: format!("r{i}"),
+                prefix: format!("zz{i}-"),
+                charset: Charset::Alnum,
+                min_len: 8,
+            })
+            .collect();
+        assert!(r.extend(&[], rules).is_ok());
+    }
     #[test]
     fn aws_and_bearer_shapes() {
         let r = Redactor::builtin();
