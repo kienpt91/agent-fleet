@@ -42,6 +42,11 @@ fleet plan plan.toml  ->  fleet start  ->  one worker per ready task, in .fleet-
   see [Memory](#memory) for measured numbers with flooding workers.
 - **A dashboard and an interactive attach.** `fleet tui` shows runs, the DAG, sanitized live output, approvals and
   gates; `fleet attach` is a real interactive terminal into a worker with a detach key.
+- **An optional local web dashboard.** `fleet daemon --web 127.0.0.1:0` serves the same views in a browser (runs and DAG,
+  live output, the approval and gate queue, send input, merge, event log with chain status, health), behind a per-start
+  token, a strict Host check, CSRF protection and the same refusal of worker processes as the control socket. It is a
+  hand-written HTTP server on `std::net`, loopback only unless you say otherwise, with no new dependency. See
+  [Web dashboard](#web-dashboard).
 
 It does not make agents smarter and it does not sandbox them. See [Limitations](#limitations).
 
@@ -54,6 +59,7 @@ cargo build --release            # produces target/release/fleet
 mkdir -p ~/.local/state/agent-fleet
 cp examples/fleet.example.toml ~/.local/state/agent-fleet/fleet.toml   # then edit [workers.agent]
 target/release/fleet daemon      # foreground; stop it with `fleet shutdown` from another terminal
+                                 # add --web 127.0.0.1:0 for the browser dashboard (prints a login URL once)
 ```
 
 In another terminal:
@@ -328,7 +334,10 @@ global options (before or after the command):
   -V, --version       show the version
 
 daemon:
-  daemon [--config <fleet.toml>]     run the daemon in the foreground
+  daemon [--config <fleet.toml>] [--web <addr> [--web-allow-remote]]
+                                     run the daemon in the foreground; --web serves the local
+                                     dashboard (<ip>:<port>, <port> or <ip>; loopback only unless
+                                     --web-allow-remote; the login URL is printed once)
   shutdown                           ask the daemon to stop
   doctor [--config <fleet.toml>]     check the setup (exit 13 when something fails)
   verify-log                         verify the event log's hash chain (exit 11 when tampered)
@@ -474,6 +483,131 @@ fleet 0.1.0 | runs 1 | pend 1 rdy 0 run 1 rev 0 ok 1 fail 0 blk 1 | sess 1/4 | u
 q quit  j/k move  Tab focus  Enter attach/answer  a/d approve/deny  s stop  t retry  m merge  r refresh  ? hel
 ```
 
+## Web dashboard
+
+`fleet daemon --web <addr>` serves a browser dashboard from the daemon. It is **off by default**; `<addr>` is `<ip>:<port>`,
+a bare `<port>` (on 127.0.0.1) or an `<ip>` (ephemeral port, so `--web 127.0.0.1:0` picks a free one). A non-loopback address is
+refused unless `--web-allow-remote` is also given, and then a warning about the missing TLS is printed. The page offers:
+
+- runs and a **DAG view** (tasks in columns by dependency depth, status badges, edges drawn as SVG), task detail with the
+  quality-gate results;
+- **live output** of a task (server-sent events with bounded chunks, a bounded 256 KiB view in the page) and a box to **send
+  input** to the worker;
+- the **decision gates and approvals queue**: the exact action, every argument, the full digest and a countdown to the
+  expiry, with Approve and Deny; the request carries the digest the page showed, so an approval is still bound to it. A
+  **merge** button asks the daemon to merge; the daemon answers `approval_required` exactly as `fleet merge` does and the
+  operator approves in the queue first;
+- the **event log** with its hash-chain verification status, and a **health panel** (the `fleet doctor` checks).
+
+Starting runs, stopping or cancelling tasks, attaching and shutting the daemon down stay on the command line.
+
+```text
+fleet daemon: pid 1666 listening on .../control/fleet.sock (stop with `fleet shutdown`)
+fleet web: dashboard on http://127.0.0.1:33019/
+fleet web: login URL (shown only now, valid until the daemon stops): http://127.0.0.1:33019/#token=<64 hex>
+```
+
+The login URL is printed once, to the daemon's terminal; the token is not written to any file or log and workers never
+see it. The token sits in the URL *fragment*, which browsers never send to a server: the page POSTs it to `/api/login`,
+receives an `HttpOnly; SameSite=Strict` session cookie (a random id, not the token) plus a per-session CSRF token, and
+removes the fragment from the address bar. Scripts can use the token as `Authorization: Bearer`. Threat model, what it
+does not protect against and the design reasons: [SECURITY.md](SECURITY.md), [ADR 10](docs/adr/0010-web-dashboard-adapter.md).
+
+### A real session
+
+[`scripts/web-demo.sh`](scripts/web-demo.sh) ran the same scripted four-task DAG as the demo above in the release binary,
+in a throwaway container, and drove it with `curl` and a headless Chromium (the image of
+[`docker/Dockerfile.web`](docker/Dockerfile.web)). The output below is that script's output, with the repeated response
+headers and the long JSON lines cut (`...`); 64-character hex strings (token, session id, digests) are shown as `<64 hex>`:
+
+```text
+$ # no credentials
+HTTP/1.1 401 Unauthorized
+{"error":{"code":"forbidden","message":"not logged in: open the login URL the daemon printed, or send the token as a bearer token","subject":null},"schema":"fleet.error/1"}
+
+$ # a Host header that is not the daemon's address (DNS rebinding)
+HTTP/1.1 421 Misdirected Request
+
+$ # the page: static, hardened headers, no inline code
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Connection: close
+Content-Length: 1366
+Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Cache-Control: no-store
+X-Frame-Options: DENY
+...
+
+$ # login: the page exchanges the fragment token for an HttpOnly SameSite=Strict cookie
+HTTP/1.1 200 OK
+Set-Cookie: fleet_session=<64 hex>; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200
+{"bind":"127.0.0.1:33019","csrf":"<64 hex>","schema":"fleet.web.session/1","version":"0.1.0"}
+
+$ # a state-changing request without the CSRF token, then with a foreign Origin
+HTTP/1.1 403 Forbidden
+{"error":{"code":"forbidden","message":"the CSRF token is missing or wrong",...}
+HTTP/1.1 403 Forbidden
+{"error":{"code":"forbidden","message":"the Origin of this request is not the dashboard",...}
+
+$ # the real page in headless Chromium (profile reused, so the cookie from the first load is used afterwards)
+  [login] found: Add a users table, an API and docs
+  [dag] found: Build the users API
+  [decisions] found: Which HTTP framework
+  cookie value visible to the page script (must be 0): 0
+
+$ # merge from the web: refused until a person approves the exact action
+HTTP/1.1 409 Conflict
+{"error":{"code":"approval_required","message":"merging r1/schema needs approval a1 (digest a86becefaa95); approve it with `fleet approve a1` and run the merge again","subject":"a1"},...}
+
+$ # the approval as the page shows it (exact action and digest)
+{"approvals":[{"args":["fleet/r1/integration","fleet/r1/schema","4048b722bf2e4952b7df850a2930d1b12dbcd000"],"command":"merge","digest":"<64 hex>","display":"git: \"merge\" \"fleet/r1/integration\" \"fleet/r1/schema\" \"4048b722bf2e4952b7df850a2930d1b12dbcd000\"",...,"purpose":"merge","status":"pending","task":"schema","tool":"git"}],...}
+
+$ # approving with a wrong digest is refused, the right digest is accepted
+HTTP/1.1 400 Bad Request
+{"error":{"code":"invalid","message":"digest does not match approval a1: the action may have changed",...}
+HTTP/1.1 200 OK
+{"decision":"approved","digest":"<64 hex>","id":"a1","schema":"fleet.approval.decide/1"}
+HTTP/1.1 200 OK
+{"branch":"fleet/r1/schema","integration_branch":"fleet/r1/integration","merge_sha":"3b517847f909a00b71af601dcae67d7a945b787a","schema":"fleet.merge/1","task":"r1/schema"}
+
+$ curl -H Authorization: Bearer <64 hex> http://127.0.0.1:33019/api/log
+HTTP/1.1 200 OK
+{"error":null,"head_hash":"<64 hex>","ok":true,"records":54,"schema":"fleet.web.log/1"}
+
+$ # a worker's view: the task output through the stream endpoint (server-sent events)
+id: 0
+event: output
+data: {"lost":false,"next":0,"text":"agent: starting docs\nagent: finished docs\n"}
+
+event: end
+data: {"reason":"the session has ended"}
+```
+
+The two screenshots were taken by that Chromium (1200x800, headless, in the container) from the same run: the DAG of the run
+while `api` waits for an answer, and the approval queue with the pending merge approval of `r1/schema` (taken a moment
+later, after the gate had been answered):
+
+![The run r1 as a DAG: schema and docs completed, api blocked behind a decision gate, release pending](docs/img/web-dag.png)
+![An approval to merge r1/schema: the exact action, each argument, the digest, the time left and the Approve and Deny buttons](docs/img/web-approvals.png)
+
+### What was and was not verified
+
+- **Protocol level, over real sockets:** [`web_http.rs`](crates/fleet-infra/tests/web_http.rs) (33 tests: authentication, rate
+  limit, Host, Origin, `Sec-Fetch-Site`, CSRF, strict JSON, malformed and oversized requests, a trickling client, the connection
+  cap, event-stream bounds and shutdown) and [`e2e_web.rs`](crates/fleet-cli/tests/e2e_web.rs) (9 tests against the real daemon:
+  login, the gate/approval/merge flow, live output and input, the token absent from every worker-visible place and from disk,
+  a worker that was handed the token still refused, the flag policy, shutdown, hostile text, health and tamper detection).
+- **The page script** is checked three ways: a source scan test that fails on `innerHTML` and its relatives, a node script
+  ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), 167 checks against a hand-written fake DOM, hostile strings included) and
+  the headless Chromium run above, which loaded the real page, logged in through the fragment and the cookie, and found the
+  expected text in the rendered DOM and in the screenshots.
+- **Not done:** no desktop browser (Chrome, Firefox, Safari) was used, no hostile payload was driven through the real page in
+  Chromium (the hostile-text evidence is the JSON, the source scan and the fake DOM), the live output panel and the
+  send-input form were exercised only against the fake DOM, accessibility and touch layouts were not examined, and the
+  macOS admission path (`lsof`) was type-checked only. There is no TLS; loopback or an SSH tunnel only.
+
 ## Architecture
 
 Domain-driven layers in a cargo workspace; the compiler enforces the dependency rule and an architecture test checks
@@ -483,24 +617,27 @@ the manifests.
 | --- | --- | --- |
 | `fleet-domain` | pure rules: runs/tasks (aggregate), decision gates, approvals, quality judgement, supervision rules, sanitizer, redactor, output buffer, events, hash chain | `std` only |
 | `fleet-app` | use cases (`Orchestrator`), commands, read models, port traits, in-memory fakes and port contract suites | `fleet-domain` |
-| `fleet-infra` | adapters: git, ptys, files, event log, job runner, sockets, TOML, daemon wiring | app, domain |
+| `fleet-infra` | adapters: git, ptys, files, event log, job runner, sockets, TOML, the web dashboard (hand-written HTTP on `std::net`), daemon wiring | app, domain |
 | `fleet-cli` | the `fleet` binary: argument parsing, rendering, dashboard, attach | all |
 
 State is event-sourced: every change is a domain event, appended to a hash-chained log before it is applied;
 a restart replays the log. Time, hashing and ids reach the domain only through arguments and small traits, so the
 domain performs no I/O. See [docs/domain.md](docs/domain.md) and [docs/adr](docs/adr).
 
+For how this compares with the public feature list of a similar tool, and the roadmap with acceptance criteria for
+later phases, see [docs/parity.md](docs/parity.md).
+
 ## Tests
 
-1033 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1137 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
 | Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding), quality judgement (`refcheck-json` edge cases), supervision and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy | 249 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates; plus the port contract suites against the fakes | 228 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config) and the same contract suites against the real file adapters | 344 |
-| Soak | bounded memory with flooding workers | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules | 211 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves (19 tests); plus the port contract suites against the fakes | 247 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets (34 unit and 33 socket tests) | 425 |
+| Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (including: no HTTP, async or TLS crate anywhere, the inner layers know nothing of the web adapter), and the web dashboard against the real daemon (9 tests) | 215 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -515,18 +652,19 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               3381     3266    96.6%
+domain               3381     3269    96.7%
 application          1845     1726    93.6%
-infrastructure       3482     3176    91.2%
-cli                  2435     2160    88.7%
-overall             11143    10328    92.7%
+infrastructure       4982     4606    92.5%
+cli                  2190     1930    88.1%
+overall             12398    11531    93.0%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
 (`tui/mod.rs`, about a quarter covered) and the interactive part of `attach.rs` need a real tty and are not exercised
 by the automated tests (their pure parts, the model, key handling, rendering and input scanning, are); the recovery
 tests kill the daemon with SIGKILL, which writes no coverage profile, so the crash paths count as covered only through
-the application-layer tests of the same logic.
+the application-layer tests of the same logic. The doctor checks moved from `fleet-cli` to `fleet-infra` in phase 2, so
+the infrastructure and cli lines moved with them.
 
 ## Memory
 
@@ -536,11 +674,19 @@ run on every byte) and samples the process's resident memory from `/proc/self/st
 buffer is capped (64 KiB in the test). A 120 second run in release mode, in the Linux container:
 
 ```text
-soak: 8 workers x 120s, 32562 MiB of terminal output (271 MiB/s), rss start 4372 kB, steady min 6096 kB / max 6944 kB / first 6208 kB, growth after warm-up 736 kB, 240 samples
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.54s
+soak: 8 workers x 120s, 3477 MiB of terminal output (29 MiB/s), rss start 4504 kB, steady min 6484 kB / max 7352 kB / first 6740 kB, growth after warm-up 612 kB, 220 samples
+soak web: sse client 68515183 bytes, 4180 output events (per third [1143, 1626, 1411]), 17 reconnects, 0 refused, max 1 open stream(s); 212 status polls (0 failed); rss start 4504 kB, steady min 6484 kB / max 7352 kB, growth after warm-up 612 kB
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 124.23s
 ```
 
-Memory is flat after the buffers fill: it did not grow with the volume of output (about 32 GiB went through the daemon). The test fails if memory grows by more than 4 MiB after warm-up. By default it runs 20 seconds;
+Since phase 2 the soak runs the daemon **with the web dashboard on**: one client holds an event stream (`/api/stream`) of a
+flooding task for the whole run (reconnecting with `Last-Event-ID` when the server ends the stream at its limits and
+counting bytes only, so the client keeps no buffer), and a second polls `/api/status` every 500 ms. Memory is flat after
+the buffers fill: it did not grow with the volume of output (about 3.4 GiB went through the daemon, 68 MB of it through the
+event stream), and the growth after warm-up (612 kB) is within the 4 MiB the test allows. Four 120 second runs with the dashboard on
+(one of them before the last test-only changes) grew 496 to 668 kB. Throughput is much lower than in the earlier run without the
+dashboard (271 MiB/s): the machine was shared with other containers, and the stream and the status polls add work, but
+the cause of the difference was not investigated, so no comparison is claimed. By default the test runs 20 seconds;
 `FLEET_SOAK_SECS=120 cargo test --release -p fleet-infra --test soak -- --nocapture` reproduces the numbers above
 (your throughput will differ). Bounds elsewhere: messages 64 KiB, frames 32 KiB, files read from workers 64 KiB,
 gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 64 connections.
@@ -560,8 +706,11 @@ gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 6
   can stall supervision for up to the git timeout. Workers have no CPU, memory, process or disk limits.
 - SIGINT/SIGTERM are not handled (that needs `unsafe` or another dependency): they stop the daemon at once and the next
   start reconciles. `fleet shutdown` is the graceful way.
-- macOS: the code type-checks for `aarch64-apple-darwin` but was **not run**; pty, peer-credential and `ps`-based
-  process-identity behaviour there is unverified. Windows is not supported.
+- The web dashboard has no TLS and is meant for loopback or an SSH tunnel; a same-user process that can read the daemon's
+  memory, the terminal scrollback or the browser can take the token; five wrong credentials lock web logins for a minute for
+  everyone (see SECURITY.md).
+- macOS: the code type-checks for `aarch64-apple-darwin` but was **not run**; pty, peer-credential, `ps`-based
+  process-identity and the `lsof`-based dashboard admission behaviour there is unverified. Windows is not supported.
 - Not verified here: real coding agents (only scripted ones), very large repositories, concurrent daemons on
   network file systems, and any adversary that can already run code as your user.
 
@@ -591,8 +740,9 @@ remove it from the tree and rewrite the history if it was not published.
 
 What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
-warnings`, the test suites above, the release build, the 120 second soak, `scripts/demo.sh`, and
-`check-crates-age` (every locked crate version published on or before 2026-10-24: 0 too new). A secret scan of the
+warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
+`scripts/demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
+`node scripts/web-smoke.mjs` (167 checks) and `check-crates-age` (every locked crate version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
 
@@ -606,12 +756,16 @@ docker build -f docker/Dockerfile.dev -t fleet-dev docker/
 docker volume create fleet-cargo; docker volume create fleet-target
 docker run --rm -u 0 -v fleet-cargo:/cargo -v fleet-target:/target fleet-dev chown "$(id -u):$(id -g)" /cargo /target
 run() { docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -v fleet-cargo:/cargo -v fleet-target:/target -w /work \
-  -e HOME=/tmp/home -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target ${DOCKER_NET:+--network=$DOCKER_NET} fleet-dev sh -c "$*"; }
+  -e HOME=/tmp/home -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target ${DOCKER_NET:+--network=$DOCKER_NET} ${IMAGE:-fleet-dev} sh -c "$*"; }
 run 'cargo fetch --locked'                       # needs network, once
 DOCKER_NET=none run 'cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings'
 DOCKER_NET=none run 'scripts/test-layers.sh'     # layered suites
 DOCKER_NET=none run 'scripts/coverage.sh'        # coverage per layer
 DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/demo.sh /target/release/fleet'
+# the web dashboard: an image with curl and headless Chromium on top of fleet-dev
+docker build -f docker/Dockerfile.web -t fleet-web docker/
+IMAGE=fleet-web DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/web-demo.sh /target/release/fleet'
+node scripts/web-smoke.mjs   # any node 22 or newer on the host or in a container; no npm packages
 ```
 
 Layout: `crates/fleet-domain`, `crates/fleet-app`, `crates/fleet-infra`, `crates/fleet-cli`, `docs/`,
