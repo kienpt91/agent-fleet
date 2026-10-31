@@ -48,6 +48,12 @@ struct Fx {
 
 impl Fx {
     fn new() -> Fx {
+        Fx::with_remote_dir("remote.git")
+    }
+
+    /// `remote_dir` is the directory of the bare repository that is the remote: git prints its
+    /// path in its own messages, so what is in it is text a failure carries.
+    fn with_remote_dir(remote_dir: &str) -> Fx {
         let t = TempDir::new("forge-push");
         let repo = make_repo(&t);
         git(&repo, &["checkout", "-q", "-b", BRANCH]);
@@ -56,7 +62,7 @@ impl Fx {
         git(&repo, &["commit", "-q", "-m", "work"]);
         let head = Sha::parse(&git(&repo, &["rev-parse", "HEAD"])).unwrap();
         git(&repo, &["checkout", "-q", "main"]);
-        let bare = t.join("remote.git");
+        let bare = t.join(remote_dir);
         std::fs::create_dir_all(&bare).unwrap();
         git(&bare, &["init", "-q", "--bare", "-b", "main"]);
         git(
@@ -268,11 +274,8 @@ fn the_child_has_no_token_no_agent_and_no_askpass() {
     assert!(env.contains("GIT_CONFIG_GLOBAL=/dev/null"));
 }
 
-#[test]
-fn a_remote_branch_with_other_commits_is_never_overwritten() {
-    need_git!();
-    let fx = Fx::new();
-    // someone else put an unrelated commit on that branch of the remote
+/// Someone else puts an unrelated commit on the branch of the remote; returns that commit.
+fn put_other_commit_on_remote(fx: &Fx) -> String {
     let other = TempDir::new("other-clone");
     let clone = other.join("c");
     git(
@@ -284,11 +287,55 @@ fn a_remote_branch_with_other_commits_is_never_overwritten() {
     git(&clone, &["add", "-A"]);
     git(&clone, &["commit", "-q", "-m", "theirs"]);
     git(&clone, &["push", "-q", "origin", BRANCH]);
-    let theirs = git(&clone, &["rev-parse", "HEAD"]);
+    git(&clone, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn a_remote_branch_with_other_commits_is_never_overwritten() {
+    need_git!();
+    let fx = Fx::new();
+    let theirs = put_other_commit_on_remote(&fx);
     let err = fx.publisher().push(&fx.request()).unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
     assert!(err.message.contains("never forces"), "{}", err.message);
     assert_eq!(fx.remote_refs(), [format!("refs/heads/{BRANCH} {theirs}")]);
+}
+
+/// git repeats the path of the remote in its messages ("failed to push some refs to '<path>'").
+/// The paths of the test directories hold the process id and a clock reading, so digits such as
+/// `403` turn up in them now and then; a refusal must stay a refusal for any path.
+#[test]
+fn a_refusal_is_a_conflict_whatever_the_path_of_the_remote_says() {
+    need_git!();
+    for dir in ["403", "remote-403.git", "connection", "connection-403.git"] {
+        let fx = Fx::with_remote_dir(dir);
+        let theirs = put_other_commit_on_remote(&fx);
+        let err = fx.publisher().push(&fx.request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict, "{dir}: {err:?}");
+        assert!(
+            err.message.contains(dir),
+            "{dir}: the path is in the text git printed: {err:?}"
+        );
+        assert!(err.message.contains("never forces"), "{dir}: {err:?}");
+        assert_eq!(fx.remote_refs(), [format!("refs/heads/{BRANCH} {theirs}")]);
+    }
+}
+
+/// What the remote itself prints (`remote: ...`, a hook's output) is not git's word on what
+/// happened: a hook that declines the push and says "403" is a refusal, not an authentication
+/// failure.
+#[test]
+fn a_hook_that_declines_the_push_is_a_refusal_whatever_it_says() {
+    need_git!();
+    let fx = Fx::new();
+    fx.t.script(
+        "remote.git/hooks/pre-receive",
+        "#!/bin/sh\necho '403 Forbidden: connection timed out, authentication failed, could not resolve host'\nexit 1\n",
+    );
+    let err = fx.publisher().push(&fx.request()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+    assert!(err.message.contains("never forces"), "{}", err.message);
+    assert!(fx.remote_refs().is_empty());
 }
 
 #[test]
