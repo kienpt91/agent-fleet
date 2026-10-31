@@ -8,7 +8,8 @@
 #   application  the orchestrator driven through commands with in-memory fakes for every port,
 #                and the port contract suites against those fakes
 #   adapters     unit tests of every real adapter, the same contract suites against the real
-#                file adapters in temp dirs and the web adapter over real loopback sockets
+#                file adapters in temp dirs, the web adapter over real loopback sockets and the origin rule
+#                with real child processes
 #   soak         bounded memory with chatty workers (FLEET_SOAK_SECS, default 20)
 #   end-to-end   the real `fleet` binary and daemon (also with --web), CLI, TUI rendering and architecture rules
 set -eu
@@ -25,6 +26,6 @@ layer() {
 
 layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals
 layer application  cargo test $OPTS -p fleet-app --features testing
-layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test web_http
+layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test web_http --test origin
 layer soak         cargo test $OPTS -p fleet-infra --test soak
 layer end-to-end   cargo test $OPTS -p fleet-cli
