@@ -1000,3 +1000,25 @@ Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/
 ## License
 
 MIT, see [LICENSE](LICENSE). Copyright (c) 2026 Kien Phan.
+
+## Fan out one prompt to several agents and compare (C2)
+
+```
+fleet fanout --run r1 --title "reject trailing commas" --spec-file prompt.md --workers fast,careful --count 2 --contract contract.json
+fleet start --run r1                 # the members are ordinary tasks; the run's limits apply
+fleet compare fan1                   # facts only; --json for the structured document; --rank diff,time to reorder
+fleet pick fan1 fan1-1               # asks for the merge approval of the exact action; then
+fleet approve a1 && fleet pick fan1 fan1-1
+fleet cleanup --branches             # removes the superseded members' worktrees and branches
+```
+
+`compare` shows per member: status, tries, time, the diff against the run's base read from the repository at the recorded
+commit, touched paths against the contract's `diff` checks, gates, evidence per check (verified, unverified or failed, bound
+to commit and tree), the files several members changed and an advisory ranking whose formula is printed. A pick of
+unverified evidence needs `--allow-unverified` and the approval text says so; a branch that moved after review is refused;
+`fleet merge` of a member is refused in favour of `fleet pick`. The dashboard (`#/groups`) and the terminal dashboard (`g`)
+only show. See [ADR 17](docs/adr/0017-fan-out-groups-compare-and-pick.md).
+
+Status: tested with in-memory fakes, real git repositories and the web adapter over real sockets (`fleet-app/tests/fanout.rs`,
+`fleet-infra/tests/git_diff.rs`, `fleet-infra/tests/web_http.rs`). **Not done yet:** a real-binary end-to-end test with fake
+workers, a demo script with captured output, and updated coverage numbers; nothing was run with real agents or on macOS.
