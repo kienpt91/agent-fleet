@@ -1038,6 +1038,134 @@ fn bodies_are_validated_strictly_and_rejected_before_the_daemon_sees_them() {
 }
 
 #[test]
+fn the_goal_ledger_and_verification_are_served_read_only_through_the_daemons_own_commands() {
+    let r = Running::start();
+    let resp = r.get_bearer("/api/goals");
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert_eq!(r.get_bearer("/api/remaining").status, 200);
+    assert_eq!(r.get_bearer("/api/goal?id=ship").status, 200);
+    assert_eq!(
+        r.get_bearer("/api/verify?target=r1%2Fa&task=r1%2Fa&ticket=7")
+            .status,
+        200
+    );
+    assert_eq!(
+        r.get_bearer("/api/verify?target=ship").status,
+        200,
+        "task and ticket are optional"
+    );
+    let calls = r.fake.calls();
+    let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "goal.list",
+            "goal.remaining",
+            "goal.show",
+            "verify.status",
+            "verify.status"
+        ]
+    );
+    assert_eq!(calls[2].1.get("goal").and_then(Value::as_str), Some("ship"));
+    let v = &calls[3].1;
+    assert_eq!(v.get("target").and_then(Value::as_str), Some("r1/a"));
+    assert_eq!(v.get("task").and_then(Value::as_str), Some("r1/a"));
+    assert_eq!(v.get("ticket").and_then(Value::as_u64), Some(7));
+    assert!(calls[4].1.get("task").is_none() && calls[4].1.get("ticket").is_none());
+    // they need credentials like everything else
+    for path in [
+        "/api/goals",
+        "/api/remaining",
+        "/api/goal?id=g",
+        "/api/verify?target=g",
+    ] {
+        assert_eq!(r.get(path, &[]).status, 401, "{path}");
+    }
+    // nothing here changes anything: no way to add, attach, set a status or start a verification
+    for (m, path) in [
+        ("POST", "/api/goals"),
+        ("POST", "/api/goal"),
+        ("POST", "/api/verify"),
+        ("POST", "/api/goal/add"),
+        ("POST", "/api/goal/attach"),
+        ("POST", "/api/goal/status"),
+    ] {
+        let resp = r.request(m, path, &[], Some("{}"));
+        assert!(
+            matches!(resp.status, 404 | 405 | 401),
+            "{m} {path} -> {}",
+            resp.status
+        );
+    }
+    let (session, csrf) = r.login();
+    for path in ["/api/goals", "/api/goal", "/api/verify", "/api/remaining"] {
+        let resp = r.post_session(path, &session, &csrf, "{}");
+        assert_eq!(resp.status, 405, "{path}");
+    }
+    assert_eq!(r.fake.calls().len(), 5, "no write reached the daemon");
+}
+
+#[test]
+fn goal_and_verification_queries_are_validated() {
+    let r = Running::start();
+    for q in [
+        "/api/goal",
+        "/api/goal?id=",
+        "/api/goal?id=a&id=b",
+        "/api/goal?id=a&x=1",
+        "/api/goals?x=1",
+        "/api/remaining?x=1",
+        "/api/verify",
+        "/api/verify?target=",
+        "/api/verify?target=a&ticket=-1",
+        "/api/verify?target=a&ticket=x",
+        "/api/verify?target=a&bogus=1",
+        "/api/goal?id=%ZZ",
+    ] {
+        let resp = r.get_bearer(q);
+        assert_eq!(resp.status, 400, "{q}: {}", resp.body);
+    }
+    assert!(r.fake.calls().is_empty());
+}
+
+#[test]
+fn hostile_goal_text_and_evidence_output_stay_inert_in_the_served_documents() {
+    let r = Running::start();
+    let nasty = "<img src=x onerror=alert(1)>\u{1b}]8;;http://evil\u{7}x\u{202e}y";
+    let expected = nasty.to_string();
+    r.fake.on(move |cmd, _| {
+        Ok(Value::object([
+            ("schema", Value::str(format!("fleet.{cmd}/1"))),
+            ("title", Value::str(nasty)),
+            (
+                "history",
+                Value::array([Value::object([
+                    ("output", Value::str(nasty)),
+                    ("commit", Value::str("a".repeat(40))),
+                ])]),
+            ),
+        ]))
+    });
+    for path in [
+        "/api/goals",
+        "/api/goal?id=g",
+        "/api/remaining",
+        "/api/verify?target=g",
+    ] {
+        let resp = r.get_bearer(path);
+        assert_eq!(resp.status, 200, "{path}");
+        for c in ['<', '>', '&', '\u{1b}', '\u{202e}', '\u{7}'] {
+            assert!(!resp.body.contains(c), "{path}: raw {c:?}");
+        }
+        let doc = parse(&resp.body);
+        assert_eq!(
+            doc.get("title").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+    }
+}
+
+#[test]
 fn text_sent_to_a_worker_may_not_carry_terminal_control_characters() {
     let r = Running::start();
     // what a pasted escape sequence, a carriage return or a bidi override could do to a terminal

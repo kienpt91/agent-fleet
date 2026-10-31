@@ -151,6 +151,10 @@ enum Route {
     Log,
     Health,
     Tail,
+    Goals,
+    Goal,
+    Remaining,
+    VerifyStatus,
     Stream,
     GateResolve,
     ApprovalDecide,
@@ -168,6 +172,10 @@ fn route_for(path: &str) -> Option<(Route, Method)> {
         "/api/log" => (Route::Log, Method::Get),
         "/api/health" => (Route::Health, Method::Get),
         "/api/tail" => (Route::Tail, Method::Get),
+        "/api/goals" => (Route::Goals, Method::Get),
+        "/api/goal" => (Route::Goal, Method::Get),
+        "/api/remaining" => (Route::Remaining, Method::Get),
+        "/api/verify" => (Route::VerifyStatus, Method::Get),
         "/api/stream" => (Route::Stream, Method::Get),
         "/api/gate/resolve" => (Route::GateResolve, Method::Post),
         "/api/approval/decide" => (Route::ApprovalDecide, Method::Post),
@@ -604,6 +612,43 @@ fn run_route(
                 args.push(("max", Value::int(n)));
             }
             respond(call(shared, "task.tail", pass(args))?)
+        }
+        // The goal ledger and verification, read only. Adding goals, attaching contracts and
+        // running `verify` (which starts processes) stay on the control socket.
+        Route::Goals => {
+            parse_query(&req.query, &[])?;
+            respond(call(shared, "goal.list", Value::Null)?)
+        }
+        Route::Goal => {
+            let q = parse_query(&req.query, &["id"])?;
+            let id = q
+                .get("id")
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| error_response(400, ErrorCode::Invalid, "`id` is required"))?;
+            respond(call(
+                shared,
+                "goal.show",
+                pass(vec![("goal", Value::str(id))]),
+            )?)
+        }
+        Route::Remaining => {
+            parse_query(&req.query, &[])?;
+            respond(call(shared, "goal.remaining", Value::Null)?)
+        }
+        Route::VerifyStatus => {
+            let q = parse_query(&req.query, &["target", "task", "ticket"])?;
+            let target = q
+                .get("target")
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| error_response(400, ErrorCode::Invalid, "`target` is required"))?;
+            let mut args = vec![("target", Value::str(target))];
+            if let Some(task) = q.get("task").filter(|t| !t.is_empty()) {
+                args.push(("task", Value::str(task)));
+            }
+            if let Some(n) = query_u64(&q, "ticket")? {
+                args.push(("ticket", Value::int(n)));
+            }
+            respond(call(shared, "verify.status", pass(args))?)
         }
         Route::Stream => open_stream(shared, req, verdict).map(Reply::Stream),
         Route::GateResolve => {
