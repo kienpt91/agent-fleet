@@ -43,6 +43,13 @@ impl Orchestrator {
     }
 
     fn supervise_running(&mut self, key: &Key) {
+        if self
+            .live
+            .get(key)
+            .is_some_and(|live| self.ports.sessions.winding_down(live.session))
+        {
+            return;
+        }
         let now = self.now();
         let grace = self.cfg.kill_grace_ms;
         let question_grace = self.cfg.question_grace_ms;

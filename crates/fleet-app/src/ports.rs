@@ -252,6 +252,12 @@ pub trait SessionHost: Send {
     /// Terminates the process group of a process recorded by an earlier daemon run. Verifies
     /// `identity` first; waits up to `grace_ms` between TERM and KILL.
     fn terminate_orphan(&mut self, identity: &ProcessIdentity, grace_ms: u64) -> SignalOutcome;
+    /// True while a session whose process already ended is still being wound up by the host (a
+    /// remote task collecting its work): the supervisor then has nothing to stop and must not
+    /// count the time as a worker that refuses to die. Bounded by the host's own time limits.
+    fn winding_down(&self, _id: SessionId) -> bool {
+        false
+    }
     /// The worktree directory of a task on a remote host, for placeholders such as `{worktree}`.
     /// Hosts without remote support refuse.
     fn remote_dir(&self, _host: &HostName, _run: &RunId, _task: &TaskId) -> Result<String> {

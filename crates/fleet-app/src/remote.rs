@@ -334,6 +334,13 @@ impl SessionHost for RemoteSessions {
         }
     }
 
+    fn winding_down(&self, id: SessionId) -> bool {
+        matches!(
+            self.active.get(&id).map(|r| &r.phase),
+            Some(Phase::Collecting { .. })
+        )
+    }
+
     fn signal(&mut self, id: SessionId, signal: Signal) -> SignalOutcome {
         match self.active.get(&id) {
             None => self.inner.signal(id, signal),

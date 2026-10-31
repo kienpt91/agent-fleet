@@ -296,6 +296,14 @@ impl Orchestrator {
     fn start_failed(&mut self, key: &Key, attempt: u32, worktree: &str, message: &str) {
         // The activity feed says why (the session's own record only says "could not be started").
         self.warn(format!("{}/{}: attempt {attempt}: {message}", key.0, key.1));
+        // and `fleet tail` shows it
+        let shown = head_str(&sanitize_text(message.as_bytes()), MAX_NOTE).to_string();
+        if let Err(e) = self.ports.logs.save(&key.0, &key.1, attempt, &shown) {
+            self.warn(format!(
+                "{}/{}: could not save the reason: {}",
+                key.0, key.1, e.message
+            ));
+        }
         let begin = self
             .state
             .run(&key.0)
