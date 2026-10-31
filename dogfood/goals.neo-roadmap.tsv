@@ -1,0 +1,42 @@
+# Goals of the roadmap plan: one TSV row per goal (columns are separated by a TAB).
+# goal<TAB>parent<TAB>task<TAB>template<TAB>params<TAB>title<TAB>intent
+# parent and task are "-" when there is none; template is a file of dogfood/contracts/ without .json ("-" for none);
+# params are NAME=VALUE,NAME=VALUE for render-contract.sh (RUN, TASK, REPO, BASE, TOOLS, CONTAINER_RUN are added by apply-goals.sh).
+# Read by dogfood/apply-goals.sh. Titles and intents contain no tab and no pipe.
+m-starters	-	-	-	-	The loop works end to end on small safe tasks	Three starter tasks were done by the real agent, verified by fleet's own run and reviewed by a person before any other task starts
+g-starter-error-tests	m-starters	starter-error-tests	single-file	FILE_PATH=crates/fleet-domain/src/error.rs	fleet-domain error.rs has unit tests	error.rs has a test module that pins names, parsing, exit codes and constructors; only that file changed
+g-starter-value-property	m-starters	starter-value-property	single-file	FILE_PATH=crates/fleet-domain/src/value.rs	Value canonical form has a property test	value.rs has a property-style test of key-order independence; only that file changed
+g-starter-docs-glossary	m-starters	starter-docs-glossary	single-file	FILE_PATH=docs/domain.md	The glossary names the self-development terms	docs/domain.md has rows for protected path, human-only task and self-development; only that file changed
+m-maint	-	-	-	-	Maintenance stays small and under control	Docs links resolve, dependencies are refreshed by a script and numbers by a person
+g-maint-docs-links	m-maint	maint-docs-links	docs-only	-	Relative links and anchors in the docs resolve	Broken links and anchors in README.md and docs/ are fixed without touching any measured number
+g-maint-deps-refresh	m-maint	maint-deps-refresh	human-only	-	Dependencies are refreshed under the 7 day policy	A person ran dogfood/deps-refresh.sh, reviewed the lock diff and committed it; abandon this goal with a reason when done
+g-maint-numbers	m-maint	maint-numbers	human-only	-	The measured numbers of the docs are current	A person refreshed test counts, coverage and the other figures from a fresh verification run; abandon this goal with a reason when done
+m-n3	-	-	-	-	N3: the knowledge store	Facts with source, scope, freshness and confidence; proposal and verification flow; staleness by hash; contradiction gate; redaction; bounded sizes; fuzzed parsing
+g-n3-scaffold	m-n3	n3-scaffold	human-only	-	The neo-knowledge crate exists in the workspace	A person created the crate and added it to the architecture tests and the layer scripts; abandon this goal with a reason when done
+g-n3-source	m-n3	n3-source	single-file	FILE_PATH=crates/neo-knowledge/src/source.rs	Fact sources and their confidence	source.rs validates sources and orders confidence; only that file changed
+g-n3-fact	m-n3	n3-fact	single-file	FILE_PATH=crates/neo-knowledge/src/fact.rs	The Fact value object and its status machine	fact.rs has every legal and illegal transition tested; an agent assertion never verifies; only that file changed
+g-n3-base	m-n3	n3-base	crate-src	CRATE=neo-knowledge	The KnowledgeBase aggregate replays deterministically	base.rs and tests/replay.rs prove replay equals live and the bounds; nothing else in the crate changed except src and tests
+g-n3-stale	m-n3	n3-stale	single-file	FILE_PATH=crates/neo-knowledge/src/stale.rs	Staleness by file hash	stale.rs marks exactly the facts whose file hash changed; only that file changed
+g-n3-contradiction	m-n3	n3-contradiction	single-file	FILE_PATH=crates/neo-knowledge/src/contradiction.rs	Contradictions between verified facts	contradiction.rs finds conflicting verified facts independent of order; only that file changed
+g-n3-parse	m-n3	n3-parse	single-file	FILE_PATH=crates/neo-knowledge/src/parse.rs	Strict, fuzzed parsing of proposed facts	parse.rs parses facts.json values strictly and survives 20000 random documents; only that file changed
+g-n3-integrate	m-n3	n3-integrate	human-only	-	The knowledge store is wired into the daemon and the CLI	A person wired events, use cases, the store, the gate and the commands; abandon this goal with a reason when done
+g-n3-docs	m-n3	n3-docs	single-file	FILE_PATH=docs/knowledge.md	The knowledge store is documented	docs/knowledge.md describes what exists and what does not; only that file changed
+g-n3-review	m-n3	n3-review	human-only	-	N3 passed an independent security review	A reviewer signed off the N3 diff and the numbers are current; abandon this goal with a reason when done
+m-n4	-	-	-	-	N4: the token governor	Budgets per run, task, agent and account; metering from reports and estimates; hard stop; no negative budgets; deterministic under replay
+g-n4-scaffold	m-n4	n4-scaffold	human-only	-	The neo-governor crate exists in the workspace	A person created the crate and added it to the architecture tests and the layer scripts; abandon this goal with a reason when done
+g-n4-budget	m-n4	n4-budget	single-file	FILE_PATH=crates/neo-governor/src/budget.rs	The Budget aggregate	budget.rs never shows a negative remainder and replays deterministically; only that file changed
+g-n4-meter	m-n4	n4-meter	single-file	FILE_PATH=crates/neo-governor/src/meter.rs	Metering from reports and estimates	meter.rs never double counts and ends in the same totals in any order; only that file changed
+g-n4-estimator	m-n4	n4-estimator	single-file	FILE_PATH=crates/neo-governor/src/estimator.rs	A deterministic token estimator	estimator.rs is monotonic, total and linear; only that file changed
+g-n4-policy	m-n4	n4-policy	single-file	FILE_PATH=crates/neo-governor/src/policy.rs	Limits, priorities, bursts and daily windows	policy.rs decides Allow, Warn, Stop and Pause and Stop is monotonic; only that file changed
+g-n4-props	m-n4	n4-props	single-file	FILE_PATH=crates/neo-governor/tests/accounting.rs	Accounting property tests across modules	tests/accounting.rs drives meter, budgets and policy together; only that file changed
+g-n4-integrate	m-n4	n4-integrate	human-only	-	The governor is wired and the hard stop is enforced	A person wired events, enforcement, the usage source and the command, and ran the soak test; abandon this goal with a reason when done
+g-n4-docs	m-n4	n4-docs	single-file	FILE_PATH=docs/governor.md	The governor is documented	docs/governor.md describes what exists and what does not; only that file changed
+g-n4-review	m-n4	n4-review	human-only	-	N4 passed an independent security review	A reviewer signed off the N4 diff and the numbers are current; abandon this goal with a reason when done
+m-n5	-	-	-	-	N5: the credential broker	Credentials never enter a worker's environment, arguments, files, logs, traces or events; scoped, revocable capabilities; the provider-terms boundary is documented
+g-n5-scaffold	m-n5	n5-scaffold	human-only	-	The neo-broker crate exists in the workspace	A person created the crate and added it to the architecture tests and the layer scripts; abandon this goal with a reason when done
+g-n5-refs	m-n5	n5-refs	single-file	FILE_PATH=crates/neo-broker/src/refs.rs	Credential references, never values	refs.rs parses only references and refuses anything that looks like a secret; only that file changed
+g-n5-account	m-n5	n5-account	single-file	FILE_PATH=crates/neo-broker/src/account.rs	Accounts, leases and assignment policies	account.rs assigns the owner's accounts deterministically with three policies; only that file changed
+g-n5-capability	m-n5	n5-capability	single-file	FILE_PATH=crates/neo-broker/src/capability.rs	Scoped, revocable lease capabilities	capability.rs denies revoked, expired, over-budget and out-of-scope requests without leaking account data; only that file changed
+g-n5-terms-doc	m-n5	n5-terms-doc	single-file	FILE_PATH=docs/broker-terms.md	The provider-terms boundary is documented	docs/broker-terms.md states what the broker supports and refuses; only that file changed
+g-n5-adapter	m-n5	n5-adapter	human-only	-	The broker adapter exists and no credential leaks	A person wrote the adapter and the tests that no credential appears anywhere; abandon this goal with a reason when done
+g-n5-review	m-n5	n5-review	human-only	-	N5 passed an independent security review	A reviewer signed off every line that touches a credential; abandon this goal with a reason when done
