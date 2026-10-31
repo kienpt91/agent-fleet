@@ -9,6 +9,7 @@
 
 mod commands;
 mod dispatch;
+mod forge;
 mod reconcile;
 mod supervise;
 
@@ -76,6 +77,8 @@ pub struct Orchestrator {
     pub(crate) version: String,
     pub(crate) shutting_down: bool,
     pub(crate) shutdown_requested: bool,
+    /// Forge integration: the adapter, tickets, what was fetched, issue and pull request links.
+    pub(crate) forge: forge::ForgeRuntime,
     last_warning: Option<(String, u64)>,
 }
 
@@ -86,10 +89,12 @@ impl Orchestrator {
         let mut state = FleetState::new();
         let mut ledger = Ledger::new();
         let mut recent: VecDeque<Recent> = VecDeque::new();
+        let mut forge = forge::ForgeRuntime::default();
         ports.store.replay(&mut |s: StoredEvent| {
             push_recent(&mut recent, s.seq, s.ts_ms, &s.event);
             state.apply(&s.event);
             ledger.apply_checked(&s.event, ports.digest.as_ref());
+            forge.ledger.apply(&s.event);
             Ok(())
         })?;
         let policy = Policy {
@@ -122,6 +127,7 @@ impl Orchestrator {
             version: String::new(),
             shutting_down: false,
             shutdown_requested: false,
+            forge,
             last_warning: None,
         })
     }
@@ -179,6 +185,7 @@ impl Orchestrator {
             self.state.apply(&event);
             self.ledger
                 .apply_checked(&event, self.ports.digest.as_ref());
+            self.forge.ledger.apply(&event);
             committed_task |= matches!(event, DomainEvent::TaskCommitted { .. });
             push_recent(&mut self.recent, seq, ts, &event);
             stored.push(StoredEvent {
@@ -217,10 +224,11 @@ impl Orchestrator {
     /// Advances time-driven work: approval expiry, supervision, jobs, readiness, scheduling.
     pub fn tick(&mut self) {
         type Step = fn(&mut Orchestrator) -> Result<()>;
-        let steps: [Step; 7] = [
+        let steps: [Step; 8] = [
             Orchestrator::expire_approvals,
             Orchestrator::supervise,
             Orchestrator::collect_jobs,
+            Orchestrator::collect_forge,
             Orchestrator::start_commands,
             Orchestrator::review_scan,
             Orchestrator::promote,

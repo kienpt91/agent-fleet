@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod contracts;
+pub mod forge;
 
 use crate::config::{AppConfig, WorkerDef};
 use crate::orchestrator::Orchestrator;
@@ -1134,6 +1135,8 @@ pub fn test_config() -> AppConfig {
 pub struct Harness {
     pub orch: Orchestrator,
     pub world: World,
+    /// The fake forge; attached to the orchestrator when the configuration enables it.
+    pub forge: forge::ForgeWorld,
 }
 
 impl Harness {
@@ -1143,15 +1146,24 @@ impl Harness {
 
     pub fn with_config(cfg: AppConfig) -> Harness {
         let world = World::new();
+        let forge = forge::ForgeWorld::new();
+        let enabled = cfg.forge.enabled;
         let mut orch = Orchestrator::new(cfg, world.ports()).unwrap();
+        if enabled {
+            orch.attach_forge(Box::new(forge::FakeForgeJobs::new(forge.clone())));
+        }
         orch.startup(4242, "test").unwrap();
-        Harness { orch, world }
+        Harness { orch, world, forge }
     }
 
     /// Restarts the orchestrator on the same world (a daemon restart): state is rebuilt from the
     /// stored events and live sessions of the old instance are forgotten.
     pub fn restart(&mut self, cfg: AppConfig) -> Result<()> {
+        let enabled = cfg.forge.enabled;
         let mut orch = Orchestrator::new(cfg, self.world.ports())?;
+        if enabled {
+            orch.attach_forge(Box::new(forge::FakeForgeJobs::new(self.forge.clone())));
+        }
         orch.startup(4343, "test")?;
         self.orch = orch;
         Ok(())

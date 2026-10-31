@@ -118,6 +118,7 @@ impl Orchestrator {
                 task,
                 ticket,
             } => self.verify_status(&target, task.as_deref(), ticket),
+            Command::Forge(forge) => self.handle_forge(forge),
             Command::Shutdown => {
                 self.shutdown_requested = true;
                 self.begin_shutdown();

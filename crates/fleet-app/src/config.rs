@@ -11,6 +11,7 @@ use fleet_domain::limits::{
     MAX_WORKERS_CONFIGURED,
 };
 use fleet_domain::quality::GateFormat;
+use fleet_forge::config::ForgeConfig;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +60,8 @@ pub struct AppConfig {
     pub gates: Vec<GateDef>,
     /// Silence after which a question file makes the supervisor stop the worker.
     pub question_grace_ms: u64,
+    /// The `[github]` section: the forge integration (off by default).
+    pub forge: ForgeConfig,
 }
 
 impl AppConfig {
@@ -81,6 +84,7 @@ impl AppConfig {
             workers: BTreeMap::new(),
             gates: Vec::new(),
             question_grace_ms: 2000,
+            forge: ForgeConfig::disabled(),
         }
     }
 
@@ -176,6 +180,7 @@ impl AppConfig {
                 )));
             }
         }
+        self.forge.validate()?;
         Ok(())
     }
 
