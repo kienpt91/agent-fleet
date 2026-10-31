@@ -675,10 +675,7 @@ pub(crate) mod test_support {
                 ]))),
                 "peer" => Ok(HandlerReply::Data(obj(&[
                     ("schema", Value::str("fleet.peer/1")),
-                    (
-                        "uid",
-                        peer.uid.map(|u| Value::int(u)).unwrap_or(Value::Null),
-                    ),
+                    ("uid", peer.uid.map(Value::int).unwrap_or(Value::Null)),
                 ]))),
                 "fail" => Err(FleetError::conflict("not allowed now").with_subject("a1")),
                 "boom" => panic!("handler exploded"),
@@ -926,7 +923,7 @@ mod tests {
         let recovered = wait_until(3000, || {
             let mut c = Raw::connect(&ts.path);
             c.send_line(&encode_request("ping", &Value::Null));
-            matches!(c.read_reply(), Ok(_))
+            c.read_reply().is_ok()
         });
         assert!(recovered, "a freed slot must be usable again");
     }

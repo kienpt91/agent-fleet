@@ -697,7 +697,7 @@ mod tests {
         assert!(
             wait_until(5000, || procid::start_token(child).is_none()
                 || std::fs::read_to_string(format!("/proc/{child}/stat"))
-                    .map_or(false, |s| s.contains(") Z "))),
+                    .is_ok_and(|s| s.contains(") Z "))),
             "the child in the worker's group must be gone"
         );
     }

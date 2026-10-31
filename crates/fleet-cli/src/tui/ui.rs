@@ -630,10 +630,8 @@ mod tests {
             (41, 11),
         ] {
             let text = screen(&m, w, h);
-            if w < MIN_WIDTH || h < MIN_HEIGHT {
-                if w >= 18 && h >= 1 {
-                    assert!(text.contains("terminal too small"), "{w}x{h}");
-                }
+            if (w < MIN_WIDTH || h < MIN_HEIGHT) && w >= 18 && h >= 1 {
+                assert!(text.contains("terminal too small"), "{w}x{h}");
             }
         }
         let mut with_overlays = sample();

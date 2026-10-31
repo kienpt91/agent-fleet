@@ -1095,44 +1095,47 @@ impl Vcs for GitVcs {
         }
         let dir = self.open_repo(repo)?;
         let root = dir.join(WORKTREES);
-        let wt = Path::new(worktree);
-        if !wt.is_absolute() {
-            return Err(FleetError::forbidden("worktree path must be absolute"));
-        }
-        match fs::symlink_metadata(wt) {
-            Ok(m) => {
-                if m.file_type().is_symlink() {
-                    return Err(FleetError::forbidden(format!(
-                        "worktree {} is a symbolic link",
-                        show(worktree)
-                    )));
-                }
-                let canon = fs::canonicalize(wt)
-                    .map_err(|e| FleetError::io("cannot resolve worktree", &e))?;
-                if !canon.starts_with(&root) || canon == root {
-                    return Err(FleetError::forbidden(format!(
-                        "worktree {} is outside {WORKTREES}",
-                        show(worktree)
-                    )));
-                }
-                self.run_ok(
-                    &dir,
-                    None,
-                    &["worktree", "remove", "--force", path_str(&canon)?],
-                )?;
+        // An empty path means the worktree is already gone (only the branch is left to delete).
+        if !worktree.is_empty() {
+            let wt = Path::new(worktree);
+            if !wt.is_absolute() {
+                return Err(FleetError::forbidden("worktree path must be absolute"));
             }
-            Err(e) if not_found_kind(&e) => {
-                let plain = wt
-                    .components()
-                    .all(|c| !matches!(c, Component::ParentDir | Component::CurDir));
-                if !plain || !wt.starts_with(&root) || wt == root {
-                    return Err(FleetError::forbidden(format!(
-                        "worktree {} is outside {WORKTREES}",
-                        show(worktree)
-                    )));
+            match fs::symlink_metadata(wt) {
+                Ok(m) => {
+                    if m.file_type().is_symlink() {
+                        return Err(FleetError::forbidden(format!(
+                            "worktree {} is a symbolic link",
+                            show(worktree)
+                        )));
+                    }
+                    let canon = fs::canonicalize(wt)
+                        .map_err(|e| FleetError::io("cannot resolve worktree", &e))?;
+                    if !canon.starts_with(&root) || canon == root {
+                        return Err(FleetError::forbidden(format!(
+                            "worktree {} is outside {WORKTREES}",
+                            show(worktree)
+                        )));
+                    }
+                    self.run_ok(
+                        &dir,
+                        None,
+                        &["worktree", "remove", "--force", path_str(&canon)?],
+                    )?;
                 }
+                Err(e) if not_found_kind(&e) => {
+                    let plain = wt
+                        .components()
+                        .all(|c| !matches!(c, Component::ParentDir | Component::CurDir));
+                    if !plain || !wt.starts_with(&root) || wt == root {
+                        return Err(FleetError::forbidden(format!(
+                            "worktree {} is outside {WORKTREES}",
+                            show(worktree)
+                        )));
+                    }
+                }
+                Err(e) => return Err(FleetError::io("cannot stat worktree", &e)),
             }
-            Err(e) => return Err(FleetError::io("cannot stat worktree", &e)),
         }
         self.run_ok(&dir, None, &["worktree", "prune"])?;
         if delete_branch
@@ -2100,6 +2103,20 @@ mod tests {
             git(&fx.repo, &["branch", "--list", "fleet/r1/t3"]).trim(),
             "fleet/r1/t3"
         );
+    }
+
+    #[test]
+    fn a_branch_can_be_deleted_after_its_worktree_was_removed() {
+        need_git!();
+        let fx = Fx::new();
+        let w = fx.prepare("r1", "t1");
+        fx.vcs
+            .remove_worktree(fx.repo_s(), &w, "fleet/r1/t1", false)
+            .unwrap();
+        fx.vcs
+            .remove_worktree(fx.repo_s(), "", "fleet/r1/t1", true)
+            .unwrap();
+        assert_eq!(git(&fx.repo, &["branch", "--list", "fleet/*"]), "");
     }
 
     #[test]

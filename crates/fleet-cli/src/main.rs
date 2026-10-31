@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 fn main() {
     // The `_os` forms never panic on non-UTF-8 input; lossy conversion keeps the rest usable.
     let argv = std::env::args_os()

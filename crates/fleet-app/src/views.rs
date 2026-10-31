@@ -189,6 +189,7 @@ pub fn status_value(state: &FleetState, only: Option<&RunId>, ctx: &StatusContex
                     }),
                 ),
                 ("rss_kb", Value::Null),
+                ("output_bytes", Value::int(0u64)),
             ]),
         ),
         ("now_ms", Value::int(ctx.now_ms)),
