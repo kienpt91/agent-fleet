@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>fleet dashboard</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">fleet</div>
+  <nav class="nav" aria-label="Pages">
+    <a id="nav-runs" href="#/runs">Runs</a>
+    <a id="nav-decisions" href="#/decisions">Decisions</a>
+    <a id="nav-events" href="#/events">Events</a>
+    <a id="nav-health" href="#/health">Health</a>
+  </nav>
+  <div class="daemon">
+    <span id="hdr-version" class="chip">fleet</span>
+    <span id="hdr-sessions" class="chip">sessions</span>
+    <span id="hdr-rss" class="chip">rss</span>
+    <span id="hdr-approvals" class="badge st-unknown">0 pending approvals</span>
+    <button id="logout" type="button" class="btn small">Log out</button>
+  </div>
+</header>
+<main id="view" class="view">
+  <p class="muted">Loading the dashboard. It needs JavaScript from this daemon (same origin only).</p>
+</main>
+<footer class="foot">
+  <span id="statusline" class="muted" role="status">Starting.</span>
+</footer>
+<noscript><p class="notice">This dashboard needs JavaScript. Without it, use the fleet command line.</p></noscript>
+</body>
+</html>
