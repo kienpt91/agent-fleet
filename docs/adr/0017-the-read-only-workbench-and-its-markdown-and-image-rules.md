@@ -33,7 +33,13 @@ looser CSP, or a way to read anything outside the recorded commits.
   tree into DOM nodes from a fixed element and attribute allowlist; external links open only after an explicit click and
   an in-page confirmation, with `noopener noreferrer`.
 - **Images** are served only when the first bytes are a valid PNG, JPEG, GIF or WebP header (SVG and everything else are
-  text or binary placeholders), at most 4 MiB, with `X-Content-Type-Options: nosniff`, `Content-Security-Policy:
+  text or binary placeholders), at most 4 MiB **and a declared size within the limits**: the domain reads the width and height
+  from the header (PNG IHDR, GIF screen descriptor, WebP VP8/VP8L/VP8X, JPEG frame header found by a bounded segment walk, checked
+  arithmetic) and refuses more than 8192 pixels per side or 32 megapixels (`ImageLimits`, adjustable but clamped to hard caps of 16384
+  and 64 megapixels); a few bytes can declare a canvas of billions of pixels and the browser decodes at the declared size. Such a file is
+  a placeholder in the file document (`image_too_large`) and a 413 from the blob API; a header whose size is zero or cannot be
+  found is not an image. The blob response carries `X-Image-Width`/`X-Image-Height`; the page loads at most 8 images per Markdown
+  preview within a 48-megapixel budget, with `decoding="async"` and a CSS cap on the displayed size, with `X-Content-Type-Options: nosniff`, `Content-Security-Policy:
   default-src 'none'; sandbox`, `Content-Disposition: inline` and no filename. The page fetches them with its session
   header and shows them through a `data:` URL (already allowed by `img-src`), so the page CSP is unchanged.
 - **Changed words.** Edited line pairs (the i-th removed and i-th added line of a run) are compared by token with Myers' O(ND)
@@ -46,6 +52,16 @@ looser CSP, or a way to read anything outside the recorded commits.
   became 4096 bytes so that a maximal path fits when percent-encoded. No new listener, no new dependency.
 - **UI.** Three scripts (`app.js`, `workbench.js`, `panes.js`) and two stylesheets, all scanned by tests for forbidden
   constructs; the layout is saved in `sessionStorage` under `fleet.layout` and validated strictly on load.
+
+## Review of the implementation
+A read-only review found one low-severity denial of service (image dimensions), one low spoofing issue (a bare carriage
+return was folded into a line break by the page) and informational items. Fixed: dimensions (above); a bare `\r` is shown as
+`[U+000D]` in file, diff and code text; a backslash in a displayed name is doubled so a literal `\u{202e}` differs from the real
+character; cached documents now carry the selector of the request they answer; a link's title starts with its real URL, and
+`http(s)` links with user information or a non-ASCII host are not links (no punycode is implemented). Not changed: the browser's
+"open link in new tab" context menu bypasses the confirmation of an external link (it keeps `noopener noreferrer`, the target is
+shown on hover and focus, and the page cannot intercept the context menu); the demo script's token on the Chromium command line is
+documented in its header (it is for the disposable image only).
 
 ## Alternatives considered
 - Rendering Markdown in the page: simpler, but the property tests (allowlists, URL schemes, linear work) are much stronger

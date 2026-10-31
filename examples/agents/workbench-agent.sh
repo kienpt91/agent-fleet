@@ -1,7 +1,7 @@
 #!/bin/bash
 # A scripted stand-in for a coding agent that leaves a repository full of the things the review
 # workbench has to show: Markdown (table, code fence, list, links, an image), a PNG, an SVG with script,
-# a symlink, a binary file, a rename with an edit, a mode change, a large file, and hostile names and
+# a symlink, a binary file, a rename with an edit, a mode change, a large file, an image that declares 40000 x 40000 pixels, and hostile names and
 # contents. Used by scripts/workbench-demo.sh. Bash is needed for $'...' names.
 set -e
 mkdir -p src docs img .fleet
@@ -35,6 +35,8 @@ EOF2
 printf '# Guide\n\nSee the [readme](../README.md).\n' > docs/guide.md
 echo 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' | base64 -d > img/logo.png
 printf '\0\1\2\0binary' > blob.bin
+printf '\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x9c\x40\0\0\x9c\x40\x08\x02\0\0\0\0\0\0\0' > img/huge.png   # 40000 x 40000 pixels in 33 bytes
+printf 'first\rsecond (a bare carriage return)\n' > lone-cr.txt
 printf '<svg xmlns="x" onload="alert(1)"><script>alert(2)</script></svg>\n' > evil.svg
 ln -s docs/guide.md guide-link
 ln -s /etc/passwd absolute-link

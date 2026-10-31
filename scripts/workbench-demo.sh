@@ -5,6 +5,10 @@
 # layout, the rendered DOM is checked (facts, not only screenshots) and screenshots are written to
 # $WORKBENCH_SHOTS (default docs/img). Exits 1 when a check fails.
 #
+# For the disposable container only: the login token is passed to Chromium as part of its URL argument (visible
+# in the process list while a page loads) and Chromium runs with --no-sandbox while it renders hostile content.
+# Do not run it against a daemon you care about or on a shared machine.
+#
 # Usage: scripts/workbench-demo.sh [path-to-fleet-binary]   (inside the image of docker/Dockerfile.web)
 set -eu
 FLEET=${1:-/target/release/fleet}
@@ -110,6 +114,8 @@ shoot unified "/work/r1/review?open=diff&mode=unified&path=src/renamed.txt&layou
 shoot split "/work/r1/review?open=diff&mode=split&path=src/renamed.txt&layout=single" 'pane-diff' 'diff-body diff-split' 'diff-srow' 'src/renamed.txt'
 shoot markdown "/work/r1/review?open=markdown&path=README.md&layout=single" 'pane-markdown' 'md-doc' '<table' '<th>name' '<pre' 'fenced' '<ul' '<li' 'href="https://example.com/docs"' 'rel="noopener noreferrer"' 'Workbench fixture' '<img'
 shoot image "/work/r1/review?open=image&path=img/logo.png&layout=single" 'pane-image' 'img-stage' 'src="data:image/png;base64,'
+shoot image-huge "/work/r1/review?open=image&path=img/huge.png&layout=single" 'pane-image' 'Image too large to show' '40000' '!<img[^>]*src='
+shoot file-cr "/work/r1/review?open=file&path=lone-cr.txt&layout=single" 'pane-file' 'first[U+000D]second'
 shoot layout "/work/r1/review?layout=review&open=diff&mode=split" 'dock-h' 'dock-group' 'pane-explorer' 'pane-diff' 'role="separator"' 'role="tablist"'
 SHOT_HEIGHT=1100
 echo "== hostile names and contents driven through the real page"

@@ -852,7 +852,7 @@ API (read only, behind the same token, Host, `Sec-Fetch-Site`, worker-origin and
 ```text
 GET /api/repo/tree?task=<run/task>&commit=<head|base|sha>&path=<dir>     entries (dir, file, symlink, submodule), sorted, at most 2000
 GET /api/repo/file?task=&commit=&path=                                  text lines | binary | too_large | image | symlink | submodule
-GET /api/repo/blob?task=&commit=&path=                                  raw bytes, png/jpeg/gif/webp only (415 for anything else, 413 above 4 MiB)
+GET /api/repo/blob?task=&commit=&path=                                  raw bytes, png/jpeg/gif/webp only (415 for anything else, 413 above 4 MiB or above the pixel limits); X-Image-Width/-Height headers
 GET /api/repo/markdown?task=&commit=&path=                              a closed tree (no raw HTML), at most 512 KiB of source
 GET /api/repo/diff?task=&base=&head=&context=<0..25>                    files with status, counts, hunks and truncation notes
 ```
@@ -891,9 +891,9 @@ git runs hardened with literal pathspecs and sizes are checked before bytes are 
 bounded (2000 entries, 1 MiB per text file, 4000 lines per file and 20000 per diff, 3 MiB of diff text) and shown escaped;
 Markdown is parsed on the server to a closed tree (raw HTML is text, only `http`/`https` and repository links, no remote or
 `data:` images) and turned into DOM nodes from an element and attribute allowlist; images are served only when their first bytes are a
-valid PNG, JPEG, GIF or WebP header, as `data:` URLs in the page, so the page's CSP is unchanged.
+valid PNG, JPEG, GIF or WebP header whose declared size is at most 8192 pixels per side and 32 megapixels (a placeholder otherwise: a 33 byte file can declare 40000 x 40000 pixels), as `data:` URLs in the page, so the page's CSP is unchanged.
 
-Checked in **headless Chromium** (`scripts/workbench-demo.sh`, 15 page loads, the image of `docker/Dockerfile.web`): each pane and a split layout
+Checked in **headless Chromium** (`scripts/workbench-demo.sh`, 13 page loads, the image of `docker/Dockerfile.web`): each pane and a split layout
 render the expected DOM (rows, table, code block, links with `rel="noopener noreferrer"`, `data:image/png` source, separators
 and tablists), and with hostile names and contents loaded the page has exactly its three script elements, no `onerror`/`onclick`
 attribute, no `<svg>`/`<iframe>`, no `javascript:` or `data:` link, no remote image and no token. Not checked: a desktop
