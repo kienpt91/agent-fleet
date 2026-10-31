@@ -25,7 +25,7 @@ looser CSP, or a way to read anything outside the recorded commits.
 - **Content.** Text is decoded leniently (replacement, a notice), CRLF is reported, lines are clipped with a marker, files
   above 1 MiB (text) are placeholders, binary is decided by a NUL in the first 8000 bytes. Links are shown as text and never
   followed; submodules are shown as pointers. Diffs are bounded in files (300), hunks, lines per file (4000), total lines
-  (30000) and bytes (3 MiB); totals come from `--numstat`. Results are cached by (commit, path, range) in a cache bounded
+  (20000) and bytes (3 MiB); totals come from `--numstat`. Results are cached by (commit, path, range) in a cache bounded
   in entries (64), bytes (16 MiB) and entry size (2 MiB).
 - **Markdown** is parsed on the server by a hand-written subset (`fleet_domain::repo::markdown`) into a closed tree. Raw
   HTML is text, only `http`/`https` links and repository-relative links survive (resolved against the document's directory
@@ -36,7 +36,7 @@ looser CSP, or a way to read anything outside the recorded commits.
   text or binary placeholders), at most 4 MiB, with `X-Content-Type-Options: nosniff`, `Content-Security-Policy:
   default-src 'none'; sandbox`, `Content-Disposition: inline` and no filename. The page fetches them with its session
   header and shows them through a `data:` URL (already allowed by `img-src`), so the page CSP is unchanged.
-- **Limits.** At most four repository reads run at once (503 with `Retry-After` otherwise); the request target limit
+- **Limits.** At most three repository reads run at once (503 with `Retry-After` otherwise); the request target limit
   became 4096 bytes so that a maximal path fits when percent-encoded. No new listener, no new dependency.
 - **UI.** Three scripts (`app.js`, `workbench.js`, `panes.js`) and two stylesheets, all scanned by tests for forbidden
   constructs; the layout is saved in `sessionStorage` under `fleet.layout` and validated strictly on load.

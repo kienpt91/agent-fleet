@@ -3284,8 +3284,9 @@ printf '{"version":1,"status":"done","summary":"big"}' > .fleet/result.json
     assert_eq!(jarr(&wide, "entries").len(), 2000);
     assert!(jbool(&wide, "truncated"));
 
-    // a few hundred reads, four at a time: memory does not grow with them
-    let before = rss(&web);
+    // Two identical phases of reads, three at a time. A read builds a document of a few megabytes
+    // (bounded by the caps), so memory rises to a plateau during the first phase; the plateau is
+    // bounded and the second phase must not raise it: nothing grows with the number of reads.
     let port = info.port;
     let token = info.token.clone();
     let paths: Vec<String> = vec![
@@ -3298,39 +3299,57 @@ printf '{"version":1,"status":"done","summary":"big"}' > .fleet/result.json
         repo_url("file", "r1/a", "head", "huge.txt"),
         repo_url("file", "r1/a", "head", "many/f7.txt"),
     ];
-    let start = Instant::now();
-    let workers: Vec<_> = (0..4)
-        .map(|w| {
-            let paths = paths.clone();
-            let token = token.clone();
-            std::thread::spawn(move || {
-                let mut busy = 0;
-                for round in 0..40 {
-                    let p = &paths[(round + w) % paths.len()];
-                    let r = http(
-                        port,
-                        "GET",
-                        p,
-                        &[("Authorization", &format!("Bearer {token}"))],
-                        None,
-                    );
-                    match r.status {
-                        200 => assert!(r.body.len() < 8 * 1024 * 1024),
-                        // the number of reads that run at once is capped
-                        503 => busy += 1,
-                        other => panic!("{p}: {other} {}", &r.text()[..r.text().len().min(200)]),
+    let phase = |rounds: usize| -> usize {
+        let workers: Vec<_> = (0..4)
+            .map(|w| {
+                let paths = paths.clone();
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    let mut busy = 0;
+                    for round in 0..rounds {
+                        let p = &paths[(round + w) % paths.len()];
+                        let r = http(
+                            port,
+                            "GET",
+                            p,
+                            &[("Authorization", &format!("Bearer {token}"))],
+                            None,
+                        );
+                        match r.status {
+                            200 => assert!(r.body.len() < 8 * 1024 * 1024),
+                            // the number of reads that run at once is capped
+                            503 => busy += 1,
+                            other => {
+                                panic!("{p}: {other} {}", &r.text()[..r.text().len().min(200)])
+                            }
+                        }
                     }
-                }
-                busy
+                    busy
+                })
             })
-        })
-        .collect();
-    let busy: usize = workers.into_iter().map(|h| h.join().unwrap()).sum();
-    assert!(busy < 160, "every read was refused as busy");
+            .collect();
+        workers.into_iter().map(|h| h.join().unwrap()).sum()
+    };
+    let start = Instant::now();
+    let baseline = rss(&web);
+    let busy1 = phase(48);
+    let plateau = rss(&web);
+    let busy2 = phase(48);
     let after = rss(&web);
+    println!(
+        "workbench memory: baseline {baseline} kB, after the first phase {plateau} kB, after the second {after} kB ({} reads in {:?}, {} turned away)",
+        2 * 4 * 48,
+        start.elapsed(),
+        busy1 + busy2
+    );
+    assert!(busy1 + busy2 < 2 * 4 * 48, "every read was refused as busy");
     assert!(
-        after < before + 96 * 1024,
-        "the daemon's resident memory grew from {before} kB to {after} kB over {:?} ({busy} reads were turned away)",
+        plateau < baseline + 256 * 1024,
+        "the first phase raised the daemon's memory from {baseline} kB to {plateau} kB"
+    );
+    assert!(
+        after < plateau + 32 * 1024,
+        "memory grew from {plateau} kB to {after} kB over a second identical phase ({:?}; {busy1} and {busy2} reads were turned away)",
         start.elapsed()
     );
     // the daemon is still answering everything else

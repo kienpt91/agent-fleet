@@ -33,7 +33,7 @@ pub const MAX_DIFF_HUNKS_PER_FILE: usize = 200;
 /// Lines (context included) shown of one file.
 pub const MAX_DIFF_LINES_PER_FILE: usize = 4000;
 /// Lines shown of the whole diff.
-pub const MAX_DIFF_LINES_TOTAL: usize = 30_000;
+pub const MAX_DIFF_LINES_TOTAL: usize = 20_000;
 /// Bytes of line text shown of the whole diff.
 pub const MAX_DIFF_TEXT_BYTES: usize = 3 * 1024 * 1024;
 /// Most lines of context a request may ask for.

@@ -101,7 +101,7 @@ impl Default for WebLimits {
             max_connections: 32,
             max_per_remote_ip: 8,
             max_streams: 4,
-            max_repo_reads: 4,
+            max_repo_reads: 3,
             stream_lifetime: Duration::from_secs(600),
             stream_bytes: 4 * 1024 * 1024,
             stream_poll: Duration::from_millis(250),
