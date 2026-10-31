@@ -821,7 +821,9 @@ mod tests {
         let mut h = host();
         // Raw mode, no echo: the terminal's input buffer fills and then pushes back. In canonical
         // mode some kernels drop the overflow of a long line instead, and nothing would push back.
-        let s = h.spawn(&spec(&dir, "stty raw -echo; exec sleep 60")).unwrap();
+        let s = h
+            .spawn(&spec(&dir, "stty raw -echo; exec sleep 60"))
+            .unwrap();
         let io = h.registry().get(s.id).unwrap();
 
         let started = Instant::now();
