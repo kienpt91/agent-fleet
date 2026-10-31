@@ -816,7 +816,7 @@ pub(crate) fn stream_task(shared: &Shared, stream: &mut TcpStream, plan: &Stream
                 stream,
                 "end",
                 None,
-                &Value::object([("reason", Value::str("the session has ended"))]),
+                &Value::object([("reason", Value::str("the worker has finished"))]),
             );
             return;
         }
@@ -827,7 +827,10 @@ pub(crate) fn stream_task(shared: &Shared, stream: &mut TcpStream, plan: &Stream
                     stream,
                     "end",
                     None,
-                    &Value::object([("reason", Value::str("the session has ended"))]),
+                    &Value::object([(
+                        "reason",
+                        Value::str("your dashboard login has ended; log in again"),
+                    )]),
                 );
                 return;
             }

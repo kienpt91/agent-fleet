@@ -894,7 +894,11 @@ fn live_output_sse_and_send_input() {
     let last = rest.last().expect("the stream ended without an event");
     assert_eq!(last.name, "end", "{rest:?}");
     let reason = parse_json(&last.data);
-    assert!(jstr(&reason, "reason").contains("session"), "{}", last.data);
+    assert!(
+        jstr(&reason, "reason").contains("login has ended"),
+        "{}",
+        last.data
+    );
     // the worker is still running: the stream ended because of the logout, not the task
     assert!(jbool(&f.task("r1", "t"), "live"));
     // and the session no longer opens one

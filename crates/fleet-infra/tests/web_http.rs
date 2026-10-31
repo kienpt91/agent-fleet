@@ -1686,7 +1686,7 @@ fn a_stream_opened_with_a_session_ends_when_the_session_is_revoked() {
         .get("reason")
         .and_then(Value::as_str)
         .unwrap()
-        .contains("session"));
+        .contains("login has ended"));
     r.wait_active(0);
 }
 
