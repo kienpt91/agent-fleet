@@ -66,7 +66,7 @@ mobile app.
 | Diff annotation (comments sent back to the agent) | not planned | none | A person can answer a gate or send text to a live worker (see the web rows and `fleet send`). |
 | File editor and file explorer | not planned | none | No editor is bundled. |
 | Rich previews (Markdown, images, PDF) | not planned | none | Listed in public docs summary. |
-| GitHub integration (PRs, issues) | planned | none | Phase 3. |
+| GitHub integration (PRs, issues) | partial (implemented and tested against a fake `gh`; a real account is owner-verified) | `fleet-app/tests/forge.rs::an_approved_pull_request_is_preflighted_pushed_created_and_recorded`, `forge.rs::changing_anything_after_the_approval_invalidates_it`, `fleet-infra/tests/forge_gh.rs::gh_gets_a_minimal_environment_and_never_a_token`, `forge_gh.rs::a_rate_limit_blocks_further_calls_without_starting_gh_and_comes_back_after_the_wait`, `forge_push.rs::exactly_the_approved_commit_goes_to_exactly_one_ref_of_the_remote`, `fleet-cli/tests/e2e_forge.rs`, `scripts/github-demo.sh` | Read issues and pull requests (checks, reviews), issue to task (untrusted text), pull request creation behind an approval bound to repository, base, head branch and commit, title, body and draft flag; read-only dashboard and TUI views. `pr comment` and review actions are not implemented. Compared 2026-10-31. Verified against `gh` 2.79.0 help text only; a real account, real HTTPS push credentials and macOS are not verified (README "What was not verified"). |
 | Linear integration (issues, boards) | planned | none | Phase 3. |
 | SSH remote worktrees | planned | none | Phase 3. |
 | Self-hosted server or cloud VM runtime | not planned | none | The daemon is local only (unix socket, loopback web). Listed in public docs summary. |
