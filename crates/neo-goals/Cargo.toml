@@ -1,0 +1,20 @@
+[package]
+name = "neo-goals"
+description = "Goal ledger of NEO: the goal tree, its status machine and its evidence. Pure; depends on fleet-domain, neo-verify and std only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "neo_goals"
+path = "src/lib.rs"
+
+[dependencies]
+fleet-domain = { path = "../fleet-domain" }
+neo-verify = { path = "../neo-verify" }
+
+[lints]
+workspace = true

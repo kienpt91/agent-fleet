@@ -486,6 +486,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "neo-goals"
+version = "0.1.0"
+dependencies = [
+ "fleet-domain",
+ "neo-verify",
+]
+
+[[package]]
 name = "neo-verify"
 version = "0.1.0"
 dependencies = [

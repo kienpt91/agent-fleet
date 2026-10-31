@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/fleet-domain",
   "crates/neo-verify",
+  "crates/neo-goals",
   "crates/fleet-app",
   "crates/fleet-infra",
   "crates/fleet-cli",
