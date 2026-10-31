@@ -11,9 +11,11 @@
 )]
 
 pub mod error;
+pub mod events;
 pub mod ids;
 pub mod limits;
 pub mod output;
 pub mod redact;
 pub mod sanitize;
+pub mod status;
 pub mod value;
