@@ -629,13 +629,13 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1137 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1138 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
 | Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding), quality judgement (`refcheck-json` edge cases), supervision and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy | 249 |
 | Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves (19 tests); plus the port contract suites against the fakes | 247 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets (34 unit and 33 socket tests) | 425 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets (35 unit and 33 socket tests) | 426 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
 | End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (including: no HTTP, async or TLS crate anywhere, the inner layers know nothing of the web adapter), and the web dashboard against the real daemon (9 tests) | 215 |
 
@@ -654,9 +654,9 @@ helpers:
 layer               lines  covered  percent
 domain               3381     3269    96.7%
 application          1845     1726    93.6%
-infrastructure       4982     4606    92.5%
+infrastructure       5026     4628    92.1%
 cli                  2190     1930    88.1%
-overall             12398    11531    93.0%
+overall             12442    11553    92.9%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -674,19 +674,19 @@ run on every byte) and samples the process's resident memory from `/proc/self/st
 buffer is capped (64 KiB in the test). A 120 second run in release mode, in the Linux container:
 
 ```text
-soak: 8 workers x 120s, 3477 MiB of terminal output (29 MiB/s), rss start 4504 kB, steady min 6484 kB / max 7352 kB / first 6740 kB, growth after warm-up 612 kB, 220 samples
-soak web: sse client 68515183 bytes, 4180 output events (per third [1143, 1626, 1411]), 17 reconnects, 0 refused, max 1 open stream(s); 212 status polls (0 failed); rss start 4504 kB, steady min 6484 kB / max 7352 kB, growth after warm-up 612 kB
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 124.23s
+soak: 8 workers x 120s, 14207 MiB of terminal output (118 MiB/s), rss start 4568 kB, steady min 6436 kB / max 7476 kB / first 7048 kB, growth after warm-up 428 kB, 237 samples
+soak web: sse client 325498960 bytes, 19366 output events (per third [7860, 5639, 5867]), 84 reconnects, 0 refused, max 1 open stream(s); 227 status polls (0 failed); rss start 4568 kB, steady min 6436 kB / max 7476 kB, growth after warm-up 428 kB
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 121.04s
 ```
 
 Since phase 2 the soak runs the daemon **with the web dashboard on**: one client holds an event stream (`/api/stream`) of a
 flooding task for the whole run (reconnecting with `Last-Event-ID` when the server ends the stream at its limits and
 counting bytes only, so the client keeps no buffer), and a second polls `/api/status` every 500 ms. Memory is flat after
-the buffers fill: it did not grow with the volume of output (about 3.4 GiB went through the daemon, 68 MB of it through the
-event stream), and the growth after warm-up (612 kB) is within the 4 MiB the test allows. Four 120 second runs with the dashboard on
-(one of them before the last test-only changes) grew 496 to 668 kB. Throughput is much lower than in the earlier run without the
-dashboard (271 MiB/s): the machine was shared with other containers, and the stream and the status polls add work, but
-the cause of the difference was not investigated, so no comparison is claimed. By default the test runs 20 seconds;
+the buffers fill: it did not grow with the volume of output (about 14 GiB went through the daemon, 325 MB of it through
+the event stream), and the growth after warm-up (428 kB) is within the 4 MiB the test allows. Five 120 second runs with the
+dashboard on grew 428 to 668 kB; the throughput of those runs ranged from 26 to 184 MiB/s on a machine that was shared with
+other containers (the run above is the last and the quietest; the earlier run without the dashboard measured 271 MiB/s),
+so no throughput comparison is claimed. By default the test runs 20 seconds;
 `FLEET_SOAK_SECS=120 cargo test --release -p fleet-infra --test soak -- --nocapture` reproduces the numbers above
 (your throughput will differ). Bounds elsewhere: messages 64 KiB, frames 32 KiB, files read from workers 64 KiB,
 gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 64 connections.
