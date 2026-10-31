@@ -287,7 +287,12 @@ mod tests {
     #[test]
     fn lookalikes_are_different_names_not_traversal() {
         // full-width dots and slash, and a division slash, are ordinary characters
-        for fine in ["\u{ff0e}\u{ff0e}", "\u{ff0e}\u{ff0e}\u{ff0f}x", "a\u{2215}b", "a\u{2044}b"] {
+        for fine in [
+            "\u{ff0e}\u{ff0e}",
+            "\u{ff0e}\u{ff0e}\u{ff0f}x",
+            "a\u{2215}b",
+            "a\u{2044}b",
+        ] {
             assert!(RepoPath::parse(fine).is_ok(), "{fine:?}");
         }
         // nothing is normalized: composed and decomposed forms are two names
@@ -355,7 +360,10 @@ mod tests {
         ] {
             assert_eq!(r(bad), None, "{bad:?}");
         }
-        assert_eq!(RepoPath::root().resolve_link("a/../b").unwrap().as_str(), "b");
+        assert_eq!(
+            RepoPath::root().resolve_link("a/../b").unwrap().as_str(),
+            "b"
+        );
         assert_eq!(RepoPath::root().resolve_link("../b"), None);
         let long = format!("{}.md", "a".repeat(MAX_PATH_BYTES * 3));
         assert_eq!(dir.resolve_link(&long), None);
@@ -394,7 +402,10 @@ mod tests {
                 assert!(!p.as_str().starts_with('/'), "{s:?}");
                 assert!(!p.as_str().contains('\\'), "{s:?}");
                 assert!(!p.as_str().contains('\0'), "{s:?}");
-                assert!(p.components().all(|c| component_problem(c).is_none()), "{s:?}");
+                assert!(
+                    p.components().all(|c| component_problem(c).is_none()),
+                    "{s:?}"
+                );
                 assert!(p.depth() <= MAX_PATH_DEPTH);
             }
         }
