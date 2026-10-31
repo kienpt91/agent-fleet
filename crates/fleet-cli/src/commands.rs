@@ -64,10 +64,11 @@ global options (before or after the command):
   -V, --version       show the version
 
 daemon:
-  daemon [--config <fleet.toml>] [--web <addr> [--web-allow-remote]]
+  daemon [--config <fleet.toml>] [--web <addr> [--web-allow-remote] [--web-print-login-url]]
                                      run the daemon in the foreground; --web serves the local
                                      dashboard (<ip>:<port>, <port> or <ip>; loopback only unless
-                                     --web-allow-remote; the login URL is printed once)
+                                     --web-allow-remote; the login URL is printed once, and only to
+                                     a terminal unless --web-print-login-url)
   shutdown                           ask the daemon to stop
   doctor [--config <fleet.toml>]     check the setup (exit 13 when something fails)
   verify-log                         verify the event log's hash chain (exit 11 when tampered)
@@ -167,6 +168,8 @@ pub enum Command {
         web: Option<SocketAddr>,
         /// `--web-allow-remote`: allow `web` to be an address that is not loopback.
         web_allow_remote: bool,
+        /// `--web-print-login-url`: print the login URL even when stderr is not a terminal.
+        web_print_login_url: bool,
     },
     Attach {
         task: String,
@@ -337,9 +340,12 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
             let config = p.opt("--config")?;
             let web = p.opt("--web")?;
             let web_allow_remote = p.flag("--web-allow-remote");
+            let web_print_login_url = p.flag("--web-print-login-url");
             no_args(p)?;
-            if web_allow_remote && web.is_none() {
-                return Err(FleetError::usage("--web-allow-remote needs --web <addr>"));
+            if (web_allow_remote || web_print_login_url) && web.is_none() {
+                return Err(FleetError::usage(
+                    "--web-allow-remote and --web-print-login-url need --web <addr>",
+                ));
             }
             Command::Daemon {
                 config: config
@@ -347,6 +353,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                     .transpose()?,
                 web: web.map(|w| parse_bind(&w)).transpose()?,
                 web_allow_remote,
+                web_print_login_url,
             }
         }
         "run" => {
@@ -872,12 +879,17 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
             config,
             web,
             web_allow_remote,
+            web_print_login_url,
         } => {
             reject_json(ctx, "daemon")?;
             run_daemon(DaemonOptions {
                 state_dir: ctx.state_dir.clone(),
                 config_path: config,
-                web: web.map(|addr| WebOptions::new(addr, web_allow_remote)),
+                web: web.map(|addr| {
+                    let mut opts = WebOptions::new(addr, web_allow_remote);
+                    opts.print_login_url = web_print_login_url;
+                    opts
+                }),
             })?;
         }
         Command::Attach { task } => {
@@ -1296,7 +1308,8 @@ mod tests {
             Command::Daemon {
                 config: Some("/etc/fleet.toml".into()),
                 web: None,
-                web_allow_remote: false
+                web_allow_remote: false,
+                web_print_login_url: false
             }
         );
         assert_eq!(
@@ -1304,7 +1317,8 @@ mod tests {
             Command::Daemon {
                 config: None,
                 web: None,
-                web_allow_remote: false
+                web_allow_remote: false,
+                web_print_login_url: false
             }
         );
         assert_eq!(
@@ -1312,7 +1326,8 @@ mod tests {
             Command::Daemon {
                 config: None,
                 web: Some("127.0.0.1:0".parse().unwrap()),
-                web_allow_remote: false
+                web_allow_remote: false,
+                web_print_login_url: false
             }
         );
         assert_eq!(
@@ -1320,7 +1335,8 @@ mod tests {
             Command::Daemon {
                 config: None,
                 web: Some("127.0.0.1:8080".parse().unwrap()),
-                web_allow_remote: false
+                web_allow_remote: false,
+                web_print_login_url: false
             }
         );
         assert_eq!(
@@ -1328,13 +1344,24 @@ mod tests {
             Command::Daemon {
                 config: None,
                 web: Some("0.0.0.0:9".parse().unwrap()),
-                web_allow_remote: true
+                web_allow_remote: true,
+                web_print_login_url: false
+            }
+        );
+        assert_eq!(
+            parse_ok(&["daemon", "--web", "127.0.0.1:0", "--web-print-login-url"]),
+            Command::Daemon {
+                config: None,
+                web: Some("127.0.0.1:0".parse().unwrap()),
+                web_allow_remote: false,
+                web_print_login_url: true
             }
         );
         for bad in [
             vec!["daemon", "--web"],
             vec!["daemon", "--web", "example.com:80"],
             vec!["daemon", "--web-allow-remote"],
+            vec!["daemon", "--web-print-login-url"],
             vec!["daemon", "--web", "1", "--web", "2"],
         ] {
             assert!(parse(&bad).is_err(), "{bad:?}");

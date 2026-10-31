@@ -20,6 +20,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -497,12 +498,18 @@ pub struct WebInfo {
     pub token: String,
     pub login_url: String,
     lines: Arc<Mutex<Vec<String>>>,
+    done: Arc<AtomicBool>,
 }
 
 impl WebInfo {
     /// Everything the daemon has printed on stderr so far.
     pub fn stderr_lines(&self) -> Vec<String> {
         self.lines.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// True once the daemon's stderr is closed (it exited) and every line has been collected.
+    pub fn stderr_closed(&self) -> bool {
+        self.done.load(Ordering::SeqCst)
     }
 }
 
@@ -780,39 +787,22 @@ impl Fleet {
         run_cmd(c, Duration::from_secs(30))
     }
 
-    /// Starts `fleet daemon --web 127.0.0.1:0` as a child.
+    /// Starts `fleet daemon --web 127.0.0.1:0 --web-print-login-url` as a child.
     pub fn start_web(&mut self, extra_args: &[&str]) -> WebInfo {
         self.start_web_at("127.0.0.1:0", extra_args)
     }
 
-    /// Starts `fleet daemon --web <addr>` as a child with its stderr piped into memory, and
-    /// waits until the control socket answers and the login URL has been printed.
+    /// Starts `fleet daemon --web <addr> --web-print-login-url` as a child with its stderr piped
+    /// into memory, and waits until the control socket answers and the login URL has been
+    /// printed. (The daemon prints the URL to a pipe only when asked to.)
     pub fn start_web_at(&mut self, addr: &str, extra_args: &[&str]) -> WebInfo {
-        assert!(self.child.is_none(), "a daemon is already running");
-        let mut c = self.daemon_command();
-        c.args(["--web", addr]).args(extra_args);
-        c.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let mut child = c.spawn().expect("spawn the daemon");
-        let stderr = child.stderr.take().expect("stderr pipe");
-        self.child = Some(child);
-        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&lines);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Ok(mut l) = sink.lock() {
-                    l.push(line);
-                }
-            }
-        });
+        let mut args = vec!["--web-print-login-url"];
+        args.extend_from_slice(extra_args);
+        let (lines, done) = self.spawn_web(addr, &args);
         let seen = || lines.lock().map(|l| l.clone()).unwrap_or_default();
         let start = Instant::now();
         loop {
-            if let Some(status) = self.child.as_mut().unwrap().try_wait().expect("try_wait") {
-                self.child = None;
-                panic!("the daemon exited early ({status}):\n{}", seen().join("\n"));
-            }
+            self.assert_daemon_running(&seen());
             let login = seen()
                 .iter()
                 .filter(|l| l.contains("login URL"))
@@ -825,6 +815,7 @@ impl Fleet {
                         token,
                         login_url: url,
                         lines: Arc::clone(&lines),
+                        done,
                     };
                 }
             }
@@ -832,6 +823,80 @@ impl Fleet {
                 panic!("the daemon never answered:\n{}", seen().join("\n"));
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Starts `fleet daemon --web 127.0.0.1:0` WITHOUT `--web-print-login-url`, stderr piped (not a
+    /// terminal), and waits until the control socket answers and the banner is complete. The
+    /// returned info has an empty token: the daemon never said it.
+    pub fn start_web_quiet(&mut self) -> WebInfo {
+        let (lines, done) = self.spawn_web("127.0.0.1:0", &[]);
+        let seen = || lines.lock().map(|l| l.clone()).unwrap_or_default();
+        let start = Instant::now();
+        loop {
+            self.assert_daemon_running(&seen());
+            let banner = seen().iter().any(|l| l.contains("--web-print-login-url"));
+            let port = seen().iter().find_map(|l| {
+                let rest = &l[l.find("dashboard on http://127.0.0.1:")?..];
+                let digits: String = rest["dashboard on http://127.0.0.1:".len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse::<u16>().ok()
+            });
+            if let (true, Some(port)) = (banner, port) {
+                if self.cli(&["status"]).code == 0 {
+                    return WebInfo {
+                        port,
+                        token: String::new(),
+                        login_url: String::new(),
+                        lines: Arc::clone(&lines),
+                        done,
+                    };
+                }
+            }
+            if start.elapsed() > Duration::from_secs(30) {
+                panic!("the daemon never answered:\n{}", seen().join("\n"));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Spawns the daemon with `--web <addr>` and the extra arguments; its stderr is drained into
+    /// the returned lines by a thread that raises the flag at end of file.
+    fn spawn_web(
+        &mut self,
+        addr: &str,
+        extra_args: &[&str],
+    ) -> (Arc<Mutex<Vec<String>>>, Arc<AtomicBool>) {
+        assert!(self.child.is_none(), "a daemon is already running");
+        let mut c = self.daemon_command();
+        c.args(["--web", addr]).args(extra_args);
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().expect("spawn the daemon");
+        let stderr = child.stderr.take().expect("stderr pipe");
+        self.child = Some(child);
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let sink = Arc::clone(&lines);
+        let finished = Arc::clone(&done);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Ok(mut l) = sink.lock() {
+                    l.push(line);
+                }
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        (lines, done)
+    }
+
+    fn assert_daemon_running(&mut self, stderr: &[String]) {
+        if let Some(status) = self.child.as_mut().unwrap().try_wait().expect("try_wait") {
+            self.child = None;
+            panic!("the daemon exited early ({status}):\n{}", stderr.join("\n"));
         }
     }
 

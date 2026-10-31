@@ -27,6 +27,7 @@ use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::MAX_CONCURRENT_JOBS;
 use fleet_domain::supervision::{is_started_by_daemon, is_worker_origin, LiveSession, ProcInfo};
 use fleet_domain::value::Value;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,7 @@ pub struct WebInfo {
     pub token: String,
     pub login_url: String,
     pub allow_remote: bool,
+    pub print_login_url: bool,
 }
 
 impl std::fmt::Debug for WebInfo {
@@ -251,6 +253,7 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
                 token: web.token().to_string(),
                 login_url: web.login_url(),
                 allow_remote: web_opts.allow_remote,
+                print_login_url: web_opts.print_login_url,
             };
             let web_stop = Arc::clone(&stop);
             let thread = std::thread::Builder::new()
@@ -275,6 +278,34 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     })
 }
 
+/// What the daemon says about the dashboard when it starts. The login URL carries the web token,
+/// so it is shown only on a terminal (or when the operator asked for it): stderr that is a file,
+/// a pipe or a journal would keep it where every process of the same user can read it.
+fn web_banner(web: &WebInfo, stderr_is_terminal: bool) -> Vec<String> {
+    let mut lines = vec![format!(
+        "fleet web: dashboard on http://{}/",
+        crate::web::url_host(web.addr)
+    )];
+    if web.allow_remote && !web.addr.ip().to_canonical().is_loopback() {
+        lines.push(format!(
+            "fleet web: {}",
+            crate::web::remote_warning(web.addr)
+        ));
+    }
+    if stderr_is_terminal || web.print_login_url {
+        lines.push(format!(
+            "fleet web: login URL (shown only now, valid until the daemon stops): {}",
+            web.login_url
+        ));
+    } else {
+        lines.push(
+            "fleet web: the login URL was not printed because stderr is not a terminal (it would be kept in whatever receives it); run the daemon in a terminal or add --web-print-login-url"
+                .to_string(),
+        );
+    }
+    lines
+}
+
 /// Runs the daemon in the foreground until a `shutdown` command arrives.
 pub fn run_daemon(opts: DaemonOptions) -> Result<()> {
     let handle = start_daemon(opts)?;
@@ -284,19 +315,9 @@ pub fn run_daemon(opts: DaemonOptions) -> Result<()> {
         handle.socket().display()
     );
     if let Some(web) = handle.web() {
-        // Printed to the operator's terminal only, once. The token is not written to any file,
-        // log or event, and workers never see it.
-        eprintln!(
-            "fleet web: dashboard on http://{}/",
-            crate::web::url_host(web.addr)
-        );
-        if web.allow_remote && !web.addr.ip().to_canonical().is_loopback() {
-            eprintln!("fleet web: {}", crate::web::remote_warning(web.addr));
+        for line in web_banner(web, std::io::stderr().is_terminal()) {
+            eprintln!("{line}");
         }
-        eprintln!(
-            "fleet web: login URL (shown only now, valid until the daemon stops): {}",
-            web.login_url
-        );
     }
     handle.wait();
     Ok(())
@@ -657,6 +678,42 @@ mod tests {
     fn an_operator_process_is_admitted_whether_or_not_workers_are_running() {
         assert!(decide_origin(&peer(Some(900)), &[WORKER], DAEMON, table).is_ok());
         assert!(decide_origin(&peer(Some(900)), &[], DAEMON, table).is_ok());
+    }
+
+    fn web_info(allow_remote: bool, print: bool, addr: &str) -> WebInfo {
+        let addr: SocketAddr = addr.parse().unwrap();
+        WebInfo {
+            addr,
+            token: "t".repeat(64),
+            login_url: format!("http://{addr}/#token={}", "t".repeat(64)),
+            allow_remote,
+            print_login_url: print,
+        }
+    }
+
+    #[test]
+    fn the_login_url_is_printed_only_to_a_terminal_or_when_asked() {
+        let info = web_info(false, false, "127.0.0.1:7878");
+        let on_terminal = web_banner(&info, true).join("\n");
+        assert!(on_terminal.contains("#token="), "{on_terminal}");
+        assert!(on_terminal.contains("shown only now"));
+        let piped = web_banner(&info, false).join("\n");
+        assert!(!piped.contains("#token="), "{piped}");
+        assert!(!piped.contains(&"t".repeat(64)));
+        assert!(piped.contains("--web-print-login-url"), "{piped}");
+        assert!(piped.contains("dashboard on http://127.0.0.1:7878/"));
+        let asked = web_banner(&web_info(false, true, "127.0.0.1:7878"), false).join("\n");
+        assert!(asked.contains("#token="), "{asked}");
+    }
+
+    #[test]
+    fn the_remote_warning_is_printed_for_non_loopback_addresses_only() {
+        assert!(!web_banner(&web_info(true, false, "127.0.0.1:1"), true)
+            .join("\n")
+            .contains("no TLS"));
+        assert!(web_banner(&web_info(true, false, "0.0.0.0:1"), true)
+            .join("\n")
+            .contains("no TLS"));
     }
 
     #[test]

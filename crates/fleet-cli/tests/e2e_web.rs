@@ -10,7 +10,7 @@ mod common;
 
 use common::*;
 use fleet_domain::value::Value;
-use fleet_infra::testutil::wait_until;
+use fleet_infra::testutil::{wait_until, TempDir};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -19,6 +19,19 @@ use std::time::{Duration, Instant};
 
 fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+/// The header that carries a dashboard session id.
+const SESSION: &str = "X-Fleet-Session";
+
+fn has_hex64_run(text: &str) -> bool {
+    let mut run = 0usize;
+    for c in text.chars() {
+        run = if c.is_ascii_hexdigit() { run + 1 } else { 0 };
+        if run >= 64 {
+            return true;
+        }
+    }
+    false
 }
 
 fn has_bytes(hay: &[u8], needle: &[u8]) -> bool {
@@ -225,8 +238,12 @@ impl Web {
     }
 
     fn wait_task(&self, task: &str, wanted: &str) -> Value {
-        let st = self.wait(&format!("{task} to be {wanted}"), |st| {
-            find_task(st, "r1", task).is_some_and(|t| jstr(t, "status") == wanted)
+        self.wait_task_in(task, &[wanted])
+    }
+
+    fn wait_task_in(&self, task: &str, wanted: &[&str]) -> Value {
+        let st = self.wait(&format!("{task} to be one of {wanted:?}"), |st| {
+            find_task(st, "r1", task).is_some_and(|t| wanted.contains(&jstr(t, "status")))
         });
         find_task(&st, "r1", task).unwrap().clone()
     }
@@ -260,22 +277,17 @@ struct Sse {
 
 impl Sse {
     fn open(port: u16, path: &str, token: &str) -> Sse {
-        let mut s = connect(port);
         let bearer = format!("Bearer {token}");
-        s.write_all(
-            request_bytes(
-                port,
-                "GET",
-                path,
-                &[
-                    ("Authorization", bearer.as_str()),
-                    ("Accept", "text/event-stream"),
-                ],
-                None,
-            )
-            .as_bytes(),
-        )
-        .unwrap();
+        Sse::open_with(port, path, &[("Authorization", bearer.as_str())])
+    }
+
+    /// Opens a stream with the given credential headers.
+    fn open_with(port: u16, path: &str, creds: &[(&str, &str)]) -> Sse {
+        let mut s = connect(port);
+        let mut headers = vec![("Accept", "text/event-stream")];
+        headers.extend_from_slice(creds);
+        s.write_all(request_bytes(port, "GET", path, &headers, None).as_bytes())
+            .unwrap();
         s.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let mut sse = Sse {
@@ -467,47 +479,66 @@ fn login_flow() {
         Some(&login_body),
     );
     assert_eq!(login.status, 200, "{}", login.text());
-    let cookies = login.all("set-cookie");
-    assert_eq!(cookies.len(), 1, "{:?}", login.headers);
-    let set_cookie = cookies[0];
-    for attr in ["HttpOnly", "SameSite=Strict", "Path=/"] {
-        assert!(
-            set_cookie.contains(attr),
-            "{attr} missing from {set_cookie}"
-        );
-    }
-    let session_id = set_cookie
-        .strip_prefix("fleet_session=")
-        .and_then(|r| r.split(';').next())
-        .unwrap_or_else(|| panic!("unexpected cookie {set_cookie}"))
-        .to_string();
-    assert!(!session_id.is_empty());
-    assert_ne!(session_id, info.token);
     assert!(
-        !set_cookie.contains(&info.token),
-        "the cookie carries the token"
+        login.all("set-cookie").is_empty(),
+        "login set a cookie: {:?}",
+        login.headers
     );
     let session = login.json();
     assert_eq!(jstr(&session, "schema"), "fleet.web.session/1");
+    let session_id = jstr(&session, "session").to_string();
+    assert!(!session_id.is_empty());
+    assert_ne!(session_id, info.token);
     let csrf = jstr(&session, "csrf").to_string();
     assert!(!csrf.is_empty() && csrf != session_id && csrf != info.token);
     assert!(!login.text().contains(&info.token));
 
-    // the cookie reads
-    let cookie = format!("fleet_session={session_id}");
-    let by_cookie = http(port, "GET", "/api/status", &[("Cookie", &cookie)], None);
-    assert_eq!(by_cookie.status, 200, "{}", by_cookie.text());
-    assert_eq!(jstr(&by_cookie.json(), "schema"), "fleet.status/1");
-    let sess = http(port, "GET", "/api/session", &[("Cookie", &cookie)], None);
+    // the session travels in a header and works for reads
+    let by_session = http(port, "GET", "/api/status", &[(SESSION, &session_id)], None);
+    assert_eq!(by_session.status, 200, "{}", by_session.text());
+    assert_eq!(jstr(&by_session.json(), "schema"), "fleet.status/1");
+    // the id is a credential and is never echoed again; the CSRF token is
+    let sess = http(port, "GET", "/api/session", &[(SESSION, &session_id)], None);
+    assert_eq!(sess.status, 200, "{}", sess.text());
+    assert!(sess.json().get("session").is_some_and(Value::is_null));
     assert_eq!(jstr(&sess.json(), "csrf"), csrf);
+    assert!(!sess.text().contains(&session_id));
 
-    // a cookie POST needs the CSRF token and the dashboard's own Origin
+    // a cookie is no credential at all: a browser sends cookies to every server on the host,
+    // whatever the port, so the dashboard never reads one
+    let cookie = format!("fleet_session={session_id}");
     let ask = Value::object([("id", Value::str("g99")), ("answer", Value::str("x"))]).canonical();
+    let by_cookie = http(port, "GET", "/api/status", &[("Cookie", &cookie)], None);
+    assert_eq!(by_cookie.status, 401, "{}", by_cookie.text());
+    assert_eq!(by_cookie.code(), "forbidden");
+    let cookie_post = http(
+        port,
+        "POST",
+        "/api/gate/resolve",
+        &[
+            ("Cookie", &cookie),
+            ("Origin", &origin),
+            ("X-CSRF-Token", &csrf),
+        ],
+        Some(&ask),
+    );
+    assert_eq!(cookie_post.status, 401, "{}", cookie_post.text());
+    // not even next to a valid session header
+    let both = http(
+        port,
+        "GET",
+        "/api/status",
+        &[("Cookie", "fleet_session=nonsense"), (SESSION, &session_id)],
+        None,
+    );
+    assert_eq!(both.status, 200, "{}", both.text());
+
+    // a session POST needs the CSRF token and the dashboard's own Origin
     let no_csrf = http(
         port,
         "POST",
         "/api/gate/resolve",
-        &[("Cookie", &cookie), ("Origin", &origin)],
+        &[(SESSION, &session_id), ("Origin", &origin)],
         Some(&ask),
     );
     assert_eq!(no_csrf.status, 403, "{}", no_csrf.text());
@@ -517,7 +548,7 @@ fn login_flow() {
         "POST",
         "/api/gate/resolve",
         &[
-            ("Cookie", &cookie),
+            (SESSION, &session_id),
             ("Origin", &origin),
             ("X-CSRF-Token", &"0".repeat(64)),
         ],
@@ -528,7 +559,7 @@ fn login_flow() {
         port,
         "POST",
         "/api/gate/resolve",
-        &[("Cookie", &cookie), ("X-CSRF-Token", &csrf)],
+        &[(SESSION, &session_id), ("X-CSRF-Token", &csrf)],
         Some(&ask),
     );
     assert_eq!(no_origin.status, 403, "{}", no_origin.text());
@@ -537,7 +568,7 @@ fn login_flow() {
         "POST",
         "/api/gate/resolve",
         &[
-            ("Cookie", &cookie),
+            (SESSION, &session_id),
             ("Origin", &origin),
             ("X-CSRF-Token", &csrf),
         ],
@@ -609,27 +640,33 @@ fn login_flow() {
     assert_eq!(r.status, 401, "{}", r.text());
     assert!(r.all("set-cookie").is_empty());
 
-    // logout ends the session
+    // logout ends the session: it stops working, and nothing is set in the browser's cookie jar
     let out = http(
         port,
         "POST",
         "/api/logout",
         &[
-            ("Cookie", &cookie),
+            (SESSION, &session_id),
             ("Origin", &origin),
             ("X-CSRF-Token", &csrf),
         ],
         Some("{}"),
     );
     assert_eq!(out.status, 200, "{}", out.text());
-    assert!(out
-        .all("set-cookie")
-        .iter()
-        .any(|c| c.contains("fleet_session=;") && c.contains("Max-Age=0")));
-    let after = http(port, "GET", "/api/status", &[("Cookie", &cookie)], None);
+    assert!(out.all("set-cookie").is_empty(), "{:?}", out.headers);
+    let after = http(port, "GET", "/api/status", &[(SESSION, &session_id)], None);
     assert_eq!(after.status, 401, "{}", after.text());
+    // an unknown or ended session is refused without costing the token holder anything
+    for _ in 0..8 {
+        let r = http(port, "GET", "/api/status", &[(SESSION, &session_id)], None);
+        assert_eq!(r.status, 401, "{}", r.text());
+    }
     // the token still works
     assert_eq!(web.get("/api/status").status, 200);
+    // and no response of this test ever set a cookie
+    assert!(http(port, "GET", "/", &[], None)
+        .all("set-cookie")
+        .is_empty());
 }
 
 // ---- 2. questions, approvals and merges over HTTP ------------------------------------------------------
@@ -812,7 +849,9 @@ fn git_branches(f: &Fleet) -> Vec<String> {
 
 #[test]
 fn live_output_sse_and_send_input() {
-    let (f, info) = web_fleet("echo first-line\nread line\necho \"got:$line\"\n");
+    let (f, info) = web_fleet(
+        "echo first-line\nread line\nprintf '%s' \"$line\" > got.txt\necho \"got:$line\"\n",
+    );
     let web = Web::new(&info);
     f.plan_and_start("r1", 1, &[t("t")]);
     f.wait_live("r1", "t");
@@ -821,6 +860,73 @@ fn live_output_sse_and_send_input() {
     let first = sse.output_until(Duration::from_secs(15), |t| t.contains("first-line"));
     assert!(!first.contains("got:"), "{first:?}");
 
+    // the stream works with a session as well, and ends when that session does
+    let origin = format!("http://127.0.0.1:{}", web.port);
+    let login = http(
+        web.port,
+        "POST",
+        "/api/login",
+        &[("Origin", &origin)],
+        Some(&Value::object([("token", Value::str(&web.token))]).canonical()),
+    );
+    assert_eq!(login.status, 200, "{}", login.text());
+    let session_id = jstr(&login.json(), "session").to_string();
+    let csrf = jstr(&login.json(), "csrf").to_string();
+    let mut by_session = Sse::open_with(
+        web.port,
+        "/api/stream?task=r1/t",
+        &[(SESSION, session_id.as_str())],
+    );
+    by_session.output_until(Duration::from_secs(15), |t| t.contains("first-line"));
+    let out = http(
+        web.port,
+        "POST",
+        "/api/logout",
+        &[
+            (SESSION, session_id.as_str()),
+            ("Origin", &origin),
+            ("X-CSRF-Token", &csrf),
+        ],
+        Some("{}"),
+    );
+    assert_eq!(out.status, 200, "{}", out.text());
+    let rest = by_session.drain_to_close(Duration::from_secs(10));
+    let last = rest.last().expect("the stream ended without an event");
+    assert_eq!(last.name, "end", "{rest:?}");
+    let reason = parse_json(&last.data);
+    assert!(jstr(&reason, "reason").contains("session"), "{}", last.data);
+    // the worker is still running: the stream ended because of the logout, not the task
+    assert!(jbool(&f.task("r1", "t"), "live"));
+    // and the session no longer opens one
+    let again = http(
+        web.port,
+        "GET",
+        "/api/stream?task=r1/t",
+        &[(SESSION, session_id.as_str())],
+        None,
+    );
+    assert_eq!(again.status, 401, "{}", again.text());
+
+    // typing is text: escape sequences, carriage returns and invisible characters are refused
+    // and nothing of them is sent
+    for (what, text) in [
+        ("ESC", "a\u{1b}[31mred"),
+        ("CR", "one\rtwo"),
+        ("bidi", "evil\u{202e}text"),
+        ("BEL", "ding\u{7}"),
+    ] {
+        let r = web.post(
+            "/api/send",
+            &Value::object([
+                ("task", Value::str("r1/t")),
+                ("text", Value::str(text)),
+                ("newline", Value::Bool(true)),
+            ]),
+        );
+        assert_eq!(r.status, 400, "{what}: {}", r.text());
+        assert_eq!(r.code(), "invalid", "{what}");
+    }
+    assert!(jbool(&f.task("r1", "t"), "live"), "the worker took input");
     // input typed in the browser reaches the worker; the markup in it stays text
     let sent = web.post(
         "/api/send",
@@ -859,6 +965,11 @@ fn live_output_sse_and_send_input() {
 
     // the stored output is the same text
     f.wait_task("r1", "t", &["completed"]);
+    // the worker received exactly the one legitimate line: none of the refused text got to it
+    assert_eq!(
+        fs::read_to_string(f.worktree("r1", "t").join("got.txt")).unwrap(),
+        "hello <b>x</b>"
+    );
     let tail = web.get("/api/tail?task=r1/t");
     assert_eq!(tail.status, 200, "{}", tail.text());
     let doc = tail.json();
@@ -1000,6 +1111,8 @@ fn assert_refused_as_worker(dir: &Path, file: &str) {
     for secret in [
         "fleet.status/1",
         "fleet.merge/1",
+        "fleet.web.session/1",
+        "csrf",
         "\"approvals\"",
         "\"runs\"",
     ] {
@@ -1115,6 +1228,14 @@ fn web_flag_policy() {
     let usage = f.daemon_refused_with(&["--web-allow-remote"]);
     assert_eq!(usage.code, 2, "{usage:?}");
     assert!(usage.stderr.contains("--web"), "{usage:?}");
+    // so does --web-print-login-url: there is no URL to print without a dashboard
+    let usage = f.daemon_refused_with(&["--web-print-login-url"]);
+    assert_eq!(usage.code, 2, "{usage:?}");
+    assert!(usage.stderr.contains("--web"), "{usage:?}");
+    assert!(
+        !f.state.join("control/fleet.sock").exists(),
+        "a daemon was started"
+    );
     // a name is not an address
     let name = f.daemon_refused_with(&["--web", "example.com:80"]);
     assert_eq!(name.code, 2, "{name:?}");
@@ -1313,4 +1434,319 @@ fn health_and_log_panels() {
     let doc = parse_json(&last);
     assert!(!jstr(&doc, "error").is_empty(), "no error text in {last}");
     assert!(doc.get("head_hash").is_some_and(Value::is_null));
+}
+
+// ---- 10. the login URL stays off non-terminals ------------------------------------------------------------------------
+
+#[test]
+fn login_url_is_not_printed_when_stderr_is_not_a_terminal() {
+    let mut f = Fleet::new();
+    let info = f.start_web_quiet();
+    // the dashboard is up, and nobody was told how to log in
+    let page = http(info.port, "GET", "/", &[], None);
+    assert_eq!(page.status, 200);
+    assert_eq!(http(info.port, "GET", "/api/status", &[], None).status, 401);
+    assert_eq!(f.shutdown(), 0);
+    assert!(
+        wait_until(10_000, || info.stderr_closed()),
+        "the daemon's stderr never closed"
+    );
+    let text = info.stderr_lines().join("\n");
+    assert!(text.contains("dashboard on http://127.0.0.1:"), "{text}");
+    assert!(text.contains("--web-print-login-url"), "{text}");
+    assert!(!text.contains("#token="), "{text}");
+    assert!(!text.contains("shown only now"), "{text}");
+    assert!(
+        !has_hex64_run(&text),
+        "a 64 digit hex string was printed: {text}"
+    );
+}
+
+// ---- 11. everything the daemon starts is refused, not only workers -----------------------------------------------------
+
+/// Bash functions shared by the probe scripts. `attack TAG` makes every request a hostile
+/// descendant could try, each into its own file in `$OUT`; `run_modes` runs it as the process
+/// itself, as a subshell, as a separate `bash` child and as a grandchild that is orphaned (adopted
+/// by init) but keeps the process group: only the daemon's registry of what it started, not the
+/// parent chain, can still tell where that one came from.
+const ATTACK_FUNCS: &str = r#"
+attack() {
+  local tag=$1
+  req POST /api/login "{\"token\":\"$TOKEN\"}" "$OUT/$tag-login.txt"
+  req GET /api/status "" "$OUT/$tag-status.txt"
+  req GET /api/session "" "$OUT/$tag-session.txt"
+  req POST /api/approval/decide "{\"id\":\"$ID\",\"approve\":true,\"digest\":\"$DIGEST\"}" "$OUT/$tag-decide.txt"
+  req POST /api/merge '{"task":"a"}' "$OUT/$tag-merge.txt"
+  "$FLEETBIN" --state-dir "$STATE" status > "$OUT/$tag-socket.txt" 2>&1
+  echo "exit=$?" >> "$OUT/$tag-socket.txt"
+}
+run_modes() {
+  attack self
+  ( attack sub )
+  bash -c 'source "$LIB"; attack child'
+  rm -f "$OUT/bg.done"
+  ( ( sleep 1; attack bg; : > "$OUT/bg.done" ) & )
+  for i in $(seq 300); do [ -e "$OUT/bg.done" ] && break; sleep 0.1; done
+}
+"#;
+
+const MODES: [&str; 4] = ["self", "sub", "child", "bg"];
+
+fn attack_lib() -> String {
+    format!("{BASH_REQ}{ATTACK_FUNCS}")
+}
+
+/// A merge request that stays pending: returns the approval id and its digest.
+fn pending_merge_approval(web: &Web, task: &str) -> (String, String) {
+    let r = web.post("/api/merge", &Value::object([("task", Value::str(task))]));
+    assert_eq!(r.status, 409, "{}", r.text());
+    assert_eq!(r.code(), "approval_required");
+    let id = r.subject();
+    let digest = jstr(
+        approval(&web.status(), &id).unwrap_or_else(|| panic!("no approval {id}")),
+        "digest",
+    )
+    .to_string();
+    assert!(is_hex64(&digest));
+    (id, digest)
+}
+
+/// Hands the probe scripts the approval they are going to try to decide (written in one step so
+/// that a script that polls for it never reads half of it).
+fn publish_decision(out: &TempDir, id: &str, digest: &str) {
+    fs::write(out.join("decide.tmp"), format!("{id} {digest}\n")).unwrap();
+    fs::rename(out.join("decide.tmp"), out.join("decide.txt")).unwrap();
+}
+
+/// Every probe request was answered 403 `forbidden` by the admission rule, whatever it was
+/// (including a valid login with the real token), and the control socket refused as well.
+fn assert_every_probe_refused(out: &Path, token: &str) {
+    for tag in MODES {
+        for name in ["login", "status", "session", "decide", "merge"] {
+            let file = format!("{tag}-{name}.txt");
+            assert_refused_as_worker(out, &file);
+            let text = fs::read_to_string(out.join(&file)).unwrap();
+            assert!(!text.contains(token), "{file} echoes the token");
+            assert!(!text.contains("\"session\":\""), "{file}: {text}");
+        }
+        let file = format!("{tag}-socket.txt");
+        let text = fs::read_to_string(out.join(&file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(text.contains("worker processes"), "{file}: {text}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("exit=") && l != "exit=0"),
+            "{file}: the control socket answered: {text}"
+        );
+        assert!(!text.contains("r1/"), "{file} shows the runs: {text}");
+    }
+}
+
+/// The operator side is untouched while the daemon's own processes are being refused, and the very
+/// same probe script, run from this process (which the daemon did not start), is answered: it is
+/// the refusal of the daemon's processes that the tests above saw, not a broken script.
+fn assert_operator_unaffected(f: &Fleet, web: &Web, lib: &Path) {
+    let ok = web.get("/api/status");
+    assert_eq!(ok.status, 200, "{}", ok.text());
+    assert_eq!(jstr(&ok.json(), "schema"), "fleet.status/1");
+    assert_eq!(jstr(&f.status(), "schema"), "fleet.status/1");
+
+    let dir = TempDir::new("op");
+    let ran = std::process::Command::new("bash")
+        .env_clear()
+        .env("PATH", system_path())
+        .env("PORT", web.port.to_string())
+        .env("TOKEN", &web.token)
+        .env("OUT", dir.path())
+        .env("STATE", &f.state)
+        .env("FLEETBIN", FLEET_BIN)
+        .env("LIB", lib)
+        // an approval that does not exist: the operator's decide must not touch a real one
+        .env("ID", "a999")
+        .env("DIGEST", "0".repeat(64))
+        .args(["-c", "source \"$LIB\"; attack operator"])
+        .status()
+        .unwrap();
+    assert!(ran.success());
+    let read = |name: &str| fs::read_to_string(dir.join(&format!("operator-{name}.txt"))).unwrap();
+    for (name, status, schema) in [
+        ("login", "200", "fleet.web.session/1"),
+        ("status", "200", "fleet.status/1"),
+        ("session", "200", "fleet.web.session/1"),
+        ("decide", "404", "fleet.error/1"),
+        ("merge", "409", "fleet.error/1"),
+    ] {
+        let text = read(name);
+        assert!(
+            text.starts_with(&format!("HTTP/1.1 {status}")),
+            "operator {name}: {text}"
+        );
+        assert!(text.contains(schema), "operator {name}: {text}");
+    }
+    assert!(read("socket").lines().any(|l| l == "exit=0"));
+}
+
+const GATE_PROBE: &str = r#"#!/bin/bash
+grep -q 'XPORT=' .fleet/brief.md || exit 0
+while IFS= read -r l; do
+  [[ $l =~ XPORT=([0-9]+) ]] && PORT=${BASH_REMATCH[1]}
+  [[ $l =~ XTOKEN=([0-9a-f]+) ]] && TOKEN=${BASH_REMATCH[1]}
+  [[ $l =~ XBIN=([^ ]+) ]] && FLEETBIN=${BASH_REMATCH[1]}
+  [[ $l =~ XSTATE=([^ ]+) ]] && STATE=${BASH_REMATCH[1]}
+  [[ $l =~ XOUT=([^ ]+) ]] && OUT=${BASH_REMATCH[1]}
+  [[ $l =~ XLIB=([^ ]+) ]] && LIB=${BASH_REMATCH[1]}
+done < .fleet/brief.md
+export PORT TOKEN FLEETBIN STATE OUT LIB
+source "$LIB"
+for i in $(seq 400); do [ -s "$OUT/decide.txt" ] && break; sleep 0.1; done
+[ -s "$OUT/decide.txt" ] || exit 3
+read -r ID DIGEST < "$OUT/decide.txt"
+export ID DIGEST
+run_modes
+# the gate passes exactly when every request was refused
+bad=0
+for f in "$OUT"/*-login.txt "$OUT"/*-status.txt "$OUT"/*-session.txt "$OUT"/*-decide.txt "$OUT"/*-merge.txt; do
+  grep -q '^HTTP/1.1 403' "$f" || bad=1
+done
+exit $bad
+"#;
+
+/// Covers admission of a quality gate. A gate is code the daemon runs on the agent's behalf in the
+/// task's worktree, so what it could read (the brief, here carrying the web token on purpose) is
+/// what a prompt-injected agent could plant there. The earlier rule refused only the descendants
+/// of the pty workers, so a gate, a child of it, or a leftover of it that was adopted by init could
+/// log in with the token, read the status and decide the approval it can see. Each of those
+/// requests, and the control socket, must now be refused while the gate runs, and the daemon must
+/// go on working (the task completes and the gate reports that it passed).
+#[test]
+fn a_quality_gate_child_cannot_use_the_web_ui_or_the_socket() {
+    let mut f = Fleet::new();
+    let out = TempDir::new("o");
+    let lib = f.tmp.write("attack-lib.sh", &attack_lib());
+    let gate = f.tmp.script("gate.sh", GATE_PROBE);
+    let worker = f.script("w.sh", "echo \"$FLEET_TASK\" > \"$FLEET_TASK.txt\"");
+    f.write_cfg(&simple_cfg(&worker, "").set("max_retries", "0").gate(
+        "probe",
+        &gate,
+        &[],
+        "timeout_secs = 90",
+    ));
+    let info = f.start_web(&[]);
+    let web = Web::new(&info);
+    // the secrets are handed over on purpose, as if the brief had leaked them
+    let spec = format!(
+        "XPORT={} XTOKEN={} XBIN={} XSTATE={} XOUT={} XLIB={}",
+        info.port,
+        info.token,
+        FLEET_BIN,
+        f.state.display(),
+        out.path().display(),
+        lib.display()
+    );
+    f.plan_and_start("r1", 2, &[t("a"), t("b").spec(&spec)]);
+
+    // a pending approval exists while the gate of `b` runs
+    web.wait_task("a", "completed");
+    let (id, digest) = pending_merge_approval(&web, "a");
+    publish_decision(&out, &id, &digest);
+
+    let b = web.wait_task_in("b", &["completed", "failed"]);
+    assert_eq!(jstr(&b, "status"), "completed", "{}", b.canonical());
+    let gates = jarr(&b, "gates");
+    assert_eq!(gates.len(), 1, "{}", b.canonical());
+    assert!(jbool(&gates[0], "passed"), "{}", b.canonical());
+    assert_every_probe_refused(out.path(), &info.token);
+
+    // nothing was decided or merged
+    let st = web.status();
+    assert_eq!(jstr(approval(&st, &id).unwrap(), "status"), "pending");
+    assert_eq!(jstr(&f.approvals()[0], "status"), "pending");
+    assert!(
+        git_branches(&f).iter().all(|b| b != "fleet/r1/integration"),
+        "a merge happened"
+    );
+    assert_operator_unaffected(&f, &web, &lib);
+}
+
+/// Covers admission of a process started by an approved command. The command runs outside any
+/// worker session, so it was the second hole of the earlier rule: it, a child of it and an orphaned
+/// grandchild (which sleeps first, so the parent chain no longer leads anywhere) could use the
+/// token the way the operator does. They must all be refused, the approval they can see must stay
+/// pending, and the operator's own requests keep working.
+#[test]
+fn a_process_started_by_an_approved_command_cannot_use_the_web_ui() {
+    let mut f = Fleet::new();
+    let out = TempDir::new("o");
+    let lib = f.tmp.write("attack-lib.sh", &attack_lib());
+    let ext = f.tmp.join("ext.sh");
+    let worker = f.script(
+        "w.sh",
+        &fill(
+            "case \"$FLEET_TASK\" in\n  c)\n    if grep -q -e 'The approved command was started' -e 'An operator denied' \"$FLEET_BRIEF_FILE\"; then exit 0; fi\n    printf '{\"version\":1,\"kind\":\"approval\",\"text\":\"need the helper\",\"action\":{\"command\":\"@EXT@\",\"args\":[]}}' > .fleet/question.json ;;\n  *) echo \"$FLEET_TASK\" > \"$FLEET_TASK.txt\" ;;\nesac\n",
+            &[("EXT", &ext)],
+        ),
+    );
+    f.write_cfg(&simple_cfg(&worker, ""));
+    let info = f.start_web(&[]);
+    let web = Web::new(&info);
+    // the helper holds the token on purpose, as if it had leaked to it
+    f.tmp.script(
+        "ext.sh",
+        &format!(
+            "#!/bin/bash\nexport PORT={} TOKEN={} OUT={} STATE={} FLEETBIN={} LIB={}\nread -r ID DIGEST < \"$OUT/decide.txt\"\nexport ID DIGEST\nsource \"$LIB\"\nrun_modes\n: > \"$OUT/ext.done\"\n",
+            info.port,
+            info.token,
+            out.path().display(),
+            f.state.display(),
+            FLEET_BIN,
+            lib.display()
+        ),
+    );
+    f.plan_and_start("r1", 2, &[t("a"), t("c")]);
+
+    // `a` finishes (its merge approval stays pending for the helper to try), `c` asks to run the
+    // helper
+    web.wait_task("a", "completed");
+    let st = web.wait("the helper's approval", |st| {
+        jarr(st, "approvals")
+            .iter()
+            .any(|a| jstr(a, "task") == "c" && jstr(a, "status") == "pending")
+    });
+    let helper = jarr(&st, "approvals")
+        .iter()
+        .find(|a| jstr(a, "task") == "c")
+        .unwrap()
+        .clone();
+    assert_eq!(jstr(&helper, "purpose"), "external-command");
+    assert_eq!(jstr(&helper, "command"), ext.to_str().unwrap());
+    let (merge_id, merge_digest) = pending_merge_approval(&web, "a");
+    publish_decision(&out, &merge_id, &merge_digest);
+
+    // the operator approves the helper over the web, with the digest the dashboard shows
+    let helper_id = jstr(&helper, "id").to_string();
+    let helper_digest = jstr(&helper, "digest").to_string();
+    let ok = web.post(
+        "/api/approval/decide",
+        &Value::object([
+            ("id", Value::str(&helper_id)),
+            ("approve", Value::Bool(true)),
+            ("digest", Value::str(&helper_digest)),
+        ]),
+    );
+    assert_eq!(ok.status, 200, "{}", ok.text());
+
+    wait_file(&out.join("ext.done"));
+    web.wait_task("c", "completed");
+    assert_every_probe_refused(out.path(), &info.token);
+
+    let st = web.status();
+    assert_eq!(
+        jstr(approval(&st, &helper_id).unwrap(), "status"),
+        "consumed"
+    );
+    assert_eq!(jstr(approval(&st, &merge_id).unwrap(), "status"), "pending");
+    assert!(
+        git_branches(&f).iter().all(|b| b != "fleet/r1/integration"),
+        "a merge happened"
+    );
+    assert_operator_unaffected(&f, &web, &lib);
 }
