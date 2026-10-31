@@ -22,6 +22,8 @@ pub mod undo;
 pub mod protocol;
 pub mod server;
 pub mod client;
+pub mod config_file;
+pub mod memory;
 
 #[doc(hidden)]
 pub mod testutil;
