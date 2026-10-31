@@ -85,7 +85,12 @@ fn demo_flow_end_to_end() {
     assert_eq!(jnum(&api, "retries_used"), 0);
     let api_brief =
         fs::read_to_string(f.repo.join(".fleet-worktrees/r1/api/.fleet/brief.md")).unwrap();
-    assert!(api_brief.contains("Answer: axum"), "{api_brief}");
+    assert!(api_brief.contains("Operator says: axum"), "{api_brief}");
+    // the worker's own question is quoted, not presented as fleet's words
+    assert!(
+        api_brief.contains("\n  > Which HTTP framework should the API use?"),
+        "{api_brief}"
+    );
 
     // worktrees and branches
     for task in ["schema", "api", "docs", "release"] {

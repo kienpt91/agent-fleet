@@ -21,9 +21,20 @@ use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 /// Ctrl-] (GS). Rarely used by agents or shells, and what telnet users already know.
 pub const DETACH_KEY: u8 = 0x1d;
 const STDIN_CHUNK: usize = 1024;
-/// Written on exit so a TUI agent cannot leave the terminal in the alternate screen, with a hidden
-/// cursor, bracketed paste or mouse reporting enabled.
-const TERMINAL_RESET: &str = "\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1006l";
+/// Written on exit so a TUI agent cannot leave the terminal in a state the passthrough sanitizer
+/// let it set: alternate screen (47, 1047, 1049), hidden cursor (25), autowrap off (7), cursor
+/// keys, blinking, mouse reporting and focus events (1, 12, 1000, 1002, 1003, 1004, 1006),
+/// bracketed paste (2004) and synchronized updates (2026). Modes 7 and 25 are on by default, so
+/// they are set; every other mode is switched off. The test below keeps this in step with the
+/// sanitizer's list.
+const TERMINAL_RESET: &str = concat!(
+    "\x1b[0m",
+    "\x1b[?25h\x1b[?7h",
+    "\x1b[?1l\x1b[?12l",
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l",
+    "\x1b[?2004l\x1b[?2026l",
+    "\x1b[?47l\x1b[?1047l\x1b[?1048l\x1b[?1049l",
+);
 const RESIZE_POLL: Duration = Duration::from_millis(250);
 const STOP_POLL: Duration = Duration::from_millis(50);
 
@@ -281,5 +292,56 @@ mod tests {
         let (fwd, detach) = scan_input("héllo\u{1d}x".as_bytes());
         assert!(detach);
         assert_eq!(String::from_utf8(fwd).ok().as_deref(), Some("héllo"));
+    }
+
+    /// Private modes a worker's output may set or reset on the attached terminal: found by
+    /// asking the sanitizer the attach path really uses, so a mode added there without a reset
+    /// here fails this test.
+    fn modes_passed_through() -> Vec<u32> {
+        (0..=4000u32)
+            .filter(|n| {
+                ["h", "l"].iter().all(|f| {
+                    let mut s = fleet_domain::sanitize::Sanitizer::new(
+                        fleet_domain::sanitize::Mode::Passthrough,
+                    );
+                    let mut out = String::new();
+                    let seq = format!("\x1b[?{n}{f}");
+                    s.feed(seq.as_bytes(), &mut out);
+                    s.finish(&mut out);
+                    out == seq
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_passthrough_sanitizer_allows_exactly_the_modes_the_reset_knows() {
+        assert_eq!(
+            modes_passed_through(),
+            vec![1, 7, 12, 25, 47, 1000, 1002, 1003, 1004, 1006, 1047, 1048, 1049, 2004, 2026]
+        );
+    }
+
+    #[test]
+    fn the_terminal_reset_undoes_every_mode_a_worker_can_set() {
+        for mode in modes_passed_through() {
+            // Autowrap (7) and the cursor (25) are on by default and must be switched back on;
+            // everything else is off by default.
+            let default_on = matches!(mode, 7 | 25);
+            let wanted = format!("\x1b[?{mode}{}", if default_on { 'h' } else { 'l' });
+            let opposite = format!("\x1b[?{mode}{}", if default_on { 'l' } else { 'h' });
+            assert!(
+                TERMINAL_RESET.contains(&wanted),
+                "mode {mode}: no {wanted:?}"
+            );
+            assert!(
+                !TERMINAL_RESET.contains(&opposite),
+                "mode {mode}: the reset must not also contain {opposite:?}"
+            );
+        }
+        assert!(
+            TERMINAL_RESET.starts_with("\x1b[0m"),
+            "attributes are reset too"
+        );
     }
 }

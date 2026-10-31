@@ -12,7 +12,7 @@ use fleet_infra::config_file::load_config;
 use fleet_infra::eventlog::verify_file;
 use fleet_infra::git::check_git_version;
 use fleet_infra::server::verify_socket_permissions;
-use fleet_infra::statedir::StateLayout;
+use fleet_infra::statedir::{verify_token_file, StateLayout};
 use fleet_infra::undo::AgentUndo;
 use std::fmt::Write as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -66,6 +66,7 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
         check_git(&input.env),
         check_state_dir(&input.layout.root, current_uid()),
         check_socket(&input.layout.socket),
+        check_token(&input.layout.token, &input.layout.socket),
         check_daemon(&input.layout.socket),
         check_events(&input.layout.events),
     ];
@@ -202,6 +203,28 @@ fn check_socket(socket: &Path) -> Check {
     }
     match verify_socket_permissions(socket) {
         Ok(()) => Check::new(name, Status::Ok, socket.display().to_string()),
+        Err(e) => Check::new(name, Status::Fail, e.message),
+    }
+}
+
+/// The capability token next to the socket: present and private while the daemon runs. The value
+/// is never read here, let alone shown.
+fn check_token(token: &Path, socket: &Path) -> Check {
+    let name = "control token";
+    let token_exists = std::fs::symlink_metadata(token).is_ok();
+    if std::fs::symlink_metadata(socket).is_err() {
+        return if token_exists {
+            Check::new(
+                name,
+                Status::Info,
+                "left over from a daemon that is not running",
+            )
+        } else {
+            Check::new(name, Status::Info, "none (daemon not running)")
+        };
+    }
+    match verify_token_file(token) {
+        Ok(()) => Check::new(name, Status::Ok, format!("{} (mode 0600)", token.display())),
         Err(e) => Check::new(name, Status::Fail, e.message),
     }
 }
@@ -467,6 +490,52 @@ mod tests {
         assert_eq!(explicit[0].status, Status::Fail);
         let default = check_config(None, &missing, &[]);
         assert_eq!(default[0].status, Status::Info);
+    }
+
+    #[test]
+    fn token_check_follows_the_socket_and_the_file_mode() {
+        let t = TempDir::new("doc-token");
+        let socket = t.join("fleet.sock");
+        let token = t.join("token");
+        // nothing there: the daemon is simply not running
+        assert_eq!(check_token(&token, &socket).status, Status::Info);
+        // a token without a socket is a leftover of a daemon that did not clean up
+        let secret = fleet_infra::statedir::create_token_file(&token).unwrap();
+        let c = check_token(&token, &socket);
+        assert_eq!(c.status, Status::Info);
+        assert!(c.detail.contains("not running"), "{}", c.detail);
+        // with a socket, the token must exist and be private
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let c = check_token(&token, &socket);
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        assert!(c.detail.contains("0600"), "{}", c.detail);
+        chmod(&token, 0o640);
+        let c = check_token(&token, &socket);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("0600"), "{}", c.detail);
+        chmod(&token, 0o600);
+        std::fs::remove_file(&token).unwrap();
+        assert_eq!(check_token(&token, &socket).status, Status::Fail);
+        // a symlink in place of the token is refused
+        let target = t.write("elsewhere", &secret);
+        chmod(&target, 0o600);
+        std::os::unix::fs::symlink(&target, &token).unwrap();
+        assert_eq!(check_token(&token, &socket).status, Status::Fail);
+    }
+
+    #[test]
+    fn the_token_value_is_never_part_of_a_check() {
+        let t = TempDir::new("doc-token-secret");
+        let socket = t.join("fleet.sock");
+        let token = t.join("token");
+        let secret = fleet_infra::statedir::create_token_file(&token).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        for mode in [0o600, 0o644] {
+            chmod(&token, mode);
+            let c = check_token(&token, &socket);
+            let shown = render_text(std::slice::from_ref(&c)) + &to_value(&[c]).canonical();
+            assert!(!shown.contains(&secret), "{shown}");
+        }
     }
 
     #[test]

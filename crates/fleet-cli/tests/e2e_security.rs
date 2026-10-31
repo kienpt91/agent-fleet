@@ -13,9 +13,20 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+use fleet_domain::error::{ErrorCode, FleetError};
+use fleet_domain::value::Value;
+use fleet_infra::protocol::{
+    encode_request, parse_response, read_line_bounded, MAX_RESPONSE_BYTES,
+};
+use std::io::{BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::time::Instant;
+
+use fleet_infra::client::{AttachEvent, Client};
+
 /// Variables a worker or external command may see: the allowlist, what fleet adds, and what a
 /// shell or the pty layer adds by itself.
-const TOLERATED: [&str; 15] = [
+const TOLERATED: [&str; 16] = [
     "PATH",
     "HOME",
     "LANG",
@@ -24,6 +35,7 @@ const TOLERATED: [&str; 15] = [
     "FLEET_TASK",
     "FLEET_WORKTREE",
     "FLEET_BRIEF_FILE",
+    "XDG_STATE_HOME",
     "SHELL",
     "PWD",
     "OLDPWD",
@@ -75,6 +87,7 @@ fn state_directory_control_directory_and_socket_are_private() {
     assert_eq!(mode_of(&f.state.join("events.log")), 0o600);
     assert_eq!(mode_of(&f.state.join("events.head")), 0o600);
     assert_eq!(mode_of(&f.state.join("daemon.lock")), 0o600);
+    assert_eq!(mode_of(&f.state.join("control/token")), 0o600);
     for log in walk_files(&f.state.join("logs")) {
         assert_eq!(mode_of(&log), 0o600, "{}", log.display());
     }
@@ -165,6 +178,12 @@ fn workers_cannot_learn_the_control_plane_or_the_daemons_secrets() {
     let s = f.script("w.sh", &body);
     f.write_cfg(&plain_cfg().worker("w", &s, &["{task}"], ""));
     f.start();
+    let daemon_token = fs::read_to_string(f.state.join("control/token")).unwrap();
+    assert_eq!(
+        daemon_token.len(),
+        64,
+        "the control token is 32 bytes of hex"
+    );
     f.plan_and_start("r1", 1, &[t("t")]);
     f.wait_task("r1", "t", &["completed"]);
 
@@ -182,6 +201,7 @@ fn workers_cannot_learn_the_control_plane_or_the_daemons_secrets() {
             "GIT_",
             secret.as_str(),
             token.as_str(),
+            daemon_token.as_str(),
             state_slash.as_str(),
         ] {
             assert!(
@@ -221,6 +241,12 @@ fn workers_cannot_learn_the_control_plane_or_the_daemons_secrets() {
         "{env}"
     );
     assert_eq!(argv.lines().last(), Some("t"), "{argv}");
+    // `fleet` run by the worker without --state-dir must not find the operator's daemon
+    assert!(
+        env.lines()
+            .any(|l| l == format!("XDG_STATE_HOME={}/.fleet/xdg-state", wt.display())),
+        "{env}"
+    );
 
     // and the secrets are nowhere in what fleet stores or shows either
     let tail = f.ok(&["tail", "t"]).stdout;
@@ -229,12 +255,36 @@ fn workers_cannot_learn_the_control_plane_or_the_daemons_secrets() {
     let brief = fs::read_to_string(wt.join(".fleet/brief.md")).unwrap();
     for shown in [&tail, &st, &brief, &f.daemon_log()] {
         assert!(
+            !shown.contains(&daemon_token),
+            "the token was shown: {shown}"
+        );
+        assert!(
             !shown.contains(&secret) && !shown.contains(&token),
             "{shown}"
         );
     }
     assert!(tree_contains(&f.state, &secret).is_none());
     assert!(tree_contains(&f.state, &token).is_none());
+
+    // the control token and the socket path are in nothing the worker can read or has written
+    let doctor = f.cli(&["doctor"]);
+    assert_eq!(doctor.code, 0, "{doctor:?}");
+    for shown in [&doctor.stdout, &doctor.stderr, &f.events_raw()] {
+        assert!(
+            !shown.contains(&daemon_token),
+            "the token was shown: {shown}"
+        );
+    }
+    assert!(
+        tree_contains(&wt, &daemon_token).is_none(),
+        "the control token is in the worker's worktree"
+    );
+    for needle in ["fleet.sock", state_slash.as_str()] {
+        assert!(
+            tree_contains(&wt, needle).is_none(),
+            "{needle:?} is in the worker's worktree"
+        );
+    }
 }
 
 #[test]
@@ -243,7 +293,7 @@ fn a_worker_cannot_approve_resolve_or_read_status_but_the_operator_can() {
     let mut f = Fleet::new();
     let bin = Path::new(FLEET_BIN);
     let body = fill(
-        "case \"$FLEET_TASK\" in\n  spy)\n    while [ ! -f @OUT@/go ]; do sleep 0.1; done\n    @FLEET@ --state-dir @STATE@ approve a1 > @OUT@/approve.out 2>&1; echo $? > @OUT@/approve.code\n    @FLEET@ --state-dir @STATE@ gate resolve g1 --answer x > @OUT@/gate.out 2>&1; echo $? > @OUT@/gate.code\n    @FLEET@ --state-dir @STATE@ status > @OUT@/status.out 2>&1; echo $? > @OUT@/status.code\n    @FLEET@ --state-dir @STATE@ status --json > @OUT@/json.out 2>&1; echo $? > @OUT@/json.code\n    @FLEET@ --state-dir @STATE@ merge done > @OUT@/merge.out 2>&1; echo $? > @OUT@/merge.code\n    echo finished > @OUT@/all.done\n    ;;\n  *) echo quiet > f.txt ;;\nesac\n",
+        "case \"$FLEET_TASK\" in\n  spy)\n    while [ ! -f @OUT@/go ]; do sleep 0.1; done\n    @FLEET@ --state-dir @STATE@ approve a1 > @OUT@/approve.out 2>&1; echo $? > @OUT@/approve.code\n    @FLEET@ --state-dir @STATE@ gate resolve g1 --answer x > @OUT@/gate.out 2>&1; echo $? > @OUT@/gate.code\n    @FLEET@ --state-dir @STATE@ status > @OUT@/status.out 2>&1; echo $? > @OUT@/status.code\n    @FLEET@ --state-dir @STATE@ status --json > @OUT@/json.out 2>&1; echo $? > @OUT@/json.code\n    @FLEET@ --state-dir @STATE@ merge done > @OUT@/merge.out 2>&1; echo $? > @OUT@/merge.code\n    @FLEET@ --state-dir @STATE@ stop done > @OUT@/stop.out 2>&1; echo $? > @OUT@/stop.code\n    @FLEET@ --state-dir @STATE@ send spy hello > @OUT@/send.out 2>&1; echo $? > @OUT@/send.code\n    @FLEET@ --state-dir @STATE@ shutdown > @OUT@/shutdown.out 2>&1; echo $? > @OUT@/shutdown.code\n    echo finished > @OUT@/all.done\n    ;;\n  *) echo quiet > f.txt ;;\nesac\n",
         &[("OUT", out.path()), ("FLEET", bin), ("STATE", &f.state)],
     );
     let s = f.script("w.sh", &body);
@@ -258,7 +308,9 @@ fn a_worker_cannot_approve_resolve_or_read_status_but_the_operator_can() {
     fs::write(out.join("go"), "").unwrap();
     wait_file(&out.join("all.done"));
 
-    for name in ["approve", "gate", "status", "json", "merge"] {
+    for name in [
+        "approve", "gate", "status", "json", "merge", "stop", "send", "shutdown",
+    ] {
         let code = out.read(&format!("{name}.code"));
         let text = out.read(&format!("{name}.out"));
         assert_eq!(code.trim(), "10", "{name}: {text}");
@@ -283,6 +335,166 @@ fn a_worker_cannot_approve_resolve_or_read_status_but_the_operator_can() {
     f.ok(&["approve", "a1"]);
     f.ok(&["merge", "done"]);
     assert!(!jstr(&f.task("r1", "done"), "merged").is_empty());
+}
+
+/// One request over a fresh connection, the way any process of the same user could send it.
+fn raw_call(socket: &Path, cmd: &str, token: Option<&str>) -> Result<Value, FleetError> {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut line = encode_request(cmd, &Value::Null, token);
+    line.push('\n');
+    stream.write_all(line.as_bytes()).unwrap();
+    let mut reader = BufReader::new(stream);
+    let reply = read_line_bounded(&mut reader, MAX_RESPONSE_BYTES)
+        .unwrap()
+        .expect("the daemon answers");
+    parse_response(&reply)
+}
+
+#[test]
+fn the_control_socket_needs_the_per_run_token_for_everything_but_ping() {
+    let mut f = one_task_fleet("exit 0", plain_cfg());
+    let socket = f.state.join("control/fleet.sock");
+    let token_file = f.state.join("control/token");
+    let token = fs::read_to_string(&token_file).unwrap();
+    // the socket's file mode is not the only barrier any more
+    assert!(raw_call(&socket, "ping", None).is_ok());
+    for cmd in ["status", "shutdown", "approval.list"] {
+        let err = raw_call(&socket, cmd, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "{cmd}: {err:?}");
+        let err = raw_call(&socket, cmd, Some(&"0".repeat(64))).unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::Forbidden,
+            "{cmd} with a wrong token: {err:?}"
+        );
+        assert!(
+            !err.message.contains(&token),
+            "an error must not repeat the token"
+        );
+    }
+    // the refused shutdown did not stop anything; the real token works for the same commands
+    assert!(raw_call(&socket, "status", Some(&token)).is_ok());
+    assert_eq!(f.cli(&["status"]).code, 0);
+
+    // a new daemon run has a new token, and the old one is worth nothing
+    f.kill_daemon();
+    f.start();
+    let fresh = fs::read_to_string(&token_file).unwrap();
+    assert_ne!(fresh, token);
+    assert_eq!(mode_of(&token_file), 0o600);
+    let err = raw_call(&socket, "status", Some(&token)).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Forbidden);
+    assert!(raw_call(&socket, "status", Some(&fresh)).is_ok());
+}
+
+#[test]
+fn a_worker_running_fleet_without_a_state_dir_finds_no_daemon_but_the_operator_does() {
+    let out = TempDir::new("o");
+    let mut f = Fleet::new();
+    // The operator's daemon is where `fleet` looks by default: below HOME, which workers keep.
+    f.state = f.home.join(".local/state/agent-fleet");
+    let body = fill(
+        "@FLEET@ status > @OUT@/status.out 2>&1; echo $? > @OUT@/status.code\n@FLEET@ approve a1 > @OUT@/approve.out 2>&1; echo $? > @OUT@/approve.code\necho \"$XDG_STATE_HOME\" > @OUT@/xdg.txt\n",
+        &[("OUT", out.path()), ("FLEET", Path::new(FLEET_BIN))],
+    );
+    let s = f.script("w.sh", &body);
+    f.write_cfg(&plain_cfg().worker("w", &s, &["{task}"], ""));
+    f.start();
+    f.plan_and_start("r1", 1, &[t("t")]);
+    f.wait_task("r1", "t", &["completed"]);
+
+    for name in ["status", "approve"] {
+        let code = out.read(&format!("{name}.code"));
+        let text = out.read(&format!("{name}.out"));
+        assert_eq!(code.trim(), "3", "{name} must find no daemon: {text}");
+        assert!(!text.contains("fleet.status"), "{name}: {text}");
+    }
+    let wt = f.worktree("r1", "t");
+    assert_eq!(
+        out.read("xdg.txt").trim(),
+        format!("{}/.fleet/xdg-state", wt.display())
+    );
+    assert!(!out.read("xdg.txt").contains(f.state.to_str().unwrap()));
+
+    // the same lookup with the operator's own environment does reach the daemon
+    let mut c = f.command();
+    c.arg("status");
+    let operator = run_cmd(c, Duration::from_secs(60));
+    assert_eq!(operator.code, 0, "{operator:?}");
+}
+
+// ---- a worker that never reads its input cannot hold the daemon ---------------------------------------
+
+#[test]
+fn input_to_a_worker_that_never_reads_fails_with_an_error_and_the_daemon_stays_responsive() {
+    let f = one_task_fleet("exec sleep 120", plain_cfg());
+    f.plan_and_start("r1", 1, &[t("t")]);
+    f.wait_live("r1", "t");
+    let mut client = Client::connect(&f.state.join("control/fleet.sock")).unwrap();
+    let text = "x".repeat(4000);
+    let started = Instant::now();
+    let mut refused = 0;
+    for i in 0..600 {
+        let args = Value::object([
+            ("task", Value::str("t")),
+            ("text", Value::str(text.as_str())),
+            ("newline", Value::Bool(false)),
+        ]);
+        let call = Instant::now();
+        match client.call("task.send", args) {
+            Ok(_) => {}
+            Err(e) => {
+                assert_eq!(e.code, ErrorCode::Unavailable, "send {i}: {e:?}");
+                assert!(e.message.contains("not reading its input"), "{e:?}");
+                refused += 1;
+            }
+        }
+        assert!(
+            call.elapsed() < Duration::from_secs(10),
+            "send {i} took {:?}",
+            call.elapsed()
+        );
+    }
+    assert!(refused > 0, "2.4 MB went into a worker that reads nothing");
+    assert!(started.elapsed() < Duration::from_secs(60));
+
+    // the engine and the other connections never noticed
+    assert_eq!(jstr(&f.task("r1", "t"), "status"), "running");
+    assert_eq!(f.cli(&["tail", "t"]).code, 0);
+    f.ok(&["stop", "t"]);
+    let task = f.wait_task("r1", "t", &["failed"]);
+    assert_eq!(jstr(&task, "failure"), "stopped by an operator");
+}
+
+#[test]
+fn an_attached_client_can_detach_from_a_worker_that_never_reads() {
+    let f = one_task_fleet("exec sleep 120", plain_cfg());
+    f.plan_and_start("r1", 1, &[t("t")]);
+    f.wait_live("r1", "t");
+    let client = Client::connect(&f.state.join("control/fleet.sock")).unwrap();
+    let (mut reader, mut writer) = client.attach("t", 80, 24).unwrap().split();
+    let keys = vec![b'k'; 4096];
+    let started = Instant::now();
+    for _ in 0..400 {
+        writer.input(&keys).unwrap();
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the daemon stopped reading the attach connection: {:?}",
+        started.elapsed()
+    );
+    writer.detach().unwrap();
+    let mut events = 0;
+    while let Ok(Some(event)) = reader.next_event() {
+        assert!(matches!(event, AttachEvent::Output(_)), "{event:?}");
+        events += 1;
+        assert!(events < 10_000, "the attach did not end after the detach");
+    }
+    // the worker is untouched and the daemon still answers
+    assert_eq!(jstr(&f.task("r1", "t"), "status"), "running");
 }
 
 #[test]
@@ -638,7 +850,7 @@ fn external_fleet() -> External {
         ),
     );
     let body = fill(
-        "if grep -q -e 'The approved command ran' -e 'An operator denied' \"$FLEET_BRIEF_FILE\"; then exit 0; fi\nprintf '{\"version\":1,\"kind\":\"approval\",\"text\":\"need the helper\",\"action\":{\"command\":\"@EXT@\",\"args\":[\"one\",\"two\"]}}' > .fleet/question.json\n",
+        "if grep -q -e 'The approved command was started' -e 'An operator denied' \"$FLEET_BRIEF_FILE\"; then exit 0; fi\nprintf '{\"version\":1,\"kind\":\"approval\",\"text\":\"need the helper\",\"action\":{\"command\":\"@EXT@\",\"args\":[\"one\",\"two\"]}}' > .fleet/question.json\n",
         &[("EXT", &ext)],
     );
     let s = f.script("w.sh", &body);
@@ -693,7 +905,11 @@ fn an_approved_external_command_runs_exactly_once_with_the_allowlisted_environme
     assert_eq!(jstr(&f.approvals()[0], "status"), "consumed");
     // the worker was told what happened
     let brief = fs::read_to_string(f.worktree("r1", "t").join(".fleet/brief.md")).unwrap();
-    assert!(brief.contains("The approved command ran"), "{brief}");
+    assert!(
+        brief.contains("The approved command was started"),
+        "{brief}"
+    );
+    assert!(brief.contains("Result: exit code 0"), "{brief}");
     assert!(brief.contains("helper-output-line"), "{brief}");
 }
 
