@@ -682,7 +682,7 @@ impl Run {
             } => {
                 t.status = TaskStatus::Running;
                 t.attempt = *attempt;
-                t.worktree = Some(worktree.clone());
+                t.worktree = Some(worktree.clone()).filter(|w| !w.is_empty());
                 t.block = None;
                 t.gates.clear();
                 t.session = Some(SessionRecord {

@@ -36,8 +36,9 @@ pub struct ReplayInfo {
 
 /// Append-only, ordered, durable record of domain events.
 pub trait EventStore: Send {
-    /// Appends `events` as one atomic batch: either all are recorded or none.
-    fn append(&mut self, ts_ms: u64, events: &[DomainEvent]) -> Result<()>;
+    /// Appends `events` as one atomic batch: either all are recorded or none. Returns the
+    /// sequence number of the last event of the batch (the current head when the batch is empty).
+    fn append(&mut self, ts_ms: u64, events: &[DomainEvent]) -> Result<u64>;
     /// Visits every stored event in order. A damaged store is an error (`Tampered`).
     fn replay(&self, visit: &mut dyn FnMut(StoredEvent) -> Result<()>) -> Result<ReplayInfo>;
 }
@@ -118,7 +119,8 @@ pub trait Vcs: Send {
     /// Merges a task branch into the run's integration branch, creating that branch first when
     /// needed. A conflict aborts the merge and leaves the integration branch as it was.
     fn merge_into_integration(&self, req: &IntegrationMerge) -> Result<IntegrationResult>;
-    /// Removes a worktree (and its branch when `delete_branch`).
+    /// Removes a worktree (and its branch when `delete_branch`). A worktree path that is empty or
+    /// already gone is not an error, so a branch can be deleted after its worktree was cleaned.
     fn remove_worktree(
         &self,
         repo: &str,
@@ -296,8 +298,9 @@ pub trait UndoTool: Send {
     fn available(&self) -> bool;
     /// Records a checkpoint of the worktree; returns a short description.
     fn checkpoint(&self, worktree: &str, label: &str) -> Result<String>;
-    /// Reverts the worktree to the last checkpoint; returns the tool's report.
-    fn undo(&self, worktree: &str) -> Result<String>;
+    /// Previews (`apply == false`) or applies reverting the worktree's last checkpoint; returns
+    /// the tool's report.
+    fn undo(&self, worktree: &str, apply: bool) -> Result<String>;
 }
 
 // ---- event publication --------------------------------------------------------------------------

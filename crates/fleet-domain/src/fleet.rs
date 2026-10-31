@@ -621,6 +621,69 @@ impl FleetState {
         Ok(events)
     }
 
+    /// Bringing the work of completed dependencies into a task's branch conflicted (and was
+    /// aborted): the task is blocked behind a decision gate before it ever ran.
+    pub fn dependency_conflicted(
+        &self,
+        run_id: &RunId,
+        task_id: &TaskId,
+        files: Vec<String>,
+    ) -> Result<Vec<DomainEvent>> {
+        let run = self.run(run_id)?;
+        let task = run
+            .task(task_id)
+            .ok_or_else(|| FleetError::not_found(format!("task {task_id} does not exist")))?;
+        if task.status != TaskStatus::Ready {
+            return Err(FleetError::conflict(format!(
+                "task {task_id} is {}, not ready",
+                task.status
+            )));
+        }
+        if self.open_decision_count() >= MAX_OPEN_DECISIONS {
+            return Err(FleetError::limit(
+                "too many unanswered questions and approvals",
+            ));
+        }
+        let listed = if files.is_empty() {
+            "unknown files".to_string()
+        } else {
+            files.join(", ")
+        };
+        let text = format!(
+            "Bringing the work of {} into the branch of task {task_id} conflicted in: {listed}. \
+             The merge was aborted. Merge those branches into {} by hand in its worktree and describe what you did.",
+            task.deps
+                .iter()
+                .map(TaskId::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            task.branch
+        );
+        let id = DecisionId::from_seq(self.decision_seq.saturating_add(1));
+        Ok(vec![
+            DomainEvent::MergeConflicted {
+                run: run_id.clone(),
+                task: task_id.clone(),
+                files,
+            },
+            Decision::open(
+                id.clone(),
+                run_id.clone(),
+                task_id.clone(),
+                DecisionKind::Conflict,
+                &text,
+                Vec::new(),
+            )?,
+            DomainEvent::TaskBlocked {
+                run: run_id.clone(),
+                task: task_id.clone(),
+                kind: BlockKind::Conflict,
+                subject: id.to_string(),
+                detail: text,
+            },
+        ])
+    }
+
     /// A merge conflicted and was aborted: the task is blocked behind a decision gate.
     pub fn merge_conflicted(
         &self,
@@ -1441,6 +1504,48 @@ mod tests {
         assert_eq!(t.status, TaskStatus::Ready);
         assert!(t.conflict_files.is_empty());
         assert!(t.notes[0].contains("Operator says"));
+    }
+
+    #[test]
+    fn a_dependency_conflict_blocks_a_ready_task_before_it_runs() {
+        let mut s = FleetState::new();
+        let (run, ev) = s.create_run(new_run()).unwrap();
+        s.apply(&ev);
+        let (_, ev) = s
+            .add_tasks(&run, vec![nt("a", &[]), nt("b", &["a"])])
+            .unwrap();
+        apply_all(&mut s, &ev);
+        let ev = s.promote_all();
+        apply_all(&mut s, &ev);
+        // b is pending until a completes
+        assert!(s
+            .dependency_conflicted(&run, &tid("b"), vec!["x".into()])
+            .is_err());
+        s.apply(&DomainEvent::TaskCompleted {
+            run: run.clone(),
+            task: tid("a"),
+        });
+        let ev = s.promote_all();
+        apply_all(&mut s, &ev);
+        let events = s
+            .dependency_conflicted(&run, &tid("b"), vec!["src/x.rs".into()])
+            .unwrap();
+        assert_eq!(
+            kinds(&events),
+            vec!["merge_conflicted", "decision_opened", "task_blocked"]
+        );
+        apply_all(&mut s, &events);
+        let t = s.run(&run).unwrap().task(&tid("b")).unwrap();
+        assert_eq!(t.status, TaskStatus::Blocked);
+        assert_eq!(t.block.as_ref().unwrap().kind, BlockKind::Conflict);
+        let events = s
+            .resolve_decision(&DecisionId::from_seq(1), "merged by hand")
+            .unwrap();
+        apply_all(&mut s, &events);
+        assert_eq!(
+            s.run(&run).unwrap().task(&tid("b")).unwrap().status,
+            TaskStatus::Ready
+        );
     }
 
     // ---- state ----

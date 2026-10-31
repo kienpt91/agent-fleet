@@ -83,6 +83,7 @@ pub enum Command {
     },
     Undo {
         task: String,
+        apply: bool,
     },
     Events {
         limit: usize,
@@ -300,7 +301,10 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
             run: a.opt_str("run")?.map(RunId::parse).transpose()?,
             branches: a.opt_bool("branches")?.unwrap_or(false),
         },
-        "undo" => Command::Undo { task: task()? },
+        "undo" => Command::Undo {
+            task: task()?,
+            apply: a.opt_bool("apply")?.unwrap_or(false),
+        },
         "events" => Command::Events {
             limit: a
                 .opt_u64("limit")?
