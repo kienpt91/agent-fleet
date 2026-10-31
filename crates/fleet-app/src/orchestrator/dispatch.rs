@@ -120,12 +120,18 @@ impl Orchestrator {
                 }
             }
         }
+        let task_worker = task
+            .worker
+            .clone()
+            .or_else(|| self.cfg.default_worker.clone());
+        let notes = self.board.notes_for(run_id, task_id, task_worker.as_ref());
         let brief = build_brief(&BriefInput {
             run: run_id,
             objective: &objective,
             task: &task,
             dependencies,
             attempt,
+            messages: Some(&notes),
         });
         if let Err(e) = self.ports.contract.prepare(&worktree, &brief) {
             self.start_failed(
@@ -133,6 +139,15 @@ impl Orchestrator {
                 attempt,
                 &worktree,
                 &format!("could not prepare .fleet: {}", e.message),
+            );
+            return;
+        }
+        if let Err(e) = self.prepare_messages(run_id, task_id, &worktree) {
+            self.start_failed(
+                &key,
+                attempt,
+                &worktree,
+                &format!("could not prepare the message directories: {}", e.message),
             );
             return;
         }

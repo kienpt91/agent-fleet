@@ -9,6 +9,7 @@
 
 mod commands;
 mod dispatch;
+mod messaging;
 mod reconcile;
 mod supervise;
 
@@ -20,6 +21,7 @@ use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
 use fleet_domain::fleet::{FleetState, Policy};
 use fleet_domain::ids::{ApprovalId, RunId, TaskId};
+use fleet_domain::msg::board::MessageBoard;
 use fleet_domain::run::{RetryPolicy, WorkerEnd};
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::supervision::{KillEscalation, SupervisionPolicy};
@@ -52,6 +54,8 @@ pub struct Orchestrator {
     pub(crate) state: FleetState,
     /// The goal ledger, a projection of the same event log as `state`.
     pub(crate) ledger: Ledger,
+    /// The message channels and messages, a projection of the same event log.
+    pub(crate) board: MessageBoard,
     pub(crate) policy: Policy,
     pub(crate) live: BTreeMap<Key, Live>,
     /// Quality-gate jobs in flight: (run, task, attempt).
@@ -85,11 +89,13 @@ impl Orchestrator {
         cfg.validate()?;
         let mut state = FleetState::new();
         let mut ledger = Ledger::new();
+        let mut board = MessageBoard::new();
         let mut recent: VecDeque<Recent> = VecDeque::new();
         ports.store.replay(&mut |s: StoredEvent| {
             push_recent(&mut recent, s.seq, s.ts_ms, &s.event);
             state.apply(&s.event);
             ledger.apply_checked(&s.event, ports.digest.as_ref());
+            board.apply(&s.event);
             Ok(())
         })?;
         let policy = Policy {
@@ -106,6 +112,7 @@ impl Orchestrator {
             ports,
             state,
             ledger,
+            board,
             policy,
             live: BTreeMap::new(),
             gate_jobs: BTreeSet::new(),
@@ -179,6 +186,7 @@ impl Orchestrator {
             self.state.apply(&event);
             self.ledger
                 .apply_checked(&event, self.ports.digest.as_ref());
+            self.board.apply(&event);
             committed_task |= matches!(event, DomainEvent::TaskCommitted { .. });
             push_recent(&mut self.recent, seq, ts, &event);
             stored.push(StoredEvent {
@@ -217,7 +225,7 @@ impl Orchestrator {
     /// Advances time-driven work: approval expiry, supervision, jobs, readiness, scheduling.
     pub fn tick(&mut self) {
         type Step = fn(&mut Orchestrator) -> Result<()>;
-        let steps: [Step; 7] = [
+        let steps: [Step; 8] = [
             Orchestrator::expire_approvals,
             Orchestrator::supervise,
             Orchestrator::collect_jobs,
@@ -225,6 +233,7 @@ impl Orchestrator {
             Orchestrator::review_scan,
             Orchestrator::promote,
             Orchestrator::schedule,
+            Orchestrator::messages,
         ];
         for step in steps {
             if let Err(e) = step(self) {

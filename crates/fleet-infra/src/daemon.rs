@@ -13,6 +13,7 @@ use crate::eventlog::FileEventStore;
 use crate::git::GitVcs;
 use crate::jobs::{JobTracker, ThreadJobRunner};
 use crate::logs::FileOutputLogs;
+use crate::msgfs::{FsInbox, FsOutbox, FsRedactor};
 use crate::procid;
 use crate::pty::{PtySessionHost, SessionIo, SessionRegistry};
 use crate::server::{AttachSession, HandlerReply, PeerInfo, RequestHandler, Server};
@@ -219,6 +220,9 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
             registry.clone(),
         )),
         contract: Box::new(FsContractFiles::new(Arc::clone(&redactor))),
+        outbox: Box::new(FsOutbox::new()),
+        inbox: Box::new(FsInbox::new()),
+        redact: Box::new(FsRedactor::new(Arc::clone(&redactor))),
         jobs: Box::new(
             ThreadJobRunner::new(MAX_CONCURRENT_JOBS, Arc::clone(&redactor))
                 .with_tracker(tracker.clone())
@@ -577,6 +581,9 @@ pub const WEB_COMMANDS: &[&str] = &[
     "goal.show",
     "goal.remaining",
     "verify.status",
+    // messages between agents, read only: `msg.send`, `msg.mute` and `msg.unmute` are not offered
+    "msg.list",
+    "msg.show",
 ];
 
 /// The dashboard's view of the daemon: the same handler as the control socket, restricted to
@@ -719,6 +726,8 @@ mod tests {
             ("goal.show", args(&[("goal", "g")])),
             ("goal.remaining", args(&[])),
             ("verify.status", args(&[("target", "r1/a")])),
+            ("msg.list", args(&[])),
+            ("msg.show", args(&[("id", "m1")])),
         ] {
             assert!(WEB_COMMANDS.contains(&cmd), "{cmd}");
             let parsed = parse_command(cmd, &a).unwrap();
@@ -744,6 +753,10 @@ mod tests {
             "cleanup",
             "undo",
             "shutdown",
+            // messages: the operator's send and mute stay on the control socket
+            "msg.send",
+            "msg.mute",
+            "msg.unmute",
         ] {
             assert!(!WEB_COMMANDS.contains(&cmd), "{cmd} must not be offered");
         }
@@ -754,7 +767,15 @@ mod tests {
                     *cmd,
                     "task.send" | "gate.resolve" | "approval.decide" | "merge"
                 ) || cmd.starts_with("goal.")
-                    || matches!(*cmd, "status" | "events" | "task.tail" | "verify.status"),
+                    || matches!(
+                        *cmd,
+                        "status"
+                            | "events"
+                            | "task.tail"
+                            | "verify.status"
+                            | "msg.list"
+                            | "msg.show"
+                    ),
                 "{cmd}"
             );
         }

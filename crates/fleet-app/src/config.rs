@@ -10,6 +10,7 @@ use fleet_domain::limits::{
     MAX_ENV_ALLOW, MAX_GATES_CONFIGURED, MAX_RETRIES_CEILING, MAX_SESSIONS_HARD,
     MAX_WORKERS_CONFIGURED,
 };
+use fleet_domain::msg::limits::MessagingLimits;
 use fleet_domain::quality::GateFormat;
 use std::collections::BTreeMap;
 
@@ -59,6 +60,8 @@ pub struct AppConfig {
     pub gates: Vec<GateDef>,
     /// Silence after which a question file makes the supervisor stop the worker.
     pub question_grace_ms: u64,
+    /// Limits and switches of the message channels (`[messages]`).
+    pub messaging: MessagingLimits,
 }
 
 impl AppConfig {
@@ -81,6 +84,7 @@ impl AppConfig {
             workers: BTreeMap::new(),
             gates: Vec::new(),
             question_grace_ms: 2000,
+            messaging: MessagingLimits::default(),
         }
     }
 
@@ -176,6 +180,7 @@ impl AppConfig {
                 )));
             }
         }
+        self.messaging.validate()?;
         Ok(())
     }
 

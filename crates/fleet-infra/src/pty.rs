@@ -1,8 +1,10 @@
 //! Worker sessions: a command running in its own pty, session and process group, with a bounded
 //! output buffer.
 //!
-//! Input reaches a session only through [`SessionIo::write_input`], which the control socket calls
-//! for `send` and `attach`; nothing else in the daemon writes to a worker's terminal. It goes
+//! Input reaches a session through [`SessionIo::write_input`], which the control socket calls
+//! for `send` and `attach`, and through [`PtySessionHost::notify`], the single sanitized line the
+//! operator may switch on with `[messages] notify_input`; nothing else in the daemon writes to a
+//! worker's terminal. It goes
 //! through a bounded queue to a writer thread per session, so a worker that never reads its
 //! stdin yields an error (`the worker is not reading its input`) instead of blocking a control
 //! connection. Output is read by one thread per session into the domain's `OutputBuffer`
@@ -33,6 +35,8 @@ const DEFAULT_COLS: u16 = 120;
 /// How long `release` waits for the reader thread to drain the last output of an exited session.
 const DRAIN_WAIT: Duration = Duration::from_millis(500);
 
+/// The longest line `notify` types (the fixed sentence and an id are far shorter).
+const MAX_NOTICE_BYTES: usize = 120;
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     match m.lock() {
         Ok(g) => g,
@@ -585,6 +589,28 @@ impl SessionHost for PtySessionHost {
 
     fn terminate_orphan(&mut self, identity: &ProcessIdentity, grace_ms: u64) -> SignalOutcome {
         procid::terminate_group_blocking(identity, grace_ms)
+    }
+
+    fn notify(&mut self, id: SessionId, line: &str) -> Result<()> {
+        let io = self
+            .registry
+            .get(id)
+            .ok_or_else(|| FleetError::conflict("the session is not running"))?;
+        // Only printable ASCII, bounded: whatever the caller passed, no escape sequence, control
+        // character or invisible character reaches the terminal; then one carriage return, as
+        // `fleet send` types.
+        let mut bytes: Vec<u8> = line
+            .bytes()
+            .filter(|b| (0x20..0x7f).contains(b))
+            .take(MAX_NOTICE_BYTES)
+            .collect();
+        bytes.push(b'\r');
+        io.write_input(&bytes).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock => {
+                FleetError::unavailable("the worker is not reading its input")
+            }
+            _ => FleetError::conflict("the session ended before the notice could be typed"),
+        })
     }
 }
 

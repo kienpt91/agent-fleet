@@ -647,14 +647,21 @@ impl MessageBoard {
                 let action = plan.approval.then(|| message.approval_action());
                 Verdict::Accepted(Accepted { id, event, action })
             }
-            Err(f) => Verdict::Refused(self.refusal(sub, f, bytes, cx)),
+            Err(f) => Verdict::Refused(self.refusal(sub, f, bytes, cx.hasher, cx.now_ms)),
         }
     }
 
-    fn refusal(&self, sub: &Submission<'_>, f: Failure, bytes: u64, cx: &Context<'_>) -> Refused {
+    fn refusal(
+        &self,
+        sub: &Submission<'_>,
+        f: Failure,
+        bytes: u64,
+        hasher: &dyn Digest,
+        now_ms: u64,
+    ) -> Refused {
         let id = MessageId::from_seq(self.seq.saturating_add(1));
         let channel = flatten_line(sub.channel, 40);
-        let digest = cx.hasher.sha256_hex(sub.body.as_bytes());
+        let digest = hasher.sha256_hex(sub.body.as_bytes());
         let events = vec![DomainEvent::MessageBlocked {
             id: id.clone(),
             run: sub.run.clone(),
@@ -664,7 +671,7 @@ impl MessageBoard {
             detail: f.detail.clone(),
             digest,
             bytes,
-            at_ms: cx.now_ms,
+            at_ms: now_ms,
             source: sub.source.clone(),
         }];
         let trip = f.trip.and_then(|(mute, trip)| {
@@ -692,23 +699,67 @@ impl MessageBoard {
         }
     }
 
+    /// A file that is not a message at all (it did not parse, it is too large): refused like any
+    /// other, and counted towards a flood.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refuse_file(
+        &self,
+        run: &RunId,
+        from: &Sender,
+        reason: BlockReason,
+        detail: &str,
+        source: Option<String>,
+        hasher: &dyn Digest,
+        now_ms: u64,
+    ) -> Refused {
+        let sub = Submission {
+            run,
+            from: from.clone(),
+            channel: "",
+            to: None,
+            kind: MessageKind::Info,
+            subject: "",
+            body: "",
+            in_reply_to: None,
+            source,
+        };
+        let failure = self.flood(run, from, now_ms).unwrap_or(Failure {
+            reason,
+            detail: flatten_line(detail, 160),
+            trip: None,
+        });
+        self.refusal(&sub, failure, 0, hasher, now_ms)
+    }
+
+    /// Whether this exact file of this sender was dealt with already (accepted or refused), so a
+    /// file that is read twice, after a restart or a failed rename, is one message.
+    pub fn seen_source(&self, run: &RunId, from: &Sender, source: &str) -> bool {
+        self.sources
+            .contains(&(run.clone(), from.text(), source.to_string()))
+    }
+
+    /// A task that keeps sending messages that are refused is a flood.
+    fn flood(&self, run: &RunId, from: &Sender, now_ms: u64) -> Option<Failure> {
+        let Sender::Task(t) = from else {
+            return None;
+        };
+        let flooding = self
+            .refused_windows
+            .get(&(run.clone(), t.clone()))
+            .is_some_and(|w| w.count(now_ms, MINUTE_MS) >= MAX_BLOCKED_PER_MINUTE);
+        flooding.then(|| Failure {
+            reason: BlockReason::Rate,
+            detail: "too many refused messages in a minute".to_string(),
+            trip: Some((MuteReason::Flood, flood_trip(t, MAX_BLOCKED_PER_MINUTE))),
+        })
+    }
+
     /// Every check a message must pass, in order. The first failure is the reason.
     fn plan(&self, sub: &Submission<'_>, cx: &Context<'_>) -> std::result::Result<Plan, Failure> {
         let now = cx.now_ms;
         let run = sub.run;
-        // a task that keeps sending refused messages is a flood
-        if let Sender::Task(t) = &sub.from {
-            let flooding = self
-                .refused_windows
-                .get(&(run.clone(), t.clone()))
-                .is_some_and(|w| w.count(now, MINUTE_MS) >= MAX_BLOCKED_PER_MINUTE);
-            if flooding {
-                return Err(Failure {
-                    reason: BlockReason::Rate,
-                    detail: "too many refused messages in a minute".to_string(),
-                    trip: Some((MuteReason::Flood, flood_trip(t, MAX_BLOCKED_PER_MINUTE))),
-                });
-            }
+        if let Some(f) = self.flood(run, &sub.from, now) {
+            return Err(f);
         }
         let Some(name) = ChannelName::parse(sub.channel).ok() else {
             return fail(BlockReason::UnknownChannel, shown(sub.channel));

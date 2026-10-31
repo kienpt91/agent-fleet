@@ -8,9 +8,13 @@ use fleet_domain::approval::Digest;
 use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
+use fleet_domain::ids::MessageId;
 use fleet_domain::ids::{ApprovalId, GoalId, RunId, Sha, TaskId};
+use fleet_domain::msg::inbox::InboxItem;
+use fleet_domain::msg::message::OutboxMessage;
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::{GateFormat, GateOutcome};
+use fleet_domain::status::BlockReason;
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
 use neo_verify::contract::{ContractId, VerificationContract};
 use neo_verify::judge::CheckReport;
@@ -249,6 +253,11 @@ pub trait SessionHost: Send {
     /// Terminates the process group of a process recorded by an earlier daemon run. Verifies
     /// `identity` first; waits up to `grace_ms` between TERM and KILL.
     fn terminate_orphan(&mut self, identity: &ProcessIdentity, grace_ms: u64) -> SignalOutcome;
+    /// Types one line (and a newline) into the session's terminal, for the optional
+    /// `notify_input` notice. Never blocks: when the worker does not read its input the line is
+    /// dropped and the answer is an error. The caller passes a fixed sentence and an id, never
+    /// text a peer wrote.
+    fn notify(&mut self, id: SessionId, line: &str) -> Result<()>;
 }
 
 // ---- worker contract files ------------------------------------------------------------------
@@ -260,6 +269,75 @@ pub trait ContractFiles: Send {
     fn read_result(&self, worktree: &str) -> ContractRead<WorkerResult>;
     /// Cheap check used while the worker runs: does a question file exist?
     fn question_present(&self, worktree: &str) -> bool;
+}
+
+// ---- messages between agents ------------------------------------------------------------------
+
+/// What one file of a worker's outbox turned out to be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutboxRead {
+    /// A well-formed message (shape checked only: the board decides everything else).
+    Valid(OutboxMessage),
+    /// Not a message; the reason and a text that is safe to record.
+    Invalid(BlockReason, String),
+    /// Not finished: it parses badly and was written moments ago. Looked at again later.
+    NotReady,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxItem {
+    /// The file's name, `<n>.json`.
+    pub name: String,
+    pub read: OutboxRead,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutboxScan {
+    pub items: Vec<OutboxItem>,
+    /// The outbox could not be opened safely (a link, a file where a directory belongs): nothing
+    /// was read. The text is safe to show.
+    pub refused: Option<String>,
+}
+
+/// Reads what workers write to `.fleet/outbox/`. Everything below the worktree is the worker's:
+/// the reader never follows a link, never waits on a FIFO and reads at most a fixed number of
+/// bytes of at most a fixed number of files.
+pub trait OutboxReader: Send {
+    /// At most `max` pending files of the worktree's outbox, in numeric order of their names.
+    fn scan(&self, worktree: &str, max: usize) -> OutboxScan;
+    /// Marks a file as dealt with so it is not read again: an accepted message's file is
+    /// removed, a refused one is renamed `<n>.rejected`.
+    fn settle(&self, worktree: &str, name: &str, accepted: bool) -> Result<()>;
+}
+
+/// What a write to an inbox did, for the audit and the operator.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InboxReport {
+    /// Messages whose file was written or rewritten.
+    pub written: Vec<MessageId>,
+    /// Files in the inbox that the daemon did not write, removed. A worker made them (or a
+    /// delivery was altered): they look like deliveries and are not.
+    pub removed: Vec<String>,
+}
+
+/// Writes the inbox of a worker: `.fleet/inbox/<message id>.json` and the `index.json` that lists
+/// the real ones with their digests. Only the daemon writes there.
+pub trait InboxWriter: Send {
+    /// Makes `.fleet/outbox/` and `.fleet/inbox/` exist (replacing whatever else is there: the
+    /// worker is not running), empties the outbox of an earlier attempt and brings the inbox in
+    /// line with `items`.
+    fn prepare(&self, worktree: &str, items: &[InboxItem]) -> Result<InboxReport>;
+    /// Brings the inbox of a *running* worker in line with `items`, the complete list of what
+    /// was delivered: every file present with exactly its content, `index.json` rewritten, every
+    /// file the daemon did not write removed. A `.fleet` or `inbox` that is a link, or anything
+    /// that is not what it should be, is an error and nothing is written (fail closed).
+    fn sync(&self, worktree: &str, items: &[InboxItem]) -> Result<InboxReport>;
+}
+
+/// Redaction of text that is stored or delivered: the configured rules, literals and values of
+/// secret-looking variables of the daemon.
+pub trait TextRedactor: Send {
+    fn redact(&self, text: &str) -> String;
 }
 
 // ---- background jobs ------------------------------------------------------------------------
@@ -420,6 +498,9 @@ pub struct Ports {
     pub vcs: Box<dyn Vcs>,
     pub sessions: Box<dyn SessionHost>,
     pub contract: Box<dyn ContractFiles>,
+    pub outbox: Box<dyn OutboxReader>,
+    pub inbox: Box<dyn InboxWriter>,
+    pub redact: Box<dyn TextRedactor>,
     pub jobs: Box<dyn JobRunner>,
     pub logs: Box<dyn OutputLogs>,
     pub undo: Box<dyn UndoTool>,
