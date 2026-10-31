@@ -15,9 +15,12 @@ use crate::goal::{AttachedContract, Goal, NewGoal, TaskRef};
 use crate::limits::{
     MAX_CHILDREN, MAX_DEPTH, MAX_EVIDENCE, MAX_GOALS, MAX_INTENT, MAX_REASON, MAX_TASKS_PER_GOAL,
 };
+use fleet_domain::approval::Digest;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{show, validate_line, validate_text, EvidenceId, GoalId, RunId, TaskId};
+use fleet_domain::ids::{
+    show, validate_line, validate_text, EvidenceId, GoalId, RunId, Sha, TaskId,
+};
 use fleet_domain::limits::MAX_TITLE;
 use fleet_domain::sanitize::flatten_line;
 use fleet_domain::status::GoalStatus;
@@ -51,7 +54,7 @@ pub enum TaskContract {
     Passed,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Ledger {
     goals: BTreeMap<GoalId, Goal>,
     /// Goal ids in the order they were added: a parent always comes before its children.
@@ -59,6 +62,24 @@ pub struct Ledger {
     /// Shared, so that settling on a copy of the ledger does not copy every piece of evidence.
     evidence: BTreeMap<EvidenceId, Arc<Evidence>>,
     evidence_seq: u64,
+    /// The commit each task's worker output was committed as in review (from `task_committed`):
+    /// the only commit whose evidence counts for that task.
+    heads: BTreeMap<TaskRef, Sha>,
+    /// Pieces of evidence kept in memory ([`MAX_EVIDENCE`]; smaller only in tests).
+    evidence_cap: usize,
+}
+
+impl Default for Ledger {
+    fn default() -> Ledger {
+        Ledger {
+            goals: BTreeMap::new(),
+            order: Vec::new(),
+            evidence: BTreeMap::new(),
+            evidence_seq: 0,
+            heads: BTreeMap::new(),
+            evidence_cap: MAX_EVIDENCE,
+        }
+    }
 }
 
 fn manual_reason(reason: &str, default: &str) -> Result<String> {
@@ -128,11 +149,70 @@ impl Ledger {
         self.evidence.len()
     }
 
-    /// Where the goal's own contract stands; `None` when it has none.
+    /// True when `e` may count: its checks ran on a clean export of a commit and that commit is the
+    /// one it has to be. `head` names the commit explicitly (the merge gate asks about the branch
+    /// head it is about to merge); without it the commit recorded for the evidence's own task in
+    /// review counts. A task that has no recorded commit has no valid evidence.
+    fn valid(&self, e: &Evidence, head: Option<&Sha>) -> bool {
+        if !e.counts() {
+            return false;
+        }
+        match head {
+            Some(h) => e.commit() == h,
+            None => self
+                .heads
+                .get(&TaskRef::new(e.run().clone(), e.task().clone()))
+                .is_some_and(|h| e.commit() == h),
+        }
+    }
+
+    /// True when `e` counts toward its contract right now: it was taken on a clean export, and
+    /// on the commit its task's review recorded.
+    pub fn counts(&self, e: &Evidence) -> bool {
+        self.valid(e, None)
+    }
+
+    /// The contract of `g` judged on the valid evidence of one task (`task`) or of any task
+    /// (`None`).
+    fn goal_state(&self, g: &Goal, task: Option<&TaskRef>, head: Option<&Sha>) -> ContractState {
+        let Some(c) = &g.contract else {
+            return ContractState::Pending;
+        };
+        let evidence: Vec<&Evidence> = self
+            .evidence_of(&g.id)
+            .into_iter()
+            .filter(|e| self.valid(e, head))
+            .filter(|e| task.is_none_or(|t| e.run() == &t.run && e.task() == &t.task))
+            .collect();
+        c.contract.state(&c.id, &evidence)
+    }
+
+    /// Where the goal's own contract stands; `None` when it has none. A goal that names tasks is
+    /// `passed` only when its contract passed for each of them, on the commit that task's review
+    /// recorded; a goal without tasks looks at the valid evidence of any task.
     pub fn contract_state(&self, goal: &GoalId) -> Option<ContractState> {
         let g = self.goals.get(goal)?;
-        let c = g.contract.as_ref()?;
-        Some(c.contract.state(&c.id, &self.evidence_of(goal)))
+        g.contract.as_ref()?;
+        if g.tasks.is_empty() {
+            return Some(self.goal_state(g, None, None));
+        }
+        let states: Vec<ContractState> = g
+            .tasks
+            .iter()
+            .map(|t| self.goal_state(g, Some(t), None))
+            .collect();
+        Some(if states.contains(&ContractState::Failed) {
+            ContractState::Failed
+        } else if states.iter().all(|s| *s == ContractState::Passed) {
+            ContractState::Passed
+        } else {
+            ContractState::Pending
+        })
+    }
+
+    /// The commit a task's review recorded last.
+    pub fn head_of(&self, run: &RunId, task: &TaskId) -> Option<&Sha> {
+        self.heads.get(&TaskRef::new(run.clone(), task.clone()))
     }
 
     /// Goals that have not been abandoned and name `run/task` as one of their tasks.
@@ -152,16 +232,27 @@ impl Ledger {
     }
 
     pub fn task_contract(&self, run: &RunId, task: &TaskId) -> TaskContract {
+        self.task_contract_for(run, task, None)
+    }
+
+    /// Like [`Ledger::task_contract`], but only evidence of exactly `commit` counts: the question
+    /// "is this the commit that was proven?" asked about a commit that is about to be merged.
+    pub fn task_contract_at(&self, run: &RunId, task: &TaskId, commit: &Sha) -> TaskContract {
+        self.task_contract_for(run, task, Some(commit))
+    }
+
+    fn task_contract_for(&self, run: &RunId, task: &TaskId, head: Option<&Sha>) -> TaskContract {
         let governing = self.governing(run, task);
         if governing.is_empty() {
             return TaskContract::NotGoverned;
         }
+        let me = TaskRef::new(run.clone(), task.clone());
         let mut pending = false;
         for g in governing {
-            match self.contract_state(&g.id) {
-                Some(ContractState::Failed) => return TaskContract::Failed,
-                Some(ContractState::Pending) | None => pending = true,
-                Some(ContractState::Passed) => {}
+            match self.goal_state(g, Some(&me), head) {
+                ContractState::Failed => return TaskContract::Failed,
+                ContractState::Pending => pending = true,
+                ContractState::Passed => {}
             }
         }
         if pending {
@@ -216,7 +307,7 @@ impl Ledger {
             return false;
         }
         match &g.contract {
-            Some(c) => c.contract.state(&c.id, &self.evidence_of(&g.id)) == ContractState::Passed,
+            Some(_) => self.contract_state(&g.id) == Some(ContractState::Passed),
             None => !live.is_empty(),
         }
     }
@@ -378,9 +469,31 @@ impl Ledger {
                 "a check result names a check the contract does not have",
             ));
         }
-        if self.evidence.len().saturating_add(reports.len()) > MAX_EVIDENCE {
+        // Superseded evidence is dropped to make room; the new evidence supersedes the newest
+        // piece of every check it reports on. Only if that cannot make room is it refused.
+        let replaceable = self.superseded_ids().len().saturating_add(
+            reports
+                .iter()
+                .filter(|r| {
+                    self.evidence_of(&scope.goal).iter().any(|e| {
+                        e.check() == &r.check
+                            && e.contract() == &scope.contract
+                            && e.run() == &scope.run
+                            && e.task() == &scope.task
+                    })
+                })
+                .count(),
+        );
+        if self
+            .evidence
+            .len()
+            .saturating_add(reports.len())
+            .saturating_sub(replaceable)
+            > self.evidence_cap
+        {
             return Err(FleetError::limit(format!(
-                "the ledger holds {MAX_EVIDENCE} pieces of evidence already"
+                "the ledger holds {} pieces of evidence that are all still current",
+                self.evidence_cap
             )));
         }
         let mut seq = self.evidence_seq;
@@ -476,14 +589,28 @@ impl Ledger {
                 from,
                 to,
                 reason,
-            } => match self.goals.get_mut(goal) {
-                Some(g) if g.status == *from => {
-                    g.status = *to;
-                    g.reason = flatten_line(reason, MAX_REASON);
-                    true
+            } => {
+                // `verified` is derived: a status event that says it without the evidence and
+                // the children to back it (a forged or reordered history) changes nothing.
+                if *to == GoalStatus::Verified
+                    && !self.goals.get(goal).is_some_and(|g| self.satisfied(g))
+                {
+                    return false;
                 }
-                _ => false,
-            },
+                match self.goals.get_mut(goal) {
+                    Some(g) if g.status == *from => {
+                        g.status = *to;
+                        g.reason = flatten_line(reason, MAX_REASON);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            DomainEvent::TaskCommitted { run, task, head } => {
+                self.heads
+                    .insert(TaskRef::new(run.clone(), task.clone()), head.clone());
+                true
+            }
             DomainEvent::CriteriaAttached {
                 goal,
                 contract_id,
@@ -497,10 +624,7 @@ impl Ledger {
                     .goals
                     .get(goal)
                     .is_some_and(|g| g.contract.as_ref().is_some_and(|c| c.id == *e.contract()));
-                if !fits
-                    || self.evidence.contains_key(e.id())
-                    || self.evidence.len() >= MAX_EVIDENCE
-                {
+                if !fits || self.evidence.contains_key(e.id()) {
                     return false;
                 }
                 self.evidence_seq = self.evidence_seq.max(e.id().seq());
@@ -508,10 +632,80 @@ impl Ledger {
                     g.evidence.push(e.id().clone());
                 }
                 self.evidence.insert(e.id().clone(), Arc::new(e));
+                self.evict_superseded();
                 true
             }
             _ => false,
         }
+    }
+
+    /// Evidence that a newer piece for the same check of the same task and contract has replaced.
+    /// Superseded evidence no longer counts for anything; it is dropped from memory (not from the
+    /// log) when the ledger holds more than `MAX_EVIDENCE` pieces, oldest first. The same rule runs
+    /// on replay, so the ledger is the same after a restart.
+    fn superseded_ids(&self) -> Vec<EvidenceId> {
+        type Key = (GoalId, RunId, TaskId, String, String);
+        let key = |e: &Evidence| -> Key {
+            (
+                e.goal().clone(),
+                e.run().clone(),
+                e.task().clone(),
+                e.contract().to_string(),
+                e.check().to_string(),
+            )
+        };
+        let mut newest: BTreeMap<Key, &EvidenceId> = BTreeMap::new();
+        for e in self.evidence.values() {
+            // ids ascend with the map order, so the last one seen of a key is the newest
+            newest.insert(key(e), e.id());
+        }
+        self.evidence
+            .values()
+            .filter(|e| newest.get(&key(e)) != Some(&e.id()))
+            .map(|e| e.id().clone())
+            .collect()
+    }
+
+    fn evict_superseded(&mut self) {
+        let excess = self.evidence.len().saturating_sub(self.evidence_cap);
+        if excess == 0 {
+            return;
+        }
+        let mut gone = self.superseded_ids();
+        gone.sort_by_key(EvidenceId::seq);
+        gone.truncate(excess);
+        for id in gone {
+            if let Some(e) = self.evidence.remove(&id) {
+                if let Some(g) = self.goals.get_mut(e.goal()) {
+                    g.evidence.retain(|x| x != &id);
+                }
+            }
+        }
+    }
+
+    /// [`Ledger::apply`] for events read from the log or just produced: a `criteria_attached`
+    /// whose id is not the SHA-256 of its contract's canonical text is refused (a forged id would
+    /// bind evidence to a contract it was not taken for).
+    pub fn apply_checked(&mut self, event: &DomainEvent, digest: &dyn Digest) -> bool {
+        if let DomainEvent::CriteriaAttached {
+            contract_id,
+            contract,
+            ..
+        } = event
+        {
+            let honest = VerificationContract::from_value(&contract.0)
+                .is_ok_and(|c| c.id(digest).as_str() == contract_id);
+            if !honest {
+                return false;
+            }
+        }
+        self.apply(event)
+    }
+
+    /// The status changes the evidence, the recorded commits and the children call for right now,
+    /// as events: what a restart (or a new commit of a task) may have left unsettled.
+    pub fn resettle(&self) -> Vec<DomainEvent> {
+        self.settled(Vec::new())
     }
 
     fn apply_added(
@@ -667,13 +861,36 @@ mod tests {
         commit(ledger, events)
     }
 
+    fn sha(c: char) -> Sha {
+        Sha::parse(&c.to_string().repeat(40)).unwrap()
+    }
+
+    /// An empty ledger that knows the commits `r1/t1` and `r1/t2` were reviewed at (`c1`, `c2`).
+    fn new_ledger() -> Ledger {
+        let mut l = Ledger::new();
+        for (task, head) in [("t1", 'a'), ("t2", 'b')] {
+            assert!(l.apply(&DomainEvent::TaskCommitted {
+                run: RunId::parse("r1").unwrap(),
+                task: TaskId::parse(task).unwrap(),
+                head: sha(head),
+            }));
+        }
+        l
+    }
+
     fn scope(goal: &str, c: &AttachedContract) -> EvidenceScope {
+        scope_of(goal, c, "t1", 'a')
+    }
+
+    fn scope_of(goal: &str, c: &AttachedContract, task: &str, commit: char) -> EvidenceScope {
         EvidenceScope {
             goal: gid(goal),
-            run: None,
-            task: None,
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse(task).unwrap(),
             contract: c.id.clone(),
-            commit: None,
+            commit: sha(commit),
+            tree: sha('9'),
+            dirty: false,
         }
     }
 
@@ -708,7 +925,7 @@ mod tests {
 
     #[test]
     fn goals_get_ids_titles_and_a_tree_position() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         assert!(l.is_empty());
         let (id, events) = l
             .add_goal(NewGoal {
@@ -748,7 +965,7 @@ mod tests {
 
     #[test]
     fn adding_a_goal_validates_everything() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         add(&mut l, new_goal("root", None, None));
         let code = |g: NewGoal| l.add_goal(g).unwrap_err().code;
         assert_eq!(code(new_goal("root", None, None)), ErrorCode::Conflict);
@@ -796,7 +1013,7 @@ mod tests {
 
     #[test]
     fn depth_fan_out_and_size_are_bounded() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         add(&mut l, new_goal("d1", None, None));
         for depth in 2..=MAX_DEPTH {
             add(
@@ -817,7 +1034,7 @@ mod tests {
                 .code,
             ErrorCode::Limit
         );
-        let mut big = Ledger::new();
+        let mut big = new_ledger();
         for i in 0..MAX_GOALS {
             add(&mut big, new_goal(&format!("g{i}"), None, None));
         }
@@ -831,7 +1048,7 @@ mod tests {
 
     #[test]
     fn evidence_verifies_a_leaf_and_a_later_failure_takes_it_back() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         let c = contract(&[("tests", true), ("lint", false)]);
         let events = add(&mut l, new_goal("leaf", None, Some(c.clone())));
         assert_eq!(kinds(&events), ["goal_added", "criteria_attached"]);
@@ -870,7 +1087,7 @@ mod tests {
 
     #[test]
     fn evidence_ids_count_up_and_evidence_is_never_edited() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         let c = contract(&[("tests", true)]);
         add(&mut l, new_goal("leaf", None, Some(c.clone())));
         evidence(&mut l, "leaf", &c, vec![("tests", Verdict::Failed)]);
@@ -892,7 +1109,7 @@ mod tests {
 
     #[test]
     fn a_parent_is_verified_only_when_children_and_its_own_contract_agree() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         let pc = contract(&[("integration", true)]);
         let cc = contract(&[("unit", true)]);
         add(&mut l, new_goal("parent", None, Some(pc.clone())));
@@ -940,7 +1157,7 @@ mod tests {
 
     #[test]
     fn a_parent_without_a_contract_follows_its_children_and_a_leaf_without_one_never_verifies() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         let cc = contract(&[("unit", true)]);
         add(&mut l, new_goal("parent", None, None));
         add(&mut l, new_goal("kid", Some("parent"), Some(cc.clone())));
@@ -967,7 +1184,7 @@ mod tests {
 
     #[test]
     fn a_parent_whose_children_are_all_abandoned_is_not_verified() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         add(&mut l, new_goal("parent", None, None));
         add(&mut l, new_goal("kid", Some("parent"), None));
         let ev = l
@@ -980,7 +1197,7 @@ mod tests {
 
     #[test]
     fn status_changes_by_hand_follow_the_machine() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         let c = contract(&[("tests", true)]);
         add(&mut l, new_goal("g", None, Some(c.clone())));
         let err = l
@@ -1046,7 +1263,7 @@ mod tests {
 
     #[test]
     fn attaching_another_contract_discards_the_old_verification() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         let c1 = contract(&[("tests", true)]);
         let c2 = contract(&[("tests", true), ("docs", true)]);
         add(&mut l, new_goal("g", None, Some(c1.clone())));
@@ -1080,7 +1297,7 @@ mod tests {
 
     #[test]
     fn evidence_must_fit_the_goal_and_its_contract() {
-        let mut l = Ledger::new();
+        let mut l = new_ledger();
         let c = contract(&[("tests", true)]);
         add(&mut l, new_goal("bare", None, None));
         add(&mut l, new_goal("g", None, Some(c.clone())));
@@ -1116,176 +1333,295 @@ mod tests {
         );
     }
 
+    fn small_ledger(cap: usize) -> Ledger {
+        let mut l = new_ledger();
+        l.evidence_cap = cap;
+        l
+    }
+
     #[test]
-    fn evidence_is_bounded() {
-        let mut l = Ledger::new();
+    fn superseded_evidence_is_dropped_when_the_ledger_is_full_and_current_evidence_is_never_refused(
+    ) {
+        let mut l = small_ledger(20);
         let c = contract(&[("tests", true)]);
         add(&mut l, new_goal("g", None, Some(c.clone())));
-        for _ in 0..MAX_EVIDENCE {
+        for _ in 0..30 {
             evidence(&mut l, "g", &c, vec![("tests", Verdict::Failed)]);
         }
-        let err = l
-            .record_evidence(&scope("g", &c), vec![report("tests", Verdict::Passed)], 1)
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Limit);
-        assert_eq!(l.evidence_count(), MAX_EVIDENCE);
+        assert_eq!(l.evidence_count(), 20, "the oldest pieces made room");
+        assert_eq!(l.goal(&gid("g")).unwrap().evidence.len(), 20);
+        let newest = l.evidence_of(&gid("g")).last().unwrap().id().seq();
+        assert_eq!(newest, 30);
+        assert!(l.evidence(&EvidenceId::from_seq(1)).is_none());
+        // a pass still lands and verifies
+        evidence(&mut l, "g", &c, vec![("tests", Verdict::Passed)]);
+        assert_eq!(status(&l, "g"), GoalStatus::Verified);
     }
 
     #[test]
-    fn events_that_do_not_fit_are_ignored() {
-        let mut l = Ledger::new();
+    fn eviction_is_the_same_on_replay() {
+        let mut l = small_ledger(8);
+        let mut log = Vec::new();
+        let c = contract(&[("tests", true)]);
+        log.extend(add(&mut l, new_goal("g", None, Some(c.clone()))));
+        for _ in 0..20 {
+            log.extend(evidence(&mut l, "g", &c, vec![("tests", Verdict::Failed)]));
+        }
+        let mut again = small_ledger(8);
+        for e in &log {
+            assert!(again.apply(e));
+        }
+        let ids = |l: &Ledger| {
+            l.evidence_of(&gid("g"))
+                .iter()
+                .map(|e| e.id().seq())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&again), ids(&l));
+        assert_eq!(ids(&l).len(), 8);
+    }
+
+    #[test]
+    fn evidence_that_is_all_current_is_refused_at_the_cap() {
+        let mut l = small_ledger(6);
+        let ids: Vec<String> = (0..3).map(|i| format!("c{i}")).collect();
+        let checks: Vec<(&str, bool)> = ids.iter().map(|i| (i.as_str(), true)).collect();
+        let c = contract(&checks);
+        add(&mut l, new_goal("g", None, Some(c.clone())));
+        let run = |l: &mut Ledger, task: &str| {
+            let sc = scope_of("g", &c, task, 'a');
+            let reports = ids.iter().map(|i| report(i, Verdict::Passed)).collect();
+            l.record_evidence(&sc, reports, 1).map(|ev| commit(l, ev))
+        };
+        assert!(run(&mut l, "t1").is_ok());
+        assert!(run(&mut l, "t2").is_ok());
+        // six pieces, all newest for their task: a third task cannot make room
+        let err = run(&mut l, "t3").unwrap_err();
+        assert_eq!(err.code, ErrorCode::Limit);
+        assert_eq!(l.evidence_count(), 6);
+        // but a re-run of an existing task replaces its own pieces
+        assert!(run(&mut l, "t1").is_ok());
+        assert_eq!(l.evidence_count(), 6);
+    }
+
+    // ---- evidence is bound to the commit and the task it was taken on ----------------------------
+
+    fn committed(l: &mut Ledger, task: &str, head: char) -> Vec<DomainEvent> {
+        let ev = DomainEvent::TaskCommitted {
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse(task).unwrap(),
+            head: sha(head),
+        };
+        assert!(l.apply(&ev));
+        l.resettle()
+    }
+
+    #[test]
+    fn a_new_commit_of_the_task_takes_the_verification_of_the_old_one_away() {
+        let mut l = new_ledger();
+        let c = contract(&[("tests", true)]);
+        let mut g = new_goal("g", None, Some(c.clone()));
+        g.tasks = vec![TaskRef::parse("r1/t1").unwrap()];
+        add(&mut l, g);
+        evidence(&mut l, "g", &c, vec![("tests", Verdict::Passed)]);
+        assert_eq!(status(&l, "g"), GoalStatus::Verified);
+        // the task is reviewed again and its output is committed as another commit
+        let settle = committed(&mut l, "t1", 'f');
+        assert_eq!(kinds(&settle), ["goal_status_changed"]);
+        commit(&mut l, settle);
+        assert_eq!(status(&l, "g"), GoalStatus::InProgress);
+        assert_eq!(l.contract_state(&gid("g")), Some(ContractState::Pending));
+        // evidence of the new commit verifies it again
+        let ev = l
+            .record_evidence(
+                &scope_of("g", &c, "t1", 'f'),
+                vec![report("tests", Verdict::Passed)],
+                2,
+            )
+            .unwrap();
+        commit(&mut l, ev);
+        assert_eq!(status(&l, "g"), GoalStatus::Verified);
+        // and a commit recorded again for the same head changes nothing
+        assert!(committed(&mut l, "t1", 'f').is_empty());
+    }
+
+    #[test]
+    fn evidence_of_another_commit_than_the_reviewed_one_does_not_count() {
+        let mut l = new_ledger();
+        let c = contract(&[("tests", true)]);
+        let mut g = new_goal("g", None, Some(c.clone()));
+        g.tasks = vec![TaskRef::parse("r1/t1").unwrap()];
+        add(&mut l, g);
+        // t1 was reviewed at 'a'; a run that saw 'e' (a manual run after the worker committed again)
+        let ev = l
+            .record_evidence(
+                &scope_of("g", &c, "t1", 'e'),
+                vec![report("tests", Verdict::Passed)],
+                2,
+            )
+            .unwrap();
+        commit(&mut l, ev);
+        assert_eq!(status(&l, "g"), GoalStatus::Open);
+        assert_eq!(l.contract_state(&gid("g")), Some(ContractState::Pending));
+        let (r1, t1) = (RunId::parse("r1").unwrap(), TaskId::parse("t1").unwrap());
+        assert_eq!(l.task_contract(&r1, &t1), TaskContract::Pending);
+        // asked about the commit that was proven, the answer is yes; about any other, no
+        assert_eq!(
+            l.task_contract_at(&r1, &t1, &sha('e')),
+            TaskContract::Passed
+        );
+        assert_eq!(
+            l.task_contract_at(&r1, &t1, &sha('a')),
+            TaskContract::Pending
+        );
+        assert_eq!(l.head_of(&r1, &t1), Some(&sha('a')));
+        assert!(l.head_of(&r1, &TaskId::parse("zz").unwrap()).is_none());
+    }
+
+    #[test]
+    fn evidence_without_a_recorded_commit_of_its_task_never_counts() {
+        let mut l = Ledger::new(); // no task_committed events
         let c = contract(&[("tests", true)]);
         add(&mut l, new_goal("g", None, Some(c.clone())));
-        let added = |id: &str, parent: Option<&str>, tasks: Vec<&str>| DomainEvent::GoalAdded {
-            goal: gid(id),
-            parent: parent.map(gid),
-            title: "t".into(),
-            intent: String::new(),
-            tasks: tasks.into_iter().map(String::from).collect(),
-        };
-        assert!(!l.apply(&added("g", None, vec![])), "duplicate id");
-        assert!(
-            !l.apply(&added("x", Some("missing"), vec![])),
-            "unknown parent"
-        );
-        assert!(
-            !l.apply(&added("x", None, vec!["not-a-task-ref"])),
-            "bad task"
-        );
-        assert!(
-            !l.apply(&DomainEvent::Warning {
-                message: "w".into()
-            }),
-            "foreign event"
-        );
-        let change =
-            |goal: &str, from: GoalStatus, to: GoalStatus| DomainEvent::GoalStatusChanged {
-                goal: gid(goal),
-                from,
-                to,
-                reason: String::new(),
-            };
-        assert!(
-            !l.apply(&change("g", GoalStatus::Blocked, GoalStatus::Open)),
-            "wrong from"
-        );
-        assert!(
-            !l.apply(&change("zz", GoalStatus::Open, GoalStatus::Blocked)),
-            "unknown goal"
-        );
-        let criteria = |goal: &str, id: &str, doc: Value| DomainEvent::CriteriaAttached {
-            goal: gid(goal),
-            contract_id: id.into(),
-            contract: Document(doc),
-        };
-        assert!(!l.apply(&criteria("g", "short", c.contract.to_value())));
-        assert!(!l.apply(&criteria(
-            "g",
-            c.id.as_str(),
-            Value::object([("version", Value::int(7))])
-        )));
-        assert!(!l.apply(&criteria("zz", c.id.as_str(), c.contract.to_value())));
-        // evidence for an unknown goal, for another contract, or malformed
-        let other = contract(&[("tests", true), ("more", false)]);
-        for bad in [scope("zz", &c), scope("g", &other)] {
-            let e = Evidence::record(
-                EvidenceId::from_seq(50),
-                &bad,
-                report("tests", Verdict::Passed),
-                1,
-            );
-            assert!(!l.apply(&e.to_event()));
-        }
-        assert_eq!(l.len(), 1);
-        assert_eq!(l.evidence_count(), 0);
+        evidence(&mut l, "g", &c, vec![("tests", Verdict::Passed)]);
+        assert_eq!(status(&l, "g"), GoalStatus::Open);
     }
 
     #[test]
-    fn remaining_lists_open_leaves_and_blockers() {
-        let mut l = Ledger::new();
+    fn evidence_taken_with_uncommitted_changes_is_kept_and_never_counts() {
+        let mut l = new_ledger();
         let c = contract(&[("tests", true)]);
-        add(&mut l, new_goal("root", None, None));
-        add(&mut l, new_goal("a", Some("root"), Some(c.clone())));
-        add(&mut l, new_goal("b", Some("root"), None));
-        add(&mut l, new_goal("c", Some("root"), None));
-        add(&mut l, new_goal("d", Some("root"), None));
-        for (id, to) in [
-            ("b", GoalStatus::Blocked),
-            ("c", GoalStatus::InProgress),
-            ("d", GoalStatus::Abandoned),
-        ] {
-            let ev = l.set_status(&gid(id), to, "x").unwrap();
-            commit(&mut l, ev);
-        }
-        let r = l.remaining();
-        let names = |v: &[&Goal]| v.iter().map(|g| g.id.to_string()).collect::<Vec<_>>();
-        assert_eq!(names(&r.open_leaves), ["a", "c"]);
-        assert_eq!(names(&r.blocked), ["b"]);
-        evidence(&mut l, "a", &c, vec![("tests", Verdict::Passed)]);
-        let r = l.remaining();
-        assert_eq!(names(&r.open_leaves), ["c"]);
+        add(&mut l, new_goal("g", None, Some(c.clone())));
+        let mut sc = scope("g", &c);
+        sc.dirty = true;
+        let ev = l
+            .record_evidence(&sc, vec![report("tests", Verdict::Passed)], 1)
+            .unwrap();
+        commit(&mut l, ev);
+        assert_eq!(l.evidence_count(), 1, "kept and shown");
+        assert_eq!(status(&l, "g"), GoalStatus::Open, "but it proves nothing");
+        assert_eq!(l.contract_state(&gid("g")), Some(ContractState::Pending));
     }
 
     #[test]
-    fn a_parent_with_only_its_own_contract_left_is_a_leaf_of_the_remaining_work() {
-        let mut l = Ledger::new();
-        let pc = contract(&[("integration", true)]);
-        let cc = contract(&[("unit", true)]);
-        add(&mut l, new_goal("parent", None, Some(pc)));
-        add(&mut l, new_goal("kid", Some("parent"), Some(cc.clone())));
-        assert_eq!(
-            l.remaining()
-                .open_leaves
-                .iter()
-                .map(|g| g.id.to_string())
-                .collect::<Vec<_>>(),
-            ["kid"]
-        );
-        evidence(&mut l, "kid", &cc, vec![("unit", Verdict::Passed)]);
-        assert_eq!(
-            l.remaining()
-                .open_leaves
-                .iter()
-                .map(|g| g.id.to_string())
-                .collect::<Vec<_>>(),
-            ["parent"]
-        );
-    }
-
-    #[test]
-    fn tasks_are_governed_by_the_contracts_of_their_goals() {
-        let mut l = Ledger::new();
+    fn a_goal_with_several_tasks_needs_the_contract_to_pass_for_each_of_them() {
+        let mut l = new_ledger();
         let c = contract(&[("tests", true)]);
-        let r1 = RunId::parse("r1").unwrap();
-        let t1 = TaskId::parse("t1").unwrap();
-        let t2 = TaskId::parse("t2").unwrap();
-        assert_eq!(l.task_contract(&r1, &t1), TaskContract::NotGoverned);
-        let mut with_task = new_goal("g", None, Some(c.clone()));
-        with_task.tasks = vec![TaskRef::new(r1.clone(), t1.clone())];
-        add(&mut l, with_task);
-        let mut no_contract = new_goal("h", None, None);
-        no_contract.tasks = vec![TaskRef::new(r1.clone(), t2.clone())];
-        add(&mut l, no_contract);
-        assert_eq!(l.owners_of(&r1, &t1).len(), 1);
-        assert_eq!(l.governing(&r1, &t1).len(), 1);
-        assert_eq!(l.task_contract(&r1, &t1), TaskContract::Pending);
-        assert_eq!(l.owners_of(&r1, &t2).len(), 1);
+        let mut g = new_goal("g", None, Some(c.clone()));
+        g.tasks = vec![
+            TaskRef::parse("r1/t1").unwrap(),
+            TaskRef::parse("r1/t2").unwrap(),
+        ];
+        add(&mut l, g);
+        let run = |l: &mut Ledger, task: &str, commit_c: char, v: Verdict| {
+            let ev = l
+                .record_evidence(
+                    &scope_of("g", &c, task, commit_c),
+                    vec![report("tests", v)],
+                    1,
+                )
+                .unwrap();
+            commit(l, ev);
+        };
+        run(&mut l, "t1", 'a', Verdict::Passed);
+        assert_eq!(status(&l, "g"), GoalStatus::Open, "t2 was never proven");
+        let (r1, t1, t2) = (
+            RunId::parse("r1").unwrap(),
+            TaskId::parse("t1").unwrap(),
+            TaskId::parse("t2").unwrap(),
+        );
+        assert_eq!(l.task_contract(&r1, &t1), TaskContract::Passed);
         assert_eq!(
             l.task_contract(&r1, &t2),
-            TaskContract::NotGoverned,
-            "no contract, no extra guard"
+            TaskContract::Pending,
+            "t1's pass is not t2's"
         );
-        evidence(&mut l, "g", &c, vec![("tests", Verdict::Failed)]);
-        assert_eq!(l.task_contract(&r1, &t1), TaskContract::Failed);
-        evidence(&mut l, "g", &c, vec![("tests", Verdict::Passed)]);
-        assert_eq!(l.task_contract(&r1, &t1), TaskContract::Passed);
-        let ev = l.set_status(&gid("g"), GoalStatus::Abandoned, "").unwrap();
-        commit(&mut l, ev);
+        run(&mut l, "t2", 'b', Verdict::Failed);
+        assert_eq!(l.contract_state(&gid("g")), Some(ContractState::Failed));
+        run(&mut l, "t2", 'b', Verdict::Passed);
+        assert_eq!(status(&l, "g"), GoalStatus::Verified);
+        assert_eq!(l.task_contract(&r1, &t2), TaskContract::Passed);
+    }
+
+    // ---- replay does not trust derived fields ----------------------------------------------------------
+
+    struct Fnv2;
+    impl Digest for Fnv2 {
+        fn sha256_hex(&self, data: &[u8]) -> String {
+            Fnv.sha256_hex(data)
+        }
+    }
+
+    #[test]
+    fn a_contract_id_that_is_not_the_hash_of_its_contract_is_refused() {
+        let mut l = new_ledger();
+        add(&mut l, new_goal("g", None, None));
+        let c = contract(&[("tests", true)]);
+        let honest = criteria_event(&gid("g"), &c);
+        let DomainEvent::CriteriaAttached {
+            goal,
+            contract: doc,
+            ..
+        } = honest.clone()
+        else {
+            panic!("criteria")
+        };
+        let forged = DomainEvent::CriteriaAttached {
+            goal,
+            contract_id: "ee".repeat(32),
+            contract: doc,
+        };
+        assert!(!l.apply_checked(&forged, &Fnv2));
+        assert!(l.goal(&gid("g")).unwrap().contract.is_none());
+        assert!(l.apply_checked(&honest, &Fnv2));
         assert_eq!(
-            l.task_contract(&r1, &t1),
-            TaskContract::NotGoverned,
-            "abandoned goals govern nothing"
+            l.goal(&gid("g")).unwrap().contract.as_ref().unwrap().id,
+            c.id
         );
+        // other events pass through unchanged
+        assert!(l.apply_checked(
+            &DomainEvent::GoalAdded {
+                goal: gid("h"),
+                parent: None,
+                title: "h".into(),
+                intent: String::new(),
+                tasks: vec![]
+            },
+            &Fnv2
+        ));
+    }
+
+    #[test]
+    fn a_status_event_that_says_verified_without_the_evidence_changes_nothing() {
+        let mut l = new_ledger();
+        let c = contract(&[("tests", true)]);
+        add(&mut l, new_goal("g", None, Some(c.clone())));
+        let forged = DomainEvent::GoalStatusChanged {
+            goal: gid("g"),
+            from: GoalStatus::Open,
+            to: GoalStatus::Verified,
+            reason: "trust me".into(),
+        };
+        assert!(!l.apply(&forged));
+        assert_eq!(status(&l, "g"), GoalStatus::Open);
+        // with failing evidence it is just as refused
+        evidence(&mut l, "g", &c, vec![("tests", Verdict::Failed)]);
+        assert!(!l.apply(&forged));
+        // with passing evidence the same words are what the ledger derives itself
+        evidence(&mut l, "g", &c, vec![("tests", Verdict::Passed)]);
+        assert_eq!(status(&l, "g"), GoalStatus::Verified);
+    }
+
+    #[test]
+    fn resettle_repairs_a_ledger_whose_history_left_a_goal_unsettled() {
+        // events as an older or hand-made log could hold them: evidence recorded for a commit that
+        // was not the reviewed one, with the status line missing
+        let mut l = new_ledger();
+        let c = contract(&[("tests", true)]);
+        add(&mut l, new_goal("g", None, Some(c.clone())));
+        assert!(l.resettle().is_empty());
+        evidence(&mut l, "g", &c, vec![("tests", Verdict::Passed)]);
+        assert!(l.resettle().is_empty(), "nothing is left to settle");
     }
 
     // ---- property tests ----------------------------------------------------------------------
@@ -1350,7 +1686,7 @@ mod tests {
     fn random_histories_keep_every_invariant_and_replay_exactly() {
         for seed in 0..40u64 {
             let mut rng = Lcg(seed + 1);
-            let mut l = Ledger::new();
+            let mut l = new_ledger();
             let mut log: Vec<DomainEvent> = Vec::new();
             let mut seen_evidence: BTreeMap<EvidenceId, Evidence> = BTreeMap::new();
             let contracts = [
@@ -1361,7 +1697,23 @@ mod tests {
             for step in 0..120 {
                 let ids: Vec<GoalId> = l.order.clone();
                 let pick = |rng: &mut Lcg| ids.get(rng.next(ids.len())).cloned();
-                let result: Result<Vec<DomainEvent>> = match rng.next(10) {
+                let result: Result<Vec<DomainEvent>> = match rng.next(12) {
+                    10..=11 => {
+                        // a task is reviewed again and committed as another commit
+                        let task = ["t1", "t2"][rng.next(2)];
+                        let head = ['a', 'b', 'f', 'c'][rng.next(4)];
+                        let ev = DomainEvent::TaskCommitted {
+                            run: RunId::parse("r1").unwrap(),
+                            task: TaskId::parse(task).unwrap(),
+                            head: sha(head),
+                        };
+                        assert!(l.apply(&ev));
+                        let mut events = vec![ev];
+                        events.extend(l.resettle());
+                        // the task_committed event is already applied; hand the rest back
+                        log.push(events.remove(0));
+                        Ok(events)
+                    }
                     0..=2 => {
                         let parent = if rng.next(3) == 0 {
                             None
@@ -1396,7 +1748,13 @@ mod tests {
                                     };
                                     reports.push(report(ch.id.as_str(), v));
                                 }
-                                l.record_evidence(&scope(goal.as_str(), &c), reports, step as u64)
+                                let task = ["t1", "t2"][rng.next(2)];
+                                let commit_c = ['a', 'b', 'f', 'c'][rng.next(4)];
+                                l.record_evidence(
+                                    &scope_of(goal.as_str(), &c, task, commit_c),
+                                    reports,
+                                    step as u64,
+                                )
                             }
                             None => continue,
                         },
@@ -1436,7 +1794,7 @@ mod tests {
                 }
             }
             // replaying the log from nothing gives the same ledger
-            let mut again = Ledger::new();
+            let mut again = new_ledger();
             for e in &log {
                 assert!(again.apply(e));
             }
@@ -1461,7 +1819,7 @@ mod tests {
         let c = contract(&[("tests", true)]);
         for seed in 0..50u64 {
             let mut rng = Lcg(seed + 100);
-            let mut l = Ledger::new();
+            let mut l = new_ledger();
             add(&mut l, new_goal("g", None, Some(c.clone())));
             for _ in 0..30 {
                 let to = statuses[rng.next(statuses.len())];

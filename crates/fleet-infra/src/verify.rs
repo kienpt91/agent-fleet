@@ -61,6 +61,8 @@ pub(crate) fn run_verify_within(job: &VerifyJob, ctx: &JobContext, budget: Durat
         attempt: job.attempt,
         origin: job.origin,
         commit: job.state.head.clone(),
+        tree: job.state.tree.clone(),
+        dirty: job.state.dirty,
         results,
     }
 }
@@ -73,6 +75,8 @@ pub(crate) fn panic_result(job: &VerifyJob, why: &str) -> VerifyDone {
         attempt: job.attempt,
         origin: job.origin,
         commit: job.state.head.clone(),
+        tree: job.state.tree.clone(),
+        dirty: job.state.dirty,
         results: job
             .targets
             .iter()
@@ -276,8 +280,10 @@ mod tests {
                 worktree: self.worktree.display().to_string(),
                 state: WorktreeState {
                     head: Sha::parse(&"e".repeat(40)).unwrap(),
+                    tree: Sha::parse(&"f".repeat(40)).unwrap(),
                     changed: changed.iter().map(|c| c.to_string()).collect(),
                     truncated: false,
+                    dirty: false,
                 },
                 env: vec![("PATH".into(), "/usr/bin:/bin".into())],
                 targets: vec![VerifyTarget {
@@ -474,15 +480,17 @@ mod tests {
         let e = neo_verify::evidence::Evidence::from_parts(
             fleet_domain::ids::EvidenceId::from_seq(1),
             GoalId::parse("g").unwrap(),
-            None,
-            None,
+            RunId::parse("r1").unwrap(),
+            TaskId::parse("t1").unwrap(),
             job.targets[0].contract_id.clone(),
             job.targets[0].contract.checks()[0].id.clone(),
             Verdict::Passed,
             None,
             "s".into(),
             evidence_text.clone(),
-            None,
+            job.state.head.clone(),
+            job.state.tree.clone(),
+            false,
             1,
         );
         assert!(!e.output().contains('\u{1b}') && !e.output().contains('\u{7}'));

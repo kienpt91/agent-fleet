@@ -1175,8 +1175,14 @@ impl Vcs for GitVcs {
     fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState> {
         let wt = self.check_worktree(worktree)?;
         let head = self.head_sha(&wt)?;
-        // Everything that differs from the base commit: committed work, staged and unstaged
-        // changes of tracked files, and untracked files that are not ignored.
+        let tree = self.run_ok(
+            &wt,
+            None,
+            &["rev-parse", "--verify", "--end-of-options", "HEAD^{tree}"],
+        )?;
+        let tree = Sha::parse(tree.text().trim())?;
+        // What the commits changed since the base: this, not the working state, is what a merge
+        // brings in. Every path is listed, `.fleet/` ones included.
         let diff = self.run_ok(
             &wt,
             None,
@@ -1187,35 +1193,43 @@ impl Vcs for GitVcs {
                 "--no-ext-diff",
                 "--no-renames",
                 base.as_str(),
+                head.as_str(),
                 "--",
             ],
         )?;
-        let untracked = self.run_ok(
-            &wt,
-            None,
-            &["ls-files", "--others", "--exclude-standard", "-z"],
-        )?;
         let mut paths: BTreeSet<String> = BTreeSet::new();
-        for raw in diff
-            .stdout
-            .split(|b| *b == 0)
-            .chain(untracked.stdout.split(|b| *b == 0))
-        {
-            if raw.is_empty() {
-                continue;
-            }
-            let path = String::from_utf8_lossy(raw).into_owned();
-            // fleet's own directory is not the worker's work
-            if path == ".fleet" || path.starts_with(".fleet/") {
-                continue;
-            }
-            paths.insert(path);
+        for raw in diff.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            paths.insert(String::from_utf8_lossy(raw).into_owned());
         }
         let truncated = paths.len() > MAX_CHANGED_PATHS;
+        // Uncommitted work: staged, modified or untracked files (ignored ones are not work and
+        // are not in any commit), apart from fleet's own directory.
+        let status = self.run_ok(
+            &wt,
+            None,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--no-renames",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
+        )?;
+        let dirty = status
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|entry| entry.len() > 3)
+            .any(|entry| {
+                let path = entry.get(3..).unwrap_or_default();
+                path != b".fleet" && !path.starts_with(b".fleet/")
+            });
         Ok(WorktreeState {
             head,
+            tree,
             changed: paths.into_iter().take(MAX_CHANGED_PATHS).collect(),
             truncated,
+            dirty,
         })
     }
 
@@ -1614,7 +1628,7 @@ mod tests {
     // ---- worktree state --------------------------------------------------------------------
 
     #[test]
-    fn worktree_state_reports_head_and_every_kind_of_change_against_the_base() {
+    fn worktree_state_lists_what_the_commits_changed_and_whether_work_is_uncommitted() {
         need_git!();
         let fx = Fx::new();
         let base = fx.base();
@@ -1622,62 +1636,82 @@ mod tests {
         // nothing yet
         let s = fx.vcs.worktree_state(&wt, &base).unwrap();
         assert_eq!(s.head, base);
-        assert!(s.changed.is_empty() && !s.truncated, "{s:?}");
-        // committed, then staged, modified, untracked, deleted, in a subdirectory
+        assert!(s.changed.is_empty() && !s.truncated && !s.dirty, "{s:?}");
+        assert_eq!(
+            s.tree.as_str(),
+            git(Path::new(&wt), &["rev-parse", "HEAD^{tree}"])
+        );
+        // committed work: the paths of the commits, nothing else
         let head = fx.edit_and_commit(&wt, "src/committed.txt", "a\n");
+        fx.edit_and_commit(&wt, "docs/new.md", "b\n");
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert_eq!(s.changed, ["docs/new.md", "src/committed.txt"]);
+        assert!(!s.dirty);
+        assert_ne!(s.head, head);
+        // uncommitted work is not a change of the commit, but makes the worktree dirty
+        fs::write(Path::new(&wt).join("README.md"), "changed\n").unwrap();
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert_eq!(s.changed, ["docs/new.md", "src/committed.txt"]);
+        assert!(s.dirty, "a modified tracked file");
+        git(Path::new(&wt), &["checkout", "--", "README.md"]);
+        fs::write(Path::new(&wt).join("untracked.txt"), "u\n").unwrap();
+        assert!(
+            fx.vcs.worktree_state(&wt, &base).unwrap().dirty,
+            "an untracked file"
+        );
+        fs::remove_file(Path::new(&wt).join("untracked.txt")).unwrap();
         fs::write(Path::new(&wt).join("staged.txt"), "s\n").unwrap();
         git(Path::new(&wt), &["add", "staged.txt"]);
-        fs::write(Path::new(&wt).join("README.md"), "changed\n").unwrap();
-        fs::write(Path::new(&wt).join("untracked.txt"), "u\n").unwrap();
-        fs::remove_file(Path::new(&wt).join("src/lib.txt")).unwrap();
+        assert!(
+            fx.vcs.worktree_state(&wt, &base).unwrap().dirty,
+            "a staged file"
+        );
+        git(Path::new(&wt), &["reset", "-q", "--", "staged.txt"]);
+        fs::remove_file(Path::new(&wt).join("staged.txt")).unwrap();
+        assert!(!fx.vcs.worktree_state(&wt, &base).unwrap().dirty);
+    }
+
+    #[test]
+    fn fleets_own_directory_and_ignored_files_do_not_make_a_worktree_dirty() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        fx.edit_and_commit(&wt, ".gitignore", "ignored.log\n");
         fs::create_dir_all(Path::new(&wt).join(".fleet")).unwrap();
         fs::write(Path::new(&wt).join(".fleet/brief.md"), "brief\n").unwrap();
-        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
-        assert_eq!(s.head, head);
-        assert_eq!(
-            s.changed,
-            [
-                "README.md",
-                "src/committed.txt",
-                "src/lib.txt",
-                "staged.txt",
-                "untracked.txt"
-            ]
-        );
-        assert!(!s.truncated);
-    }
-
-    #[test]
-    fn a_change_that_was_reverted_is_not_a_change() {
-        need_git!();
-        let fx = Fx::new();
-        let base = fx.base();
-        let wt = fx.prepare("r1", "t1");
-        fx.edit_and_commit(&wt, "README.md", "temporary\n");
-        let original = git(
-            Path::new(&wt),
-            &["show", &format!("{}:README.md", base.as_str())],
-        );
-        fx.edit_and_commit(&wt, "README.md", &format!("{original}\n"));
-        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
-        assert!(s.changed.is_empty(), "{s:?}");
-    }
-
-    #[test]
-    fn file_names_are_reported_verbatim_and_ignored_files_are_not_changes() {
-        need_git!();
-        let fx = Fx::new();
-        let base = fx.base();
-        let wt = fx.prepare("r1", "t1");
-        fs::write(Path::new(&wt).join("odd name\twith tab.txt"), "x").unwrap();
-        fs::write(Path::new(&wt).join("naïve.txt"), "x").unwrap();
-        fs::write(Path::new(&wt).join(".gitignore"), "ignored.log\n").unwrap();
         fs::write(Path::new(&wt).join("ignored.log"), "x").unwrap();
         let s = fx.vcs.worktree_state(&wt, &base).unwrap();
-        assert_eq!(
-            s.changed,
-            [".gitignore", "naïve.txt", "odd name\twith tab.txt"]
-        );
+        assert!(!s.dirty, "{s:?}");
+        assert_eq!(s.changed, [".gitignore"]);
+    }
+
+    #[test]
+    fn a_path_under_the_fleet_directory_that_the_worker_committed_is_a_change() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        fs::create_dir_all(Path::new(&wt).join(".fleet")).unwrap();
+        fs::write(Path::new(&wt).join(".fleet/planted.sh"), "echo hi\n").unwrap();
+        fs::write(Path::new(&wt).join("a.txt"), "a\n").unwrap();
+        git(Path::new(&wt), &["add", "-f", ".fleet/planted.sh", "a.txt"]);
+        git(Path::new(&wt), &["commit", "-q", "-m", "worker commit"]);
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert_eq!(s.changed, [".fleet/planted.sh", "a.txt"]);
+        assert!(!s.dirty);
+    }
+
+    #[test]
+    fn file_names_are_reported_verbatim() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        fx.edit_and_commit(&wt, "odd name\twith tab.txt", "x");
+        fx.edit_and_commit(&wt, "naïve.txt", "x");
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert_eq!(s.changed, ["naïve.txt", "odd name\twith tab.txt"]);
     }
 
     #[test]

@@ -554,15 +554,17 @@ impl VerificationContract {
         ContractId(digest.sha256_hex(self.canonical().as_bytes()))
     }
 
-    /// Where the contract stands given everything recorded so far. Only evidence of this exact
-    /// contract (`id`) counts, and for each mandatory check only the newest piece: a later run
-    /// replaces an earlier one, in either direction.
+    /// Where the contract stands given the evidence the caller considers valid. Only evidence of
+    /// this exact contract (`id`) that [`Evidence::counts`] (no uncommitted changes behind it)
+    /// is looked at, and for each mandatory check only the newest piece: a later run replaces an
+    /// earlier one, in either direction. Which commit the evidence must name, and for which task,
+    /// is the caller's rule (the ledger's): this function judges what it is given.
     pub fn state(&self, id: &ContractId, evidence: &[&Evidence]) -> ContractState {
         let mut missing = false;
         for check in self.mandatory_checks() {
             let newest = evidence
                 .iter()
-                .filter(|e| e.contract() == id && e.check() == &check.id)
+                .filter(|e| e.counts() && e.contract() == id && e.check() == &check.id)
                 .max_by_key(|e| e.id().seq());
             match newest {
                 None => missing = true,
@@ -1103,20 +1105,50 @@ pub(crate) mod tests {
     }
 
     fn evidence(seq: u64, contract: &ContractId, check: &str, verdict: Verdict) -> Evidence {
+        evidence_with(seq, contract, check, verdict, false)
+    }
+
+    fn evidence_with(
+        seq: u64,
+        contract: &ContractId,
+        check: &str,
+        verdict: Verdict,
+        dirty: bool,
+    ) -> Evidence {
         Evidence::from_parts(
             EvidenceId::from_seq(seq),
             GoalId::parse("g").unwrap(),
-            None,
-            None,
+            fleet_domain::ids::RunId::parse("r1").unwrap(),
+            fleet_domain::ids::TaskId::parse("t1").unwrap(),
             contract.clone(),
             CheckId::parse(check).unwrap(),
             verdict,
             None,
             "s".into(),
             String::new(),
-            None,
+            fleet_domain::ids::Sha::parse(&"a".repeat(40)).unwrap(),
+            fleet_domain::ids::Sha::parse(&"b".repeat(40)).unwrap(),
+            dirty,
             seq,
         )
+    }
+
+    #[test]
+    fn evidence_taken_with_uncommitted_changes_never_counts() {
+        let c = VerificationContract::from_value(&cmd(vec![])).unwrap();
+        let id = c.id(&Toy);
+        let clean = evidence_with(1, &id, "c", Verdict::Passed, false);
+        let dirty_pass = evidence_with(2, &id, "c", Verdict::Passed, true);
+        let dirty_fail = evidence_with(3, &id, "c", Verdict::Failed, true);
+        assert_eq!(c.state(&id, &[&dirty_pass]), ContractState::Pending);
+        assert_eq!(c.state(&id, &[&dirty_fail]), ContractState::Pending);
+        // newer but dirty evidence does not replace an older clean piece, in either direction
+        assert_eq!(c.state(&id, &[&clean, &dirty_fail]), ContractState::Passed);
+        let clean_fail = evidence_with(4, &id, "c", Verdict::Failed, false);
+        assert_eq!(
+            c.state(&id, &[&clean_fail, &dirty_pass]),
+            ContractState::Failed
+        );
     }
 
     #[test]

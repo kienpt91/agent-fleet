@@ -269,7 +269,16 @@ fn the_job_carries_what_it_needs_and_nothing_secret() {
     assert_eq!(job.targets[0].contract.checks().len(), 2);
     let env: std::collections::BTreeMap<_, _> = job.env.iter().cloned().collect();
     assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
-    assert_eq!(env.get("FLEET_TASK").map(String::as_str), Some("a"));
+    assert_eq!(
+        env.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["HOME", "PATH"],
+        "exactly the operator's allowlist: the adapter adds a home and a working directory of its own"
+    );
+    assert!(
+        !env.keys()
+            .any(|k| k.starts_with("FLEET_") || k.starts_with("XDG_")),
+        "nothing that points into the worker's worktree or fleet's state"
+    );
     assert!(
         !env.contains_key("SENTINEL_TOKEN"),
         "no secret of the daemon reaches a check"
@@ -313,6 +322,8 @@ fn a_failed_check_is_evidence_a_retry_and_a_quote_in_the_next_brief() {
         run,
         task,
         commit,
+        tree,
+        dirty,
         ..
     } = &evidence[0]
     else {
@@ -320,9 +331,11 @@ fn a_failed_check_is_evidence_a_retry_and_a_quote_in_the_next_brief() {
     };
     assert_eq!((check.as_str(), *verdict), ("tests", Verdict::Failed));
     assert_eq!(output, "assertion failed: 2 + 2 == 5");
-    assert_eq!(run.as_ref().unwrap().as_str(), "r1");
-    assert_eq!(task.as_ref().unwrap().as_str(), "a");
-    assert_eq!(commit.as_ref().unwrap().as_str(), "d".repeat(40));
+    assert_eq!(run.as_str(), "r1");
+    assert_eq!(task.as_str(), "a");
+    assert_eq!(commit.as_str(), "c".repeat(40));
+    assert_eq!(tree.as_str(), "e".repeat(40));
+    assert!(!dirty);
     let brief = last_brief(&h);
     assert!(brief.contains("verify g/tests"), "{brief}");
     assert!(
@@ -678,6 +691,18 @@ fn verify_call(
     h.call("verify", obj(vec![("target", s(target))]))
 }
 
+fn status_of_run(h: &mut Harness, target: &str, ticket: u64) -> fleet_domain::error::Result<Value> {
+    h.call(
+        "verify.status",
+        obj(vec![("target", s(target)), ("ticket", Value::int(ticket))]),
+    )
+    .map(|r| r.data().clone())
+}
+
+fn ticket_of(reply: &fleet_app::api::Reply) -> u64 {
+    reply.data().get("ticket").and_then(Value::as_u64).unwrap()
+}
+
 fn status_doc(h: &mut Harness, target: &str) -> Value {
     h.call("verify.status", obj(vec![("target", s(target))]))
         .unwrap()
@@ -880,4 +905,230 @@ fn the_children_of_running_jobs_count_as_worker_origin_like_live_sessions() {
     assert!(live.iter().any(|l| l.pid == 4200 && l.pgid == 4200));
     h.world.set_job_groups(&[]);
     assert_eq!(h.orch.live_sessions().len(), 1);
+}
+
+// ---- evidence is about one commit of one task --------------------------------------------------------
+
+fn sha_of(c: char) -> fleet_domain::ids::Sha {
+    fleet_domain::ids::Sha::parse(&c.to_string().repeat(40)).unwrap()
+}
+
+#[test]
+fn verify_reports_on_its_own_run_by_ticket_not_on_the_ledger_standing() {
+    let mut h = reviewed_failing();
+    h.world.set_verify_mode(VerifyMode::Manual);
+    // an earlier run passes and is recorded
+    let first = verify_call(&mut h, "r1/a").unwrap();
+    let t1 = ticket_of(&first);
+    let running = status_of_run(&mut h, "r1/a", t1).unwrap();
+    assert_eq!(running.get("running"), Some(&Value::Bool(true)));
+    assert_eq!(running.get("passed"), Some(&Value::Bool(false)));
+    h.world.complete_verify("r1", "a", &[]);
+    ticks(&mut h);
+    let done = status_of_run(&mut h, "r1/a", t1).unwrap();
+    assert_eq!(done.get("running"), Some(&Value::Bool(false)));
+    assert_eq!(done.get("passed"), Some(&Value::Bool(true)));
+    assert_eq!(done.get("recorded"), Some(&Value::Bool(true)));
+    assert_eq!(done.get("ticket").and_then(Value::as_u64), Some(t1));
+
+    // the next run cannot be recorded: the ledger still says "passed", the run says it did not
+    let second = verify_call(&mut h, "r1/a").unwrap();
+    let t2 = ticket_of(&second);
+    assert_ne!(t1, t2);
+    h.world.fail_appends(true);
+    h.world.complete_verify("r1", "a", &[]);
+    h.orch.tick();
+    h.world.fail_appends(false);
+    let lost = status_of_run(&mut h, "r1/a", t2).unwrap();
+    assert_eq!(lost.get("running"), Some(&Value::Bool(false)));
+    assert_eq!(lost.get("passed"), Some(&Value::Bool(false)), "{lost:?}");
+    assert_eq!(lost.get("recorded"), Some(&Value::Bool(false)));
+    assert!(text(&lost, "note").contains("could not be recorded"));
+    assert_eq!(
+        status_doc(&mut h, "r1/a").get("passed"),
+        Some(&Value::Bool(true)),
+        "without a ticket the ledger's standing is shown"
+    );
+    // a ticket nobody knows
+    assert_eq!(
+        status_of_run(&mut h, "r1/a", 999).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+}
+
+#[test]
+fn a_run_on_a_worktree_with_uncommitted_changes_is_kept_but_proves_nothing() {
+    let mut h = reviewed_failing();
+    h.world.set_verify_mode(VerifyMode::Manual);
+    h.world.set_worktree_dirty(true);
+    let t = ticket_of(&verify_call(&mut h, "r1/a").unwrap());
+    h.world.complete_verify("r1", "a", &[]);
+    ticks(&mut h);
+    let done = status_of_run(&mut h, "r1/a", t).unwrap();
+    assert_eq!(done.get("passed"), Some(&Value::Bool(false)), "{done:?}");
+    assert_eq!(done.get("recorded"), Some(&Value::Bool(true)));
+    assert!(text(&done, "note").contains("uncommitted"), "{done:?}");
+    let shown = goal(&mut h, "g");
+    assert_eq!(
+        text(&shown, "status"),
+        "open",
+        "a dirty pass settles nothing"
+    );
+    let latest = shown.get("checks").and_then(Value::as_array).unwrap()[0]
+        .get("latest")
+        .unwrap()
+        .clone();
+    assert_eq!(latest.get("dirty"), Some(&Value::Bool(true)));
+    assert_eq!(latest.get("counts"), Some(&Value::Bool(false)));
+    assert_eq!(text(&latest, "verdict"), "passed");
+    assert_eq!(text(&latest, "tree"), "e".repeat(40));
+    assert_eq!(text(&latest, "commit"), "c".repeat(40));
+}
+
+#[test]
+fn a_worktree_that_changed_after_the_review_commit_fails_the_attempt() {
+    let mut h = governed(&[("tests", true)], |_| {});
+    h.world.set_worktree_dirty(true);
+    finish_ok(&mut h, "a");
+    ticks(&mut h);
+    assert_eq!(count(&h, "task_completed"), 0);
+    assert_ne!(goal_status(&mut h, "g"), "verified");
+    assert!(h.world.stored_events().iter().any(|e| matches!(
+        e,
+        DomainEvent::GateChecked { gate, passed: false, .. } if gate == "verify worktree"
+    )));
+    assert!(last_brief(&h).contains("changed after its work was committed"));
+}
+
+#[test]
+fn a_new_commit_of_the_task_takes_the_verification_of_the_old_one_away() {
+    let mut h = reviewed_failing();
+    h.world.set_verify_mode(VerifyMode::Manual);
+    verify_call(&mut h, "r1/a").unwrap();
+    h.world.complete_verify("r1", "a", &[]);
+    ticks(&mut h);
+    assert_eq!(goal_status(&mut h, "g"), "verified");
+    assert_eq!(verification(&mut h, "g"), "verified");
+    // the operator retries; the new attempt commits different work
+    h.world.set_branch_head("fleet/r1/a", sha_of('9'));
+    h.call("task.retry", obj(vec![("task", s("r1/a"))]))
+        .unwrap();
+    ticks(&mut h);
+    finish_ok(&mut h, "a");
+    ticks(&mut h);
+    assert_eq!(task_status(&mut h, "a"), "review");
+    assert_eq!(
+        goal_status(&mut h, "g"),
+        "in_progress",
+        "the new commit made the old evidence stale"
+    );
+    assert_eq!(verification(&mut h, "g"), "unverified");
+    let jobs = h.world.verify_jobs();
+    assert_eq!(jobs.last().unwrap().state.head, sha_of('9'));
+    h.world.complete_verify("r1", "a", &[]);
+    ticks(&mut h);
+    assert_eq!(task_status(&mut h, "a"), "completed");
+    assert_eq!(goal_status(&mut h, "g"), "verified");
+}
+
+#[test]
+fn a_governed_task_is_not_merged_unless_the_branch_is_the_commit_that_was_proven() {
+    let mut h = governed(&[("tests", true)], |c| c.merge_needs_approval = false);
+    finish_ok(&mut h, "a");
+    ticks(&mut h);
+    assert_eq!(task_status(&mut h, "a"), "completed");
+    // the branch moves after the proof (a leftover process of the worker commits in the worktree)
+    h.world.set_branch_head("fleet/r1/a", sha_of('7'));
+    let err = h.call("merge", obj(vec![("task", s("r1/a"))])).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+    assert!(
+        err.message.contains("verification contract"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("fleet verify r1/a"), "{}", err.message);
+    assert!(h.world.merges().is_empty());
+    assert_eq!(count(&h, "task_merged"), 0);
+    // back on the proven commit it merges
+    h.world.set_branch_head("fleet/r1/a", sha_of('c'));
+    h.call("merge", obj(vec![("task", s("r1/a"))])).unwrap();
+    assert_eq!(count(&h, "task_merged"), 1);
+    // tasks no contract guards are never held back by this
+    finish_ok(&mut h, "b");
+    ticks(&mut h);
+    h.world.set_branch_head("fleet/r1/b", sha_of('5'));
+    h.call("merge", obj(vec![("task", s("r1/b"))])).unwrap();
+}
+
+#[test]
+fn only_a_few_verifications_run_at_once() {
+    let mut cfg = test_config();
+    cfg.max_sessions = 4;
+    let mut h = Harness::with_config(cfg);
+    h.world.set_verify_mode(VerifyMode::Manual);
+    h.call(
+        "run.create",
+        obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+    )
+    .unwrap();
+    for t in ["a", "b", "c"] {
+        h.call(
+            "task.add",
+            obj(vec![("run", s("r1")), ("id", s(t)), ("title", s(t))]),
+        )
+        .unwrap();
+        h.call(
+            "goal.add",
+            obj(vec![
+                ("id", s(&format!("g{t}"))),
+                ("title", s(t)),
+                ("tasks", list(&[&format!("r1/{t}")])),
+                ("contract", contract(&[("tests", true)])),
+            ]),
+        )
+        .unwrap();
+    }
+    h.call("run.start", obj(vec![("run", s("r1"))])).unwrap();
+    for t in ["a", "b", "c"] {
+        finish_ok(&mut h, t);
+    }
+    ticks(&mut h);
+    assert_eq!(
+        h.world.verify_jobs().len(),
+        2,
+        "the third waits for a free slot"
+    );
+    h.world.complete_verify("r1", "a", &[]);
+    ticks(&mut h);
+    assert_eq!(h.world.verify_jobs().len(), 3);
+    for t in ["b", "c"] {
+        h.world.complete_verify("r1", t, &[]);
+    }
+    ticks(&mut h);
+    for t in ["a", "b", "c"] {
+        assert_eq!(task_status(&mut h, t), "completed");
+    }
+}
+
+#[test]
+fn a_goal_that_names_tasks_is_not_verified_by_a_run_in_another_worktree() {
+    let mut h = reviewed_failing();
+    h.call(
+        "goal.add",
+        obj(vec![
+            ("id", s("other")),
+            ("title", s("other")),
+            ("tasks", list(&["r1/b"])),
+            ("contract", contract(&[("tests", true)])),
+        ]),
+    )
+    .unwrap();
+    let err = h
+        .call(
+            "verify",
+            obj(vec![("target", s("other")), ("task", s("r1/a"))]),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err:?}");
+    assert!(err.message.contains("would not count"), "{}", err.message);
 }

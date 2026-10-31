@@ -873,16 +873,29 @@ pub fn execute_verify(
     out: &mut dyn Write,
     poll: Duration,
 ) -> Result<i32> {
-    let args = || {
+    let started = caller.call(
+        "verify",
         obj(vec![
             ("target", st(target.to_string())),
             ("task", task.map(Value::str)),
-        ])
-    };
-    caller.call("verify", args())?;
+        ]),
+    )?;
+    // Ask about this run, by its ticket: the ledger may already say "passed" because of an
+    // earlier run, and a run that could not be recorded must not look like a success.
+    let ticket = started
+        .get("ticket")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| FleetError::internal("the daemon's verify reply has no ticket"))?;
     let deadline = Instant::now().checked_add(timeout);
     loop {
-        let data = caller.call("verify.status", args())?;
+        let data = caller.call(
+            "verify.status",
+            obj(vec![
+                ("target", st(target.to_string())),
+                ("task", task.map(Value::str)),
+                ("ticket", Some(Value::int(ticket))),
+            ]),
+        )?;
         if data.get("running").and_then(Value::as_bool) != Some(true) {
             let text = if json {
                 json_line(&data)
@@ -2146,9 +2159,17 @@ mod tests {
                 "verification",
                 s(if passed { "verified" } else { "unverified" }),
             ),
+            ("ticket", Value::int(7u64)),
             ("running", Value::Bool(running)),
             ("passed", Value::Bool(passed)),
             ("goals", Value::array([])),
+        ]))
+    }
+
+    fn started() -> Result<Value> {
+        Ok(Value::object([
+            ("schema", s("fleet.verify.started/1")),
+            ("ticket", Value::int(7u64)),
         ]))
     }
 
@@ -2173,7 +2194,7 @@ mod tests {
 
     #[test]
     fn verify_waits_until_the_contracts_finished_then_reports_by_exit_code() {
-        let started = Ok(Value::object([("schema", s("fleet.verify.started/1"))]));
+        let started = started();
         let (r, out, f) = run_verify(
             vec![
                 started.clone(),
@@ -2213,8 +2234,32 @@ mod tests {
     }
 
     #[test]
+    fn verify_asks_about_its_own_run_and_a_run_that_was_not_recorded_is_not_a_pass() {
+        let mut lost = verify_status(false, false).unwrap();
+        if let Value::Object(m) = &mut lost {
+            m.insert("recorded".into(), Value::Bool(false));
+            m.insert("note".into(), s("the result could not be recorded"));
+        }
+        let (r, out, f) = run_verify(vec![started(), Ok(lost)], false, Duration::from_secs(5));
+        assert_eq!(r.unwrap(), 6);
+        assert!(
+            out.contains("note: the result could not be recorded"),
+            "{out}"
+        );
+        assert_eq!(f.calls[1].0, "verify.status");
+        assert_eq!(f.calls[1].1.get("ticket").and_then(Value::as_u64), Some(7));
+        // a daemon that gives no ticket cannot be asked about a run
+        let (r, _, _) = run_verify(
+            vec![Ok(Value::object([("schema", s("x"))]))],
+            false,
+            Duration::from_secs(1),
+        );
+        assert_eq!(r.unwrap_err().code, ErrorCode::Internal);
+    }
+
+    #[test]
     fn verify_times_out_while_the_daemon_keeps_working() {
-        let started = Ok(Value::object([("schema", s("fleet.verify.started/1"))]));
+        let started = started();
         let (r, out, _) = run_verify(
             vec![started, verify_status(true, false)],
             false,

@@ -125,7 +125,17 @@ fn latest_cells(check: &Value) -> Vec<String> {
     let latest = check.get("latest").filter(|l| !l.is_null());
     match latest {
         None => vec!["not run".to_string(), String::new()],
-        Some(e) => vec![text(e, "verdict"), text_or_dash(e, "summary")],
+        Some(e) => {
+            let mut verdict = text(e, "verdict");
+            if e.get("counts").and_then(Value::as_bool) == Some(false) {
+                verdict.push_str(if e.get("dirty").and_then(Value::as_bool) == Some(true) {
+                    " (uncommitted changes: does not count)"
+                } else {
+                    " (not the reviewed commit: does not count)"
+                });
+            }
+            vec![verdict, text_or_dash(e, "summary")]
+        }
     }
 }
 
@@ -331,6 +341,10 @@ pub fn render_verify(v: &Value) -> String {
     let task = text(v, "task");
     if !task.is_empty() {
         let _ = writeln!(out, "task {task}: {}", text_or_dash(v, "verification"));
+    }
+    let note = text(v, "note");
+    if !note.is_empty() {
+        let _ = writeln!(out, "note: {note}");
     }
     for g in items(v, "goals") {
         let _ = writeln!(
@@ -587,6 +601,31 @@ mod tests {
                 ),
             ])
         };
+        let mut stale = evidence("passed", "");
+        if let Value::Object(m) = &mut stale {
+            m.insert("counts".into(), Value::Bool(false));
+            m.insert("dirty".into(), Value::Bool(true));
+        }
+        let mut g = goal("g", 1, "open");
+        if let Value::Object(m) = &mut g {
+            m.insert("checks".into(), Value::array([check(stale.clone())]));
+        }
+        assert!(render_goal_show(&g).contains("passed (uncommitted changes: does not count)"));
+        if let Value::Object(m) = &mut stale {
+            m.insert("dirty".into(), Value::Bool(false));
+        }
+        if let Value::Object(m) = &mut g {
+            m.insert("checks".into(), Value::array([check(stale)]));
+        }
+        assert!(render_goal_show(&g).contains("passed (not the reviewed commit: does not count)"));
+        let mut noted = doc(false, "passed");
+        if let Value::Object(m) = &mut noted {
+            m.insert(
+                "note".into(),
+                s("the commit that was checked is not the reviewed one"),
+            );
+        }
+        assert!(render_verify(&noted).contains("note: the commit that was checked"));
         let ok = render_verify(&doc(true, "passed"));
         assert!(ok.starts_with("verification of r1/a: PASSED\n"), "{ok}");
         let bad = render_verify(&doc(false, "failed"));

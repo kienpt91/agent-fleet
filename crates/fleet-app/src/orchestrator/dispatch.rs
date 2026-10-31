@@ -11,6 +11,7 @@ use fleet_domain::run::WorkerEnd;
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::status::{EndKind, TaskStatus};
 use fleet_domain::supervision::SupervisionPolicy;
+use neo_verify::limits::MAX_CONCURRENT_VERIFICATIONS;
 
 impl Orchestrator {
     /// Starts workers for ready tasks while capacity allows.
@@ -349,12 +350,15 @@ impl Orchestrator {
         // worker said counts. Only a pass lets the review go on to the quality gates.
         let targets = self.verification_targets(&key.0, &key.1);
         if !targets.is_empty() && !self.verified.contains(&rkey) {
-            if self.verifying.contains_key(key) || self.ports.jobs.running() >= MAX_CONCURRENT_JOBS
+            if self.verifying.contains_key(key)
+                || self.verifying.len() >= MAX_CONCURRENT_VERIFICATIONS
+                || self.ports.jobs.running() >= MAX_CONCURRENT_JOBS
             {
                 return;
             }
-            if let Err(e) =
-                self.start_verification(key, task.attempt, VerifyOrigin::Review, &worktree, targets)
+            if let Err(e) = self
+                .start_verification(key, task.attempt, VerifyOrigin::Review, &worktree, targets)
+                .map(|_| ())
             {
                 self.fail_task(
                     key,
@@ -589,7 +593,7 @@ impl Orchestrator {
 /// Variables fleet itself sets for children. Never the socket, the state directory or a token:
 /// `XDG_STATE_HOME` points inside the worktree, so a `fleet` run by an agent looks for the
 /// daemon's socket in a directory that is not the operator's.
-pub(crate) fn fleet_env(run: &RunId, task: &TaskId, worktree: &str) -> Vec<(String, String)> {
+fn fleet_env(run: &RunId, task: &TaskId, worktree: &str) -> Vec<(String, String)> {
     vec![
         ("FLEET_RUN".to_string(), run.to_string()),
         ("FLEET_TASK".to_string(), task.to_string()),

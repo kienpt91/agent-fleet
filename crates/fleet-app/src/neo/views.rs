@@ -143,7 +143,10 @@ fn check_detail(c: &Check) -> String {
     flatten_line(&text, DETAIL_WIDTH)
 }
 
-fn evidence_value(e: &Evidence) -> Value {
+/// One piece of evidence. `counts` says whether it counts toward its contract right now: it
+/// does not when the worktree had uncommitted changes behind it or when its commit is not the one
+/// the task's last review recorded.
+fn evidence_value(e: &Evidence, counts: bool) -> Value {
     Value::object([
         ("id", Value::str(e.id().as_str())),
         ("check", Value::str(e.check().as_str())),
@@ -151,8 +154,11 @@ fn evidence_value(e: &Evidence) -> Value {
         ("exit_code", e.exit_code().map_or(Value::Null, Value::int)),
         ("summary", Value::str(e.summary())),
         ("output", Value::str(e.output())),
-        ("commit", opt_str(e.commit().map(|c| c.as_str()))),
-        ("task", opt_str(e.task().map(|t| t.as_str()))),
+        ("commit", Value::str(e.commit().as_str())),
+        ("tree", Value::str(e.tree().as_str())),
+        ("dirty", Value::Bool(e.dirty())),
+        ("counts", Value::Bool(counts)),
+        ("task", Value::str(e.task().as_str())),
         ("at_ms", Value::int(e.at_ms())),
     ])
 }
@@ -174,7 +180,10 @@ fn checks_value(ledger: &Ledger, g: &Goal) -> Value {
             ("kind", Value::str(c.kind.name())),
             ("mandatory", Value::Bool(c.mandatory)),
             ("detail", Value::str(check_detail(c))),
-            ("latest", newest.map_or(Value::Null, |e| evidence_value(e))),
+            (
+                "latest",
+                newest.map_or(Value::Null, |e| evidence_value(e, ledger.counts(e))),
+            ),
         ])
     }))
 }
@@ -185,7 +194,7 @@ pub fn goal_show(state: &FleetState, ledger: &Ledger, g: &Goal) -> Value {
         .iter()
         .rev()
         .take(HISTORY_SHOWN)
-        .map(|e| evidence_value(e))
+        .map(|e| evidence_value(e, ledger.counts(e)))
         .collect();
     let Value::Object(mut map) = goal_summary(state, ledger, g) else {
         return Value::Null;
@@ -279,15 +288,21 @@ pub fn remaining(state: &FleetState, ledger: &Ledger) -> Value {
 
 /// The state of a `fleet verify`: whether the contracts are still running and where each of the
 /// goals' contracts stands, with the newest evidence per check.
-pub fn verify_status(
-    state: &FleetState,
-    ledger: &Ledger,
-    target: &str,
-    task: Option<&TaskRef>,
-    running: bool,
-    goals: &[GoalId],
-) -> Value {
-    let rows: Vec<Value> = goals
+/// What `verify_status` shows.
+pub(crate) struct VerifyView<'a> {
+    pub(crate) target: &'a str,
+    pub(crate) task: Option<&'a TaskRef>,
+    pub(crate) running: bool,
+    /// The run the person asked about, when they named one.
+    pub(crate) ticket: Option<u64>,
+    /// How that run ended, once it has.
+    pub(crate) outcome: Option<&'a crate::neo::VerifyOutcome>,
+    pub(crate) goals: &'a [GoalId],
+}
+
+pub(crate) fn verify_status(state: &FleetState, ledger: &Ledger, v: VerifyView<'_>) -> Value {
+    let rows: Vec<Value> = v
+        .goals
         .iter()
         .filter_map(|id| ledger.find(id))
         .map(|g| {
@@ -300,20 +315,38 @@ pub fn verify_status(
             ])
         })
         .collect();
-    let passed = !goals.is_empty()
-        && goals.iter().all(|id| {
-            ledger.contract_state(id) == Some(neo_verify::evidence::ContractState::Passed)
-        });
+    // With a ticket, `passed` is the verdict on that run; without one, the ledger's standing.
+    let passed = match (v.ticket, v.outcome) {
+        (Some(_), Some(o)) => o.passed,
+        (Some(_), None) => false,
+        (None, _) => {
+            !v.goals.is_empty()
+                && v.goals.iter().all(|id| {
+                    ledger.contract_state(id) == Some(neo_verify::evidence::ContractState::Passed)
+                })
+        }
+    };
     Value::object([
         ("schema", Value::str("fleet.verify/1")),
-        ("target", Value::str(target)),
-        ("task", opt_str(task.map(|t| t.to_string()).as_deref())),
+        ("target", Value::str(v.target)),
+        ("task", opt_str(v.task.map(|t| t.to_string()).as_deref())),
         (
             "verification",
-            opt_str(task.map(|t| task_verification(state, ledger, t))),
+            opt_str(v.task.map(|t| task_verification(state, ledger, t))),
         ),
-        ("running", Value::Bool(running)),
+        ("ticket", v.ticket.map_or(Value::Null, Value::int)),
+        ("running", Value::Bool(v.running)),
         ("passed", Value::Bool(passed)),
+        (
+            "recorded",
+            v.outcome.map_or(Value::Null, |o| Value::Bool(o.recorded)),
+        ),
+        (
+            "note",
+            v.outcome
+                .filter(|o| !o.note.is_empty())
+                .map_or(Value::Null, |o| Value::str(&o.note)),
+        ),
         ("goals", Value::array(rows)),
     ])
 }

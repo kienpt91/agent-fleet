@@ -151,11 +151,13 @@ define_events! {
     /// A verification contract became the acceptance criteria of a goal. `contract` is the
     /// contract document, `contract_id` the SHA-256 of its canonical text.
     CriteriaAttached = "criteria_attached" { goal: GoalId, contract_id: String, contract: Document },
-    /// One check of a contract was run by fleet itself. Immutable once recorded.
+    /// One check of a contract was run by fleet itself, on a clean export of `commit` (whose tree
+    /// is `tree`); `dirty` says the task's worktree had uncommitted changes when the run started,
+    /// which makes the evidence about the commit only (it does not count). Immutable once recorded.
     EvidenceRecorded = "evidence_recorded" {
-        id: EvidenceId, goal: GoalId, run: Option<RunId>, task: Option<TaskId>, contract_id: String,
+        id: EvidenceId, goal: GoalId, run: RunId, task: TaskId, contract_id: String,
         check: String, verdict: Verdict, exit_code: Option<i64>, summary: String, output: String,
-        commit: Option<Sha>, at_ms: u64,
+        commit: Sha, tree: Sha, dirty: bool, at_ms: u64,
     },
 }
 
@@ -187,8 +189,8 @@ impl DomainEvent {
             | IntegrationCreated { run }
             | CheckpointRecorded { run, .. }
             | OrphanReconciled { run, .. }
-            | WorktreeRemoved { run, .. } => Some(run),
-            EvidenceRecorded { run, .. } => run.as_ref(),
+            | WorktreeRemoved { run, .. }
+            | EvidenceRecorded { run, .. } => Some(run),
             DaemonStarted { .. }
             | DecisionResolved { .. }
             | ApprovalDecided { .. }
@@ -380,15 +382,17 @@ mod tests {
             DomainEvent::EvidenceRecorded {
                 id: EvidenceId::from_seq(3),
                 goal: GoalId::parse("ship").unwrap(),
-                run: Some(run()),
-                task: Some(task()),
+                run: run(),
+                task: task(),
                 contract_id: "ab".repeat(32),
                 check: "tests".into(),
                 verdict: Verdict::Failed,
                 exit_code: Some(1),
                 summary: "exit code 1".into(),
                 output: "boom".into(),
-                commit: Some(Sha::parse(&"c".repeat(40)).unwrap()),
+                commit: Sha::parse(&"c".repeat(40)).unwrap(),
+                tree: Sha::parse(&"d".repeat(40)).unwrap(),
+                dirty: true,
                 at_ms: 99,
             },
             DomainEvent::Warning {
@@ -478,24 +482,25 @@ mod tests {
             tasks: vec![],
         };
         assert_eq!(added.run(), None);
-        let evidence = |run: Option<RunId>| DomainEvent::EvidenceRecorded {
+        let evidence = DomainEvent::EvidenceRecorded {
             id: EvidenceId::from_seq(1),
             goal: GoalId::parse("g").unwrap(),
-            run,
-            task: None,
+            run: run(),
+            task: task(),
             contract_id: "0".repeat(64),
             check: "c".into(),
             verdict: Verdict::Passed,
             exit_code: Some(0),
             summary: String::new(),
             output: String::new(),
-            commit: None,
+            commit: Sha::parse(&"a".repeat(40)).unwrap(),
+            tree: Sha::parse(&"b".repeat(40)).unwrap(),
+            dirty: false,
             at_ms: 1,
         };
-        assert_eq!(evidence(Some(run())).run(), Some(&run()));
-        assert_eq!(evidence(None).run(), None);
+        assert_eq!(evidence.run(), Some(&run()));
         assert_eq!(
-            evidence(None).headline(),
+            evidence.headline(),
             "evidence e1: goal g check \"c\" passed"
         );
         assert_eq!(added.headline(), "goal g added");

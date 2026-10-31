@@ -11,6 +11,8 @@ mod goals;
 mod verify;
 pub mod views;
 
+pub(crate) use verify::{VerifyOutcome, Verifying};
+
 use crate::api::Reply;
 use fleet_domain::value::Value;
 

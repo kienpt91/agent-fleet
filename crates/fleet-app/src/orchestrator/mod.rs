@@ -12,10 +12,9 @@ mod dispatch;
 mod reconcile;
 mod supervise;
 
-pub(crate) use dispatch::fleet_env;
-
 use crate::config::AppConfig;
-use crate::ports::{Ports, SessionId, StoredEvent, VerifyOrigin};
+use crate::neo::{VerifyOutcome, Verifying};
+use crate::ports::{Ports, SessionId, StoredEvent};
 use crate::views::Recent;
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
@@ -61,7 +60,10 @@ pub struct Orchestrator {
     pub(crate) committed: BTreeSet<(RunId, TaskId, u32)>,
     pub(crate) command_jobs: BTreeSet<ApprovalId>,
     /// Verification jobs in flight: the task's attempt and why they run.
-    pub(crate) verifying: BTreeMap<Key, (u32, VerifyOrigin)>,
+    pub(crate) verifying: BTreeMap<Key, Verifying>,
+    /// Tickets handed out by `verify`, and how the last runs ended.
+    pub(crate) verify_seq: u64,
+    pub(crate) verify_outcomes: VecDeque<VerifyOutcome>,
     /// Reviews whose contracts passed in fleet's own run: (run, task, attempt). Only these may
     /// go on to the quality gates and complete.
     pub(crate) verified: BTreeSet<(RunId, TaskId, u32)>,
@@ -87,7 +89,7 @@ impl Orchestrator {
         ports.store.replay(&mut |s: StoredEvent| {
             push_recent(&mut recent, s.seq, s.ts_ms, &s.event);
             state.apply(&s.event);
-            ledger.apply(&s.event);
+            ledger.apply_checked(&s.event, ports.digest.as_ref());
             Ok(())
         })?;
         let policy = Policy {
@@ -110,6 +112,8 @@ impl Orchestrator {
             committed: BTreeSet::new(),
             command_jobs: BTreeSet::new(),
             verifying: BTreeMap::new(),
+            verify_seq: 0,
+            verify_outcomes: VecDeque::new(),
             verified: BTreeSet::new(),
             pending_ends: BTreeMap::new(),
             recent,
@@ -169,10 +173,13 @@ impl Orchestrator {
         let count = events.len() as u64;
         let first = last.saturating_add(1).saturating_sub(count);
         let mut stored = Vec::with_capacity(events.len());
+        let mut committed_task = false;
         for (i, event) in events.into_iter().enumerate() {
             let seq = first.saturating_add(i as u64);
             self.state.apply(&event);
-            self.ledger.apply(&event);
+            self.ledger
+                .apply_checked(&event, self.ports.digest.as_ref());
+            committed_task |= matches!(event, DomainEvent::TaskCommitted { .. });
             push_recent(&mut self.recent, seq, ts, &event);
             stored.push(StoredEvent {
                 seq,
@@ -181,6 +188,12 @@ impl Orchestrator {
             });
         }
         self.ports.publisher.publish(&stored);
+        if committed_task {
+            // The commit a task's evidence has to name changed: what was verified at an earlier
+            // commit is not verified any more.
+            let settle = self.ledger.resettle();
+            self.commit(settle)?;
+        }
         Ok(())
     }
 

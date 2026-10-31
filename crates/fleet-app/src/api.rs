@@ -127,6 +127,8 @@ pub enum Command {
     VerifyStatus {
         target: String,
         task: Option<String>,
+        /// The ticket `verify` returned: report on that run.
+        ticket: Option<u64>,
     },
     Shutdown,
 }
@@ -407,6 +409,7 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
         "verify.status" => Command::VerifyStatus {
             target: a.req_str("target")?.to_string(),
             task: a.opt_str("task")?.map(str::to_string),
+            ticket: a.opt_u64("ticket")?,
         },
         "shutdown" => Command::Shutdown,
         other => {
@@ -718,7 +721,8 @@ mod tests {
             .unwrap(),
             Command::VerifyStatus {
                 target: "g".into(),
-                task: Some("r1/a".into())
+                task: Some("r1/a".into()),
+                ticket: None
             }
         );
     }
@@ -772,6 +776,7 @@ mod tests {
             Command::VerifyStatus {
                 target: "g".into(),
                 task: None,
+                ticket: None,
             },
         ] {
             assert!(is_read_only(&cmd), "{cmd:?}");

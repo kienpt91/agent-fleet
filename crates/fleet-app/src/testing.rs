@@ -102,6 +102,7 @@ struct Inner {
     worktree_changed: Vec<String>,
     worktree_truncated: bool,
     fail_worktree_state: bool,
+    worktree_dirty: bool,
     jobs_started: Vec<Job>,
     jobs_done: VecDeque<JobDone>,
     jobs_running: usize,
@@ -341,6 +342,10 @@ impl World {
     }
     pub fn free_job_slots(&self) {
         self.lock().jobs_running = 0;
+    }
+    /// Whether the fake worktrees report uncommitted changes.
+    pub fn set_worktree_dirty(&self, dirty: bool) {
+        self.lock().worktree_dirty = dirty;
     }
     pub fn fail_worktree_state(&self, fail: bool) {
         self.lock().fail_worktree_state = fail;
@@ -643,15 +648,25 @@ impl Vcs for FakeVcs {
         Ok(self.0.lock().merged_branches.contains(branch))
     }
 
-    fn worktree_state(&self, _worktree: &str, _base: &Sha) -> Result<WorktreeState> {
+    fn worktree_state(&self, worktree: &str, _base: &Sha) -> Result<WorktreeState> {
         let g = self.0.lock();
         if g.fail_worktree_state {
             return Err(FleetError::internal("git could not read the worktree"));
         }
+        // The head of the branch the worktree was prepared for, as `branch_head` answers it.
+        let head = g
+            .prepared
+            .iter()
+            .rev()
+            .find(|(path, _)| path == worktree)
+            .and_then(|(_, branch)| g.branch_heads.get(branch).cloned())
+            .map_or_else(|| Sha::parse(&"c".repeat(40)), Ok)?;
         Ok(WorktreeState {
-            head: Sha::parse(&"d".repeat(40))?,
+            head,
+            tree: Sha::parse(&"e".repeat(40))?,
             changed: g.worktree_changed.clone(),
             truncated: g.worktree_truncated,
+            dirty: g.worktree_dirty,
         })
     }
 }
@@ -902,6 +917,8 @@ fn verify_outcome(
         attempt: job.attempt,
         origin: job.origin,
         commit: job.state.head.clone(),
+        tree: job.state.tree.clone(),
+        dirty: job.state.dirty,
         results,
     }
 }

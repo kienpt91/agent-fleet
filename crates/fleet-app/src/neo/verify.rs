@@ -3,9 +3,11 @@
 //!
 //! The rule this module enforces: a task that a goal with a contract works on completes only
 //! after fleet's own run of every such contract passed every mandatory check. During review the
-//! contracts run first (in the task's worktree, on the committed work); a pass lets the review go
-//! on to the quality gates and then complete; a failure is a failed gate, with the failing checks
-//! quoted in the next attempt's brief. What the worker reported plays no part in the decision.
+//! contracts run first, on a clean export of the commit the review recorded (never in the live
+//! worktree: the adapter exports it); a pass lets the review go on to the quality gates and then
+//! complete; a failure is a failed gate, with the failing checks quoted in the next attempt's
+//! brief. What the worker reported plays no part in the decision, and evidence counts only for
+//! the commit that was exported.
 
 use super::data;
 use crate::api::Reply;
@@ -15,11 +17,38 @@ use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::{show, GoalId, RunId, TaskId};
 use fleet_domain::limits::MAX_CONCURRENT_JOBS;
 use fleet_domain::quality::GateOutcome;
+use fleet_domain::sanitize::flatten_line;
 use fleet_domain::status::{TaskStatus, Verdict};
 use fleet_domain::value::Value;
 use neo_goals::goal::TaskRef;
 use neo_goals::ledger::TaskContract;
 use neo_verify::evidence::EvidenceScope;
+use neo_verify::limits::MAX_CONCURRENT_VERIFICATIONS;
+
+/// A verification job in flight.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Verifying {
+    /// Numbers this run for the person who started it (`fleet verify` asks for its own result).
+    pub ticket: u64,
+}
+
+/// What became of one run, kept (for the last few runs) so that the person who started it hears
+/// about *their* run, not about the ledger's state from an earlier one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifyOutcome {
+    pub key: Key,
+    pub ticket: u64,
+    /// The evidence of every contract of the run was recorded.
+    pub recorded: bool,
+    /// Every mandatory check passed, on the commit the review recorded, with no uncommitted
+    /// changes in the worktree, and the evidence was recorded.
+    pub passed: bool,
+    /// Why the run does not count, when it does not.
+    pub note: String,
+}
+
+/// Outcomes kept.
+pub(crate) const OUTCOMES_KEPT: usize = 64;
 
 impl Orchestrator {
     /// The contracts that stand between `run/task` and completion.
@@ -37,7 +66,9 @@ impl Orchestrator {
             .collect()
     }
 
-    /// Starts a verification job for a task. At most one runs per task.
+    /// Starts a verification job for a task and returns its ticket. At most one runs per task and
+    /// at most `MAX_CONCURRENT_VERIFICATIONS` at a time: a hung command cannot take every job
+    /// slot of the daemon.
     pub(crate) fn start_verification(
         &mut self,
         key: &Key,
@@ -45,26 +76,42 @@ impl Orchestrator {
         origin: VerifyOrigin,
         worktree: &str,
         targets: Vec<VerifyTarget>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         if self.verifying.contains_key(key) {
             return Err(FleetError::conflict(format!(
                 "{}/{} is being verified already",
                 key.0, key.1
             )));
         }
-        if self.ports.jobs.running() >= MAX_CONCURRENT_JOBS {
+        if self.verifying.len() >= MAX_CONCURRENT_VERIFICATIONS
+            || self.ports.jobs.running() >= MAX_CONCURRENT_JOBS
+        {
             return Err(FleetError::limit(
-                "too many jobs are running; try again later",
+                "too many verifications or jobs are running; try again later",
             ));
         }
         let base = self.state.run(&key.0)?.base_sha.clone();
         let state = self.ports.vcs.worktree_state(worktree, &base)?;
-        let env = self.cfg.env.build(
-            &self.cfg.parent_env,
-            &[],
-            &[],
-            &crate::orchestrator::fleet_env(&key.0, &key.1, worktree),
-        );
+        if origin == VerifyOrigin::Review {
+            // What is verified is what will be merged: the head the review recorded is the one
+            // the worktree has now, even if the worker committed in it meanwhile.
+            let recorded = self
+                .state
+                .run(&key.0)
+                .ok()
+                .and_then(|r| r.task(&key.1))
+                .and_then(|t| t.head.clone());
+            if recorded.as_ref() != Some(&state.head) {
+                let ev = self
+                    .state
+                    .run(&key.0)
+                    .and_then(|r| r.record_commit(&key.1, state.head.clone()))?;
+                self.commit(vec![ev])?;
+            }
+        }
+        // The operator's allowlist, nothing else: the adapter gives the commands a home, a
+        // temporary directory and a working directory of their own.
+        let env = self.cfg.env.build(&self.cfg.parent_env, &[], &[], &[]);
         self.ports.jobs.start(Job::Verify(Box::new(VerifyJob {
             run: key.0.clone(),
             task: key.1.clone(),
@@ -75,8 +122,10 @@ impl Orchestrator {
             env,
             targets,
         })))?;
-        self.verifying.insert(key.clone(), (attempt, origin));
-        Ok(())
+        self.verify_seq = self.verify_seq.saturating_add(1);
+        let ticket = self.verify_seq;
+        self.verifying.insert(key.clone(), Verifying { ticket });
+        Ok(ticket)
     }
 
     /// One goal of a result as gate outcomes, mandatory checks only (optional checks are
@@ -107,20 +156,29 @@ impl Orchestrator {
             .collect()
     }
 
+    fn remember_outcome(&mut self, outcome: VerifyOutcome) {
+        self.verify_outcomes.push_back(outcome);
+        while self.verify_outcomes.len() > OUTCOMES_KEPT {
+            self.verify_outcomes.pop_front();
+        }
+    }
+
     /// Records the results of a verification job as evidence and, for a review, decides whether
     /// the task may go on.
     pub(crate) fn handle_verify_done(&mut self, done: VerifyDone) {
         let key: Key = (done.run.clone(), done.task.clone());
-        self.verifying.remove(&key);
+        let ticket = self.verifying.remove(&key).map_or(0, |v| v.ticket);
         let mut recorded = true;
         let mut cannot_record: Option<String> = None;
         for result in &done.results {
             let scope = EvidenceScope {
                 goal: result.goal.clone(),
-                run: Some(done.run.clone()),
-                task: Some(done.task.clone()),
+                run: done.run.clone(),
+                task: done.task.clone(),
                 contract: result.contract_id.clone(),
-                commit: Some(done.commit.clone()),
+                commit: done.commit.clone(),
+                tree: done.tree.clone(),
+                dirty: done.dirty,
             };
             let now = self.now();
             let outcome = self
@@ -138,6 +196,47 @@ impl Orchestrator {
                 ));
             }
         }
+        // Does this run count? Every mandatory check of every contract passed, on the commit the
+        // review recorded for the task, and nothing was uncommitted behind it.
+        let head = self.ledger.head_of(&key.0, &key.1).cloned();
+        let on_the_reviewed_commit = head.as_ref() == Some(&done.commit);
+        let all_passed = done.results.iter().all(|r| {
+            let mandatory = self
+                .ledger
+                .find(&r.goal)
+                .and_then(|g| g.contract.as_ref())
+                .map(|c| {
+                    c.contract
+                        .mandatory_checks()
+                        .map(|m| m.id.clone())
+                        .collect::<Vec<_>>()
+                });
+            mandatory.is_some_and(|ids| {
+                ids.iter().all(|id| {
+                    r.reports
+                        .iter()
+                        .any(|rep| &rep.check == id && rep.verdict == Verdict::Passed)
+                })
+            })
+        });
+        let note = if !recorded {
+            "the result could not be recorded".to_string()
+        } else if done.dirty {
+            "the worktree has uncommitted changes: the checks ran on the last commit, and this evidence does not count".to_string()
+        } else if !on_the_reviewed_commit {
+            "the commit that was checked is not the one the last review recorded for the task: this evidence does not count".to_string()
+        } else if !all_passed {
+            "a mandatory check did not pass".to_string()
+        } else {
+            String::new()
+        };
+        self.remember_outcome(VerifyOutcome {
+            key: key.clone(),
+            ticket,
+            recorded,
+            passed: note.is_empty(),
+            note: flatten_line(&note, 240),
+        });
         if done.origin != VerifyOrigin::Review {
             return;
         }
@@ -156,6 +255,21 @@ impl Orchestrator {
             self.fail_task(&key, format!("the verification cannot be recorded: {why}"));
             return;
         }
+        let mut outcomes: Vec<GateOutcome> = done
+            .results
+            .iter()
+            .flat_map(|r| self.outcomes_of(r))
+            .collect();
+        if done.dirty {
+            // The work was committed for review; changes that appeared since are a process of
+            // the worker still writing, and what is merged is not what was checked.
+            outcomes.push(GateOutcome {
+                name: "verify worktree".to_string(),
+                passed: false,
+                summary: "the worktree changed after its work was committed".to_string(),
+                output: "Files were changed or added after the work was committed for review. Make sure no process of yours is still running when you finish.".to_string(),
+            });
+        }
         // The pass must be this run's: every contract that guards the task now (not only those
         // that did when the job started) must be among the results, so that evidence of an earlier
         // run of another contract, or of the same one on another commit, never stands in for it.
@@ -164,16 +278,14 @@ impl Orchestrator {
                 .iter()
                 .any(|r| r.goal == t.goal && r.contract_id == t.contract_id)
         });
-        if recorded && covered && self.ledger.task_contract(&key.0, &key.1) == TaskContract::Passed
+        if recorded
+            && covered
+            && !done.dirty
+            && self.ledger.task_contract(&key.0, &key.1) == TaskContract::Passed
         {
             self.verified.insert(rkey);
             return;
         }
-        let outcomes: Vec<GateOutcome> = done
-            .results
-            .iter()
-            .flat_map(|r| self.outcomes_of(r))
-            .collect();
         if outcomes.iter().all(|o| o.passed) {
             // Nothing failed, yet the contracts do not all stand passed: a contract changed or a
             // goal was added while the checks ran. Run them again; never complete on this.
@@ -221,6 +333,12 @@ impl Orchestrator {
                         show(id.as_str())
                     ))
                 })?;
+                if !g.tasks.is_empty() && !g.tasks.contains(&chosen) {
+                    return Err(FleetError::invalid(format!(
+                        "goal {} does not name task {chosen}; its evidence would not count for it",
+                        show(id.as_str())
+                    )));
+                }
                 Ok(((chosen.run, chosen.task), vec![id]))
             }
             None => {
@@ -274,7 +392,7 @@ impl Orchestrator {
                 })
             })
             .collect();
-        self.start_verification(
+        let ticket = self.start_verification(
             &key,
             task_state.attempt,
             VerifyOrigin::Manual,
@@ -284,6 +402,7 @@ impl Orchestrator {
         Ok(data(
             "fleet.verify.started/1",
             vec![
+                ("ticket", Value::int(ticket)),
                 ("target", Value::str(target)),
                 ("task", Value::str(format!("{}/{}", key.0, key.1))),
                 (
@@ -294,17 +413,45 @@ impl Orchestrator {
         ))
     }
 
-    pub(crate) fn verify_status(&self, target: &str, task: Option<&str>) -> Result<Reply> {
+    /// Where a verification stands. With the `ticket` of the run a person started it reports on
+    /// that run (running, or how it ended); without one it reports the ledger's state of the
+    /// contracts.
+    pub(crate) fn verify_status(
+        &self,
+        target: &str,
+        task: Option<&str>,
+        ticket: Option<u64>,
+    ) -> Result<Reply> {
         let (key, goals) = self.verify_subject(target, task)?;
-        let running = self.verifying.contains_key(&key);
+        let in_flight = self.verifying.get(&key).copied();
+        let running = match ticket {
+            Some(t) => in_flight.is_some_and(|v| v.ticket == t),
+            None => in_flight.is_some(),
+        };
+        let outcome = ticket.and_then(|t| {
+            self.verify_outcomes
+                .iter()
+                .find(|o| o.ticket == t && o.key == key)
+        });
+        if let Some(t) = ticket {
+            if !running && outcome.is_none() {
+                return Err(FleetError::conflict(format!(
+                    "the result of verification {t} is not known (the daemon restarted while it ran, or it was started by someone else)"
+                )));
+            }
+        }
         let task_ref = TaskRef::new(key.0, key.1);
         Ok(Reply::Data(super::views::verify_status(
             &self.state,
             &self.ledger,
-            target,
-            Some(&task_ref),
-            running,
-            &goals,
+            super::views::VerifyView {
+                target,
+                task: Some(&task_ref),
+                running,
+                ticket,
+                outcome,
+                goals: &goals,
+            },
         )))
     }
 }

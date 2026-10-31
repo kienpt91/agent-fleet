@@ -10,15 +10,22 @@ use fleet_domain::ids::{EvidenceId, GoalId, RunId, Sha, TaskId};
 use fleet_domain::sanitize::{head_str, sanitize_text, tail_str};
 use fleet_domain::status::Verdict;
 
-/// Where a piece of evidence belongs and what it was taken from.
+/// Where a piece of evidence belongs and what it was taken from: always a clean export of one
+/// commit of one task's branch, never the live worktree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidenceScope {
     pub goal: GoalId,
-    pub run: Option<RunId>,
-    pub task: Option<TaskId>,
+    pub run: RunId,
+    pub task: TaskId,
     pub contract: ContractId,
-    /// The commit checked out in the worktree when the check ran.
-    pub commit: Option<Sha>,
+    /// The commit that was exported and checked.
+    pub commit: Sha,
+    /// The tree object of that commit: what exactly was on disk for the checks.
+    pub tree: Sha,
+    /// The task's worktree had changes that are not in `commit` when the run started. The checks
+    /// ran on the commit regardless, so the evidence says nothing about the working state: it is
+    /// kept and shown, and never counts toward a contract's state.
+    pub dirty: bool,
 }
 
 /// Where a contract stands.
@@ -46,15 +53,17 @@ impl ContractState {
 pub struct Evidence {
     id: EvidenceId,
     goal: GoalId,
-    run: Option<RunId>,
-    task: Option<TaskId>,
+    run: RunId,
+    task: TaskId,
     contract: ContractId,
     check: CheckId,
     verdict: Verdict,
     exit_code: Option<i64>,
     summary: String,
     output: String,
-    commit: Option<Sha>,
+    commit: Sha,
+    tree: Sha,
+    dirty: bool,
     at_ms: u64,
 }
 
@@ -74,15 +83,17 @@ impl Evidence {
     pub fn from_parts(
         id: EvidenceId,
         goal: GoalId,
-        run: Option<RunId>,
-        task: Option<TaskId>,
+        run: RunId,
+        task: TaskId,
         contract: ContractId,
         check: CheckId,
         verdict: Verdict,
         exit_code: Option<i64>,
         summary: String,
         output: String,
-        commit: Option<Sha>,
+        commit: Sha,
+        tree: Sha,
+        dirty: bool,
         at_ms: u64,
     ) -> Evidence {
         Evidence {
@@ -97,6 +108,8 @@ impl Evidence {
             summary: bounded_summary(&summary),
             output: bounded_output(&output),
             commit,
+            tree,
+            dirty,
             at_ms,
         }
     }
@@ -120,6 +133,8 @@ impl Evidence {
             report.summary,
             report.output,
             scope.commit.clone(),
+            scope.tree.clone(),
+            scope.dirty,
             at_ms,
         )
     }
@@ -130,11 +145,11 @@ impl Evidence {
     pub fn goal(&self) -> &GoalId {
         &self.goal
     }
-    pub fn run(&self) -> Option<&RunId> {
-        self.run.as_ref()
+    pub fn run(&self) -> &RunId {
+        &self.run
     }
-    pub fn task(&self) -> Option<&TaskId> {
-        self.task.as_ref()
+    pub fn task(&self) -> &TaskId {
+        &self.task
     }
     pub fn contract(&self) -> &ContractId {
         &self.contract
@@ -157,8 +172,20 @@ impl Evidence {
     pub fn output(&self) -> &str {
         &self.output
     }
-    pub fn commit(&self) -> Option<&Sha> {
-        self.commit.as_ref()
+    pub fn commit(&self) -> &Sha {
+        &self.commit
+    }
+    pub fn tree(&self) -> &Sha {
+        &self.tree
+    }
+    /// True when the worktree had uncommitted changes while this was taken.
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
+    /// True when this piece may count toward a contract's state: its checks ran on a clean
+    /// export of a commit and nothing about the working state is hidden behind it.
+    pub fn counts(&self) -> bool {
+        !self.dirty
     }
     pub fn at_ms(&self) -> u64 {
         self.at_ms
@@ -177,6 +204,8 @@ impl Evidence {
             summary: self.summary.clone(),
             output: self.output.clone(),
             commit: self.commit.clone(),
+            tree: self.tree.clone(),
+            dirty: self.dirty,
             at_ms: self.at_ms,
         }
     }
@@ -196,6 +225,8 @@ impl Evidence {
             summary,
             output,
             commit,
+            tree,
+            dirty,
             at_ms,
         } = event
         else {
@@ -213,6 +244,8 @@ impl Evidence {
             summary.clone(),
             output.clone(),
             commit.clone(),
+            tree.clone(),
+            *dirty,
             *at_ms,
         ))
     }
@@ -225,10 +258,12 @@ mod tests {
     fn scope() -> EvidenceScope {
         EvidenceScope {
             goal: GoalId::parse("g").unwrap(),
-            run: Some(RunId::parse("r1").unwrap()),
-            task: Some(TaskId::parse("t1").unwrap()),
+            run: RunId::parse("r1").unwrap(),
+            task: TaskId::parse("t1").unwrap(),
             contract: ContractId::parse(&"a".repeat(64)).unwrap(),
-            commit: Some(Sha::parse(&"b".repeat(40)).unwrap()),
+            commit: Sha::parse(&"b".repeat(40)).unwrap(),
+            tree: Sha::parse(&"c".repeat(40)).unwrap(),
+            dirty: false,
         }
     }
 
@@ -247,8 +282,8 @@ mod tests {
         let e = Evidence::record(EvidenceId::from_seq(4), &scope(), report("boom"), 1234);
         assert_eq!(e.id().as_str(), "e4");
         assert_eq!(e.goal().as_str(), "g");
-        assert_eq!(e.run().unwrap().as_str(), "r1");
-        assert_eq!(e.task().unwrap().as_str(), "t1");
+        assert_eq!(e.run().as_str(), "r1");
+        assert_eq!(e.task().as_str(), "t1");
         assert_eq!(e.contract().as_str(), "a".repeat(64));
         assert_eq!(e.check().as_str(), "tests");
         assert_eq!(e.verdict(), Verdict::Failed);
@@ -256,7 +291,9 @@ mod tests {
         assert_eq!(e.exit_code(), Some(2));
         assert_eq!(e.summary(), "exit code 2, expected 0");
         assert_eq!(e.output(), "boom");
-        assert_eq!(e.commit().unwrap().as_str(), "b".repeat(40));
+        assert_eq!(e.commit().as_str(), "b".repeat(40));
+        assert_eq!(e.tree().as_str(), "c".repeat(40));
+        assert!(!e.dirty() && e.counts());
         assert_eq!(e.at_ms(), 1234);
     }
 

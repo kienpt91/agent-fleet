@@ -17,7 +17,12 @@ pub const MAX_MATCH_PATH: usize = 4 * 1024;
 
 pub const MIN_TIMEOUT_MS: u64 = 100;
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-pub const MAX_TIMEOUT_MS: u64 = 3_600_000;
+pub const MAX_TIMEOUT_MS: u64 = 1_800_000;
+/// All checks of one verification job together may take this long.
+pub const JOB_BUDGET_MS: u64 = 1_800_000;
+/// Verification jobs that run at the same time (a hung command holds one of these, not every
+/// job slot of the daemon).
+pub const MAX_CONCURRENT_VERIFICATIONS: usize = 2;
 
 /// Largest file a file assertion reads (to hash it or to search it).
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;

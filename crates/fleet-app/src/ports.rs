@@ -94,17 +94,24 @@ pub struct IntegrationResult {
     pub created: bool,
 }
 
-/// What a worktree looks like right now, for verification.
+/// What a task's worktree looks like right now, for verification. Verification is about the
+/// *commit*: what is merged is the branch, never the working state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeState {
     /// The commit checked out in the worktree.
     pub head: Sha,
-    /// Paths that differ from the run's base commit (committed, staged, modified or untracked,
-    /// without fleet's own `.fleet` directory), relative to the worktree, at most
-    /// `neo_verify::limits::MAX_CHANGED_PATHS` of them.
+    /// The tree object of `head`.
+    pub tree: Sha,
+    /// Paths the commits since the run's base commit changed (`base..head`), relative to the
+    /// repository root, at most `neo_verify::limits::MAX_CHANGED_PATHS` of them. Paths under
+    /// `.fleet/` are listed like any other: a branch that carries one is not within any scope that
+    /// does not allow it.
     pub changed: Vec<String>,
     /// There were more changed paths than `changed` lists.
     pub truncated: bool,
+    /// The worktree has changes that are not in `head` (staged, modified or untracked files that
+    /// are not ignored, apart from fleet's own `.fleet` directory).
+    pub dirty: bool,
 }
 
 /// Version control. Every operation happens on fleet's own branches and worktrees; the user's
@@ -149,7 +156,8 @@ pub trait Vcs: Send {
     ) -> Result<()>;
     /// True when `branch` is contained in `into`.
     fn is_merged(&self, repo: &str, branch: &str, into: &str) -> Result<bool>;
-    /// The commit and the changed paths of a task worktree, measured against `base`.
+    /// The commit, its tree, the paths it changed since `base` and whether the worktree has
+    /// uncommitted changes.
     fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState>;
 }
 
@@ -284,10 +292,13 @@ pub struct VerifyJob {
     pub attempt: u32,
     pub origin: VerifyOrigin,
     pub worktree: String,
-    /// What the worktree looked like when the job was started (for diff constraints, and the
-    /// commit that evidence is recorded against).
+    /// What the worktree looked like when the job was started: the commit the checks run on (a
+    /// clean export of it, not the worktree), what that commit changed (for diff constraints) and
+    /// whether the worktree had uncommitted changes.
     pub state: WorktreeState,
-    /// The complete environment of every command: the worker allowlist and nothing else.
+    /// The environment of every command before the adapter isolates it: the operator's allowlist
+    /// and nothing else. The adapter replaces the home and temporary directories, the working
+    /// directory and everything that points into the worktree.
     pub env: Vec<(String, String)>,
     pub targets: Vec<VerifyTarget>,
 }
@@ -306,7 +317,11 @@ pub struct VerifyDone {
     pub task: TaskId,
     pub attempt: u32,
     pub origin: VerifyOrigin,
+    /// The commit that was exported and checked, its tree and whether the worktree had
+    /// uncommitted changes when the run started (the job's [`WorktreeState`]).
     pub commit: Sha,
+    pub tree: Sha,
+    pub dirty: bool,
     pub results: Vec<VerifiedContract>,
 }
 
