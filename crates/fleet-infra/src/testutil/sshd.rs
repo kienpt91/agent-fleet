@@ -90,11 +90,14 @@ impl TestSshd {
             other_key,
             child: None,
         };
-        sshd.launch();
+        if let Err(why) = sshd.launch() {
+            return fail_or_skip(&why);
+        }
         Some(sshd)
     }
 
-    fn launch(&mut self) {
+    /// Starts the server and waits until it accepts connections; the error says why it did not.
+    fn launch(&mut self) -> Result<(), String> {
         let d = self.dir.path().display().to_string();
         let config = format!(
             "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/host_ed25519\nPidFile {d}/sshd.pid\n\
@@ -121,13 +124,19 @@ impl TestSshd {
         self.child = Some(child);
         let start = Instant::now();
         while TcpStream::connect(("127.0.0.1", self.port)).is_err() {
-            assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "sshd did not come up: {}",
-                self.dir.read("sshd.log")
-            );
+            let exited = self
+                .child
+                .as_mut()
+                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+            if exited || start.elapsed() > Duration::from_secs(15) {
+                return Err(format!(
+                    "sshd did not come up: {}",
+                    self.dir.read("sshd.log")
+                ));
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
+        Ok(())
     }
 
     pub fn stop(&mut self) {
@@ -144,7 +153,7 @@ impl TestSshd {
         let _ = fs::remove_file(self.dir.join("host_ed25519"));
         let _ = fs::remove_file(self.dir.join("host_ed25519.pub"));
         keygen(&self.dir.join("host_ed25519"));
-        self.launch();
+        self.launch().expect("restart sshd");
     }
 
     /// The server's public host key: `ssh-ed25519 AAAA...`.

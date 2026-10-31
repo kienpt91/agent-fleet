@@ -294,6 +294,8 @@ impl Orchestrator {
 
     /// Records an attempt that never got a process: a dispatch followed by a failed end.
     fn start_failed(&mut self, key: &Key, attempt: u32, worktree: &str, message: &str) {
+        // The activity feed says why (the session's own record only says "could not be started").
+        self.warn(format!("{}/{}: attempt {attempt}: {message}", key.0, key.1));
         let begin = self
             .state
             .run(&key.0)
