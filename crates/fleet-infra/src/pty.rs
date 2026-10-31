@@ -819,7 +819,9 @@ mod tests {
     fn input_to_a_worker_that_never_reads_is_refused_quickly_and_nothing_else_blocks() {
         let dir = TempDir::new("pty");
         let mut h = host();
-        let s = h.spawn(&spec(&dir, "sleep 60")).unwrap();
+        // Raw mode, no echo: the terminal's input buffer fills and then pushes back. In canonical
+        // mode some kernels drop the overflow of a long line instead, and nothing would push back.
+        let s = h.spawn(&spec(&dir, "stty raw -echo; exec sleep 60")).unwrap();
         let io = h.registry().get(s.id).unwrap();
 
         let started = Instant::now();
