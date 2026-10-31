@@ -558,6 +558,10 @@ impl WebBackend for DaemonWeb {
         }
     }
 
+    fn process_alive(&self, pid: u32) -> bool {
+        procid::proc_info(pid).is_some()
+    }
+
     fn log_status(&self) -> Result<crate::eventlog::VerifyReport> {
         crate::eventlog::verify_file(&self.layout.events)
     }

@@ -89,6 +89,10 @@ impl WebBackend for Fake {
         (self.handler.lock().unwrap())(cmd, &args)
     }
 
+    fn process_alive(&self, _pid: u32) -> bool {
+        true
+    }
+
     fn log_status(&self) -> Result<VerifyReport> {
         self.log.lock().unwrap().clone()
     }

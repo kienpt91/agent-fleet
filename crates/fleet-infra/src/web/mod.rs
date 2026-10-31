@@ -46,6 +46,9 @@ pub trait WebBackend: Send + Sync {
     fn admit(&self, peer: &PeerInfo) -> Result<()>;
     /// Runs one daemon command (the same names as on the control socket).
     fn call(&self, cmd: &str, args: Value) -> Result<Value>;
+    /// Whether the process still exists and can be inspected. A holder of a connection that has
+    /// vanished by the time it is judged is skipped, see `judge_holders`.
+    fn process_alive(&self, pid: u32) -> bool;
     /// Verifies the event log's hash chain.
     fn log_status(&self) -> Result<VerifyReport>;
     /// The `fleet doctor` checklist as a `fleet.doctor/1` document.
@@ -405,7 +408,7 @@ fn admit(shared: &Shared, peer: SocketAddr, local: SocketAddr) -> Result<()> {
                     pid: Some(pid),
                 })
             },
-            |pid| crate::procid::proc_info(pid).is_some(),
+            |pid| shared.backend.process_alive(pid),
         ),
     }
 }
@@ -687,6 +690,9 @@ mod tests {
             }
             fn call(&self, _: &str, _: Value) -> Result<Value> {
                 Ok(Value::Null)
+            }
+            fn process_alive(&self, _: u32) -> bool {
+                true
             }
             fn log_status(&self) -> Result<VerifyReport> {
                 Err(FleetError::not_found("none"))
