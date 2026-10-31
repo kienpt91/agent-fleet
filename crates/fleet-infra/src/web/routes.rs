@@ -155,6 +155,7 @@ enum Route {
     Goal,
     Remaining,
     VerifyStatus,
+    Forge,
     Stream,
     GateResolve,
     ApprovalDecide,
@@ -176,6 +177,7 @@ fn route_for(path: &str) -> Option<(Route, Method)> {
         "/api/goal" => (Route::Goal, Method::Get),
         "/api/remaining" => (Route::Remaining, Method::Get),
         "/api/verify" => (Route::VerifyStatus, Method::Get),
+        "/api/forge" => (Route::Forge, Method::Get),
         "/api/stream" => (Route::Stream, Method::Get),
         "/api/gate/resolve" => (Route::GateResolve, Method::Post),
         "/api/approval/decide" => (Route::ApprovalDecide, Method::Post),
@@ -634,6 +636,18 @@ fn run_route(
         Route::Remaining => {
             parse_query(&req.query, &[])?;
             respond(call(shared, "goal.remaining", Value::Null)?)
+        }
+        // What the operator's commands fetched from GitHub and what was made of it, from the
+        // daemon's memory. The dashboard never starts `gh` and never reads a ticket.
+        Route::Forge => {
+            parse_query(&req.query, &[])?;
+            let snapshot = call(shared, "forge.snapshot", Value::Null)?;
+            let links = call(shared, "forge.links", Value::Null)?;
+            respond(pass(vec![
+                ("schema", Value::str("fleet.web.forge/1")),
+                ("snapshot", snapshot),
+                ("links", links),
+            ]))
         }
         Route::VerifyStatus => {
             let q = parse_query(&req.query, &["target", "task", "ticket"])?;

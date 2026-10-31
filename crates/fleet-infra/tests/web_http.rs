@@ -1106,6 +1106,77 @@ fn the_goal_ledger_and_verification_are_served_read_only_through_the_daemons_own
 }
 
 #[test]
+fn the_github_view_serves_the_cached_snapshot_and_links_and_nothing_reaches_the_forge() {
+    let r = Running::start();
+    r.fake.on(|cmd, _| {
+        Ok(Value::object([
+            ("schema", Value::str(format!("fleet.{cmd}/1"))),
+            ("title", Value::str("<img src=x onerror=alert(1)>")),
+        ]))
+    });
+    let resp = r.get_bearer("/api/forge");
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let doc = parse(&resp.body);
+    for (key, cmd) in [("snapshot", "forge.snapshot"), ("links", "forge.links")] {
+        assert_eq!(
+            doc.get(key)
+                .and_then(|d| d.get("schema"))
+                .and_then(Value::as_str),
+            Some(format!("fleet.{cmd}/1").as_str())
+        );
+    }
+    assert!(!resp.body.contains('<'), "{}", resp.body);
+    assert_eq!(r.fake.call_names(), vec!["forge.snapshot", "forge.links"]);
+    // credentials like everything else, and no query
+    assert_eq!(r.get("/api/forge", &[]).status, 401);
+    assert_eq!(r.get_bearer("/api/forge?x=1").status, 400);
+    // it cannot be written to
+    for m in ["POST", "PUT", "DELETE", "PATCH"] {
+        let resp = r.request(m, "/api/forge", &[], Some("{}"));
+        assert!(
+            matches!(resp.status, 401 | 404 | 405),
+            "{m} -> {}",
+            resp.status
+        );
+    }
+    let (session, csrf) = r.login();
+    assert_eq!(
+        r.post_session("/api/forge", &session, &csrf, "{}").status,
+        405
+    );
+    // no route reaches a command that starts gh, reads a ticket, makes a task or a pull request
+    for path in [
+        "/api/issue",
+        "/api/issues",
+        "/api/issue/list",
+        "/api/issue/show",
+        "/api/issue/to-task",
+        "/api/pr",
+        "/api/pr/create",
+        "/api/pr/list",
+        "/api/pr/show",
+        "/api/pr/status",
+        "/api/pulls",
+        "/api/forge/result",
+        "/api/forge/snapshot",
+        "/api/forge/links",
+        "/api/github",
+    ] {
+        for m in ["GET", "POST"] {
+            let (session, csrf) = (session.as_str(), csrf.as_str());
+            let resp = if m == "POST" {
+                r.post_session(path, session, csrf, "{}")
+            } else {
+                r.get_bearer(path)
+            };
+            assert!(matches!(resp.status, 404 | 405), "{m} {path}");
+        }
+    }
+    // the dashboard only ever asked for the two read-only views
+    assert_eq!(r.fake.call_names(), vec!["forge.snapshot", "forge.links"]);
+}
+
+#[test]
 fn goal_and_verification_queries_are_validated() {
     let r = Running::start();
     for q in [

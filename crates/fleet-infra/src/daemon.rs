@@ -585,6 +585,11 @@ pub const WEB_COMMANDS: &[&str] = &[
     "goal.show",
     "goal.remaining",
     "verify.status",
+    // what the operator's `github`, `issue` and `pr` commands fetched and linked, from memory:
+    // nothing that starts `gh`, reads a ticket, makes a task or a pull request is offered
+    "forge.status",
+    "forge.snapshot",
+    "forge.links",
 ];
 
 /// The dashboard's view of the daemon: the same handler as the control socket, restricted to
@@ -762,9 +767,42 @@ mod tests {
                     *cmd,
                     "task.send" | "gate.resolve" | "approval.decide" | "merge"
                 ) || cmd.starts_with("goal.")
-                    || matches!(*cmd, "status" | "events" | "task.tail" | "verify.status"),
+                    || matches!(
+                        *cmd,
+                        "status"
+                            | "events"
+                            | "task.tail"
+                            | "verify.status"
+                            | "forge.status"
+                            | "forge.snapshot"
+                            | "forge.links"
+                    ),
                 "{cmd}"
             );
+        }
+    }
+
+    #[test]
+    fn the_dashboard_offers_the_forge_views_read_only_and_nothing_that_reaches_github() {
+        for cmd in ["forge.status", "forge.snapshot", "forge.links"] {
+            assert!(WEB_COMMANDS.contains(&cmd), "{cmd}");
+            let parsed = parse_command(cmd, &Value::Null).unwrap();
+            assert!(
+                fleet_app::api::is_read_only(&parsed),
+                "{cmd} changes nothing"
+            );
+        }
+        for cmd in [
+            "issue.list",
+            "issue.show",
+            "issue.to-task",
+            "pr.list",
+            "pr.show",
+            "pr.status",
+            "pr.create",
+            "forge.result",
+        ] {
+            assert!(!WEB_COMMANDS.contains(&cmd), "{cmd} must not be offered");
         }
     }
 
