@@ -61,6 +61,29 @@ impl Action {
         }
     }
 
+    /// Delivery of one message to its recipients. The action names the message, the channel, the
+    /// sender, the recipients and the digest of what was written; the words themselves are peer
+    /// content and are not part of an approval (a person reads them with `fleet msg show`).
+    pub fn message(
+        id: &crate::ids::MessageId,
+        channel: &str,
+        from: &str,
+        to: &[String],
+        content_digest: &str,
+    ) -> Action {
+        Action {
+            tool: "message".to_string(),
+            command: "deliver".to_string(),
+            args: vec![
+                id.to_string(),
+                channel.to_string(),
+                from.to_string(),
+                to.join(","),
+                format!("sha256:{content_digest}"),
+            ],
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.args.len() > MAX_ACTION_ARGS
             || self.args.iter().any(|a| a.len() > MAX_ACTION_ARG_LEN)

@@ -429,6 +429,7 @@ impl FleetState {
                     quote_lines(&decision.text)
                 ),
                 DecisionKind::Conflict => format!("{}\nOperator says: {answer}", decision.text),
+                DecisionKind::Channel => format!("{}\nOperator says: {answer}", decision.text),
             };
             events.extend(run.unblock(&decision.task, &note)?);
         }
@@ -448,7 +449,7 @@ impl FleetState {
         let decided = approval.decide(approve, seen_digest, now_ms, hasher)?;
         let mut events = vec![decided];
         let needs_unblock = match approval.purpose {
-            Purpose::Merge => false,
+            Purpose::Merge | Purpose::Message => false,
             Purpose::Manual => true,
             Purpose::ExternalCommand => !approve,
         };
@@ -480,7 +481,7 @@ impl FleetState {
                 continue;
             };
             events.push(expired);
-            if a.purpose == Purpose::Merge {
+            if matches!(a.purpose, Purpose::Merge | Purpose::Message) {
                 continue;
             }
             let Ok(run) = self.run(&a.run) else { continue };
@@ -499,6 +500,64 @@ impl FleetState {
             }
         }
         events
+    }
+
+    /// An approval for the delivery of one message (a channel that requires approval). It blocks
+    /// no task: the sender keeps running and the message waits. `task` is the sender, so the
+    /// digest also binds who wrote it.
+    pub fn request_message_approval(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        action: &Action,
+        ttl_ms: u64,
+        now_ms: u64,
+        hasher: &dyn Digest,
+    ) -> Result<(ApprovalId, DomainEvent)> {
+        self.run(run)?;
+        if self.open_decision_count() >= MAX_OPEN_DECISIONS {
+            return Err(FleetError::limit(
+                "too many unanswered questions and approvals",
+            ));
+        }
+        let id = ApprovalId::from_seq(self.approval_seq.saturating_add(1));
+        let event = Approval::request(
+            id.clone(),
+            run.clone(),
+            task.clone(),
+            Purpose::Message,
+            action,
+            Window { now_ms, ttl_ms },
+            hasher,
+        )?;
+        Ok((id, event))
+    }
+
+    /// A decision gate that asks a person whether a muted channel (or task) may speak again. It
+    /// blocks nothing. The text names ids and numbers only, never what an agent wrote.
+    pub fn raise_channel_gate(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        text: &str,
+        choices: &[&str],
+    ) -> Result<(DecisionId, DomainEvent)> {
+        self.run(run)?;
+        if self.open_decision_count() >= MAX_OPEN_DECISIONS {
+            return Err(FleetError::limit(
+                "too many unanswered questions and approvals",
+            ));
+        }
+        let id = DecisionId::from_seq(self.decision_seq.saturating_add(1));
+        let event = Decision::open(
+            id.clone(),
+            run.clone(),
+            task.clone(),
+            DecisionKind::Channel,
+            text,
+            choices.iter().map(|c| (*c).to_string()).collect(),
+        )?;
+        Ok((id, event))
     }
 
     /// First step of running an approved command: consumes the approval and records that the
@@ -1888,5 +1947,101 @@ mod tests {
         for ev in &log {
             assert_eq!(DomainEvent::from_value(&ev.to_value()).as_ref(), Ok(ev));
         }
+    }
+
+    #[test]
+    fn a_message_approval_blocks_nobody_and_binds_the_message_action() {
+        let (mut s, run) = fleet_with_running(&["a", "b"]);
+        let action = Action::message(
+            &crate::ids::MessageId::from_seq(1),
+            "review",
+            "task:a",
+            &["b".to_string()],
+            "abc123",
+        );
+        let (id, ev) = s
+            .request_message_approval(&run, &tid("a"), &action, 5_000, 100, &FakeDigest)
+            .unwrap();
+        assert_eq!(id, ApprovalId::from_seq(1));
+        s.apply(&ev);
+        let approval = s.approval(&id).unwrap();
+        assert_eq!(approval.purpose, Purpose::Message);
+        assert_eq!(approval.expires_ms, 5_100);
+        assert_eq!(approval.action, action);
+        // the sender keeps running: no task was blocked
+        assert_eq!(
+            s.run(&run).unwrap().task(&tid("a")).unwrap().status,
+            TaskStatus::Running
+        );
+        // approving or denying it unblocks nothing either, and the digest must still be named
+        assert!(s
+            .decide_approval(&id, true, "abc", 200, &FakeDigest)
+            .is_err());
+        let events = s.decide_seen(&id, true, 200, &FakeDigest).unwrap();
+        assert_eq!(kinds(&events), ["approval_decided"]);
+        apply_all(&mut s, &events);
+        assert_eq!(s.approval(&id).unwrap().status, ApprovalStatus::Approved);
+        // an unanswered one lapses without touching the task
+        let (id2, ev) = s
+            .request_message_approval(&run, &tid("b"), &action, 1_000, 300, &FakeDigest)
+            .unwrap();
+        s.apply(&ev);
+        let events = s.expire_approvals(5_000);
+        assert!(
+            events.iter().all(|e| e.kind() == "approval_expired"),
+            "{events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ApprovalExpired { id } if *id == id2)));
+        apply_all(&mut s, &events);
+        assert_eq!(
+            s.run(&run).unwrap().task(&tid("b")).unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(s
+            .request_message_approval(
+                &RunId::parse("nope").unwrap(),
+                &tid("a"),
+                &action,
+                1,
+                1,
+                &FakeDigest
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn a_channel_gate_blocks_no_task_and_resolving_it_adds_no_note() {
+        let (mut s, run) = fleet_with_running(&["a", "b"]);
+        let (id, ev) = s
+            .raise_channel_gate(
+                &run,
+                &tid("a"),
+                "channel review was muted",
+                &["unmute", "keep muted"],
+            )
+            .unwrap();
+        assert_eq!(id, DecisionId::from_seq(1));
+        s.apply(&ev);
+        let d = s.decision(&id).unwrap();
+        assert_eq!(d.kind, DecisionKind::Channel);
+        assert_eq!(d.choices, ["unmute", "keep muted"]);
+        assert_eq!(s.open_decision_count(), 1);
+        assert_eq!(
+            s.run(&run).unwrap().task(&tid("a")).unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(
+            s.resolve_decision(&id, "maybe").is_err(),
+            "only a listed choice"
+        );
+        let events = s.resolve_decision(&id, "unmute").unwrap();
+        assert_eq!(kinds(&events), ["decision_resolved"], "nothing to unblock");
+        apply_all(&mut s, &events);
+        assert_eq!(s.open_decision_count(), 0);
+        assert!(s
+            .raise_channel_gate(&RunId::parse("nope").unwrap(), &tid("a"), "x", &[])
+            .is_err());
     }
 }

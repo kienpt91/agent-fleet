@@ -256,6 +256,17 @@ string_id!(
     Sha,
     validate_sha
 );
+string_id!(
+    /// Identifies a message of the agent-to-agent channels: `m` followed by a number.
+    MessageId,
+    |s| validate_counter_id("message", 'm', s)
+);
+string_id!(
+    /// Name of a message channel, declared by the operator in a plan. Same character rules as a
+    /// worker name (reserved words are fine: a channel name is never a path or a ref).
+    ChannelName,
+    validate_channel_name
+);
 
 impl DecisionId {
     pub fn from_seq(n: u64) -> Self {
@@ -300,6 +311,37 @@ impl EvidenceId {
             .and_then(|d| d.parse().ok())
             .unwrap_or(0)
     }
+}
+
+impl MessageId {
+    pub fn from_seq(n: u64) -> Self {
+        MessageId(format!("m{n}"))
+    }
+
+    /// The number after the `m`; messages are ordered by it.
+    pub fn seq(&self) -> u64 {
+        self.0
+            .strip_prefix('m')
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+fn validate_channel_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > MAX_ID_LEN {
+        return Err(FleetError::invalid("channel name has a bad length"));
+    }
+    let first_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if !first_ok || !name.chars().all(is_id_char) {
+        return Err(FleetError::invalid(format!(
+            "channel name {} must match [a-z0-9][a-z0-9_-]*",
+            show(name)
+        )));
+    }
+    Ok(())
 }
 
 fn validate_counter_id(kind: &str, prefix: char, s: &str) -> Result<()> {
@@ -416,6 +458,43 @@ mod tests {
     #[test]
     fn show_escapes_controls() {
         assert_eq!(show("a\u{1b}[31m"), "\"a\\u{1b}[31m\"");
+    }
+
+    #[test]
+    fn message_ids_count_and_channel_names_are_plain() {
+        let m = MessageId::from_seq(12);
+        assert_eq!(m.as_str(), "m12");
+        assert_eq!(m.seq(), 12);
+        assert!(MessageId::parse("m12").is_ok());
+        for bad in [
+            "12",
+            "m",
+            "m1x",
+            "g1",
+            "m-1",
+            "M1",
+            &format!("m{}", "9".repeat(20)),
+        ] {
+            assert!(MessageId::parse(bad).is_err(), "{bad}");
+        }
+        for ok in ["review", "a", "to-lead_2", "head", "integration"] {
+            assert!(ChannelName::parse(ok).is_ok(), "{ok}");
+        }
+        let long = "a".repeat(41);
+        for bad in [
+            "",
+            "-x",
+            "_x",
+            "A",
+            "a b",
+            "a/b",
+            "a.b",
+            "a\n",
+            "é",
+            long.as_str(),
+        ] {
+            assert!(ChannelName::parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
