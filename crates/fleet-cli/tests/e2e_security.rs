@@ -430,7 +430,9 @@ fn a_worker_running_fleet_without_a_state_dir_finds_no_daemon_but_the_operator_d
 
 #[test]
 fn input_to_a_worker_that_never_reads_fails_with_an_error_and_the_daemon_stays_responsive() {
-    let f = one_task_fleet("exec sleep 120", plain_cfg());
+    // Raw mode, no echo: the terminal's input buffer fills and then pushes back. In canonical
+    // mode some kernels drop the overflow of a long line instead, and nothing would ever push back.
+    let f = one_task_fleet("stty raw -echo\nexec sleep 120", plain_cfg());
     f.plan_and_start("r1", 1, &[t("t")]);
     f.wait_live("r1", "t");
     let mut client = Client::connect(&f.state.join("control/fleet.sock")).unwrap();
