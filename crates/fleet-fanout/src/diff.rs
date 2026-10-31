@@ -12,6 +12,31 @@ use std::collections::BTreeSet;
 pub const MAX_FILES_LISTED: usize = 500;
 /// Paths listed in one [`ScopeReport`] list.
 pub const MAX_SCOPE_PATHS: usize = 50;
+/// What a binary file adds to the size of a change: git counts no lines for it, so without a weight a
+/// change made of binary files would look empty.
+pub const BINARY_FILE_WEIGHT: u64 = 100;
+/// What a change without lines (a mode change, a type change) adds to the size of a change.
+pub const LINELESS_CHANGE_WEIGHT: u64 = 10;
+
+/// Where a member's touched paths stand against the contract's mandatory `diff` checks. Only a check
+/// that was run over every touched path says `In`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeState {
+    In,
+    Out,
+    /// Not known: no mandatory `diff` check, the diff could not be read, or it was listed only in part.
+    Unknown,
+}
+
+impl ScopeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeState::In => "in_scope",
+            ScopeState::Out => "out_of_scope",
+            ScopeState::Unknown => "unknown",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChangeKind {
@@ -55,6 +80,8 @@ pub struct DiffStat {
     pub insertions: u64,
     pub deletions: u64,
     pub binary_files: u64,
+    /// What binary files and changes without lines add to [`DiffStat::size`], over every file.
+    pub weight_extra: u64,
     pub changes: Vec<FileChange>,
     /// More files changed than `changes` lists.
     pub truncated: bool,
@@ -77,6 +104,12 @@ impl DiffStat {
             stat.deletions = stat.deletions.saturating_add(c.deletions);
             if c.binary {
                 stat.binary_files = stat.binary_files.saturating_add(1);
+                stat.weight_extra = stat.weight_extra.saturating_add(BINARY_FILE_WEIGHT);
+            } else if c.insertions == 0
+                && c.deletions == 0
+                && matches!(c.kind, ChangeKind::Modified | ChangeKind::TypeChanged)
+            {
+                stat.weight_extra = stat.weight_extra.saturating_add(LINELESS_CHANGE_WEIGHT);
             }
         }
         stat.truncated = all.len() > MAX_FILES_LISTED;
@@ -85,10 +118,13 @@ impl DiffStat {
         stat
     }
 
-    /// Lines inserted plus lines deleted: the size of the change. Binary files add nothing here
-    /// (git does not count their lines); [`DiffStat::binary_files`] says how many there were.
+    /// The size of the change: lines inserted plus lines deleted, plus [`BINARY_FILE_WEIGHT`] for each
+    /// binary file and [`LINELESS_CHANGE_WEIGHT`] for each mode or type change (git counts no lines for
+    /// them, and a size that ignored them could be made small by writing the change as binary files).
     pub fn size(&self) -> u64 {
-        self.insertions.saturating_add(self.deletions)
+        self.insertions
+            .saturating_add(self.deletions)
+            .saturating_add(self.weight_extra)
     }
 
     /// Every path the change touches: where a file is now and, for a rename, where it was. This is
@@ -184,7 +220,7 @@ mod tests {
         ]);
         assert_eq!(stat.files, 3);
         assert_eq!((stat.insertions, stat.deletions), (10, 4));
-        assert_eq!(stat.size(), 14);
+        assert_eq!(stat.size(), 14 + BINARY_FILE_WEIGHT);
         assert_eq!(stat.binary_files, 1);
         assert!(!stat.truncated);
         let paths: Vec<&str> = stat.changes.iter().map(|c| c.path.as_str()).collect();
@@ -201,6 +237,47 @@ mod tests {
         assert_eq!(stat.insertions, (MAX_FILES_LISTED + 7) as u64);
         assert_eq!(stat.changes.len(), MAX_FILES_LISTED);
         assert!(stat.truncated);
+    }
+
+    #[test]
+    fn binary_and_lineless_changes_have_a_weight_so_they_cannot_hide_a_big_change() {
+        let binary = DiffStat::from_changes(
+            (0..3)
+                .map(|i| FileChange {
+                    binary: true,
+                    ..change(&format!("blob{i}.bin"), ChangeKind::Added, 0, 0)
+                })
+                .collect(),
+        );
+        assert_eq!(binary.size(), 3 * BINARY_FILE_WEIGHT);
+        let text = DiffStat::from_changes(vec![change("a.rs", ChangeKind::Added, 50, 0)]);
+        assert!(binary.size() > text.size());
+        let mode = DiffStat::from_changes(vec![
+            change("run.sh", ChangeKind::Modified, 0, 0),
+            change("link", ChangeKind::TypeChanged, 0, 0),
+            FileChange {
+                old_path: Some("old".to_string()),
+                ..change("new", ChangeKind::Renamed, 0, 0)
+            },
+        ]);
+        assert_eq!(
+            mode.size(),
+            2 * LINELESS_CHANGE_WEIGHT,
+            "a pure rename stays free"
+        );
+        // the weight counts every file, also those the list leaves out
+        let many = DiffStat::from_changes(
+            (0..MAX_FILES_LISTED + 20)
+                .map(|i| FileChange {
+                    binary: true,
+                    ..change(&format!("b{i:04}"), ChangeKind::Added, 0, 0)
+                })
+                .collect(),
+        );
+        assert_eq!(
+            many.size(),
+            (MAX_FILES_LISTED as u64 + 20) * BINARY_FILE_WEIGHT
+        );
     }
 
     #[test]

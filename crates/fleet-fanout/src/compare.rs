@@ -5,7 +5,7 @@
 //! changed. What a worker *said* (its summary) is carried along as untrusted text for display and is
 //! never an input of the verification status or of the ranking.
 
-use crate::diff::{DiffStat, ScopeReport};
+use crate::diff::{DiffStat, ScopeReport, ScopeState};
 use crate::group::MemberState;
 use crate::rank::{rank, RankInput, RankRule, Ranked};
 use fleet_domain::ids::{Sha, TaskId};
@@ -87,7 +87,9 @@ pub struct MemberFacts {
     pub has_contract: bool,
     pub checks: Vec<CheckFact>,
     pub scopes: Vec<ScopeReport>,
-    /// The contract has a mandatory `diff` check and the diff could not be read: whether the
+    /// Some contract that names the task has a mandatory `diff` check.
+    pub has_scope_check: bool,
+    /// There is such a check and the diff could not be read, or was listed only in part: whether the
     /// member stayed in scope is not known (and is not assumed).
     pub scope_unknown: bool,
     /// What the worker reported (untrusted) and why the task failed (fleet's own text).
@@ -111,14 +113,42 @@ impl MemberFacts {
         }
     }
 
-    /// No path outside the allow globs of a mandatory `diff` check was touched, and that is known.
+    /// Where the touched paths stand against the mandatory `diff` checks. A path outside the globs is
+    /// out of scope even when the list was cut; "inside" needs a mandatory check over every touched path:
+    /// without a check, or with a diff that is not whole, the scope is not known.
+    pub fn scope_state(&self) -> ScopeState {
+        if self
+            .scopes
+            .iter()
+            .filter(|s| s.mandatory)
+            .any(|s| !s.clean())
+        {
+            ScopeState::Out
+        } else if !self.has_scope_check || self.scope_unknown {
+            ScopeState::Unknown
+        } else {
+            ScopeState::In
+        }
+    }
+
+    /// Why the scope is not known, when it is not.
+    pub fn scope_reason(&self) -> String {
+        match self.scope_state() {
+            ScopeState::In => "every touched path is inside the allowed paths".to_string(),
+            ScopeState::Out => "a path outside the allowed paths was touched".to_string(),
+            ScopeState::Unknown if !self.has_scope_check => {
+                "no mandatory diff check names this task, so nothing says which paths it may touch"
+                    .to_string()
+            }
+            ScopeState::Unknown => {
+                "the diff could not be read, or was listed only in part, so the touched paths were not all checked"
+                    .to_string()
+            }
+        }
+    }
+
     pub fn in_scope(&self) -> bool {
-        !self.scope_unknown
-            && self
-                .scopes
-                .iter()
-                .filter(|s| s.mandatory)
-                .all(|s| s.clean())
+        self.scope_state() == ScopeState::In
     }
 
     /// Where verification stands for the member's recorded commit and tree, and why.
@@ -180,7 +210,7 @@ impl MemberFacts {
             task: self.task.clone(),
             completed: self.completed(),
             verified: self.verified_now(),
-            in_scope: self.in_scope(),
+            scope: self.scope_state(),
             diff_size: self.diff.as_ref().map(DiffStat::size),
             duration_ms: self.duration_ms,
             attempts: self.attempts,
@@ -258,7 +288,7 @@ pub struct MemberReport {
     pub verification: EvidenceStatus,
     pub verification_reason: String,
     pub branch_moved: bool,
-    pub in_scope: bool,
+    pub scope: ScopeState,
     pub rank: Ranked,
 }
 
@@ -282,7 +312,7 @@ pub fn compare(rule: &RankRule, facts: Vec<MemberFacts>) -> Comparison {
             let (verification, verification_reason) = f.verification();
             members.push(MemberReport {
                 branch_moved: f.branch_moved(),
-                in_scope: f.in_scope(),
+                scope: f.scope_state(),
                 verification,
                 verification_reason,
                 facts: f,
@@ -359,6 +389,7 @@ mod tests {
             has_contract: true,
             checks: vec![check("tests", true, EvidenceStatus::Verified)],
             scopes: Vec::new(),
+            has_scope_check: true,
             scope_unknown: false,
             summary: Some("did it".to_string()),
             failure: None,
@@ -421,28 +452,41 @@ mod tests {
     }
 
     #[test]
-    fn scope_counts_mandatory_diff_checks_only() {
-        let mut m = facts("a");
-        m.scopes.push(ScopeReport {
-            check: "soft".to_string(),
-            mandatory: false,
-            allowed_touched: vec![],
-            outside: vec!["x".to_string()],
-            outside_count: 1,
-        });
-        assert!(m.in_scope());
-        m.scopes.push(ScopeReport {
+    fn scope_counts_mandatory_diff_checks_only_and_is_in_scope_only_when_checked_whole() {
+        let out = |mandatory| ScopeReport {
             check: "scope".to_string(),
-            mandatory: true,
+            mandatory,
             allowed_touched: vec![],
             outside: vec!["y".to_string()],
             outside_count: 1,
-        });
+        };
+        let mut m = facts("a");
+        assert_eq!(m.scope_state(), ScopeState::In);
+        assert!(m.in_scope());
+        m.scopes.push(out(false));
+        assert_eq!(
+            m.scope_state(),
+            ScopeState::In,
+            "an optional check does not decide"
+        );
+        m.scopes.push(out(true));
+        assert_eq!(m.scope_state(), ScopeState::Out);
         assert!(!m.in_scope());
-        // an unreadable diff is not an in-scope diff
+        // a path outside is outside even when the diff was listed only in part
+        m.scope_unknown = true;
+        assert_eq!(m.scope_state(), ScopeState::Out);
+
+        // an unreadable or cut diff is not an in-scope diff
         let mut unknown = facts("b");
         unknown.scope_unknown = true;
-        assert!(!unknown.in_scope());
+        assert_eq!(unknown.scope_state(), ScopeState::Unknown);
+        assert!(unknown.scope_reason().contains("not all checked"));
+        // no mandatory diff check at all: nothing was judged, so nothing is "inside"
+        let mut none = facts("c");
+        none.has_scope_check = false;
+        assert_eq!(none.scope_state(), ScopeState::Unknown);
+        assert!(!none.in_scope());
+        assert!(none.scope_reason().contains("no mandatory diff check"));
     }
 
     #[test]
@@ -474,7 +518,7 @@ mod tests {
         assert_eq!(order, ["a", "c", "b", "d"]);
         assert_eq!(cmp.members[0].rank.position, 1);
         assert_eq!(cmp.members[2].verification, EvidenceStatus::Failed);
-        assert!(!cmp.members[1].in_scope);
+        assert_eq!(cmp.members[1].scope, ScopeState::Out);
         assert!(cmp.overlap.incomplete, "d's diff is missing");
         assert_eq!(cmp.rule, RankRule::default());
     }

@@ -1164,7 +1164,7 @@ fn a_merge_conflict_on_the_pick_aborts_it_and_leaves_the_group_undecided() {
 }
 
 #[test]
-fn a_merge_that_happened_before_the_pick_was_recorded_is_not_merged_again() {
+fn a_merge_that_was_recorded_without_its_pick_is_picked_at_the_restart_and_not_merged_again() {
     let mut h = four_ways();
     // the daemon merged the pick and died before it recorded the winner
     h.world
@@ -1180,13 +1180,322 @@ fn a_merge_that_happened_before_the_pick_was_recorded_is_not_merged_again() {
         )
         .unwrap();
     h.restart(config(&["fast", "careful"])).unwrap();
-    let r = pick(&mut h, "fan1", "fan1-1", false).unwrap();
-    assert_eq!(text(r.data(), "merge_sha"), "d".repeat(40));
+    let g = group(&mut h, "fan1");
+    assert_eq!(text(&g, "winner"), "fan1-1");
+    assert_eq!(text(&g, "merge_sha"), "d".repeat(40));
     assert!(
         h.world.merge_requests().is_empty(),
         "nothing was merged a second time"
     );
+    let err = pick(&mut h, "fan1", "fan1-1", false).unwrap_err();
+    assert!(err.message.contains("winner already"), "{}", err.message);
+}
+
+// ---- scope that is not known ----------------------------------------------------------------------------
+
+fn scope_of(cmp: &Value, task: &str) -> Value {
+    field(&member(cmp, task), "scope").clone()
+}
+
+#[test]
+fn a_diff_listed_only_in_part_is_never_in_scope_and_cannot_be_picked_without_the_flag() {
+    let mut cfg = config(&["fast", "careful"]);
+    cfg.compare_rank = fleet_fanout::rank::RankRule::parse(&["in-scope"]).unwrap();
+    let mut h = harness_with(cfg, 8);
+    h.world.set_verify_mode(VerifyMode::Manual);
+    fanout(&mut h, &["fast", "careful"], 1, Some(contract())).unwrap();
+    start(&mut h);
+    // 500 files inside src/ that sort first and one outside that sorts after the listed 500
+    let mut many: Vec<FileChange> = (0..500)
+        .map(|i| change(&format!("src/f{i:04}.rs"), 1, 0))
+        .collect();
+    many.push(change("zzz-outside.txt", 1, 0));
+    work(&h, "fan1-1", '1', many);
+    work(&h, "fan1-2", '2', vec![change("src/a.rs", 9, 0)]);
+    finish(&mut h, "fan1-1", "done");
+    verified_run(&mut h, "fan1-1", &[]);
+    finish(&mut h, "fan1-2", "done");
+    verified_run(&mut h, "fan1-2", &[]);
+    let cmp = compare(&mut h, "fan1");
+    let cut = scope_of(&cmp, "fan1-1");
+    assert_eq!(text(&cut, "state"), "unknown", "{}", cut.canonical());
+    assert_eq!(field(&cut, "in_scope").as_bool(), Some(false));
+    assert_eq!(field(&cut, "unknown").as_bool(), Some(true));
+    assert!(text(&cut, "reason").contains("not all checked"));
+    assert_eq!(
+        field(field(&member(&cmp, "fan1-1"), "diff"), "truncated").as_bool(),
+        Some(true)
+    );
+    assert_eq!(text(&scope_of(&cmp, "fan1-2"), "state"), "in_scope");
+    assert_eq!(
+        order(&cmp),
+        ["fan1-2", "fan1-1"],
+        "known to be inside ranks above not known"
+    );
+
+    let err = pick(&mut h, "fan1", "fan1-1", false).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{}", err.message);
+    assert!(
+        err.message.contains("scope that is not known")
+            && err.message.contains("--allow-unverified"),
+        "{}",
+        err.message
+    );
+    assert!(approvals(&mut h).is_empty());
+    let id = asked(pick(&mut h, "fan1", "fan1-1", true).unwrap_err());
+    let a = approvals(&mut h).remove(0);
+    assert!(
+        text(&a, "display").contains("scope: UNKNOWN"),
+        "{}",
+        text(&a, "display")
+    );
+    assert!(text(&a, "display").contains("--allow-unverified"));
+    approve(&mut h, &id);
+    let done = pick(&mut h, "fan1", "fan1-1", true).unwrap();
+    assert_eq!(text(done.data(), "verification"), "verified, scope unknown");
+    // the member inside the scope needs no flag
+    let mut h2 = four_ways();
+    let ok = asked(pick(&mut h2, "fan1", "fan1-1", false).unwrap_err());
+    assert!(
+        text(&approvals(&mut h2).remove(0), "display").contains("scope: inside the allowed paths"),
+        "{ok}"
+    );
+}
+
+#[test]
+fn a_contract_without_a_diff_check_leaves_the_scope_unknown_not_inside() {
+    let mut h = harness();
+    let no_scope = obj(vec![
+        ("version", Value::int(1)),
+        (
+            "checks",
+            Value::array([obj(vec![
+                ("id", s("tests")),
+                ("kind", s("command")),
+                ("program", s("/usr/bin/make")),
+                ("args", list(&["test"])),
+            ])]),
+        ),
+    ]);
+    h.world.set_verify_mode(VerifyMode::Manual);
+    fanout(&mut h, &["fast", "careful"], 1, Some(no_scope)).unwrap();
+    start(&mut h);
+    for (t, c) in [("fan1-1", '1'), ("fan1-2", '2')] {
+        work(&h, t, c, vec![change("anywhere/at/all.rs", 3, 0)]);
+        finish(&mut h, t, "done");
+        verified_run(&mut h, t, &[]);
+    }
+    let cmp = compare(&mut h, "fan1");
+    let m = member(&cmp, "fan1-1");
+    assert_eq!(text(field(&m, "verification"), "status"), "verified");
+    let scope = scope_of(&cmp, "fan1-1");
+    assert_eq!(text(&scope, "state"), "unknown");
+    assert_eq!(field(&scope, "in_scope").as_bool(), Some(false));
+    assert!(text(&scope, "reason").contains("no mandatory diff check"));
+    let err = pick(&mut h, "fan1", "fan1-1", false).unwrap_err();
+    assert!(
+        err.message.contains("scope that is not known"),
+        "{}",
+        err.message
+    );
+    assert!(approvals(&mut h).is_empty());
+    let id = asked(pick(&mut h, "fan1", "fan1-1", true).unwrap_err());
+    approve(&mut h, &id);
+    assert_eq!(
+        text(
+            pick(&mut h, "fan1", "fan1-1", true).unwrap().data(),
+            "verification"
+        ),
+        "verified, scope unknown"
+    );
+}
+
+#[test]
+fn a_contract_that_guards_the_member_is_not_helped_by_the_flag_and_the_message_says_so() {
+    let mut h = harness();
+    fanout(&mut h, &["fast", "careful"], 1, None).unwrap();
+    start(&mut h);
+    work(&h, "fan1-1", '1', vec![change("src/a.rs", 1, 0)]);
+    finish(&mut h, "fan1-1", "done");
+    finish(&mut h, "fan1-2", "done");
+    ticks(&mut h);
+    // a contract that names the member is attached after the work was reviewed; fleet has not run it
+    h.call(
+        "goal.add",
+        obj(vec![
+            ("id", s("late")),
+            ("title", s("late contract")),
+            ("tasks", list(&["r1/fan1-1"])),
+            ("contract", contract()),
+        ]),
+    )
+    .unwrap();
+    let err = pick(&mut h, "fan1", "fan1-1", true).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(
+        err.message.contains("cannot help") && err.message.contains("fleet verify r1/fan1-1"),
+        "{}",
+        err.message
+    );
+    assert!(approvals(&mut h).is_empty());
+}
+
+// ---- the weight of binary files in the size of a change ------------------------------------------------------
+
+#[test]
+fn a_change_made_of_binary_files_is_not_the_smallest_diff() {
+    let mut h = harness();
+    fanout(&mut h, &["fast", "careful"], 1, None).unwrap();
+    start(&mut h);
+    let blobs: Vec<FileChange> = (0..3)
+        .map(|i| FileChange {
+            binary: true,
+            ..change(&format!("blob{i}.bin"), 0, 0)
+        })
+        .collect();
+    work(&h, "fan1-1", '1', blobs);
+    work(&h, "fan1-2", '2', vec![change("src/a.rs", 40, 0)]);
+    finish(&mut h, "fan1-1", "done");
+    finish(&mut h, "fan1-2", "done");
+    ticks(&mut h);
+    let cmp = h
+        .call(
+            "group.compare",
+            obj(vec![("group", s("fan1")), ("rank", list(&["diff"]))]),
+        )
+        .unwrap()
+        .data()
+        .clone();
+    assert_eq!(order(&cmp), ["fan1-2", "fan1-1"]);
+    assert_eq!(
+        field(field(&member(&cmp, "fan1-1"), "diff"), "size").as_u64(),
+        Some(300)
+    );
+    assert_eq!(
+        field(field(&member(&cmp, "fan1-1"), "diff"), "binary_files").as_u64(),
+        Some(3)
+    );
+}
+
+// ---- a member stays a member ----------------------------------------------------------------------------------
+
+#[test]
+fn a_superseded_member_is_not_merged_or_built_on_even_after_its_group_was_forgotten() {
+    let mut cfg = config(&["fast", "careful"]);
+    cfg.merge_needs_approval = false;
+    let mut h = harness_with(cfg, 8);
+    fanout(&mut h, &["fast", "careful"], 1, None).unwrap();
+    start(&mut h);
+    // a task cannot be built on a member before the pick, nor on a loser after it
+    let add = |h: &mut Harness, id: &str, after: &str| {
+        h.call(
+            "task.add",
+            obj(vec![
+                ("run", s("r1")),
+                ("id", s(id)),
+                ("title", s(id)),
+                ("after", list(&[after])),
+            ]),
+        )
+    };
+    let early = add(&mut h, "early", "fan1-1").unwrap_err();
+    assert_eq!(early.code, ErrorCode::Conflict, "{}", early.message);
+    finish(&mut h, "fan1-1", "done");
+    finish(&mut h, "fan1-2", "done");
+    ticks(&mut h);
+    pick(&mut h, "fan1", "fan1-1", true).unwrap();
+    h.call("cleanup", obj(vec![("branches", Value::Bool(true))]))
+        .unwrap();
+    assert_eq!(text(&group(&mut h, "fan1"), "status"), "closed");
+    assert!(add(&mut h, "loser", "fan1-2").is_err());
+    add(&mut h, "winner", "fan1-1").unwrap();
+    let merge = |h: &mut Harness| h.call("merge", obj(vec![("task", s("fan1-2"))]));
+    assert!(merge(&mut h).unwrap_err().message.contains("fleet pick"));
+
+    // 64 more groups push the resolved one out of the registry
+    for _ in 0..63 {
+        fanout(&mut h, &["fast", "careful"], 1, None).unwrap();
+    }
+    assert!(
+        fanout(&mut h, &["fast", "careful"], 1, None).is_ok(),
+        "a resolved group makes room"
+    );
+    let listed = h.call("group.list", Value::Null).unwrap();
+    assert!(
+        !items(listed.data(), "groups")
+            .iter()
+            .any(|g| text(g, "id") == "fan1"),
+        "the group was forgotten"
+    );
+    let err = merge(&mut h).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(
+        err.message.contains("superseded in a fan-out group"),
+        "{}",
+        err.message
+    );
+    assert!(add(&mut h, "loser-again", "fan1-2").is_err());
+    assert!(add(&mut h, "winner-again", "fan1-1").is_ok());
+    assert!(h.world.merges().iter().all(|(_, b)| b != "fleet/r1/fan1-2"));
+}
+
+// ---- a crash between the merge and the record of the winner ---------------------------------------------
+
+/// The pick of `fan1-1` is approved; the store dies after the merge was recorded (`approval_consumed`,
+/// `task_merged`) and before `winner_picked`.
+fn crashed_between_the_merge_and_the_winner() -> Harness {
+    let mut h = four_ways();
+    let id = asked(pick(&mut h, "fan1", "fan1-1", false).unwrap_err());
+    approve(&mut h, &id);
+    h.world.fail_appends_after(2);
+    let err = pick(&mut h, "fan1", "fan1-1", false).unwrap_err();
+    assert!(err.message.contains("unavailable"), "{}", err.message);
+    h.world.fail_appends(false);
+    assert_eq!(count(&h, "task_merged"), 1);
+    assert_eq!(count(&h, "winner_picked"), 0);
+    h
+}
+
+#[test]
+fn another_member_cannot_be_picked_and_merged_on_top_of_one_that_is_merged_already() {
+    let mut h = crashed_between_the_merge_and_the_winner();
+    let merges = h.world.merges().len();
+    for allow in [false, true] {
+        let err = pick(&mut h, "fan1", "fan1-4", allow).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict, "{}", err.message);
+        assert!(
+            err.message.contains("fan1-1") && err.message.contains("merged already"),
+            "{}",
+            err.message
+        );
+    }
+    assert_eq!(
+        approvals(&mut h).len(),
+        1,
+        "no approval was asked for the second merge"
+    );
+    assert_eq!(h.world.merges().len(), merges, "nothing more was merged");
+    // the one that was merged can be recorded without a second merge
+    let r = pick(&mut h, "fan1", "fan1-1", false).unwrap();
+    assert_eq!(text(r.data(), "task"), "r1/fan1-1");
+    assert_eq!(h.world.merges().len(), merges);
     assert_eq!(text(&group(&mut h, "fan1"), "winner"), "fan1-1");
+}
+
+#[test]
+fn a_restart_records_the_winner_whose_merge_was_recorded() {
+    let mut h = crashed_between_the_merge_and_the_winner();
+    h.restart(config(&["fast", "careful"])).unwrap();
+    let g = group(&mut h, "fan1");
+    assert_eq!(text(&g, "winner"), "fan1-1");
+    assert_eq!(text(&g, "status"), "decided");
+    assert_eq!(text(&g, "winner_verification"), "verified");
+    assert_eq!(count(&h, "winner_picked"), 1);
+    let err = pick(&mut h, "fan1", "fan1-4", true).unwrap_err();
+    assert!(err.message.contains("winner already"), "{}", err.message);
+    // and a second restart records nothing more
+    h.restart(config(&["fast", "careful"])).unwrap();
+    assert_eq!(count(&h, "winner_picked"), 1);
 }
 
 // ---- superseding and cleanup -------------------------------------------------------------------------
@@ -1313,7 +1622,7 @@ fn hostile_titles_summaries_and_paths_stay_inert_in_every_view() {
         vec![
             change(&format!("src/{hostile}.rs"), 1, 0),
             FileChange {
-                old_path: Some(format!("old/{hostile}")),
+                old_path: Some(format!("src/old/{hostile}")),
                 kind: ChangeKind::Renamed,
                 ..change("src/new.rs", 0, 0)
             },

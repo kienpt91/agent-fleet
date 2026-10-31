@@ -19,14 +19,61 @@ use fleet_domain::ids::{show, ApprovalId, GroupId, Sha, TaskId};
 use fleet_domain::sanitize::flatten_line;
 use fleet_domain::status::{CloseReason, GoalStatus};
 use fleet_domain::value::Value;
-use fleet_fanout::compare::EvidenceStatus;
+use fleet_fanout::compare::{EvidenceStatus, MemberFacts};
+use fleet_fanout::diff::ScopeState;
+use fleet_fanout::group::Group;
 use std::collections::BTreeSet;
+
+/// The statement of the evidence and the scope that an approval of a pick carries.
+fn evidence_line(f: &MemberFacts, flagged: bool) -> String {
+    let (status, why) = f.verification();
+    // the words an operator must not miss come first: long arguments are cut when listed
+    let mut line = match (status, flagged) {
+        (EvidenceStatus::Verified, false) => "evidence: verified".to_string(),
+        (EvidenceStatus::Verified, true) => {
+            "evidence: verified, picked with --allow-unverified".to_string()
+        }
+        (_, _) => "evidence: UNVERIFIED, picked with --allow-unverified".to_string(),
+    };
+    line.push_str(&format!(" ({})", flatten_line(&why, 160)));
+    line.push_str(&match f.scope_state() {
+        ScopeState::In => "; scope: inside the allowed paths".to_string(),
+        ScopeState::Unknown => {
+            format!(
+                "; scope: UNKNOWN ({})",
+                flatten_line(&f.scope_reason(), 160)
+            )
+        }
+        ScopeState::Out => "; scope: OUTSIDE the allowed paths".to_string(),
+    });
+    line
+}
+
+/// The word recorded with the winner: how its evidence and its scope stood.
+fn pick_word(f: &MemberFacts) -> String {
+    match (f.verification().0, f.scope_state()) {
+        (EvidenceStatus::Verified, ScopeState::In) => "verified",
+        (EvidenceStatus::Verified, _) => "verified, scope unknown",
+        _ => "unverified",
+    }
+    .to_string()
+}
 
 fn short(sha: &Sha) -> &str {
     sha.as_str().get(..12).unwrap_or(sha.as_str())
 }
 
 impl Orchestrator {
+    /// The member of `g` whose task was merged already, with its merge commit.
+    fn merged_member(&self, g: &Group) -> Option<(TaskId, Sha)> {
+        let run = self.state.run(&g.run).ok()?;
+        g.members.iter().find_map(|m| {
+            run.task(&m.task)
+                .and_then(|t| t.merged.clone())
+                .map(|sha| (m.task.clone(), sha))
+        })
+    }
+
     pub(crate) fn group_pick(
         &mut self,
         group: &GroupId,
@@ -43,7 +90,7 @@ impl Orchestrator {
                 show(group.as_str())
             )));
         }
-        let (repo, base, branch, reviewed, merged) = {
+        let (repo, base, branch, reviewed) = {
             let run = self.state.run(&key.0)?;
             let task = run
                 .task(&key.1)
@@ -53,16 +100,23 @@ impl Orchestrator {
                 run.base_sha.clone(),
                 task.branch.clone(),
                 task.head.clone(),
-                task.merged.clone(),
             )
         };
 
-        // A merge that happened before the pick could be recorded (the daemon stopped in between):
-        // finish the pick on that merge, nothing is merged twice.
-        if let (Some(sha), true) = (merged.clone(), g.winner.is_none()) {
-            g.check_pick(&key.1)?;
-            let word = self.pick_verification(&g, &key, &repo, &base)?.0;
-            return self.record_pick(group, &key, sha, word, remove_others, &branch);
+        // A merge that happened before its pick could be recorded (the daemon stopped in between)
+        // is finished, never repeated, and no other member is merged on top of it.
+        if g.winner.is_none() {
+            if let Some((merged, sha)) = self.merged_member(&g) {
+                if merged != key.1 {
+                    return Err(FleetError::conflict(format!(
+                        "member {merged} of group {} was merged already and its pick was not recorded; run `fleet pick {} {merged}` to record it: no other member is merged on top of it",
+                        g.id, g.id
+                    )));
+                }
+                g.check_pick(&key.1)?;
+                let facts = self.pick_facts(&g, &key, &repo, &base)?;
+                return self.record_pick(group, &key, sha, &facts, remove_others, &branch);
+            }
         }
 
         g.check_pick(&key.1)?;
@@ -80,32 +134,42 @@ impl Orchestrator {
                 short(&reviewed)
             )));
         }
-        let (word, why) = self.pick_verification(&g, &key, &repo, &base)?;
-        let status = match word.as_str() {
-            "verified" => EvidenceStatus::Verified,
-            "failed" => EvidenceStatus::Failed,
-            _ => EvidenceStatus::Unverified,
-        };
+        let facts = self.pick_facts(&g, &key, &repo, &base)?;
+        let (status, why) = facts.verification();
+        let scope = facts.scope_state();
         match status {
             EvidenceStatus::Failed => {
                 return Err(FleetError::conflict(format!(
                     "{reference} cannot be picked: {why}"
                 )))
             }
-            EvidenceStatus::Unverified if !allow_unverified => {
+            EvidenceStatus::Unverified if facts.has_contract => {
                 return Err(FleetError::conflict(format!(
-                    "{reference} has unverified evidence ({why}); pick it only with --allow-unverified, which the approval will state"
+                    "{reference} has no passing evidence for its commit ({why}); a verification contract guards it, so --allow-unverified cannot help: run `fleet verify {}/{}` first",
+                    key.0, key.1
                 )))
             }
             _ => {}
         }
-        let evidence_line = match status {
-            EvidenceStatus::Verified => format!("evidence: verified ({})", flatten_line(&why, 200)),
-            _ => format!(
-                "evidence: UNVERIFIED, picked with --allow-unverified ({})",
-                flatten_line(&why, 200)
-            ),
-        };
+        if scope == ScopeState::Out {
+            return Err(FleetError::conflict(format!(
+                "{reference} cannot be picked: {}",
+                facts.scope_reason()
+            )));
+        }
+        let needs_flag = status == EvidenceStatus::Unverified || scope == ScopeState::Unknown;
+        if needs_flag && !allow_unverified {
+            let what = if status == EvidenceStatus::Unverified {
+                format!("unverified evidence ({why})")
+            } else {
+                format!("a scope that is not known ({})", facts.scope_reason())
+            };
+            return Err(FleetError::conflict(format!(
+                "{reference} has {what}; pick it only with --allow-unverified, which the approval will state"
+            )));
+        }
+        let evidence_line = evidence_line(&facts, needs_flag);
+        let word = pick_word(&facts);
         let group_id = g.id.to_string();
         let action = move |integration: &str, branch: &str, head: &Sha| Action {
             tool: "git".to_string(),
@@ -134,60 +198,41 @@ impl Orchestrator {
                 return Err(FleetError::new(
                     ErrorCode::ApprovalRequired,
                     format!(
-                        "picking {reference} for group {} needs approval {subject} (digest {prefix}; the evidence is {}); approve it with `fleet approve {subject}` and run `fleet pick {} {reference}` again",
-                        g.id,
-                        if status == EvidenceStatus::Verified {
-                            "verified"
-                        } else {
-                            "UNVERIFIED"
-                        },
-                        g.id
+                        "picking {reference} for group {} needs approval {subject} (digest {prefix}; the evidence is {word}); approve it with `fleet approve {subject}` and run `fleet pick {} {reference}` again",
+                        g.id, g.id
                     ),
                 )
                 .with_subject(subject));
             }
             Err(e) => return Err(e),
         };
-        self.record_pick(group, &key, merged.sha, word, remove_others, &branch)
+        self.record_pick(group, &key, merged.sha, &facts, remove_others, &branch)
     }
 
-    /// How the evidence of a member stands for its recorded commit and tree: the word recorded with
-    /// the pick (`verified`, `unverified` or `failed`) and why.
-    fn pick_verification(
-        &mut self,
-        g: &fleet_fanout::group::Group,
-        key: &Key,
-        repo: &str,
-        base: &Sha,
-    ) -> Result<(String, String)> {
+    /// The facts of one member: how its evidence and its scope stand for its recorded commit and tree.
+    fn pick_facts(&mut self, g: &Group, key: &Key, repo: &str, base: &Sha) -> Result<MemberFacts> {
         let Some(member) = g.member(&key.1).cloned() else {
             return Err(FleetError::not_found("not a member of the group"));
         };
-        let facts = self.facts_of(g, &member, repo, base)?;
-        let (status, why) = facts.verification();
-        Ok((status.as_str().to_string(), why))
+        self.facts_of(g, &member, repo, base)
     }
 
     /// Records the winner (the merge is done), supersedes the others and, when asked, removes
-    /// their worktrees and branches now.
+    /// their worktrees and branches now. A cleanup that fails is a warning: the pick stands.
     fn record_pick(
         &mut self,
         group: &GroupId,
         key: &Key,
         merge_sha: Sha,
-        verification: String,
+        facts: &MemberFacts,
         remove_others: bool,
         branch: &str,
     ) -> Result<Reply> {
-        let word = if verification == "verified" {
-            "verified"
-        } else {
-            "unverified"
-        };
+        let word = pick_word(facts);
         let event = self
             .fanout
             .groups
-            .pick_event(group, &key.1, merge_sha.clone(), word)?;
+            .pick_event(group, &key.1, merge_sha.clone(), &word)?;
         let superseded: Vec<TaskId> = match &event {
             DomainEvent::WinnerPicked { superseded, .. } => superseded.clone(),
             _ => Vec::new(),
@@ -200,10 +245,17 @@ impl Orchestrator {
                 .iter()
                 .map(|t| (key.0.clone(), t.clone()))
                 .collect();
-            if let Reply::Data(v) = self.cleanup_filtered(Some(&key.0), true, Some(&keys))? {
-                if let Some(list) = v.get("removed").and_then(Value::as_array) {
-                    removed.extend(list.iter().cloned());
+            match self.cleanup_filtered(Some(&key.0), true, Some(&keys)) {
+                Ok(Reply::Data(v)) => {
+                    if let Some(list) = v.get("removed").and_then(Value::as_array) {
+                        removed.extend(list.iter().cloned());
+                    }
                 }
+                Ok(_) => {}
+                Err(e) => self.warn(format!(
+                    "group {group}: the pick is recorded, but removing the others failed: {}",
+                    e.message
+                )),
             }
         }
         Ok(data(
@@ -222,6 +274,43 @@ impl Orchestrator {
                 ("removed", Value::array(removed)),
             ],
         ))
+    }
+
+    /// A merge whose pick was not recorded (the daemon stopped between the two): the winner is
+    /// recorded now, once, for the member that was merged.
+    pub(crate) fn record_unrecorded_picks(&mut self) {
+        let groups: Vec<Group> = self
+            .fanout
+            .groups
+            .iter()
+            .filter(|g| g.winner.is_none() && g.closed.is_none())
+            .cloned()
+            .collect();
+        for g in groups {
+            let Some((task, sha)) = self.merged_member(&g) else {
+                continue;
+            };
+            if g.check_pick(&task).is_err() {
+                continue;
+            }
+            let key: Key = (g.run.clone(), task.clone());
+            let (repo, base) = match self.state.run(&g.run) {
+                Ok(r) => (r.repo.clone(), r.base_sha.clone()),
+                Err(_) => continue,
+            };
+            let word = match self.pick_facts(&g, &key, &repo, &base) {
+                Ok(f) => pick_word(&f),
+                Err(_) => "unverified".to_string(),
+            };
+            let recorded = self
+                .fanout
+                .groups
+                .pick_event(&g.id, &task, sha, &word)
+                .and_then(|e| self.commit(vec![e]));
+            if let Err(e) = recorded {
+                self.warn(format!("group {}: {}", g.id, e.message));
+            }
+        }
     }
 
     /// The group events that follow from `events` (which were applied already): a member whose

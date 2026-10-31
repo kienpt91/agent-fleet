@@ -69,6 +69,8 @@ struct Inner {
     now_ms: u64,
     events: Vec<StoredEvent>,
     fail_append: bool,
+    /// Appends that still succeed before the store starts failing (a crash between two commits).
+    appends_left: Option<usize>,
     published: Vec<StoredEvent>,
 
     base_sha: Option<Sha>,
@@ -179,7 +181,14 @@ impl World {
         self.lock().published.clone()
     }
     pub fn fail_appends(&self, fail: bool) {
-        self.lock().fail_append = fail;
+        let mut g = self.lock();
+        g.fail_append = fail;
+        g.appends_left = None;
+    }
+    /// Lets `n` more appends succeed, then makes every append fail until `fail_appends(false)`:
+    /// the daemon dying between two commits of one use case.
+    pub fn fail_appends_after(&self, n: usize) {
+        self.lock().appends_left = Some(n);
     }
 
     // ---- vcs ----
@@ -504,6 +513,14 @@ pub struct MemoryEventStore(World);
 impl EventStore for MemoryEventStore {
     fn append(&mut self, ts_ms: u64, events: &[DomainEvent]) -> Result<u64> {
         let mut g = self.0.lock();
+        if let Some(left) = g.appends_left {
+            if left == 0 {
+                g.fail_append = true;
+                g.appends_left = None;
+            } else {
+                g.appends_left = Some(left - 1);
+            }
+        }
         if g.fail_append {
             return Err(FleetError::internal("the store is unavailable"));
         }

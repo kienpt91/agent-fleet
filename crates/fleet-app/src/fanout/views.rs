@@ -9,7 +9,7 @@ use fleet_domain::fleet::FleetState;
 use fleet_domain::sanitize::flatten_line;
 use fleet_domain::value::Value;
 use fleet_fanout::compare::{Comparison, EvidenceStatus, MemberReport, Overlap};
-use fleet_fanout::diff::{DiffStat, ScopeReport};
+use fleet_fanout::diff::{DiffStat, ScopeReport, ScopeState};
 use fleet_fanout::group::{Group, MemberState};
 use fleet_fanout::rank::{Criterion, RankRule};
 
@@ -252,8 +252,10 @@ fn member_value(m: &MemberReport) -> Value {
         (
             "scope",
             Value::object([
-                ("in_scope", Value::Bool(m.in_scope)),
-                ("unknown", Value::Bool(f.scope_unknown)),
+                ("in_scope", Value::Bool(m.scope == ScopeState::In)),
+                ("state", Value::str(m.scope.as_str())),
+                ("unknown", Value::Bool(m.scope == ScopeState::Unknown)),
+                ("reason", flat(&f.scope_reason())),
                 ("checks", Value::array(f.scopes.iter().map(scope_value))),
             ]),
         ),

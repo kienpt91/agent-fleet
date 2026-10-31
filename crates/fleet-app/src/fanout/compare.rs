@@ -108,6 +108,7 @@ impl Orchestrator {
             .collect();
         let mut checks = Vec::new();
         let mut scopes = Vec::new();
+        let mut has_scope_check = false;
         let mut scope_unknown = false;
         for goal in &goals {
             let Some(attached) = &goal.contract else {
@@ -143,13 +144,19 @@ impl Orchestrator {
                     summary: newest.map(|e| e.summary().to_string()).unwrap_or_default(),
                 });
                 if let CheckKind::DiffOnly { allow } = &check.kind {
+                    has_scope_check |= check.mandatory;
                     match &touched {
-                        Some(paths) => scopes.push(scope_report(
-                            check.id.as_str(),
-                            check.mandatory,
-                            allow,
-                            paths,
-                        )),
+                        Some(paths) => {
+                            scopes.push(scope_report(
+                                check.id.as_str(),
+                                check.mandatory,
+                                allow,
+                                paths,
+                            ));
+                            // the paths of a diff that was listed only in part were not all judged
+                            scope_unknown |=
+                                check.mandatory && diff.as_ref().is_some_and(|d| d.truncated);
+                        }
                         None => scope_unknown |= check.mandatory,
                     }
                 }
@@ -179,6 +186,7 @@ impl Orchestrator {
             has_contract: !goals.is_empty(),
             checks,
             scopes,
+            has_scope_check,
             scope_unknown,
             summary: task.summary.clone(),
             failure: task.failure.clone(),

@@ -996,7 +996,7 @@ DOCKER_NET=none run 'scripts/neo-demo.sh /target/release/fleet'   # the NEO N1 d
 DOCKER_NET=none run 'scripts/fanout-demo.sh /target/release/fleet'   # the fan-out demo
 ```
 
-Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/fleet-app`, `crates/fleet-infra`,
+Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/fleet-fanout`, `crates/fleet-app`, `crates/fleet-infra`,
 `crates/fleet-cli`, `docs/`, `examples/`, `scripts/`, `docker/`.
 
 ## Fan out one prompt to several agents and compare
@@ -1012,8 +1012,15 @@ whose formula is printed. The criteria and their order come from `[compare] rank
 ranking. `fleet pick <group> <task>` is the only way a member's work reaches the integration branch: it asks for the normal
 merge approval, bound to the digest of the exact action (group, branch, commit and the evidence statement), and after the merge
 the other members are `superseded`; their worktrees and branches stay until `fleet cleanup [--branches]` (or `--remove-others`).
-Unverified evidence is picked only with `--allow-unverified` and the approval then says `UNVERIFIED`; failed evidence is never
-overridable; a branch that moved after review is refused; `fleet merge` of a member is refused in favour of `fleet pick`.
+`--allow-unverified` is the one opt-in for what fleet could not check: it applies to a member that no contract guards
+(unverified evidence) and to a member whose **scope is not known** (no mandatory `diff` check in its contract, or a diff
+that was listed only in part, over 500 files); the approval then says `UNVERIFIED` and/or `scope: UNKNOWN`. A member that a
+contract guards but that has no passing evidence is refused whatever the flag (`fleet verify` it first); failed evidence and
+a path outside the allowed paths are never overridable; a branch that moved after review is refused; a merge that was
+recorded without its pick (a stop in between) is recorded at the next start and no other member is then merged on top
+of it; `fleet merge` of a member, also of a loser whose group was forgotten, is refused in favour of `fleet pick`, and so
+is a task that depends on a member other than the winner. The size used by the `diff` criterion counts a binary file as 100
+lines and a mode or type change as 10, so a change cannot be made to look small by writing it as binary files.
 The dashboard (`#/groups`) and the terminal dashboard (`g`) only show; `group.fanout` and `group.pick` are not on the web
 allowlist. See [ADR 17](docs/adr/0017-fan-out-groups-compare-and-pick.md).
 

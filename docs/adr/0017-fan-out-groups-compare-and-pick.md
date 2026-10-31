@@ -21,14 +21,15 @@ The ranking of members is a temptation to automate the choice.
   read from the ledger for exactly that commit **and** tree; scope is the touched paths (both ends of a rename) judged
   against the allow globs of the contract's `diff` checks. What the worker wrote (its summary) is shown, flattened and
   quoted, and is not an input of anything derived.
+- **Scope is three-valued.** `in_scope` needs a mandatory `diff` check over every touched path; no such check, an unreadable diff or one listed only in part (more than 500 files) is `unknown`, which ranks between inside and outside and needs the same opt-in as unverified evidence to pick. A path outside is outside even in a partial list.
 - **The ranking is advisory and has no hidden inputs.** It is an ordered list of named criteria (default: completed,
   verified, in-scope, diff, time), then task id; `[compare] rank` in `fleet.toml` (validated strictly) or `--rank` reorders it; the formula and each member's deciding criterion
   are printed. Nothing acts on it.
 - **A pick is a merge.** `fleet pick` requests the normal merge approval, bound to the digest of an action that carries
   the group and the evidence statement (`UNVERIFIED ... --allow-unverified` when it is). The branch must still point at the
-  commit review recorded; failed evidence is never overridden; unverified evidence needs the flag. After the merge the
+  commit review recorded; failed evidence is never overridden; evidence that is missing needs the flag when no contract guards the member (a guarded member needs `fleet verify` first), and so does a scope that is not known. After the merge the
   other members are `superseded`; their worktrees and branches stay until `fleet cleanup [--branches]` or `--remove-others`.
-  A plain `fleet merge` of a member is refused, so the pick is the only way a group's result is merged. Pick needs every
+  A plain `fleet merge` of a member is refused, also after its group was forgotten (superseded members are remembered) and a task cannot depend on a member that is not the winner, so the pick is the only way a group's result is merged. A merge recorded without its pick (a stop between the two commits) is finished at the next start; no other member is picked while one is merged. Pick needs every
   member to have ended (cancel or stop the others first).
 - **Read only elsewhere.** The dashboard (`/api/groups`, `/api/group`, `/api/group/compare`, text nodes only) and the
   terminal dashboard (`g`) show groups and comparisons; `group.fanout` and `group.pick` are not on the web allowlist.
@@ -36,4 +37,4 @@ The ranking of members is a temptation to automate the choice.
 ## Consequences
 Contractless groups are `unverified` throughout and can only be picked with `--allow-unverified`. The group's goal is
 verified only if every member passed and is abandoned when the group is resolved. Diffs of 16 members cost 16 cached git
-calls on the daemon's thread. Not done: a fan-out into several runs, automatic picking, ranking weights.
+calls on the daemon's thread. Not done: a fan-out into several runs, automatic picking, ranking weights. Known and accepted: `fleet cleanup --branches` deletes superseded branches (unmerged on purpose) without a further confirmation, the explicit flag being the confirmation; ties fall to the task id as text (`fan1-10` before `fan1-2`); on replay a pick is accepted only for a completed member of a finished group.

@@ -244,6 +244,7 @@ impl Orchestrator {
     }
 
     fn add_tasks(&mut self, run: &RunId, tasks: Vec<NewTask>, schema: &str) -> Result<Reply> {
+        self.refuse_group_dependencies(run, &tasks)?;
         let (ids, events) = self.state.add_tasks(run, tasks)?;
         self.commit(events)?;
         self.promote()?;
@@ -257,6 +258,24 @@ impl Orchestrator {
                 ),
             ],
         ))
+    }
+
+    /// A task that depends on a fan-out member would get that member's branch merged into its own, and
+    /// then reach the integration branch around the pick: only the winner may be built on.
+    fn refuse_group_dependencies(&self, run: &RunId, tasks: &[NewTask]) -> Result<()> {
+        for dep in tasks.iter().flat_map(|t| &t.deps) {
+            let winner = self
+                .fanout
+                .groups
+                .group_of(run, dep)
+                .is_some_and(|g| g.winner.as_ref() == Some(dep));
+            if self.fanout.groups.was_member(run, dep) && !winner {
+                return Err(FleetError::conflict(format!(
+                    "task {dep} is a member of a fan-out group and is not its winner: build on the winner after `fleet pick`"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn load_plan(
@@ -277,6 +296,7 @@ impl Orchestrator {
                 ))
             }
             (Some(r), None) => {
+                self.refuse_group_dependencies(&r, &tasks)?;
                 // Validate the tasks against the run before changing anything.
                 self.state.add_tasks(&r, tasks.clone())?;
                 r
@@ -467,6 +487,12 @@ impl Orchestrator {
                 g.id,
                 g.id,
                 key.1
+            )));
+        }
+        if self.fanout.groups.was_member(&key.0, &key.1) {
+            return Err(FleetError::conflict(format!(
+                "{} was superseded in a fan-out group: its work was left out on purpose and is not merged by `fleet merge`",
+                qualified(&key.0, &key.1)
             )));
         }
         let merged = self.merge_task(&key, None)?;

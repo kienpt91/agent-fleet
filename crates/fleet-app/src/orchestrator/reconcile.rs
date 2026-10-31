@@ -34,6 +34,8 @@ impl Orchestrator {
         if let Err(e) = self.commit(groups) {
             self.warn(e.message);
         }
+        // A merge whose pick the stopped daemon did not record: record it, so no other member is merged.
+        self.record_unrecorded_picks();
         Ok(())
     }
 

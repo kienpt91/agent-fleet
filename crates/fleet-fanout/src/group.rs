@@ -27,6 +27,8 @@ pub const MIN_MEMBERS: usize = 2;
 pub const MAX_MEMBERS: usize = 16;
 /// Groups kept in memory; closed ones make room for new ones, oldest first.
 pub const MAX_GROUPS: usize = 64;
+/// Superseded members remembered after their group was forgotten.
+pub const MAX_RETIRED: usize = 4096;
 /// Longest accepted group title (the member titles add the worker's name).
 pub const MAX_GROUP_TITLE: usize = 150;
 
@@ -242,7 +244,14 @@ impl Group {
                 verification,
                 ..
             } => {
-                if self.winner.is_some() || self.closed.is_some() || self.member(task).is_none() {
+                // only what the live pick allows: a finished group, and a member whose task completed
+                if self.winner.is_some()
+                    || self.closed.is_some()
+                    || self.status() != GroupStatus::Finished
+                    || self
+                        .member(task)
+                        .is_none_or(|m| m.state != MemberState::Completed)
+                {
                     return;
                 }
                 for m in &mut self.members {
@@ -289,6 +298,9 @@ pub struct Groups {
     /// Group ids in the order they were created.
     order: Vec<GroupId>,
     by_task: BTreeMap<(RunId, TaskId), GroupId>,
+    /// Superseded members of groups that were forgotten: their work was left out on purpose, so they
+    /// stay refused as merges and as dependencies.
+    retired: BTreeSet<(RunId, TaskId)>,
     /// Groups created so far, pruned ones included: generated ids never repeat.
     created: u64,
 }
@@ -342,10 +354,18 @@ impl Groups {
 
     fn room(&self) -> bool {
         self.groups.len() < MAX_GROUPS
-            || self
-                .groups
-                .values()
-                .any(|g| g.closed == Some(CloseReason::Resolved))
+            || (self.retired.len() + MAX_MEMBERS <= MAX_RETIRED
+                && self
+                    .groups
+                    .values()
+                    .any(|g| g.closed == Some(CloseReason::Resolved)))
+    }
+
+    /// The task is, or was, a member of a fan-out group: its work reaches the integration branch only
+    /// through that group's pick, also after the group was forgotten.
+    pub fn was_member(&self, run: &RunId, task: &TaskId) -> bool {
+        let key = (run.clone(), task.clone());
+        self.by_task.contains_key(&key) || self.retired.contains(&key)
     }
 
     // ---- commands --------------------------------------------------------------------------
@@ -543,7 +563,9 @@ impl Groups {
                 if !fresh {
                     return;
                 }
-                if self.groups.len() >= MAX_GROUPS && !self.prune_one() {
+                if self.groups.len() >= MAX_GROUPS
+                    && (self.retired.len() + MAX_MEMBERS > MAX_RETIRED || !self.prune_one())
+                {
                     return;
                 }
                 self.created = self.created.saturating_add(1);
@@ -613,6 +635,9 @@ impl Groups {
         if let Some(g) = self.groups.remove(&victim) {
             for m in &g.members {
                 self.by_task.remove(&(g.run.clone(), m.task.clone()));
+                if m.state == MemberState::Superseded {
+                    self.retired.insert((g.run.clone(), m.task.clone()));
+                }
             }
         }
         self.order.retain(|id| *id != victim);
@@ -1034,6 +1059,79 @@ mod tests {
         assert!(d.reconcile(&still).is_empty());
         let gone = Ended(BTreeMap::new(), BTreeSet::new());
         assert_eq!(d.reconcile(&gone).len(), 1);
+    }
+
+    #[test]
+    fn replay_ignores_a_winner_that_could_not_have_been_picked() {
+        let pick = |t: &str| DomainEvent::WinnerPicked {
+            group: gid("fan1"),
+            task: tid(t),
+            merge_sha: sha('a'),
+            verification: "verified".into(),
+            superseded: vec![],
+        };
+        let mut g = registry("fan1", &["a", "b"]);
+        // nobody finished: a forged pick of a running member does nothing
+        g.apply(2, &pick("a"));
+        assert!(g.get(&gid("fan1")).unwrap().winner.is_none());
+        settle(&mut g, 3, &[completed("a")], &none());
+        g.apply(4, &pick("a"));
+        assert!(
+            g.get(&gid("fan1")).unwrap().winner.is_none(),
+            "b has not ended"
+        );
+        settle(&mut g, 5, &[failed("b")], &none());
+        g.apply(6, &pick("b"));
+        assert!(g.get(&gid("fan1")).unwrap().winner.is_none(), "b failed");
+        g.apply(7, &pick("a"));
+        assert_eq!(g.get(&gid("fan1")).unwrap().winner, Some(tid("a")));
+    }
+
+    #[test]
+    fn a_superseded_member_stays_a_member_after_its_group_was_forgotten() {
+        let mut g = Groups::new();
+        for i in 0..MAX_GROUPS {
+            let (a, b) = (format!("a{i}"), format!("b{i}"));
+            let (_, ev) = g
+                .create(new_group(&format!("g{i}"), &[a.as_str(), b.as_str()]))
+                .unwrap();
+            g.apply(i as u64, &ev);
+        }
+        for t in ["a0", "b0"] {
+            g.apply(
+                1_000,
+                &DomainEvent::MemberFinished {
+                    group: gid("g0"),
+                    task: tid(t),
+                    outcome: MemberOutcome::Completed,
+                },
+            );
+        }
+        let pick = g
+            .pick_event(&gid("g0"), &tid("a0"), sha('a'), "verified")
+            .unwrap();
+        g.apply(1_001, &pick);
+        g.apply(
+            1_002,
+            &DomainEvent::GroupClosed {
+                group: gid("g0"),
+                reason: CloseReason::Resolved,
+            },
+        );
+        assert!(g.was_member(&run(), &tid("b0")));
+        let (_, ev) = g.create(new_group("extra", &["x", "y"])).unwrap();
+        g.apply(1_003, &ev);
+        assert!(g.find(&gid("g0")).is_none(), "the group was forgotten");
+        assert!(g.group_of(&run(), &tid("b0")).is_none());
+        assert!(
+            g.was_member(&run(), &tid("b0")),
+            "the loser is still refused as a merge"
+        );
+        assert!(
+            !g.was_member(&run(), &tid("a0")),
+            "the winner is merged and free"
+        );
+        assert!(!g.was_member(&run(), &tid("nobody")));
     }
 
     #[test]

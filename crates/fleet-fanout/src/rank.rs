@@ -6,6 +6,7 @@
 //! member: there are no weights, no scores and nothing that is not shown. The result is a
 //! suggestion for a person; nothing in fleet acts on it.
 
+use crate::diff::ScopeState;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::ids::{show, TaskId};
 
@@ -59,10 +60,10 @@ impl Criterion {
                 "members whose mandatory checks all passed in fleet's own run for the branch's current commit and tree before those that did not"
             }
             Criterion::InScope => {
-                "members that touched no path outside the allow globs of the contract's mandatory diff checks before those that did"
+                "members whose paths are known to be inside the allow globs of the contract's mandatory diff checks, then those whose scope is not known (no such check, or the diff could not be read in full), then those that touched a path outside"
             }
             Criterion::SmallerDiff => {
-                "smaller diff (lines inserted plus deleted) first; unknown size last"
+                "smaller diff first (lines inserted plus deleted, a binary file counts 100, a mode or type change 10); unknown size last"
             }
             Criterion::ShorterTime => {
                 "shorter time from first dispatch to the end first; unknown time last"
@@ -169,7 +170,7 @@ pub struct RankInput {
     pub task: TaskId,
     pub completed: bool,
     pub verified: bool,
-    pub in_scope: bool,
+    pub scope: ScopeState,
     /// Lines inserted plus deleted; `None` when the diff could not be read.
     pub diff_size: Option<u64>,
     pub duration_ms: Option<u64>,
@@ -190,7 +191,11 @@ fn key_of(c: Criterion, i: &RankInput) -> u64 {
     match c {
         Criterion::Completed => yes_first(i.completed),
         Criterion::Verified => yes_first(i.verified),
-        Criterion::InScope => yes_first(i.in_scope),
+        Criterion::InScope => match i.scope {
+            ScopeState::In => 0,
+            ScopeState::Unknown => 1,
+            ScopeState::Out => 2,
+        },
         Criterion::SmallerDiff => i.diff_size.unwrap_or(u64::MAX),
         Criterion::ShorterTime => i.duration_ms.unwrap_or(u64::MAX),
         Criterion::FewerAttempts => u64::from(i.attempts),
@@ -241,7 +246,7 @@ mod tests {
             task: tid(task),
             completed: true,
             verified: true,
-            in_scope: true,
+            scope: ScopeState::In,
             diff_size: Some(10),
             duration_ms: Some(1_000),
             attempts: 1,
@@ -272,7 +277,11 @@ mod tests {
                 task: tid(&format!("m{i:02}")),
                 completed: rng.next(4) != 0,
                 verified: rng.next(2) == 0,
-                in_scope: rng.next(3) != 0,
+                scope: match rng.next(3) {
+                    0 => ScopeState::Out,
+                    1 => ScopeState::Unknown,
+                    _ => ScopeState::In,
+                },
                 diff_size: if rng.next(5) == 0 {
                     None
                 } else {
@@ -383,6 +392,21 @@ mod tests {
             ranked[2].decided_by,
             DecidedBy::Criterion(Criterion::Verified)
         );
+    }
+
+    #[test]
+    fn a_scope_that_is_not_known_ranks_between_inside_and_outside() {
+        let rule = RankRule::parse(&["in-scope"]).unwrap();
+        let with = |t: &str, scope| RankInput { scope, ..input(t) };
+        let got = order(
+            &rule,
+            &[
+                with("a", ScopeState::Out),
+                with("b", ScopeState::Unknown),
+                with("c", ScopeState::In),
+            ],
+        );
+        assert_eq!(got, ["c", "b", "a"]);
     }
 
     #[test]
@@ -526,7 +550,10 @@ mod tests {
                 .iter()
                 .map(|i| RankInput {
                     completed: !i.completed,
-                    in_scope: !i.in_scope,
+                    scope: match i.scope {
+                        ScopeState::In => ScopeState::Out,
+                        _ => ScopeState::In,
+                    },
                     duration_ms: Some(rng.next(1_000)),
                     attempts: rng.next(9) as u32,
                     ..i.clone()
@@ -548,7 +575,7 @@ mod tests {
             let mut better = inputs.clone();
             better[target].verified = true;
             better[target].completed = true;
-            better[target].in_scope = true;
+            better[target].scope = ScopeState::In;
             let after = rank(&rule, &better);
             let pos = |r: &[Ranked], t: &TaskId| r.iter().find(|x| &x.task == t).unwrap().position;
             let t = &inputs[target].task;

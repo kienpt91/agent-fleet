@@ -226,7 +226,11 @@ fn scope_lines(m: &Value, out: &mut String) {
     let scope = m.get("scope").cloned().unwrap_or(Value::Null);
     let checks = items(&scope, "checks");
     if flag(&scope, "unknown") {
-        out.push_str("  scope: not known (the diff could not be read)\n");
+        let _ = writeln!(
+            out,
+            "  scope: NOT KNOWN - {}",
+            truncate_reason(&text(&scope, "reason"))
+        );
     }
     for c in checks {
         let outside = items(c, "outside");
