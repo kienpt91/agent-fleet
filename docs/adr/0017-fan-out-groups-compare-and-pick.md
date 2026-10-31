@@ -22,7 +22,7 @@ The ranking of members is a temptation to automate the choice.
   against the allow globs of the contract's `diff` checks. What the worker wrote (its summary) is shown, flattened and
   quoted, and is not an input of anything derived.
 - **The ranking is advisory and has no hidden inputs.** It is an ordered list of named criteria (default: completed,
-  verified, in-scope, diff, time), then task id; `--rank` reorders it; the formula and each member's deciding criterion
+  verified, in-scope, diff, time), then task id; `[compare] rank` in `fleet.toml` (validated strictly) or `--rank` reorders it; the formula and each member's deciding criterion
   are printed. Nothing acts on it.
 - **A pick is a merge.** `fleet pick` requests the normal merge approval, bound to the digest of an action that carries
   the group and the evidence statement (`UNVERIFIED ... --allow-unverified` when it is). The branch must still point at the

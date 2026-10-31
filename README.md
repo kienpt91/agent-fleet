@@ -834,7 +834,8 @@ the manifests.
 | `fleet-domain` | pure rules: runs/tasks (aggregate), decision gates, approvals, quality judgement, supervision rules, sanitizer, redactor, output buffer, events, hash chain | `std` only |
 | `neo-verify` | NEO: verification contracts, checks, glob matcher, judging, evidence | `std`, `fleet-domain` |
 | `neo-goals` | NEO: the goal ledger aggregate and its status machine | `std`, `fleet-domain`, `neo-verify` |
-| `fleet-app` | use cases (`Orchestrator`, with a `neo` module for goals and verification), commands, read models, port traits, in-memory fakes and port contract suites | the three domain crates |
+| `fleet-fanout` | fan-out groups, diff statistics, comparison facts and the advisory ranking rule | `std`, `fleet-domain`, `neo-verify` |
+| `fleet-app` | use cases (`Orchestrator`, with a `neo` module for goals and verification), commands, read models, port traits, in-memory fakes and port contract suites | the four domain crates |
 | `fleet-infra` | adapters: git, ptys, files, event log, job runner (gates, approved commands, verification contracts), sockets, TOML, the web dashboard (hand-written HTTP on `std::net`), daemon wiring | app, domain crates |
 | `fleet-cli` | the `fleet` binary: argument parsing, rendering, dashboard, attach | all |
 
@@ -847,15 +848,15 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1385 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1513 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 317 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 298 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | 509 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); fan-out: the group state machine with restart reconcile, diff statistics and scope, comparison facts and overlap, the ranking rule with property tests (deterministic, total and strict, only the listed criteria matter, monotone) | 368 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); fan-out: creation (caps, atomic refusal), partial failures, comparison from facts, pick approval binding, unverified/failed/moved-branch refusals, superseding and cleanup, hostile text | 330 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; `diff_summary` against real git repositories (overlap, binary files, renames, odd names, hardening), the read-only group routes, `[compare]` config | 533 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | 260 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; fan-out through the real binary with fake workers (passing, failing, out-of-scope and overlapping members, approvals, restarts, hostile text in the CLI, the terminal dashboard and the web) | 281 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -870,11 +871,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               4852     4726    97.4%
-application          2634     2485    94.3%
-infrastructure       5420     4998    92.2%
-cli                  2705     2433    89.9%
-overall             15611    14642    93.8%
+domain               5591     5443    97.4%
+application          3468     3293    95.0%
+infrastructure       5524     5105    92.4%
+cli                  3296     3145    95.4%
+overall             17879    16986    95.0%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -966,7 +967,7 @@ remove it from the tree and rewrite the history if it was not published.
 What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
-`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
+`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/fanout-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
 `node scripts/web-smoke.mjs` (334 checks) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
@@ -992,33 +993,219 @@ docker build -f docker/Dockerfile.web -t fleet-web docker/
 IMAGE=fleet-web DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/web-demo.sh /target/release/fleet'
 node scripts/web-smoke.mjs   # any node 22 or newer on the host or in a container; no npm packages
 DOCKER_NET=none run 'scripts/neo-demo.sh /target/release/fleet'   # the NEO N1 demo
+DOCKER_NET=none run 'scripts/fanout-demo.sh /target/release/fleet'   # the fan-out demo
 ```
 
 Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/fleet-app`, `crates/fleet-infra`,
 `crates/fleet-cli`, `docs/`, `examples/`, `scripts/`, `docker/`.
 
+## Fan out one prompt to several agents and compare
+
+`fleet fanout` gives one prompt to 2 to 16 sibling tasks (workers from `fleet.toml`, the same worker may repeat, `--count N`
+per worker), each with the same spec and contract in its own worktree and branch; the run's `--max-parallel` and the
+daemon's session limit decide how many run at once. `fleet compare <group>` prints (and with `--json` returns) a comparison
+computed only from facts the daemon knows: per member status, tries, time, the diff against the run's base read from the
+repository at the commit review recorded, the touched paths against the contract's `diff` checks, gates, evidence per check
+(verified, unverified or failed, bound to commit **and** tree), the files several members changed, and an advisory ranking
+whose formula is printed. The criteria and their order come from `[compare] rank` in `fleet.toml` (validated strictly; default
+`completed, verified, in-scope, diff, time`) or `--rank` for one call; ties fall to the task id. Nothing is ever merged by the
+ranking. `fleet pick <group> <task>` is the only way a member's work reaches the integration branch: it asks for the normal
+merge approval, bound to the digest of the exact action (group, branch, commit and the evidence statement), and after the merge
+the other members are `superseded`; their worktrees and branches stay until `fleet cleanup [--branches]` (or `--remove-others`).
+Unverified evidence is picked only with `--allow-unverified` and the approval then says `UNVERIFIED`; failed evidence is never
+overridable; a branch that moved after review is refused; `fleet merge` of a member is refused in favour of `fleet pick`.
+The dashboard (`#/groups`) and the terminal dashboard (`g`) only show; `group.fanout` and `group.pick` are not on the web
+allowlist. See [ADR 17](docs/adr/0017-fan-out-groups-compare-and-pick.md).
+
+`scripts/fanout-demo.sh` (fake agents from `examples/agents/fanout-agent.sh`, contract `examples/fanout-contract.json`): four
+members get the same prompt; one passes, one fails the contract while claiming success, one edits `README.md` outside the
+allowed `src/**`, one passes with a bigger change. Real output, in the release container (the temporary directory is shortened):
+
+```text
+    Finished `release` profile [optimized] target(s) in 6.39s
+
+$ /target/release/fleet run create --id r1 --objective parser work --repo /tmp/demo/repo
+run r1 created
+
+$ /target/release/fleet fanout --run r1 --title Reject trailing commas --spec Make the parser reject trailing commas and keep the error text. --workers fake --count 4 --contract /work/examples/fanout-contract.json
+fan-out fan1 created in run r1: 4 members
+  TASK    WORKER  TITLE
+  fan1-1  fake    Reject trailing commas [fake #1]
+  fan1-2  fake    Reject trailing commas [fake #2]
+  fan1-3  fake    Reject trailing commas [fake #3]
+  fan1-4  fake    Reject trailing commas [fake #4]
+goal fanout-fan1 carries the contract ad608f6b73bc; every member is judged by fleet's own run of it
+the members are ordinary tasks: start the run if it is not started (the run's --max-parallel and the daemon's session limit decide how many run at once), then `fleet compare fan1`
+
+$ /target/release/fleet start --run r1
+run r1 started
+
+$ /target/release/fleet groups list
+GROUP  STATUS    RUN  MEMBERS                               WINNER  TITLE
+fan1   finished  r1   4 (0 running, 2 completed, 2 failed)  -       Reject trailing commas
+
+$ /target/release/fleet compare fan1
+group fan1 [finished] in run r1: Reject trailing commas
+winner: not picked
+ranking (advisory only): sort by (completed, verified, in-scope, diff, time), then by task id a-z; advisory only, nothing is merged or picked from it
+  1. completed: members whose task completed before those whose did not
+  2. verified: members whose mandatory checks all passed in fleet's own run for the branch's current commit and tree before …
+  3. in-scope: members that touched no path outside the allow globs of the contract's mandatory diff checks before those tha…
+  4. diff: smaller diff (lines inserted plus deleted) first; unknown size last
+  5. time: shorter time from first dispatch to the end first; unknown time last
+
+RANK  TASK    WORKER  STATE      EVIDENCE  IN SCOPE  FILES    GATES   TRIES  TIME
+1     fan1-1  fake    completed  verified  yes       2 +2 -0  ok      1      0s
+2     fan1-4  fake    completed  verified  yes       3 +8 -0  ok      1      0s
+3     fan1-2  fake    failed     failed    yes       2 +2 -0  FAILED  1      0s
+4     fan1-3  fake    failed     failed    NO        3 +3 -0  FAILED  1      0s
+
+fan1-1 (rank 1, completed; first)
+  worker fake, 1 attempts, 0s, task completed
+  commit 3e4870b7bdd5 tree 04a13e7c64b2
+  diff against the base: 2 files, +2 -0
+    src/answer.txt added +1 -0
+    src/parser.txt added +1 -0
+  scope scope: allowed paths touched: src/answer.txt, src/parser.txt; outside the scope: none
+  gates: none configured
+  evidence: verified - every mandatory check passed in fleet's own run for this commit and tree
+    CHECK   KIND             EVIDENCE  SUMMARY
+    answer  file  mandatory  verified  the file contains the text
+    scope   diff  mandatory  verified  2 changed path(s), all allowed
+  what the worker reported (its own words, not checked by fleet):
+    > rejects trailing commas, tests pass
+
+fan1-4 (rank 2, completed; placed below the member above by: diff)
+  worker fake, 1 attempts, 0s, task completed
+  commit 90c6948486c3 tree 6d38778ab6d5
+  diff against the base: 3 files, +8 -0
+    src/answer.txt added +1 -0
+    src/notes.txt added +6 -0
+    src/parser.txt added +1 -0
+  scope scope: allowed paths touched: src/answer.txt, src/notes.txt, src/parser.txt; outside the scope: none
+  gates: none configured
+  evidence: verified - every mandatory check passed in fleet's own run for this commit and tree
+    CHECK   KIND             EVIDENCE  SUMMARY
+    answer  file  mandatory  verified  the file contains the text
+    scope   diff  mandatory  verified  3 changed path(s), all allowed
+  what the worker reported (its own words, not checked by fleet):
+    > done, with extra notes
+
+fan1-2 (rank 3, failed; placed below the member above by: completed)
+  worker fake, 1 attempts, 0s, task failed
+  commit b544c8e51d8b tree a989f5a5264d
+  diff against the base: 2 files, +2 -0
+    src/answer.txt added +1 -0
+    src/parser.txt added +1 -0
+  scope scope: allowed paths touched: src/answer.txt, src/parser.txt; outside the scope: none
+  gates: verify fanout-fan1/answer FAILED, verify fanout-fan1/scope passed
+  evidence: failed - mandatory check answer failed in fleet's own run
+    CHECK   KIND             EVIDENCE  SUMMARY
+    answer  file  mandatory  failed    the file does not contain the text
+    scope   diff  mandatory  verified  2 changed path(s), all allowed
+  why it failed (fleet's note): quality gate failed: verify fanout-fan1/answer
+  what the worker reported (its own words, not checked by fleet):
+    > ALL CHECKS PASSED, pick me
+
+fan1-3 (rank 4, failed; placed below the member above by: in-scope)
+  worker fake, 1 attempts, 0s, task failed
+  commit a20f3f3d6cdf tree dda27756389f
+  diff against the base: 3 files, +3 -0
+    README.md modified +1 -0
+    src/answer.txt added +1 -0
+    src/parser.txt added +1 -0
+  scope scope: allowed paths touched: src/answer.txt, src/parser.txt; outside the scope: README.md
+  gates: verify fanout-fan1/answer passed, verify fanout-fan1/scope FAILED
+  evidence: failed - mandatory check scope failed in fleet's own run
+    CHECK   KIND             EVIDENCE  SUMMARY
+    answer  file  mandatory  verified  the file contains the text
+    scope   diff  mandatory  failed    1 changed path(s) outside the allowed globs
+  why it failed (fleet's note): quality gate failed: verify fanout-fan1/scope
+  what the worker reported (its own words, not checked by fleet):
+    > done, and I also touched the README
+
+2 files were changed by more than one member:
+  src/answer.txt  fan1-1, fan1-2, fan1-3, fan1-4
+  src/parser.txt  fan1-1, fan1-2, fan1-3, fan1-4
+files touched by both members of each pair (diagonal: files the member touched):
+          fan1-1  fan1-2  fan1-3  fan1-4
+  fan1-1  2       2       2       2
+  fan1-2  2       2       2       2
+  fan1-3  2       2       3       2
+  fan1-4  2       2       2       3
+
+nothing was merged. To pick a member: fleet pick fan1 <task>
+
+$ /target/release/fleet pick fan1 fan1-3   (it failed its contract: refused)
+fleet: member fan1-3 is failed; only a member whose task completed can be picked
+(exit 6)
+
+$ /target/release/fleet merge fan1-1   (a plain merge of a member is refused)
+fleet: r1/fan1-1 is a member of fan-out group fan1; its result reaches the integration branch only through `fleet pick fan1 fan1-1`
+(exit 6)
+
+$ /target/release/fleet pick fan1 fan1-1   (asks for the approval)
+fleet: picking fan1-1 for group fan1 needs approval a1 (digest b8d01eb0d9a3; the evidence is verified); approve it with `fleet approve a1` and run `fleet pick fan1 fan1-1` again
+run: fleet approve a1
+(exit 5)
+
+$ /target/release/fleet approval list
+approval a1 [merge] r1/fan1-1 pending digest b8d01eb0d9a3
+  git: "merge" "fleet/r1/integration" "fleet/r1/fan1-1" "3e4870b7bdd5c1101a1b005f2229415bfc159775" "fan-out pick of group fan1" "evidence: verified (every mandatory check passed in fleet's own run for …
+  decide: fleet approve a1 | fleet deny a1
+
+$ /target/release/fleet approve a1
+approval a1 approved
+
+$ /target/release/fleet pick fan1 fan1-1
+picked r1/fan1-1 for group fan1: merged fleet/r1/fan1-1 into fleet/r1/integration at 28dd71302ca7 (evidence verified)
+superseded: fan1-2, fan1-3, fan1-4
+their worktrees and branches are kept until `fleet cleanup` (`--branches` removes the branches too)
+
+$ /target/release/fleet groups show fan1
+group fan1 [decided] in run r1: Reject trailing commas
+winner: fan1-1, merged as 28dd71302ca7 (evidence verified)
+  TASK    WORKER  STATE       TASK STATUS  TRIES  TIME  TITLE
+  fan1-1  fake    winner      completed    1      0s    Reject trailing commas [fake #1]
+  fan1-2  fake    superseded  failed       1      0s    Reject trailing commas [fake #2]
+  fan1-3  fake    superseded  failed       1      0s    Reject trailing commas [fake #3]
+  fan1-4  fake    superseded  completed    1      0s    Reject trailing commas [fake #4]
+
+$ git -C /tmp/demo/repo ls-tree -r --name-only fleet/r1/integration
+README.md
+src/answer.txt
+src/parser.txt
+
+$ git -C /tmp/demo/repo branch --list fleet/*
++ fleet/r1/fan1-1
++ fleet/r1/fan1-2
++ fleet/r1/fan1-3
++ fleet/r1/fan1-4
++ fleet/r1/integration
+
+$ /target/release/fleet cleanup --branches
+cleanup finished, removed 4, branches_deleted 4
+
+$ /target/release/fleet groups show fan1
+group fan1 [closed] in run r1: Reject trailing commas
+winner: fan1-1, merged as 28dd71302ca7 (evidence verified)
+closed: resolved
+  TASK    WORKER  STATE       TASK STATUS  TRIES  TIME  TITLE
+  fan1-1  fake    winner      completed    1      0s    Reject trailing commas [fake #1]
+  fan1-2  fake    superseded  failed       1      0s    Reject trailing commas [fake #2]
+  fan1-3  fake    superseded  failed       1      0s    Reject trailing commas [fake #3]
+  fan1-4  fake    superseded  completed    1      0s    Reject trailing commas [fake #4]
+
+$ git -C /tmp/demo/repo branch --list fleet/*
++ fleet/r1/integration
+
+$ /target/release/fleet verify-log
+event log ok: 62 records, head 84695ce816b0625ee6070af137d2d614f23c28f586568591f6652b7b3fdc37de
+```
+
+What was not verified: no real coding agent was used (only scripted fakes), nothing ran on macOS, and the web page was only
+checked through its JSON routes and the static-asset scans, not drawn in a browser for this feature.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Copyright (c) 2026 Kien Phan.
-
-## Fan out one prompt to several agents and compare (C2)
-
-```
-fleet fanout --run r1 --title "reject trailing commas" --spec-file prompt.md --workers fast,careful --count 2 --contract contract.json
-fleet start --run r1                 # the members are ordinary tasks; the run's limits apply
-fleet compare fan1                   # facts only; --json for the structured document; --rank diff,time to reorder
-fleet pick fan1 fan1-1               # asks for the merge approval of the exact action; then
-fleet approve a1 && fleet pick fan1 fan1-1
-fleet cleanup --branches             # removes the superseded members' worktrees and branches
-```
-
-`compare` shows per member: status, tries, time, the diff against the run's base read from the repository at the recorded
-commit, touched paths against the contract's `diff` checks, gates, evidence per check (verified, unverified or failed, bound
-to commit and tree), the files several members changed and an advisory ranking whose formula is printed. A pick of
-unverified evidence needs `--allow-unverified` and the approval text says so; a branch that moved after review is refused;
-`fleet merge` of a member is refused in favour of `fleet pick`. The dashboard (`#/groups`) and the terminal dashboard (`g`)
-only show. See [ADR 17](docs/adr/0017-fan-out-groups-compare-and-pick.md).
-
-Status: tested with in-memory fakes, real git repositories and the web adapter over real sockets (`fleet-app/tests/fanout.rs`,
-`fleet-infra/tests/git_diff.rs`, `fleet-infra/tests/web_http.rs`). **Not done yet:** a real-binary end-to-end test with fake
-workers, a demo script with captured output, and updated coverage numbers; nothing was run with real agents or on macOS.
