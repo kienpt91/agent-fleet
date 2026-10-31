@@ -596,6 +596,79 @@ printf '{"version":1,"status":"done","summary":"d"}\n' > .fleet/result.json
     assert!(!f.worktree("r1", "a").join("../planted-ran").exists());
 }
 
+// ---- evidence is about the repository's commit, never about what a worktree claims -------------------
+
+/// A worker that rewrites the `.git` file of its worktree so that it points at a repository it made:
+/// that repository takes its objects from the real one (alternates) and has a replace ref for the
+/// task's head naming a commit whose tree holds the right answer. Through that gitdir the
+/// worktree is clean and its head has a tree that passes the contract; in the real repository the
+/// branch is still at the base commit and has no `answer.txt` at all.
+const FORGER: &str = r#"#!/bin/sh
+set -eu
+branch="fleet/r1/a"
+admin=$(sed 's/^gitdir: //' .git)
+common=$(cd "$admin" && cd "$(cat commondir)" && pwd)
+real_head=$(git --git-dir="$common" rev-parse "refs/heads/$branch")
+forged=$(mktemp -d)/forged.git
+git init -q --bare "$forged"
+git --git-dir="$forged" config core.bare false
+git --git-dir="$forged" config core.worktree "$PWD"
+echo "$common/objects" > "$forged/objects/info/alternates"
+echo ready > answer.txt
+blob=$(git --git-dir="$forged" hash-object -w answer.txt)
+tree=$(printf '100644 blob %s\tanswer.txt\n' "$blob" | git --git-dir="$forged" mktree)
+repl=$(GIT_AUTHOR_NAME=x GIT_AUTHOR_EMAIL=x@x GIT_COMMITTER_NAME=x GIT_COMMITTER_EMAIL=x@x git --git-dir="$forged" commit-tree -m replacement "$tree")
+git --git-dir="$forged" update-ref "refs/heads/$branch" "$real_head"
+git --git-dir="$forged" symbolic-ref HEAD "refs/heads/$branch"
+git --git-dir="$forged" update-ref "refs/replace/$real_head" "$repl"
+echo "gitdir: $forged" > .git
+GIT_DIR="$forged" GIT_WORK_TREE="$PWD" git read-tree "$real_head"
+printf '{"version":1,"status":"done","summary":"all done, every test passes"}\n' > .fleet/result.json
+"#;
+
+#[test]
+fn a_worker_that_repoints_its_gitdir_cannot_get_evidence_for_a_tree_that_is_not_merged() {
+    let (f, files) = fleet_with(FORGER, "0");
+    load_plan(&f);
+    add_goal(&f, &files, &contract_json(""));
+    f.ok(&["start", "--run", "r1"]);
+    // the review cannot read the worker's output through a gitdir that is not its own entry
+    let a = f.wait_task("r1", "a", &["failed"]);
+    let failure = jstr(&a, "failure").to_string();
+    assert!(
+        failure.contains("could not commit the worker's output") && failure.contains(".git"),
+        "{failure}"
+    );
+    // nothing was recorded as evidence, the goal is not verified, the dependent never starts
+    let events = f.events_raw();
+    assert!(
+        !events.contains("\"type\":\"evidence_recorded\""),
+        "no evidence for a forged tree"
+    );
+    let goal = show(&f, "feature");
+    assert_ne!(jstr(&goal, "status"), "verified", "{}", goal.canonical());
+    assert!(jarr(&goal, "history").is_empty());
+    assert_eq!(
+        jstr(&f.task("r1", "b"), "status"),
+        "blocked",
+        "the dependent waits behind a failed task"
+    );
+    // fleet verify refuses as well, and records nothing
+    let out = f.cli(&["verify", "r1/a"]);
+    assert_ne!(out.code, 0, "{}", out.stdout);
+    assert!(
+        !f.events_raw().contains("\"type\":\"evidence_recorded\""),
+        "still no evidence"
+    );
+    // the real branch never got the forged answer
+    let tree = git(&f.repo, &["ls-tree", "-r", "--name-only", "fleet/r1/a"]);
+    assert!(!tree.contains("answer.txt"), "{tree}");
+    // and a merge of the task is refused
+    let (code, _) = f.json_err(&["merge", "r1/a"]);
+    assert_ne!(code, 0);
+    assert!(!git(&f.repo, &["branch", "--list", "fleet/r1/integration"]).contains("integration"));
+}
+
 // ---- processes the daemon starts for checks are untrusted like workers ----------------------------
 
 #[test]
