@@ -36,7 +36,7 @@ impl Orchestrator {
         rank: Option<&[String]>,
     ) -> Result<Reply> {
         let rule = match rank {
-            None => RankRule::default(),
+            None => self.cfg.compare_rank.clone(),
             Some(names) => {
                 let names: Vec<&str> = names.iter().map(String::as_str).collect();
                 RankRule::parse(&names)?

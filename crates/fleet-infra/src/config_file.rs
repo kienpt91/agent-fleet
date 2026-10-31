@@ -48,6 +48,14 @@ struct FileConfig {
     redact: RedactSection,
     workers: BTreeMap<String, WorkerSection>,
     gates: Vec<GateSection>,
+    compare: CompareSection,
+}
+
+/// `[compare]`: how `fleet compare` orders fan-out members unless asked otherwise.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct CompareSection {
+    rank: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -205,6 +213,12 @@ fn parse_config(text: &str, parent_env: Vec<(String, String)>) -> Result<LoadedC
 
 fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<LoadedConfig> {
     let mut app = AppConfig::new(parent_env.clone());
+
+    if let Some(names) = &file.compare.rank {
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        app.compare_rank = fleet_fanout::rank::RankRule::parse(&names)
+            .map_err(|e| invalid(format!("compare.rank: {}", e.message)))?;
+    }
 
     let d = file.daemon;
     if let Some(n) = d.max_sessions {
@@ -613,6 +627,33 @@ mod tests {
         let missing = load_spec(&dir.join("nope\u{1b}.md")).unwrap_err();
         assert_eq!(missing.code, ErrorCode::NotFound);
         assert!(!missing.message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn the_ranking_criteria_are_configurable_and_validated_strictly() {
+        let default = parse("").unwrap().app.compare_rank;
+        assert_eq!(default, fleet_fanout::rank::RankRule::default());
+        let set = parse("[compare]\nrank = [\"diff\", \"verified\"]")
+            .unwrap()
+            .app
+            .compare_rank;
+        assert_eq!(set.formula(), "sort by (diff, verified), then by task id a-z; advisory only, nothing is merged or picked from it");
+        for bad in [
+            "[compare]\nrank = []",
+            "[compare]\nrank = [\"luck\"]",
+            "[compare]\nrank = [\"diff\", \"diff\"]",
+            "[compare]\nrank = \"diff\"",
+            "[compare]\nrank = [1]",
+            "[compare]\nweights = [1]",
+            "[compare]\nrank = [\"diff\"]\nauto_pick = true",
+        ] {
+            let err = parse(bad)
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {bad}"));
+            assert_eq!(err.code, ErrorCode::Invalid, "{bad}");
+        }
+        let err = parse("[compare]\nrank = [\"luck\"]").err().unwrap();
+        assert!(err.message.contains("compare.rank"), "{}", err.message);
     }
 
     fn env(items: &[(&str, &str)]) -> Vec<(String, String)> {

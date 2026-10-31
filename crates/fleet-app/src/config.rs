@@ -59,6 +59,8 @@ pub struct AppConfig {
     pub gates: Vec<GateDef>,
     /// Silence after which a question file makes the supervisor stop the worker.
     pub question_grace_ms: u64,
+    /// The criteria `fleet compare` ranks fan-out members by when the request names none.
+    pub compare_rank: fleet_fanout::rank::RankRule,
 }
 
 impl AppConfig {
@@ -81,6 +83,7 @@ impl AppConfig {
             workers: BTreeMap::new(),
             gates: Vec::new(),
             question_grace_ms: 2000,
+            compare_rank: fleet_fanout::rank::RankRule::default(),
         }
     }
 

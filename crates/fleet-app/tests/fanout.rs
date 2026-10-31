@@ -813,6 +813,36 @@ fn the_order_of_the_criteria_can_be_chosen_and_is_shown() {
 }
 
 #[test]
+fn the_configured_ranking_is_the_default_and_a_request_overrides_it() {
+    let mut cfg = config(&["fast", "careful"]);
+    cfg.compare_rank = fleet_fanout::rank::RankRule::parse(&["diff"]).unwrap();
+    let mut h = harness_with(cfg, 8);
+    h.world.set_verify_mode(VerifyMode::Manual);
+    fanout(&mut h, &["fast", "careful"], 2, Some(contract())).unwrap();
+    start(&mut h);
+    for (t, c, n) in [
+        ("fan1-1", '1', 10),
+        ("fan1-2", '2', 1),
+        ("fan1-3", '3', 5),
+        ("fan1-4", '4', 7),
+    ] {
+        work(&h, t, c, vec![change("src/parse.rs", n, 0)]);
+        finish(&mut h, t, "done");
+        verified_run(&mut h, t, &[]);
+    }
+    let cmp = compare(&mut h, "fan1");
+    assert_eq!(order(&cmp), ["fan1-2", "fan1-3", "fan1-4", "fan1-1"]);
+    assert!(text(field(&cmp, "ranking"), "formula").starts_with("sort by (diff),"));
+    let own = h
+        .call(
+            "group.compare",
+            obj(vec![("group", s("fan1")), ("rank", list(&["attempts"]))]),
+        )
+        .unwrap();
+    assert_eq!(order(own.data()), ["fan1-1", "fan1-2", "fan1-3", "fan1-4"]);
+}
+
+#[test]
 fn a_diff_that_cannot_be_read_is_reported_not_guessed() {
     let mut h = four_ways();
     h.world.fail_diff(&sha('1'));
