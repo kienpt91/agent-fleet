@@ -7,8 +7,12 @@
 #![cfg_attr(
     test,
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
+
 pub mod api;
 pub mod config;
 pub mod orchestrator;
 pub mod ports;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod views;

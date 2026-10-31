@@ -19,5 +19,8 @@ testing = []
 [dependencies]
 fleet-domain = { path = "../fleet-domain" }
 
+[dev-dependencies]
+fleet-app = { path = ".", features = ["testing"] }
+
 [lints]
 workspace = true
