@@ -8,21 +8,22 @@
 use crate::args::Parsed;
 use crate::doctor::{self, DoctorInput};
 use crate::render;
+use crate::render_neo;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::show;
 use fleet_domain::limits::{MAX_ID_LEN, MAX_SPEC};
 use fleet_domain::value::Value;
 use fleet_infra::client::Client;
-use fleet_infra::config_file::load_plan;
+use fleet_infra::config_file::{load_contract, load_plan};
 use fleet_infra::daemon::{run_daemon, DaemonOptions};
 use fleet_infra::eventlog::verify_file;
 use fleet_infra::statedir::{resolve_state_dir, StateLayout};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Every subcommand, as typed. The help text must mention each (a test enforces it).
-pub const SUBCOMMANDS: [&str; 25] = [
+pub const SUBCOMMANDS: [&str; 32] = [
     "daemon",
     "run create",
     "task add",
@@ -48,6 +49,13 @@ pub const SUBCOMMANDS: [&str; 25] = [
     "tui",
     "doctor",
     "verify-log",
+    "goals add",
+    "goals attach",
+    "goals status",
+    "goals list",
+    "goals show",
+    "goals remaining",
+    "verify",
 ];
 
 pub const HELP: &str = "\
@@ -97,6 +105,21 @@ results:
   cleanup [--run <run>] [--branches] remove finished worktrees (and branches)
   undo <task> [--apply]              preview or revert the last worker changes (needs agent-undo)
 
+goals and verification (NEO):
+  goals add --title <text> [--id <id>] [--parent <goal>] [--intent <text>|-]
+            [--task <run>/<task>]... [--contract <file.json>]
+                                     add a goal to the ledger, optionally with its verification contract
+  goals attach <goal> --contract <file.json>
+                                     make a contract the acceptance criteria of a goal
+  goals status <goal> <open|in_progress|blocked|abandoned> [--reason <text>]
+                                     (verified is never set by hand: only recorded evidence does it)
+  goals list                         the goal tree with status, contract and task verification
+  goals show <goal>                  one goal: its checks, the newest evidence of each, the history
+  goals remaining                    open leaves, blockers and the tasks that can start next
+  verify <goal|task> [--task <run>/<task>] [--timeout <secs>]
+                                     run the contracts independently of the worker and record
+                                     evidence; exit 6 when a mandatory check did not pass
+
 dashboard:
   tui                                terminal dashboard
 
@@ -109,6 +132,9 @@ exit codes: 0 ok, 1 internal, 2 usage, 3 daemon down, 4 not found, 5 approval re
 const TAIL_CHUNK: u64 = 16 * 1024;
 const DEFAULT_TAIL_LINES: usize = 40;
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
+/// How often `fleet verify` asks whether the contracts finished, and how long it waits by default.
+const VERIFY_POLL: Duration = Duration::from_millis(100);
+const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 900;
 
 /// One request/reply exchange with the daemon.
 pub trait Caller {
@@ -143,6 +169,12 @@ pub enum View {
     Merge,
     Cleanup,
     Undo(bool),
+    GoalAdded,
+    GoalAttached,
+    GoalStatus,
+    GoalList,
+    GoalShow,
+    GoalRemaining,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -175,6 +207,23 @@ pub enum Command {
         task: String,
         follow: bool,
         lines: usize,
+    },
+    GoalAdd {
+        id: Option<String>,
+        parent: Option<String>,
+        title: String,
+        intent: Option<String>,
+        tasks: Vec<String>,
+        contract: Option<PathBuf>,
+    },
+    GoalAttach {
+        goal: String,
+        contract: PathBuf,
+    },
+    Verify {
+        target: String,
+        task: Option<String>,
+        timeout_secs: u64,
     },
     Request(Request),
 }
@@ -587,11 +636,102 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
             no_args(p)?;
             Command::VerifyLog
         }
+        "goals" => parse_goals(p, stdin)?,
+        "verify" => {
+            let task = p.opt("--task")?;
+            let timeout = opt_uint(&mut p, "--timeout")?;
+            if timeout == Some(0) {
+                return Err(FleetError::usage("option --timeout must be at least 1"));
+            }
+            Command::Verify {
+                target: one_arg(p, "<goal|task>")?,
+                task,
+                timeout_secs: timeout.unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS),
+            }
+        }
         other => {
             return Err(FleetError::usage(format!(
                 "unknown command {}",
                 show(other)
             )))
+        }
+    })
+}
+
+fn parse_goals(mut p: Parsed, stdin: &mut dyn Read) -> Result<Command> {
+    let sub = p.take_word();
+    Ok(match sub.as_deref() {
+        Some("add") => {
+            let title = required(&mut p, "--title")?;
+            let id = p.opt("--id")?;
+            let parent = p.opt("--parent")?;
+            let intent = p
+                .opt("--intent")?
+                .map(|i| read_spec(i, stdin))
+                .transpose()?;
+            let tasks = p.multi("--task")?;
+            let contract = p.opt("--contract")?.map(PathBuf::from);
+            no_args(p)?;
+            Command::GoalAdd {
+                id,
+                parent,
+                title,
+                intent,
+                tasks,
+                contract,
+            }
+        }
+        Some("attach") => {
+            let contract = required(&mut p, "--contract")?;
+            Command::GoalAttach {
+                goal: one_arg(p, "<goal>")?,
+                contract: PathBuf::from(contract),
+            }
+        }
+        Some("status") => {
+            let reason = p.opt("--reason")?;
+            let mut words = p.finish()?.into_iter();
+            let goal = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing <goal>"))?;
+            let status = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing status"))?;
+            if let Some(extra) = words.next() {
+                return Err(FleetError::usage(format!(
+                    "unexpected argument {}",
+                    show(&extra)
+                )));
+            }
+            request(
+                "goal.status",
+                obj(vec![
+                    ("goal", st(goal)),
+                    ("status", st(status)),
+                    ("reason", reason.and_then(st)),
+                ]),
+                View::GoalStatus,
+            )
+        }
+        Some("list") => {
+            no_args(p)?;
+            request("goal.list", obj(vec![]), View::GoalList)
+        }
+        Some("show") => request(
+            "goal.show",
+            obj(vec![("goal", st(one_arg(p, "<goal>")?))]),
+            View::GoalShow,
+        ),
+        Some("remaining") => {
+            no_args(p)?;
+            request("goal.remaining", obj(vec![]), View::GoalRemaining)
+        }
+        other => {
+            return Err(subcommand_error(
+                "goals",
+                other,
+                "add, attach, status, list, show or remaining",
+            ))
         }
     })
 }
@@ -653,6 +793,12 @@ fn render_view(view: &View, data: &Value) -> String {
         View::Merge => render::render_merge(data),
         View::Cleanup => render::render_cleanup(data),
         View::Undo(apply) => render::render_undo(data, *apply),
+        View::GoalAdded => render_neo::render_goal_added(data),
+        View::GoalAttached => render_neo::render_goal_attached(data),
+        View::GoalStatus => render_neo::render_goal_status(data),
+        View::GoalList => render_neo::render_goal_list(data),
+        View::GoalShow => render_neo::render_goal_show(data),
+        View::GoalRemaining => render_neo::render_goal_remaining(data),
     }
 }
 
@@ -671,6 +817,58 @@ pub fn execute_request(
         render_view(&req.view, &data)
     };
     write_out(out, &text)
+}
+
+/// `fleet verify`: asks the daemon to run the contracts, waits until they finished (polling every
+/// `poll`, for at most `timeout`) and prints where they stand. The exit code is 0 when every
+/// contract passed and 6 (conflict: the work cannot be accepted) when one did not.
+pub fn execute_verify(
+    target: &str,
+    task: Option<&str>,
+    timeout: Duration,
+    caller: &mut dyn Caller,
+    json: bool,
+    out: &mut dyn Write,
+    poll: Duration,
+) -> Result<i32> {
+    let args = || {
+        obj(vec![
+            ("target", st(target.to_string())),
+            ("task", task.map(Value::str)),
+        ])
+    };
+    caller.call("verify", args())?;
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        let data = caller.call("verify.status", args())?;
+        if data.get("running").and_then(Value::as_bool) != Some(true) {
+            let text = if json {
+                json_line(&data)
+            } else {
+                render_neo::render_verify(&data)
+            };
+            write_out(out, &text)?;
+            let passed = data.get("passed").and_then(Value::as_bool) == Some(true);
+            return Ok(if passed {
+                0
+            } else {
+                ErrorCode::Conflict.exit_code()
+            });
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(FleetError::new(
+                ErrorCode::Timeout,
+                format!(
+                    "the verification did not finish within {} seconds; it keeps running in the \
+                     daemon (see `fleet goals show` for the evidence when it ends)",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        if !poll.is_zero() {
+            std::thread::sleep(poll);
+        }
+    }
 }
 
 /// The last `n` lines of `text`.
@@ -887,6 +1085,56 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
             out,
             FOLLOW_POLL,
         )?,
+        Command::GoalAdd {
+            id,
+            parent,
+            title,
+            intent,
+            tasks,
+            contract,
+        } => {
+            let contract = contract.map(|p| load_contract(&p)).transpose()?;
+            let req = Request {
+                cmd: "goal.add",
+                args: obj(vec![
+                    ("id", id.and_then(st)),
+                    ("parent", parent.and_then(st)),
+                    ("title", st(title)),
+                    ("intent", intent.and_then(st)),
+                    (
+                        "tasks",
+                        Some(Value::array(tasks.into_iter().map(Value::Str))),
+                    ),
+                    ("contract", contract),
+                ]),
+                view: View::GoalAdded,
+            };
+            execute_request(req, &mut connect(ctx)?, ctx.json, out)?;
+        }
+        Command::GoalAttach { goal, contract } => {
+            let contract = load_contract(&contract)?;
+            let req = Request {
+                cmd: "goal.attach",
+                args: obj(vec![("goal", st(goal)), ("contract", Some(contract))]),
+                view: View::GoalAttached,
+            };
+            execute_request(req, &mut connect(ctx)?, ctx.json, out)?;
+        }
+        Command::Verify {
+            target,
+            task,
+            timeout_secs,
+        } => {
+            return execute_verify(
+                &target,
+                task.as_deref(),
+                Duration::from_secs(timeout_secs),
+                &mut connect(ctx)?,
+                ctx.json,
+                out,
+                VERIFY_POLL,
+            )
+        }
         Command::Request(req) => execute_request(req, &mut connect(ctx)?, ctx.json, out)?,
     }
     Ok(0)
@@ -1637,6 +1885,330 @@ mod tests {
             f.calls[0].1,
             Value::object([("task", s("t1")), ("max", Value::int(TAIL_CHUNK))])
         );
+    }
+
+    #[test]
+    fn goals_commands_parse() {
+        assert_eq!(
+            parse_ok(&["goals", "list"]),
+            req("goal.list", vec![], View::GoalList)
+        );
+        assert_eq!(
+            parse_ok(&["goals", "remaining"]),
+            req("goal.remaining", vec![], View::GoalRemaining)
+        );
+        assert_eq!(
+            parse_ok(&["goals", "show", "ship"]),
+            req("goal.show", vec![("goal", s("ship"))], View::GoalShow)
+        );
+        assert_eq!(
+            parse_ok(&["goals", "status", "ship", "blocked", "--reason", "api key"]),
+            req(
+                "goal.status",
+                vec![
+                    ("goal", s("ship")),
+                    ("status", s("blocked")),
+                    ("reason", s("api key"))
+                ],
+                View::GoalStatus
+            )
+        );
+        assert_eq!(
+            parse_ok(&["goals", "status", "ship", "open"]),
+            req(
+                "goal.status",
+                vec![("goal", s("ship")), ("status", s("open"))],
+                View::GoalStatus
+            )
+        );
+        assert_eq!(
+            parse_ok(&[
+                "goals",
+                "add",
+                "--title",
+                "Ship",
+                "--id",
+                "ship",
+                "--parent",
+                "root",
+                "--intent",
+                "why",
+                "--task",
+                "r1/a",
+                "--task",
+                "r1/b",
+                "--contract",
+                "c.json"
+            ]),
+            Command::GoalAdd {
+                id: Some("ship".into()),
+                parent: Some("root".into()),
+                title: "Ship".into(),
+                intent: Some("why".into()),
+                tasks: vec!["r1/a".into(), "r1/b".into()],
+                contract: Some(PathBuf::from("c.json")),
+            }
+        );
+        assert_eq!(
+            parse_ok(&["goals", "add", "--title", "T"]),
+            Command::GoalAdd {
+                id: None,
+                parent: None,
+                title: "T".into(),
+                intent: None,
+                tasks: vec![],
+                contract: None,
+            }
+        );
+        assert_eq!(
+            parse_ok(&["goals", "attach", "ship", "--contract", "c.json"]),
+            Command::GoalAttach {
+                goal: "ship".into(),
+                contract: PathBuf::from("c.json")
+            }
+        );
+        let mut stdin = Cursor::new(b"intent from stdin".to_vec());
+        let cli = parse_cli(
+            &argv(&["goals", "add", "--title", "T", "--intent", "-"]),
+            &mut stdin,
+        )
+        .unwrap();
+        let Command::GoalAdd { intent, .. } = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(intent.as_deref(), Some("intent from stdin"));
+    }
+
+    #[test]
+    fn verify_parses_with_its_options() {
+        assert_eq!(
+            parse_ok(&["verify", "r1/a"]),
+            Command::Verify {
+                target: "r1/a".into(),
+                task: None,
+                timeout_secs: DEFAULT_VERIFY_TIMEOUT_SECS
+            }
+        );
+        assert_eq!(
+            parse_ok(&["verify", "ship", "--task", "r1/a", "--timeout", "30"]),
+            Command::Verify {
+                target: "ship".into(),
+                task: Some("r1/a".into()),
+                timeout_secs: 30
+            }
+        );
+    }
+
+    #[test]
+    fn goals_and_verify_usage_errors() {
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec!["goals"], "needs a subcommand"),
+            (vec!["goals", "frobnicate"], "unknown goals subcommand"),
+            (vec!["goals", "add"], "--title is required"),
+            (
+                vec!["goals", "add", "--title", "t", "extra"],
+                "unexpected argument",
+            ),
+            (vec!["goals", "attach", "g"], "--contract is required"),
+            (
+                vec!["goals", "attach", "--contract", "c.json"],
+                "missing <goal>",
+            ),
+            (vec!["goals", "status"], "missing <goal>"),
+            (vec!["goals", "status", "g"], "missing status"),
+            (
+                vec!["goals", "status", "g", "open", "x"],
+                "unexpected argument",
+            ),
+            (vec!["goals", "show"], "missing <goal>"),
+            (vec!["goals", "list", "x"], "unexpected argument"),
+            (vec!["goals", "remaining", "x"], "unexpected argument"),
+            (vec!["verify"], "missing <goal|task>"),
+            (vec!["verify", "a", "b"], "unexpected argument"),
+            (vec!["verify", "a", "--timeout", "0"], "at least 1"),
+            (vec!["verify", "a", "--timeout", "soon"], "whole number"),
+        ];
+        for (a, want) in cases {
+            let e = parse(&a).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Usage, "{a:?}");
+            assert!(e.message.contains(want), "{a:?}: {}", e.message);
+        }
+    }
+
+    fn verify_status(running: bool, passed: bool) -> Result<Value> {
+        Ok(Value::object([
+            ("schema", s("fleet.verify/1")),
+            ("target", s("r1/a")),
+            ("task", s("r1/a")),
+            (
+                "verification",
+                s(if passed { "verified" } else { "unverified" }),
+            ),
+            ("running", Value::Bool(running)),
+            ("passed", Value::Bool(passed)),
+            ("goals", Value::array([])),
+        ]))
+    }
+
+    fn run_verify(
+        replies: Vec<Result<Value>>,
+        json: bool,
+        timeout: Duration,
+    ) -> (Result<i32>, String, Fake) {
+        let mut f = Fake::new(replies);
+        let mut out = Vec::new();
+        let r = execute_verify(
+            "r1/a",
+            None,
+            timeout,
+            &mut f,
+            json,
+            &mut out,
+            Duration::ZERO,
+        );
+        (r, String::from_utf8(out).unwrap(), f)
+    }
+
+    #[test]
+    fn verify_waits_until_the_contracts_finished_then_reports_by_exit_code() {
+        let started = Ok(Value::object([("schema", s("fleet.verify.started/1"))]));
+        let (r, out, f) = run_verify(
+            vec![
+                started.clone(),
+                verify_status(true, false),
+                verify_status(true, false),
+                verify_status(false, true),
+            ],
+            false,
+            Duration::from_secs(5),
+        );
+        assert_eq!(r.unwrap(), 0);
+        assert!(out.starts_with("verification of r1/a: PASSED"), "{out}");
+        let names: Vec<&str> = f.calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            ["verify", "verify.status", "verify.status", "verify.status"]
+        );
+        assert_eq!(f.calls[0].1, Value::object([("target", s("r1/a"))]));
+        let (r, out, _) = run_verify(
+            vec![started.clone(), verify_status(false, false)],
+            false,
+            Duration::from_secs(5),
+        );
+        assert_eq!(r.unwrap(), 6, "a failed contract exits with 6");
+        assert!(out.contains("NOT PASSED"), "{out}");
+        let (r, out, _) = run_verify(
+            vec![started, verify_status(false, true)],
+            true,
+            Duration::from_secs(5),
+        );
+        assert_eq!(r.unwrap(), 0);
+        assert!(
+            out.starts_with("{\"goals\""),
+            "json mode prints the final document: {out}"
+        );
+        assert_eq!(out.lines().count(), 1);
+    }
+
+    #[test]
+    fn verify_times_out_while_the_daemon_keeps_working() {
+        let started = Ok(Value::object([("schema", s("fleet.verify.started/1"))]));
+        let (r, out, _) = run_verify(
+            vec![started, verify_status(true, false)],
+            false,
+            Duration::ZERO,
+        );
+        let e = r.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Timeout);
+        assert!(e.message.contains("keeps running"), "{}", e.message);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn verify_passes_errors_of_the_daemon_through() {
+        let (r, _, f) = run_verify(
+            vec![Err(FleetError::not_found("no goal names that task"))],
+            false,
+            Duration::from_secs(1),
+        );
+        assert_eq!(r.unwrap_err().code, ErrorCode::NotFound);
+        assert_eq!(f.calls.len(), 1);
+        let (r, _, _) = run_verify(
+            vec![Ok(Value::Null), Err(FleetError::internal("gone"))],
+            false,
+            Duration::from_secs(1),
+        );
+        assert_eq!(r.unwrap_err().code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn a_contract_file_problem_is_reported_before_the_daemon_is_asked() {
+        let dir = TempDir::new("goals-contract");
+        let state = dir.path().to_str().unwrap().to_string();
+        let missing = dir.join("nope.json").display().to_string();
+        for args in [
+            vec![
+                "--state-dir",
+                &state,
+                "goals",
+                "add",
+                "--title",
+                "t",
+                "--contract",
+                &missing,
+            ],
+            vec![
+                "--state-dir",
+                &state,
+                "goals",
+                "attach",
+                "g",
+                "--contract",
+                &missing,
+            ],
+        ] {
+            let (code, out, err) = run_args(&args);
+            assert_ne!(code, ErrorCode::DaemonDown.exit_code(), "{args:?}: {err}");
+            assert_eq!(out, "");
+            assert!(err.starts_with("fleet: "), "{err}");
+        }
+        let wrong = dir.write("c.toml", "x = 1");
+        let (code, _, err) = run_args(&[
+            "--state-dir",
+            &state,
+            "goals",
+            "add",
+            "--title",
+            "t",
+            "--contract",
+            wrong.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ErrorCode::Invalid.exit_code(), "{err}");
+        assert!(err.contains(".json"), "{err}");
+    }
+
+    #[test]
+    fn goals_requests_render_their_views() {
+        let mut f = Fake::new(vec![Ok(Value::object([
+            ("id", s("ship")),
+            ("status", s("open")),
+            ("contract_id", Value::Null),
+        ]))]);
+        let (r, out) = exec(
+            parse_ok(&["goals", "status", "ship", "open"]),
+            &mut f,
+            false,
+        );
+        r.unwrap();
+        assert_eq!(out, "goal ship is open\n");
+        let mut f = Fake::new(vec![Ok(Value::object([("goals", Value::array([]))]))]);
+        let (r, out) = exec(parse_ok(&["goals", "list"]), &mut f, false);
+        r.unwrap();
+        assert_eq!(out, "no goals\n");
+        let mut f = Fake::new(vec![Ok(Value::object([("goals", Value::array([]))]))]);
+        let (r, out) = exec(parse_ok(&["goals", "list"]), &mut f, true);
+        r.unwrap();
+        assert_eq!(out, "{\"goals\":[]}\n");
     }
 
     #[test]

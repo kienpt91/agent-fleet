@@ -397,6 +397,39 @@ pub fn load_plan(path: &Path) -> Result<Value> {
     })
 }
 
+/// Largest accepted contract file (the contract itself is capped lower by the domain).
+pub const MAX_CONTRACT_FILE_BYTES: u64 = 64 * 1024;
+
+/// Reads a verification contract file (`.json`) and returns its document for `goal.add` and
+/// `goal.attach`. Only the size, the file type and the JSON syntax are checked here; the schema
+/// is validated strictly by the application layer when the goal is added.
+pub fn load_contract(path: &Path) -> Result<Value> {
+    let is_json = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    if !is_json {
+        return Err(invalid(format!(
+            "{}: a contract file must end in .json",
+            shown_path(path)
+        )));
+    }
+    let bytes = read_regular(path, MAX_CONTRACT_FILE_BYTES)
+        .map_err(|e| read_error("the contract file", path, &e))?;
+    let doc = json::parse_value(
+        &bytes,
+        usize::try_from(MAX_CONTRACT_FILE_BYTES).unwrap_or(usize::MAX),
+    )
+    .map_err(|e| invalid(format!("{}: {e}", shown_path(path))))?;
+    if doc.as_object().is_none() {
+        return Err(invalid(format!(
+            "{}: a contract must be a JSON object",
+            shown_path(path)
+        )));
+    }
+    Ok(doc)
+}
+
 fn toml_to_value(v: &toml::Value, depth: usize) -> Result<Value> {
     if depth > MAX_PLAN_DEPTH {
         return Err(invalid("the plan is nested too deeply"));
@@ -513,6 +546,40 @@ fn plan_args(doc: &Value) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    #[test]
+    fn contract_files_are_read_with_the_same_care_as_plans() {
+        let dir = TempDir::new("contract-file");
+        let good = dir.write("c.json", "{\"version\": 1, \"checks\": []}");
+        let doc = load_contract(&good).unwrap();
+        assert_eq!(doc.get("version").and_then(Value::as_u64), Some(1));
+        let uppercase = dir.write("C.JSON", "{}");
+        assert!(load_contract(&uppercase).is_ok());
+        for (name, content) in [
+            ("a.toml", "x = 1"),
+            ("noext", "{}"),
+            ("array.json", "[]"),
+            ("broken.json", "{\"a\": "),
+            ("text.json", "\"x\""),
+        ] {
+            let p = dir.write(name, content);
+            let err = load_contract(&p).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Invalid, "{name}");
+        }
+        let big = dir.write(
+            "big.json",
+            &format!(
+                "{{\"pad\": \"{}\"}}",
+                "x".repeat(MAX_CONTRACT_FILE_BYTES as usize)
+            ),
+        );
+        assert!(load_contract(&big).is_err());
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert!(load_contract(&link).is_err(), "a symlink is refused");
+        let missing = load_contract(&dir.join("nope.json")).unwrap_err();
+        assert!(!missing.message.contains('\u{1b}'));
+    }
 
     fn env(items: &[(&str, &str)]) -> Vec<(String, String)> {
         items
