@@ -416,7 +416,7 @@ fn overlap_lines(o: &Value, out: &mut String) {
         .map(|t| clean(t.as_str().unwrap_or("")))
         .collect();
     if tasks.len() > 1 {
-        out.push_str("files touched by both members (diagonal: files touched by the member):\n");
+        out.push_str("files touched by both members of each pair (diagonal: files the member touched):\n");
         let header: Vec<&str> = std::iter::once("")
             .chain(tasks.iter().map(String::as_str))
             .collect();
