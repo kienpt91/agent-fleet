@@ -876,7 +876,10 @@ impl Orchestrator {
         let slot = match pending {
             Pending::Read { kind, repo } => match result {
                 Ok(answer) => {
-                    let value = answer.to_value();
+                    let mut value = answer.to_value();
+                    if let Value::Object(m) = &mut value {
+                        m.insert("repo".to_string(), Value::str(repo.full()));
+                    }
                     self.cache_put(kind, &repo, value.clone());
                     Slot::Done {
                         kind: kind.label(),

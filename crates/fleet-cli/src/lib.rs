@@ -12,6 +12,7 @@
 pub mod args;
 pub mod attach;
 pub mod commands;
+pub mod forge_cli;
 pub mod render;
 pub mod render_neo;
 pub mod tui;

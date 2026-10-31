@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Every subcommand, as typed. The help text must mention each (a test enforces it).
-pub const SUBCOMMANDS: [&str; 32] = [
+pub const SUBCOMMANDS: [&str; 40] = [
     "daemon",
     "run create",
     "task add",
@@ -58,6 +58,14 @@ pub const SUBCOMMANDS: [&str; 32] = [
     "goals show",
     "goals remaining",
     "verify",
+    "github status",
+    "issue list",
+    "issue show",
+    "issue to-task",
+    "pr list",
+    "pr show",
+    "pr status",
+    "pr create",
 ];
 
 pub const HELP: &str = "\
@@ -126,6 +134,20 @@ goals and verification (NEO):
   verify <goal|task> [--task <run>/<task>] [--timeout <secs>]
                                      run the contracts independently of the worker and record
                                      evidence; exit 6 when a mandatory check did not pass
+
+GitHub (off unless [github] enabled = true in fleet.toml; the daemon runs `gh`, you sign in with `gh auth login`):
+  github status                      what is configured, whether gh can run, the rate-limit state
+  issue list [--state open|closed|all] [--page N] [--limit N] [--run <run>]
+  issue show <number> [--run <run>]  title, labels, author, comments and the body (untrusted text, quoted)
+  issue to-task <number> [--run <run>] [--id <id>] [--after <task>]... [--worker <name>]
+                                     make a task of an issue; its text is quoted and labelled untrusted
+  pr list [--state open|closed|all] [--page N] [--limit N] [--run <run>]
+  pr show <number> [--run <run>]     one pull request
+  pr status <number> [--run <run>]   checks and reviews of its head commit
+  pr create --task <task> [--title <text>] [--body <text>|-] [--base <branch>] [--draft]
+                                     push the task's branch and open a pull request, after an approval
+                                     bound to repository, base, branch and commit, title, body and draft
+                                     flag (exit 5 names it); every command takes --timeout <secs>
 
 dashboard:
   tui                                terminal dashboard
@@ -246,6 +268,8 @@ pub enum Command {
         digest: Option<String>,
     },
     Request(Request),
+    /// `github`, `issue` and `pr`: the forge integration.
+    Forge(crate::forge_cli::ForgeCmd),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -671,6 +695,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                 timeout_secs: timeout.unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS),
             }
         }
+        "github" | "issue" | "pr" => Command::Forge(crate::forge_cli::parse(word, p, stdin)?),
         other => {
             return Err(FleetError::usage(format!(
                 "unknown command {}",
@@ -1237,6 +1262,13 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
             out,
         )?,
         Command::Request(req) => execute_request(req, &mut connect(ctx)?, ctx.json, out)?,
+        Command::Forge(cmd) => crate::forge_cli::execute(
+            &cmd,
+            &mut connect(ctx)?,
+            ctx.json,
+            out,
+            crate::forge_cli::POLL,
+        )?,
     }
     Ok(0)
 }
