@@ -319,7 +319,7 @@ finished, on a clean export of the committed work (not in the worktree): attempt
 
 ```text
 
-$ /target/release/fleet plan /tmp/tmp.un21Dsbx2r/plan.toml
+$ /target/release/fleet plan /tmp/tmp.9tP8sLZEbl/plan.toml
 plan loaded into run r1 (1 tasks)
 
 $ /target/release/fleet goals add --id feature --title The answer file says ready --intent answer.txt exists, says ready, and nothing else changed --task r1/answer --contract /work/examples/neo/contract.json
@@ -339,11 +339,11 @@ $ /target/release/fleet start --run r1
 run r1 started
 
 $ /target/release/fleet status
-daemon pid 20 | v0.1.0 | up 0s | sessions 0/2 | undo unavailable | rss 4000 kB
+daemon pid 96945 | v0.1.0 | up 0s | sessions 0/2 | undo unavailable | rss 3932 kB
 
 run r1 [finished] max-parallel 2
   objective  NEO demo
-  repo       /tmp/tmp.un21Dsbx2r/repo (base HEAD @ 9016d72c)
+  repo       /tmp/tmp.9tP8sLZEbl/repo (base HEAD @ 63ad81ed)
   branch     fleet/r1/integration
   tasks      pending 0, ready 0, running 0, review 0, completed 1, failed 0, blocked 0
   ID      STATUS     DEPS  TRY  WORKER  NOTE
@@ -379,12 +379,12 @@ checks (newest evidence of each):
     changes only answer.txt
 evidence history (newest first):
   EVIDENCE  CHECK   VERDICT  COMMIT        TASK    SUMMARY
-  e6        scope   passed   cfda8ce4158a  answer  1 changed path(s), all allowed
-  e5        tests   passed   cfda8ce4158a  answer  exit code 0
-  e4        answer  passed   cfda8ce4158a  answer  the file contains the text
-  e3        scope   passed   57493d9c8288  answer  1 changed path(s), all allowed
-  e2        tests   passed   57493d9c8288  answer  exit code 0
-  e1        answer  failed   57493d9c8288  answer  the file does not contain the text
+  e6        scope   passed   1a73a6409898  answer  1 changed path(s), all allowed
+  e5        tests   passed   1a73a6409898  answer  exit code 0
+  e4        answer  passed   1a73a6409898  answer  the file contains the text
+  e3        scope   passed   6f89e5e0c9b5  answer  1 changed path(s), all allowed
+  e2        tests   passed   6f89e5e0c9b5  answer  exit code 0
+  e1        answer  failed   6f89e5e0c9b5  answer  the file does not contain the text
 
 $ /target/release/fleet verify r1/answer
 verification of r1/answer: PASSED
@@ -402,7 +402,7 @@ $ /target/release/fleet goals remaining
 nothing is left to do
 
 $ /target/release/fleet verify-log
-event log ok: 31 records, head db5bc136ba2ab76080f18cfc277f6720c323abcf8987854ae1e2694816898200
+event log ok: 31 records, head 9b1b20f14f9a48d05e50f666e7a5cb9f54f66d1a0e4042b378204b0c1630fb32
 ```
 
 </details>
@@ -411,8 +411,8 @@ What the end-to-end tests ([`e2e_neo.rs`](crates/fleet-cli/tests/e2e_neo.rs)) ad
 binary: a worker that claims success with a wrong result never completes its task and its dependents never start; a
 task whose worker finished is shown as `unverified` while the contract runs; the ledger and the evidence survive
 `kill -9` of the daemon in the middle of a verification (the lost run recorded nothing and is repeated); a worker
-cannot use any of the commands; **processes started by a contract check or a quality gate are refused on the control
-socket like workers**; a check never sees ignored or uncommitted files, runs in a private export with a home of its own
+cannot use any of the commands; **processes started by a contract check, a quality gate or an approved command are refused on
+the control socket and on the web port like workers**; a check never sees ignored or uncommitted files, runs in a private export with a home of its own
 and not the operator's; a contract command planted in the worktree is never run; a `.fleet/` path a worker committed
 fails the diff constraint; secrets in check output are redacted before they reach the audit log.
 
@@ -784,7 +784,8 @@ HTTP/1.1 200 OK
 HTTP/1.1 401 Unauthorized
 ```
 
-Five screenshots taken by that Chromium (1200 px wide, headless, in the container) in the same run: the DAG of `r1` while `api`
+Five screenshots taken by that Chromium (1200 px wide, headless, in the container) in a run of the same script (ports, digests and
+times differ between runs, which is why they do not match the text above): the DAG of `r1` while `api`
 waits for an answer, the approval queue with the pending merge approval, the task page of a running worker with its live output,
 the goals page (one goal verified through fleet's own run, one task `unverified`) and a goal with its checks and evidence:
 
@@ -796,10 +797,10 @@ the goals page (one goal verified through fleet's own run, one task `unverified`
 
 ### What was and was not verified
 
-- **Protocol level, over real sockets:** [`web_http.rs`](crates/fleet-infra/tests/web_http.rs) (@@WEBHTTP@@ tests: authentication, per-client
+- **Protocol level, over real sockets:** [`web_http.rs`](crates/fleet-infra/tests/web_http.rs) (43 tests: authentication, per-client
   lockout, Host, Origin, `Sec-Fetch-Site`, CSRF, header sessions and the rejected old-style cookie, strict JSON, control characters
   in input, malformed and oversized requests, a trickling client and an idle one, the connection cap, event-stream bounds and
-  their end with the session, shutdown) and [`e2e_web.rs`](crates/fleet-cli/tests/e2e_web.rs) (@@E2EWEB@@ tests against the real daemon:
+  their end with the session, shutdown) and [`e2e_web.rs`](crates/fleet-cli/tests/e2e_web.rs) (16 tests against the real daemon:
   login, the gate/approval/merge flow, live output and input, the token absent from every worker-visible place and from disk,
   a worker, a quality-gate child and a descendant of an approved command that were all handed the token and are all still
   refused on the web port and on the socket, the flag policy, the quiet start, shutdown, hostile text, health and tamper
@@ -810,7 +811,7 @@ the goals page (one goal verified through fleet's own run, one task `unverified`
   because the tracker also lists the groups, so the ancestry rule has its own test with real child processes
   ([`origin.rs`](crates/fleet-infra/tests/origin.rs)), which fails without it.
 - **The page script** is checked three ways: a source scan test that fails on `innerHTML`, `EventSource`, cookies and their
-  relatives, a node script ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), @@SMOKE@@ checks against a hand-written fake DOM, hostile
+  relatives, a node script ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), 334 checks against a hand-written fake DOM, hostile
   strings and a frame-splitting stream reader included) and the headless Chromium run above, which loaded the real page, logged in
   through the fragment, and found the expected text in the rendered DOM and in the screenshots. The live page was in its
   "Streaming live output" state with two ticks; the check does not distinguish what came from the first read and what from the stream.
@@ -843,15 +844,15 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-@@TESTCOUNT@@ tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1369 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | @@DOMAIN@@ |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | @@APP@@ |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | @@ADAPTERS@@ |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 317 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 297 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | 496 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | @@E2E@@ |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | 258 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -866,11 +867,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               @@COV_DOMAIN@@
-application          @@COV_APP@@
-infrastructure       @@COV_INFRA@@
-cli                  @@COV_CLI@@
-overall              @@COV_ALL@@
+domain               4836     4710    97.4%
+application          2633     2484    94.3%
+infrastructure       5703     5271    92.4%
+cli                  2705     2433    89.9%
+overall             15877    14898    93.8%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -888,19 +889,19 @@ run on every byte) and samples the process's resident memory from `/proc/self/st
 buffer is capped (64 KiB in the test). A 120 second run in release mode, in the Linux container:
 
 ```text
-soak: 8 workers x 120s, 6051 MiB of terminal output (50 MiB/s), rss start 4760 kB, steady min 6656 kB / max 7524 kB / first 6920 kB, growth after warm-up 604 kB, 232 samples
-soak web: sse client 141658374 bytes, 8501 output events (per third [2734, 2311, 3456]), 40 reconnects, 0 refused, max 1 open stream(s); 221 status polls (0 failed); rss start 4760 kB, steady min 6656 kB / max 7524 kB, growth after warm-up 604 kB
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 121.60s
+soak: 8 workers x 120s, 15211 MiB of terminal output (127 MiB/s), rss start 5140 kB, steady min 7136 kB / max 7984 kB / first 7144 kB, growth after warm-up 840 kB, 237 samples
+soak web: sse client 340257414 bytes, 20240 output events (per third [7986, 7135, 5119]), 81 reconnects, 0 refused, max 1 open stream(s); 226 status polls (0 failed); rss start 5140 kB, steady min 7136 kB / max 7984 kB, growth after warm-up 840 kB
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.81s
 ```
 
 Since phase 2 the soak runs the daemon **with the web dashboard on**: one client holds an event stream (`/api/stream`) of a
 flooding task for the whole run (reconnecting with `Last-Event-ID` when the server ends the stream at its limits and
 counting bytes only, so the client keeps no buffer), and a second polls `/api/status` every 500 ms. Memory is flat after
-the buffers fill: it did not grow with the volume of output (about 6 GiB went through the daemon, 142 MB of it through the
-event stream), and the growth after warm-up (604 kB) is within the 4 MiB the test allows. Across all 120 second runs with the
-dashboard on that were made during phase 2 (six, before and after the later changes) the growth was 428 to 668 kB; the
-throughput ranged from 26 to 184 MiB/s on a machine that was shared with other containers, so no throughput comparison is
-claimed (the earlier run without the dashboard measured 271 MiB/s). By default the test runs 20 seconds;
+the buffers fill: it did not grow with the volume of output (about 15 GiB went through the daemon, 340 MB of it through the
+event stream), and the growth after warm-up (840 kB) is within the 4 MiB the test allows. Across all 120 second runs with the
+dashboard on made since the dashboard exists (seven, before and after the later changes, the last one on the merged tree)
+the growth was 428 to 840 kB; the throughput ranged from 26 to 184 MiB/s on a machine that was shared with other containers, so
+no throughput comparison is claimed (the earlier run without the dashboard measured 271 MiB/s). By default the test runs 20 seconds;
 `FLEET_SOAK_SECS=120 cargo test --release -p fleet-infra --test soak -- --nocapture` reproduces the numbers above
 (your throughput will differ). Bounds elsewhere: messages 64 KiB, frames 32 KiB, files read from workers 64 KiB,
 gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 64 connections.
@@ -963,7 +964,7 @@ What was run for this repository, all inside containers (the official Rust 1.95 
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
 `scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
-`node scripts/web-smoke.mjs` (@@SMOKE@@ checks) and `check-crates-age` (@@CRATES@@ locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
+`node scripts/web-smoke.mjs` (334 checks) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
 
