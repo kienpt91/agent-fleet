@@ -31,6 +31,7 @@ use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::{
     integration_branch, is_invisible, show, task_branch, validate_ref_name, RunId, Sha, TaskId,
 };
+use fleet_fanout::diff::DiffStat;
 use neo_verify::limits::MAX_CHANGED_PATHS;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
@@ -1687,6 +1688,34 @@ impl Vcs for GitVcs {
             truncated,
             dirty,
         })
+    }
+
+    fn diff_summary(&self, repo: &str, base: &Sha, head: &Sha) -> Result<DiffStat> {
+        // Asked of the repository, like every other fact a decision rests on: the objects, not
+        // what a worktree's own git directory says. Renames are detected (a renamed file is one
+        // change that touches two paths); external diff drivers and text conversion are off.
+        let dir = self.open_repo(repo)?;
+        let run = |mode: &str| {
+            self.run_ok(
+                &dir,
+                None,
+                &[
+                    "diff",
+                    mode,
+                    "-z",
+                    "-M",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    base.as_str(),
+                    head.as_str(),
+                    "--",
+                ],
+            )
+        };
+        let names = run("--name-status")?;
+        let counts = run("--numstat")?;
+        crate::git_diff::parse(&names.stdout, &counts.stdout)
     }
 
     fn is_merged(&self, repo: &str, branch: &str, into: &str) -> Result<bool> {

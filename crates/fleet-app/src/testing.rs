@@ -85,6 +85,10 @@ struct Inner {
     removed: Vec<(String, bool)>,
     merged_branches: BTreeSet<String>,
     sha_counter: u64,
+    /// What `diff_summary` answers for a head commit (an empty change when none was set).
+    diffs: BTreeMap<String, fleet_fanout::diff::DiffStat>,
+    diff_failures: BTreeSet<String>,
+    diff_calls: usize,
 
     sessions: BTreeMap<u64, FakeSession>,
     next_session: u64,
@@ -324,6 +328,18 @@ impl World {
     /// The tree the repository reports for any commit (default: the one `worktree_state` reports).
     pub fn set_commit_tree(&self, tree: Option<Sha>) {
         self.lock().commit_tree = tree;
+    }
+    /// What the fake repository says commit `head` changes relative to the base.
+    pub fn set_diff(&self, head: &Sha, stat: fleet_fanout::diff::DiffStat) {
+        self.lock().diffs.insert(head.to_string(), stat);
+    }
+    /// Makes `diff_summary` fail for `head` (the commit cannot be read).
+    pub fn fail_diff(&self, head: &Sha) {
+        self.lock().diff_failures.insert(head.to_string());
+    }
+    /// How many times `diff_summary` was asked.
+    pub fn diff_calls(&self) -> usize {
+        self.lock().diff_calls
     }
 
     /// The paths the fake worktrees report as changed (for diff constraints).
@@ -682,6 +698,22 @@ impl Vcs for FakeVcs {
             truncated: g.worktree_truncated,
             dirty: g.worktree_dirty,
         })
+    }
+
+    fn diff_summary(
+        &self,
+        _repo: &str,
+        _base: &Sha,
+        head: &Sha,
+    ) -> Result<fleet_fanout::diff::DiffStat> {
+        let mut g = self.0.lock();
+        g.diff_calls += 1;
+        if g.diff_failures.contains(head.as_str()) {
+            return Err(FleetError::not_found(format!(
+                "commit {head} does not exist in the repository"
+            )));
+        }
+        Ok(g.diffs.get(head.as_str()).cloned().unwrap_or_default())
     }
 }
 

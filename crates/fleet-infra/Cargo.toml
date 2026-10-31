@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 fleet-domain = { path = "../fleet-domain" }
 fleet-app = { path = "../fleet-app" }
+fleet-fanout = { path = "../fleet-fanout" }
 neo-verify = { path = "../neo-verify" }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }

@@ -312,6 +312,7 @@ version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
+ "fleet-fanout",
  "neo-verify",
  "nix 0.31.3",
  "portable-pty",

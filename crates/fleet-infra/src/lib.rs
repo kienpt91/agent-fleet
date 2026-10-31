@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod eventlog;
 pub mod fsx;
 pub mod git;
+mod git_diff;
 pub mod jobs;
 pub mod json;
 pub mod logs;
