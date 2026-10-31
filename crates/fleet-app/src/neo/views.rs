@@ -14,6 +14,7 @@ use neo_goals::goal::{Goal, TaskRef};
 use neo_goals::ledger::{Ledger, TaskContract};
 use neo_verify::contract::{Check, CheckKind, FileAssertion};
 use neo_verify::evidence::Evidence;
+use neo_verify::glob::Glob;
 use std::collections::BTreeSet;
 
 /// Pieces of evidence listed in `goal.show` (newest first).
@@ -131,14 +132,22 @@ fn check_detail(c: &Check) -> String {
             FileAssertion::Sha256(d) => format!("{path} has sha256 {d}"),
             FileAssertion::Contains(t) => format!("{path} contains {t:?}"),
         },
-        CheckKind::DiffOnly { allow } => format!(
-            "changes only {}",
-            allow
-                .iter()
-                .map(|g| g.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        CheckKind::DiffOnly { allow, deny } => {
+            let list = |globs: &[Glob]| {
+                globs
+                    .iter()
+                    .map(|g| g.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            match (allow.is_empty(), deny.is_empty()) {
+                (_, true) => format!("changes only {}", list(allow)),
+                (true, false) => format!("changes nothing matching {}", list(deny)),
+                (false, false) => {
+                    format!("changes only {}, never {}", list(allow), list(deny))
+                }
+            }
+        }
     };
     flatten_line(&text, DETAIL_WIDTH)
 }

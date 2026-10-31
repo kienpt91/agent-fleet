@@ -866,3 +866,39 @@ printf '{"version":1,"status":"done","summary":"d"}\n' > .fleet/result.json
         e.canonical()
     );
 }
+
+#[test]
+fn a_worker_that_touches_a_denied_path_never_completes_even_when_the_rest_is_in_scope() {
+    let (f, files) = fleet_with(
+        r#"#!/bin/sh
+set -eu
+echo ready > answer.txt
+mkdir -p guard
+echo changed > guard/lock.txt
+printf '{"version":1,"status":"done","summary":"d"}\n' > .fleet/result.json
+"#,
+        "0",
+    );
+    load_plan(&f);
+    add_goal(
+        &f,
+        &files,
+        r#"{"version":1,"checks":[{"id":"protected","kind":"diff","allow":["answer.txt","guard/**"],"deny":["guard/**"]}]}"#,
+    );
+    f.ok(&["start", "--run", "r1"]);
+    f.wait_task("r1", "a", &["failed"]);
+    let goal = show(&f, "feature");
+    let e = &jarr(&goal, "history")[0];
+    assert_eq!(jstr(e, "verdict"), "failed", "{}", e.canonical());
+    assert!(
+        jstr(e, "output").contains("guard/lock.txt\" (denied)"),
+        "{}",
+        e.canonical()
+    );
+    assert!(
+        jstr(e, "summary").contains("match a denied glob"),
+        "{}",
+        e.canonical()
+    );
+    assert_ne!(jstr(&goal, "status"), "verified");
+}

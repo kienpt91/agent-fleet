@@ -156,7 +156,7 @@ pub fn judge(check: &Check, observed: &Observation) -> CheckReport {
         (CheckKind::File { assertion, .. }, Observation::File(file)) => {
             judge_file(check, assertion, file)
         }
-        (CheckKind::DiffOnly { allow }, Observation::Changed { paths, truncated }) => {
+        (CheckKind::DiffOnly { allow, deny }, Observation::Changed { paths, truncated }) => {
             if *truncated || paths.len() > MAX_CHANGED_PATHS {
                 return report(
                     check,
@@ -166,9 +166,20 @@ pub fn judge(check: &Check, observed: &Observation) -> CheckReport {
                     String::new(),
                 );
             }
-            let offending: Vec<&String> = paths
+            // A denied path fails whatever `allow` says; without `allow` everything else is fine.
+            let denied = |p: &str| deny.iter().any(|g| g.matches(p));
+            let outside = |p: &str| !allow.is_empty() && !allow.iter().any(|g| g.matches(p));
+            let offending: Vec<(&String, bool)> = paths
                 .iter()
-                .filter(|p| !allow.iter().any(|g| g.matches(p)))
+                .filter_map(|p| {
+                    if denied(p) {
+                        Some((p, true))
+                    } else if outside(p) {
+                        Some((p, false))
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             if offending.is_empty() {
                 return report(
@@ -182,23 +193,29 @@ pub fn judge(check: &Check, observed: &Observation) -> CheckReport {
             let listed: Vec<String> = offending
                 .iter()
                 .take(MAX_PATHS_SHOWN)
-                .map(|p| show(p))
+                .map(|(p, is_denied)| {
+                    if *is_denied {
+                        format!("{} (denied)", show(p))
+                    } else {
+                        show(p)
+                    }
+                })
                 .collect();
             let more = offending.len().saturating_sub(MAX_PATHS_SHOWN);
             let mut output = listed.join("\n");
             if more > 0 {
                 output.push_str(&format!("\n... and {more} more"));
             }
-            report(
-                check,
-                Verdict::Failed,
-                None,
-                &format!(
-                    "{} changed path(s) outside the allowed globs",
-                    offending.len()
+            let n_denied = offending.iter().filter(|(_, d)| *d).count();
+            let n_outside = offending.len().saturating_sub(n_denied);
+            let summary = match (n_denied, n_outside) {
+                (0, n) => format!("{n} changed path(s) outside the allowed globs"),
+                (n, 0) => format!("{n} changed path(s) match a denied glob"),
+                (d, n) => format!(
+                    "{d} changed path(s) match a denied glob and {n} outside the allowed globs"
                 ),
-                output,
-            )
+            };
+            report(check, Verdict::Failed, None, &summary, output)
         }
         _ => report(
             check,
@@ -426,8 +443,14 @@ mod tests {
     }
 
     fn diff(globs: &[&str]) -> Check {
+        diff_with(globs, &[])
+    }
+
+    fn diff_with(allow: &[&str], deny: &[&str]) -> Check {
+        let globs = |items: &[&str]| items.iter().map(|g| Glob::new(g).unwrap()).collect();
         check(CheckKind::DiffOnly {
-            allow: globs.iter().map(|g| Glob::new(g).unwrap()).collect(),
+            allow: globs(allow),
+            deny: globs(deny),
         })
     }
 
@@ -458,6 +481,105 @@ mod tests {
         assert!(!r.output.contains("src/a.rs"));
         let r = judge(&c, &changed(&["src/a.rs"], true));
         assert_eq!(r.verdict, Verdict::Error);
+    }
+
+    #[test]
+    fn a_deny_list_alone_forbids_those_paths_and_nothing_else() {
+        let c = diff_with(&[], &["Cargo.lock", "crates/*/Cargo.toml", "dogfood/**"]);
+        let r = judge(
+            &c,
+            &changed(&["src/a.rs", "docs/x.md", "Cargo.toml"], false),
+        );
+        assert_eq!(r.verdict, Verdict::Passed, "{r:?}");
+        assert_eq!(judge(&c, &changed(&[], false)).verdict, Verdict::Passed);
+        for denied in [
+            "Cargo.lock",
+            "crates/neo-verify/Cargo.toml",
+            "dogfood/plan.toml",
+            "dogfood/a/b/c",
+        ] {
+            let r = judge(&c, &changed(&["src/a.rs", denied], false));
+            assert_eq!(r.verdict, Verdict::Failed, "{denied}");
+            assert!(
+                r.output.contains(&format!("\"{denied}\" (denied)")),
+                "{}",
+                r.output
+            );
+            assert!(!r.output.contains("src/a.rs"));
+            assert_eq!(r.summary, "1 changed path(s) match a denied glob");
+        }
+        // a glob is not a prefix: only what it says is denied
+        let r = judge(
+            &c,
+            &changed(
+                &["Cargo.lock.bak", "crates/Cargo.toml", "dogfood2/x"],
+                false,
+            ),
+        );
+        assert_eq!(r.verdict, Verdict::Passed, "{r:?}");
+        // `dir/**` also matches a path that is just `dir` (a file where the directory was)
+        let r = judge(&c, &changed(&["dogfood"], false));
+        assert_eq!(r.verdict, Verdict::Failed, "{r:?}");
+    }
+
+    #[test]
+    fn deny_wins_over_allow_and_both_kinds_of_offence_are_counted() {
+        let c = diff_with(&["src/**"], &["src/secret/**", "src/lock.rs"]);
+        let r = judge(&c, &changed(&["src/a.rs", "src/deep/b.rs"], false));
+        assert_eq!(r.verdict, Verdict::Passed);
+        // allowed by `allow`, forbidden by `deny`
+        let r = judge(&c, &changed(&["src/secret/key.rs"], false));
+        assert_eq!(r.verdict, Verdict::Failed);
+        assert_eq!(r.summary, "1 changed path(s) match a denied glob");
+        // outside `allow`: the old wording
+        let r = judge(&c, &changed(&["docs/a.md"], false));
+        assert_eq!(r.summary, "1 changed path(s) outside the allowed globs");
+        assert!(!r.output.contains("(denied)"));
+        // both at once
+        let r = judge(
+            &c,
+            &changed(
+                &["src/lock.rs", "src/secret/x", "docs/a.md", "src/ok.rs"],
+                false,
+            ),
+        );
+        assert_eq!(r.verdict, Verdict::Failed);
+        assert_eq!(
+            r.summary,
+            "2 changed path(s) match a denied glob and 1 outside the allowed globs"
+        );
+        assert!(r.output.contains("\"src/lock.rs\" (denied)"));
+        assert!(r.output.contains("\"docs/a.md\""));
+        assert!(!r.output.contains("src/ok.rs"));
+    }
+
+    #[test]
+    fn a_deny_glob_is_case_sensitive_like_every_glob() {
+        let c = diff_with(&[], &["SECURITY.md"]);
+        assert_eq!(
+            judge(&c, &changed(&["security.md"], false)).verdict,
+            Verdict::Passed,
+            "case folding is the job of a separate check, not of the matcher"
+        );
+        assert_eq!(
+            judge(&c, &changed(&["SECURITY.md"], false)).verdict,
+            Verdict::Failed
+        );
+    }
+
+    #[test]
+    fn a_deny_only_check_is_not_fooled_by_a_truncated_or_oversized_diff() {
+        let c = diff_with(&[], &["Cargo.lock"]);
+        assert_eq!(
+            judge(&c, &changed(&["a"], true)).verdict,
+            Verdict::Error,
+            "a diff that was cut could hide the denied path"
+        );
+        let too_many = Observation::Changed {
+            paths: vec!["a".into(); MAX_CHANGED_PATHS + 1],
+            truncated: false,
+        };
+        assert_eq!(judge(&c, &too_many).verdict, Verdict::Error);
     }
 
     #[test]

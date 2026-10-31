@@ -131,6 +131,50 @@ fn a_goal_is_added_with_a_contract_and_shown() {
 }
 
 #[test]
+fn a_diff_check_shows_what_it_allows_and_what_it_denies() {
+    let mut h = Harness::new();
+    new_run(&mut h);
+    add_task(&mut h, "a", &[]);
+    let diff = |id: &str, pairs: Vec<(&str, Value)>| {
+        let mut all = vec![("id", s(id)), ("kind", s("diff"))];
+        all.extend(pairs);
+        obj(all)
+    };
+    let contract = obj(vec![
+        ("version", Value::int(1)),
+        (
+            "checks",
+            Value::array([
+                diff("only", vec![("allow", list(&["src/**"]))]),
+                diff("never", vec![("deny", list(&["Cargo.lock", "dogfood/**"]))]),
+                diff(
+                    "both",
+                    vec![
+                        ("allow", list(&["src/**"])),
+                        ("deny", list(&["src/vendor/**"])),
+                    ],
+                ),
+            ]),
+        ),
+    ]);
+    goal_add(
+        &mut h,
+        vec![
+            ("id", s("scope")),
+            ("title", s("Scope")),
+            ("tasks", list(&["r1/a"])),
+            ("contract", contract),
+        ],
+    );
+    let shown = goal(&mut h, "scope");
+    let checks = shown.get("checks").and_then(Value::as_array).unwrap();
+    let detail = |i: usize| text(&checks[i], "detail");
+    assert_eq!(detail(0), "changes only src/**");
+    assert_eq!(detail(1), "changes nothing matching Cargo.lock, dogfood/**");
+    assert_eq!(detail(2), "changes only src/**, never src/vendor/**");
+}
+
+#[test]
 fn goals_form_a_tree_and_the_list_keeps_parents_first() {
     let mut h = Harness::new();
     goal_add(&mut h, vec![("id", s("root")), ("title", s("Root"))]);

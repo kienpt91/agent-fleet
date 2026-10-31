@@ -57,7 +57,7 @@ types, duplicate ids and out-of-range numbers are errors.
   {"id": "refs",   "kind": "refcheck-json", "program": "/usr/local/bin/refcheck", "args": ["--json", "."],
    "mandatory": false},
   {"id": "readme", "kind": "file", "path": "README.md", "assert": "contains", "value": "## Usage"},
-  {"id": "scope",  "kind": "diff", "allow": ["src/**", "tests/**"]}
+  {"id": "scope",  "kind": "diff", "allow": ["src/**", "tests/**"], "deny": ["src/vendor/**"]}
 ]}
 ```
 
@@ -66,7 +66,7 @@ types, duplicate ids and out-of-range numbers are errors.
 | `command` | the program exits with `expect_exit` (default 0) | `program` (absolute), `args`, `expect_exit` 0-255, `timeout_ms` 100 to 1800000 (default 120000) |
 | `refcheck-json` | stdout is a `refcheck` JSON document without errors (the judgement of the quality gate of the same name) | `program`, `args`, `timeout_ms` |
 | `file` | `exists`: a regular file is there; `sha256`: its SHA-256 equals `value`; `contains`: it is UTF-8 text containing `value` | `path` (relative, no `..`), `assert`, `value` |
-| `diff` | every path the commits of the task changed since the run's base commit (`.fleet/` paths included) matches a glob | `allow`: 1 to 32 globs: `*`, `?`, `**` as a whole segment; no classes, braces or escapes |
+| `diff` | every path the commits of the task changed since the run's base commit (`.fleet/` paths included) matches no `deny` glob and, when `allow` is given, at least one `allow` glob (a denied path fails whatever `allow` says; a diff cut at 10000 paths is an `error`, never a pass) | `allow`: 0 to 32 globs, `deny`: 0 to 128 globs, at least one of the two in total: `*`, `?`, `**` as a whole segment (`dir/**` also matches a path that is just `dir`); no classes, braces or escapes; case-sensitive |
 
 Every check has `id` (`[a-z0-9][a-z0-9_-]*`) and `mandatory` (default true; at least one check must be mandatory).
 Defaults are written out in the canonical form, so the contract id (the SHA-256 of the canonical text, shown shortened

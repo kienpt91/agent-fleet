@@ -11,6 +11,8 @@ pub const MAX_ARG_LEN: usize = 4 * 1024;
 pub const MAX_PATH_LEN: usize = 512;
 pub const MAX_NEEDLE: usize = 1024;
 pub const MAX_GLOBS: usize = 32;
+/// A deny list enumerates what a task must never touch, so it may be longer than an allow list.
+pub const MAX_DENY_GLOBS: usize = 128;
 pub const MAX_GLOB_LEN: usize = 256;
 /// Longest path the glob matcher looks at; longer paths never match.
 pub const MAX_MATCH_PATH: usize = 4 * 1024;
