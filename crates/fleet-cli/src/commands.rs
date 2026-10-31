@@ -97,7 +97,8 @@ decisions:
   gate list                          open questions and conflicts
   gate resolve <id> --answer <text>  answer a gate (or give the answer as the rest of the line)
   approval list                      approvals and their digests
-  approve <id> [--digest <hex>]      approve a pending action
+  approve <id> [--digest <hex>]      approve a pending action (names the digest it covers: the listed
+                                     one unless --digest is given)
   deny <id> [--digest <hex>]         deny it
 
 results:
