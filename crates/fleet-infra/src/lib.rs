@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod pty;
 pub mod server;
 pub mod statedir;
+pub mod toolrun;
 pub mod undo;
 pub mod verify;
 pub mod web;

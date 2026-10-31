@@ -163,7 +163,7 @@ pub fn identify(peer: SocketAddr, local: SocketAddr) -> PeerIdentity {
 #[cfg(target_os = "macos")]
 pub fn identify(peer: SocketAddr, local: SocketAddr) -> PeerIdentity {
     use std::process::Command;
-    let out = crate::procid::output_within(
+    let out = crate::toolrun::output_within(
         Command::new("/usr/sbin/lsof")
             .args([
                 "-nP",
@@ -175,7 +175,7 @@ pub fn identify(peer: SocketAddr, local: SocketAddr) -> PeerIdentity {
             ])
             .env_clear()
             .env("LC_ALL", "C"),
-        crate::procid::TOOL_TIMEOUT,
+        crate::toolrun::TOOL_TIMEOUT,
     );
     let Some(out) = out else {
         return PeerIdentity::Unknown;

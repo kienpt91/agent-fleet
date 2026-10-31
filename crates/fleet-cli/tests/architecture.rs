@@ -809,13 +809,15 @@ fn only_the_daemon_uses_the_web_module_inside_the_infrastructure_crate() {
 fn the_web_module_imports_only_what_it_needs_from_the_rest_of_the_crate() {
     let dir = crate_dir("fleet-infra").join("src/web");
     let allowed_modules = [
-        "web", "eventlog", "json", "statedir", "server", "protocol", "daemon",
+        "web", "eventlog", "json", "statedir", "server", "protocol", "daemon", "toolrun",
     ];
     let allowed_paths = [
         "crate::eventlog::VerifyReport",
         "crate::server::PeerInfo",
         "crate::protocol::MAX_RESPONSE_BYTES",
         "crate::daemon::VERSION",
+        "crate::toolrun::output_within",
+        "crate::toolrun::TOOL_TIMEOUT",
     ];
     let forbidden = [
         "git",
@@ -862,7 +864,7 @@ fn the_web_module_imports_only_what_it_needs_from_the_rest_of_the_crate() {
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
                 .collect();
             match module.as_str() {
-                "eventlog" | "server" | "protocol" | "daemon" => {
+                "eventlog" | "server" | "protocol" | "daemon" | "toolrun" => {
                     assert!(
                         allowed_paths.contains(&path.as_str()),
                         "{rel} imports {path}"
