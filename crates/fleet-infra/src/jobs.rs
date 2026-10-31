@@ -359,7 +359,7 @@ fn last_bytes(bytes: &[u8], max: usize) -> &[u8] {
 }
 
 /// Lossy text of stdout (+ stderr under a separator), at most the last 64 KiB.
-fn combined_text(result: &RunResult) -> String {
+pub(crate) fn combined_text(result: &RunResult) -> String {
     let mut bytes = last_bytes(&result.stdout, OUTPUT_TEXT_BYTES).to_vec();
     if !result.stderr.is_empty() {
         bytes.extend_from_slice(STDERR_SEPARATOR.as_bytes());
@@ -411,6 +411,7 @@ fn command_summary(exit: &ExitKind) -> String {
 /// Runs a job to completion on the calling thread.
 fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
     match job {
+        Job::Verify(v) => JobDone::Verify(Box::new(crate::verify::run_verify(v, redactor))),
         Job::Gates {
             run,
             task,
@@ -476,6 +477,7 @@ fn execute(job: &Job, redactor: &Arc<Redactor>) -> JobDone {
 fn panic_result(job: &Job) -> JobDone {
     const WHY: &str = "internal error: the job panicked";
     match job {
+        Job::Verify(v) => JobDone::Verify(Box::new(crate::verify::panic_result(v, WHY))),
         Job::Gates {
             run,
             task,

@@ -101,6 +101,18 @@ impl Orchestrator {
                 "fleet.events/1",
                 vec![("events", views::recent_value(&self.recent, limit))],
             )),
+            Command::GoalAdd(args) => self.goal_add(args),
+            Command::GoalAttach { goal, contract } => self.goal_attach(&goal, &contract),
+            Command::GoalSetStatus {
+                goal,
+                status,
+                reason,
+            } => self.goal_set_status(&goal, status, &reason),
+            Command::GoalList => Ok(self.goal_list()),
+            Command::GoalShow { goal } => self.goal_show(&goal),
+            Command::GoalRemaining => Ok(self.goal_remaining()),
+            Command::Verify { target, task } => self.verify_command(&target, task.as_deref()),
+            Command::VerifyStatus { target, task } => self.verify_status(&target, task.as_deref()),
             Command::Shutdown => {
                 self.shutdown_requested = true;
                 self.begin_shutdown();

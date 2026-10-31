@@ -8,7 +8,7 @@
 //! nothing) and overriding those keys through `GIT_CONFIG_COUNT`, which also copes with names that
 //! contain `=` or other characters `-c` cannot carry.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
@@ -23,11 +23,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fleet_app::ports::{
-    BaseCommit, Identity, IntegrationMerge, IntegrationResult, MergeOutcome, Vcs,
+    BaseCommit, Identity, IntegrationMerge, IntegrationResult, MergeOutcome, Vcs, WorktreeState,
 };
 use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::{is_invisible, show, validate_ref_name, RunId, Sha, TaskId};
+use neo_verify::limits::MAX_CHANGED_PATHS;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 
@@ -1171,6 +1172,53 @@ impl Vcs for GitVcs {
         Ok(())
     }
 
+    fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState> {
+        let wt = self.check_worktree(worktree)?;
+        let head = self.head_sha(&wt)?;
+        // Everything that differs from the base commit: committed work, staged and unstaged
+        // changes of tracked files, and untracked files that are not ignored.
+        let diff = self.run_ok(
+            &wt,
+            None,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-renames",
+                base.as_str(),
+                "--",
+            ],
+        )?;
+        let untracked = self.run_ok(
+            &wt,
+            None,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?;
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        for raw in diff
+            .stdout
+            .split(|b| *b == 0)
+            .chain(untracked.stdout.split(|b| *b == 0))
+        {
+            if raw.is_empty() {
+                continue;
+            }
+            let path = String::from_utf8_lossy(raw).into_owned();
+            // fleet's own directory is not the worker's work
+            if path == ".fleet" || path.starts_with(".fleet/") {
+                continue;
+            }
+            paths.insert(path);
+        }
+        let truncated = paths.len() > MAX_CHANGED_PATHS;
+        Ok(WorktreeState {
+            head,
+            changed: paths.into_iter().take(MAX_CHANGED_PATHS).collect(),
+            truncated,
+        })
+    }
+
     fn is_merged(&self, repo: &str, branch: &str, into: &str) -> Result<bool> {
         validate_ref_name(branch)?;
         let target = if into == "HEAD" {
@@ -1561,6 +1609,86 @@ mod tests {
             },
             None,
         );
+    }
+
+    // ---- worktree state --------------------------------------------------------------------
+
+    #[test]
+    fn worktree_state_reports_head_and_every_kind_of_change_against_the_base() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        // nothing yet
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert_eq!(s.head, base);
+        assert!(s.changed.is_empty() && !s.truncated, "{s:?}");
+        // committed, then staged, modified, untracked, deleted, in a subdirectory
+        let head = fx.edit_and_commit(&wt, "src/committed.txt", "a\n");
+        fs::write(Path::new(&wt).join("staged.txt"), "s\n").unwrap();
+        git(Path::new(&wt), &["add", "staged.txt"]);
+        fs::write(Path::new(&wt).join("README.md"), "changed\n").unwrap();
+        fs::write(Path::new(&wt).join("untracked.txt"), "u\n").unwrap();
+        fs::remove_file(Path::new(&wt).join("src/lib.txt")).unwrap();
+        fs::create_dir_all(Path::new(&wt).join(".fleet")).unwrap();
+        fs::write(Path::new(&wt).join(".fleet/brief.md"), "brief\n").unwrap();
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert_eq!(s.head, head);
+        assert_eq!(
+            s.changed,
+            [
+                "README.md",
+                "src/committed.txt",
+                "src/lib.txt",
+                "staged.txt",
+                "untracked.txt"
+            ]
+        );
+        assert!(!s.truncated);
+    }
+
+    #[test]
+    fn a_change_that_was_reverted_is_not_a_change() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        fx.edit_and_commit(&wt, "README.md", "temporary\n");
+        let original = git(
+            Path::new(&wt),
+            &["show", &format!("{}:README.md", base.as_str())],
+        );
+        fx.edit_and_commit(&wt, "README.md", &format!("{original}\n"));
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert!(s.changed.is_empty(), "{s:?}");
+    }
+
+    #[test]
+    fn file_names_are_reported_verbatim_and_ignored_files_are_not_changes() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        fs::write(Path::new(&wt).join("odd name\twith tab.txt"), "x").unwrap();
+        fs::write(Path::new(&wt).join("naïve.txt"), "x").unwrap();
+        fs::write(Path::new(&wt).join(".gitignore"), "ignored.log\n").unwrap();
+        fs::write(Path::new(&wt).join("ignored.log"), "x").unwrap();
+        let s = fx.vcs.worktree_state(&wt, &base).unwrap();
+        assert_eq!(
+            s.changed,
+            [".gitignore", "naïve.txt", "odd name\twith tab.txt"]
+        );
+    }
+
+    #[test]
+    fn worktree_state_refuses_what_is_not_a_fleet_worktree() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let err = fx.vcs.worktree_state(fx.repo_s(), &base).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        let err = fx.vcs.worktree_state("/nonexistent/wt", &base).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
     }
 
     // ---- isolation -----------------------------------------------------------------------

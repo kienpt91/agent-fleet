@@ -18,7 +18,9 @@ use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{ApprovalId, RunId, Sha, TaskId, WorkerName};
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::GateOutcome;
+use fleet_domain::status::Verdict;
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
+use neo_verify::judge::CheckReport;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -30,6 +32,18 @@ pub enum GateMode {
     /// The first gate fails with this output (the rest pass), immediately.
     Fail(String),
     /// The test completes jobs itself with [`World::complete_gates`].
+    Manual,
+}
+
+/// How the fake job runner answers verification jobs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Every check passes, immediately.
+    Pass,
+    /// The first mandatory check of every contract fails with this output (the rest pass),
+    /// immediately.
+    Fail(String),
+    /// The test completes jobs itself with [`World::complete_verify`].
     Manual,
 }
 
@@ -84,6 +98,10 @@ struct Inner {
     fail_prepare_contract: bool,
 
     gate_mode: Option<GateMode>,
+    verify_mode: Option<VerifyMode>,
+    worktree_changed: Vec<String>,
+    worktree_truncated: bool,
+    fail_worktree_state: bool,
     jobs_started: Vec<Job>,
     jobs_done: VecDeque<JobDone>,
     jobs_running: usize,
@@ -106,6 +124,7 @@ impl World {
             let mut g = w.lock();
             g.now_ms = 1_000_000;
             g.gate_mode = Some(GateMode::Pass);
+            g.verify_mode = Some(VerifyMode::Pass);
         }
         w
     }
@@ -294,6 +313,62 @@ impl World {
     // ---- jobs ----
     pub fn set_gate_mode(&self, mode: GateMode) {
         self.lock().gate_mode = Some(mode);
+    }
+    pub fn set_verify_mode(&self, mode: VerifyMode) {
+        self.lock().verify_mode = Some(mode);
+    }
+    /// The paths the fake worktrees report as changed (for diff constraints).
+    pub fn set_worktree_changes(&self, paths: &[&str], truncated: bool) {
+        let mut g = self.lock();
+        g.worktree_changed = paths.iter().map(|p| p.to_string()).collect();
+        g.worktree_truncated = truncated;
+    }
+    /// Makes one job slot look taken (a job that never finishes).
+    pub fn occupy_job_slot(&self) {
+        self.lock().jobs_running += 1;
+    }
+    pub fn free_job_slots(&self) {
+        self.lock().jobs_running = 0;
+    }
+    pub fn fail_worktree_state(&self, fail: bool) {
+        self.lock().fail_worktree_state = fail;
+    }
+    /// Verification jobs started so far, oldest first.
+    pub fn verify_jobs(&self) -> Vec<crate::ports::VerifyJob> {
+        self.lock()
+            .jobs_started
+            .iter()
+            .filter_map(|j| match j {
+                Job::Verify(v) => Some((**v).clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Completes the newest verification job of `run/task` with every check passing except the
+    /// ones named in `verdicts`.
+    pub fn complete_verify(&self, run: &str, task: &str, verdicts: &[(&str, Verdict)]) {
+        let mut g = self.lock();
+        let job = g
+            .jobs_started
+            .iter()
+            .rev()
+            .find_map(|j| match j {
+                Job::Verify(v) if v.run.as_str() == run && v.task.as_str() == task => {
+                    Some(v.clone())
+                }
+                _ => None,
+            })
+            .expect("no verification job was started for the task");
+        g.jobs_running = g.jobs_running.saturating_sub(1);
+        let done = verify_outcome(&job, |check, _| {
+            verdicts
+                .iter()
+                .find(|(c, _)| *c == check)
+                .map_or((Verdict::Passed, String::new()), |(_, v)| {
+                    (*v, String::new())
+                })
+        });
+        g.jobs_done.push_back(JobDone::Verify(Box::new(done)));
     }
     pub fn jobs_started(&self) -> Vec<Job> {
         self.lock().jobs_started.clone()
@@ -555,6 +630,18 @@ impl Vcs for FakeVcs {
     fn is_merged(&self, _repo: &str, branch: &str, _into: &str) -> Result<bool> {
         Ok(self.0.lock().merged_branches.contains(branch))
     }
+
+    fn worktree_state(&self, _worktree: &str, _base: &Sha) -> Result<WorktreeState> {
+        let g = self.0.lock();
+        if g.fail_worktree_state {
+            return Err(FleetError::internal("git could not read the worktree"));
+        }
+        Ok(WorktreeState {
+            head: Sha::parse(&"d".repeat(40))?,
+            changed: g.worktree_changed.clone(),
+            truncated: g.worktree_truncated,
+        })
+    }
 }
 
 // ---- sessions ------------------------------------------------------------------------------
@@ -761,6 +848,52 @@ impl ContractFiles for FakeContract {
 
 pub struct FakeJobs(World);
 
+/// The completed form of a verification job. `verdict` decides each check from its id and from
+/// whether it is the first mandatory check of its contract.
+fn verify_outcome(
+    job: &crate::ports::VerifyJob,
+    verdict: impl Fn(&str, bool) -> (Verdict, String),
+) -> crate::ports::VerifyDone {
+    let results = job
+        .targets
+        .iter()
+        .map(|t| {
+            let first = t.contract.mandatory_checks().next().map(|c| c.id.clone());
+            crate::ports::VerifiedContract {
+                goal: t.goal.clone(),
+                contract_id: t.contract_id.clone(),
+                reports: t
+                    .contract
+                    .checks()
+                    .iter()
+                    .map(|c| {
+                        let (v, output) = verdict(c.id.as_str(), first.as_ref() == Some(&c.id));
+                        CheckReport {
+                            check: c.id.clone(),
+                            verdict: v,
+                            exit_code: Some(if v == Verdict::Passed { 0 } else { 1 }),
+                            summary: if v == Verdict::Passed {
+                                "ok".to_string()
+                            } else {
+                                format!("{v}")
+                            },
+                            output,
+                        }
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    crate::ports::VerifyDone {
+        run: job.run.clone(),
+        task: job.task.clone(),
+        attempt: job.attempt,
+        origin: job.origin,
+        commit: job.state.head.clone(),
+        results,
+    }
+}
+
 impl JobRunner for FakeJobs {
     fn start(&mut self, job: Job) -> Result<()> {
         let mut g = self.0.lock();
@@ -773,6 +906,27 @@ impl JobRunner for FakeJobs {
                     "a command was launched before its start was recorded",
                 ));
             }
+        }
+        if let Job::Verify(v) = &job {
+            let done = match g.verify_mode.clone() {
+                Some(VerifyMode::Pass) => {
+                    Some(verify_outcome(v, |_, _| (Verdict::Passed, String::new())))
+                }
+                Some(VerifyMode::Fail(text)) => Some(verify_outcome(v, |_, first| {
+                    if first {
+                        (Verdict::Failed, text.clone())
+                    } else {
+                        (Verdict::Passed, String::new())
+                    }
+                })),
+                Some(VerifyMode::Manual) | None => None,
+            };
+            match done {
+                Some(done) => g.jobs_done.push_back(JobDone::Verify(Box::new(done))),
+                None => g.jobs_running += 1,
+            }
+            g.jobs_started.push(job);
+            return Ok(());
         }
         if let Job::Gates {
             run,

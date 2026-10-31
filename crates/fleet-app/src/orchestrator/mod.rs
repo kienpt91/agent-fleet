@@ -12,8 +12,10 @@ mod dispatch;
 mod reconcile;
 mod supervise;
 
+pub(crate) use dispatch::fleet_env;
+
 use crate::config::AppConfig;
-use crate::ports::{Ports, SessionId, StoredEvent};
+use crate::ports::{Ports, SessionId, StoredEvent, VerifyOrigin};
 use crate::views::Recent;
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
@@ -22,6 +24,7 @@ use fleet_domain::ids::{ApprovalId, RunId, TaskId};
 use fleet_domain::run::{RetryPolicy, WorkerEnd};
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::supervision::{KillEscalation, SupervisionPolicy};
+use neo_goals::ledger::Ledger;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Entries kept for the activity feed.
@@ -48,6 +51,8 @@ pub struct Orchestrator {
     pub(crate) cfg: AppConfig,
     pub(crate) ports: Ports,
     pub(crate) state: FleetState,
+    /// The goal ledger, a projection of the same event log as `state`.
+    pub(crate) ledger: Ledger,
     pub(crate) policy: Policy,
     pub(crate) live: BTreeMap<Key, Live>,
     /// Quality-gate jobs in flight: (run, task, attempt).
@@ -55,6 +60,11 @@ pub struct Orchestrator {
     /// Reviews whose worker output was committed already.
     pub(crate) committed: BTreeSet<(RunId, TaskId, u32)>,
     pub(crate) command_jobs: BTreeSet<ApprovalId>,
+    /// Verification jobs in flight: the task's attempt and why they run.
+    pub(crate) verifying: BTreeMap<Key, (u32, VerifyOrigin)>,
+    /// Reviews whose contracts passed in fleet's own run: (run, task, attempt). Only these may
+    /// go on to the quality gates and complete.
+    pub(crate) verified: BTreeSet<(RunId, TaskId, u32)>,
     /// Session ends that could not be recorded yet (the store failed); retried every tick so a
     /// task never stays `running` without a session.
     pub(crate) pending_ends: BTreeMap<Key, WorkerEnd>,
@@ -72,10 +82,12 @@ impl Orchestrator {
     pub fn new(cfg: AppConfig, ports: Ports) -> Result<Orchestrator> {
         cfg.validate()?;
         let mut state = FleetState::new();
+        let mut ledger = Ledger::new();
         let mut recent: VecDeque<Recent> = VecDeque::new();
         ports.store.replay(&mut |s: StoredEvent| {
             push_recent(&mut recent, s.seq, s.ts_ms, &s.event);
             state.apply(&s.event);
+            ledger.apply(&s.event);
             Ok(())
         })?;
         let policy = Policy {
@@ -91,11 +103,14 @@ impl Orchestrator {
             cfg,
             ports,
             state,
+            ledger,
             policy,
             live: BTreeMap::new(),
             gate_jobs: BTreeSet::new(),
             committed: BTreeSet::new(),
             command_jobs: BTreeSet::new(),
+            verifying: BTreeMap::new(),
+            verified: BTreeSet::new(),
             pending_ends: BTreeMap::new(),
             recent,
             started_ms,
@@ -153,6 +168,7 @@ impl Orchestrator {
         for (i, event) in events.into_iter().enumerate() {
             let seq = first.saturating_add(i as u64);
             self.state.apply(&event);
+            self.ledger.apply(&event);
             push_recent(&mut self.recent, seq, ts, &event);
             stored.push(StoredEvent {
                 seq,

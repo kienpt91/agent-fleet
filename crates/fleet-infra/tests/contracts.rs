@@ -3,15 +3,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fleet_app::ports::{ContractFiles, EventStore, OutputLogs};
+use fleet_app::ports::{ContractFiles, EventStore, JobRunner, OutputLogs};
 use fleet_app::testing::contracts::{
-    contract_files_contract, event_store_contract, output_logs_contract, ContractFile,
-    ContractHarness, Plant, PLANT_MARKER, VALID_QUESTION_JSON, VALID_RESULT_JSON,
+    contract_files_contract, event_store_contract, output_logs_contract, verify_jobs_contract,
+    ContractFile, ContractHarness, Plant, VerifyHarness, PLANT_MARKER, VALID_QUESTION_JSON,
+    VALID_RESULT_JSON,
 };
 use fleet_domain::redact::Redactor;
 use fleet_infra::contract_fs::FsContractFiles;
 use fleet_infra::digest::Sha256Digest;
 use fleet_infra::eventlog::FileEventStore;
+use fleet_infra::jobs::ThreadJobRunner;
 use fleet_infra::logs::FileOutputLogs;
 use fleet_infra::testutil::TempDir;
 use nix::sys::stat::Mode;
@@ -235,4 +237,46 @@ fn fs_contract_files_satisfy_the_contract() {
             "outside file was modified"
         );
     }
+}
+
+// ---- verification jobs ------------------------------------------------------------------------
+
+/// A fleet-shaped worktree in a temp dir whose files are exactly the ones the suite asks for.
+struct FsVerifyHarness {
+    dir: TempDir,
+}
+
+impl FsVerifyHarness {
+    fn new() -> FsVerifyHarness {
+        let dir = TempDir::new("contract-verify");
+        fs::create_dir_all(dir.join("repo/.fleet-worktrees/r1/t1")).unwrap();
+        FsVerifyHarness { dir }
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.join("repo/.fleet-worktrees/r1/t1")
+    }
+}
+
+impl VerifyHarness for FsVerifyHarness {
+    fn runner(&mut self) -> Box<dyn JobRunner> {
+        Box::new(ThreadJobRunner::new(4, Arc::new(Redactor::builtin())))
+    }
+
+    fn worktree(&self) -> String {
+        self.root().display().to_string()
+    }
+
+    fn place(&mut self, present: &[&str]) {
+        fs::remove_dir_all(self.root()).unwrap();
+        fs::create_dir_all(self.root()).unwrap();
+        for file in present {
+            fs::write(self.root().join(file), "x").unwrap();
+        }
+    }
+}
+
+#[test]
+fn thread_job_runner_satisfies_the_verify_jobs_contract() {
+    verify_jobs_contract(&mut FsVerifyHarness::new());
 }

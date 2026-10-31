@@ -11,6 +11,7 @@
 //! | [`event_store_contract`] | `EventStore`    | `&mut dyn FnMut() -> Box<dyn EventStore>`       |
 //! | [`output_logs_contract`] | `OutputLogs`    | `&mut dyn FnMut() -> Box<dyn OutputLogs>`       |
 //! | [`contract_files_contract`] | `ContractFiles` | `&mut dyn ContractHarness`                   |
+//! | [`verify_jobs_contract`] | `JobRunner` (verification jobs) | `&mut dyn VerifyHarness`          |
 //!
 //! # Running a suite against an in-memory fake
 //!
@@ -43,14 +44,20 @@
 //! file logs) are tested in the adapter's own unit tests.
 
 use super::World;
-use crate::ports::{ContractFiles, EventStore, OutputLogs, ReplayInfo, StoredEvent};
+use crate::ports::{
+    ContractFiles, EventStore, Job, JobDone, JobRunner, OutputLogs, ReplayInfo, StoredEvent,
+    VerifyDone, VerifyJob, VerifyOrigin, VerifyTarget, WorktreeState,
+};
 use fleet_domain::contract::{
     ContractRead, QuestionKind, ResultStatus, WorkerQuestion, WorkerResult,
 };
 use fleet_domain::error::{ErrorCode, FleetError};
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{ApprovalId, DecisionId, RunId, Sha, TaskId, WorkerName};
-use fleet_domain::status::{BlockKind, DecisionKind, EndKind, Purpose};
+use fleet_domain::ids::{
+    ApprovalId, DecisionId, EvidenceId, GoalId, RunId, Sha, TaskId, WorkerName,
+};
+use fleet_domain::status::{BlockKind, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
+use fleet_domain::value::{Document, Value};
 use std::fmt::Debug;
 
 // ---- event store ----------------------------------------------------------------------------
@@ -267,9 +274,53 @@ fn sample_events() -> Vec<DomainEvent> {
             task: t1.clone(),
             action: "terminated".into(),
         },
-        DomainEvent::WorktreeRemoved { run, task: t1 },
+        DomainEvent::WorktreeRemoved {
+            run: run.clone(),
+            task: t1.clone(),
+        },
         DomainEvent::Warning {
             message: tricky.into(),
+        },
+        DomainEvent::GoalAdded {
+            goal: GoalId::parse("ship-it").unwrap(),
+            parent: Some(GoalId::parse("root").unwrap()),
+            title: "Ünï goal".into(),
+            intent: tricky.into(),
+            tasks: vec!["r1/t1".into(), "r1/t2".into()],
+        },
+        DomainEvent::GoalStatusChanged {
+            goal: GoalId::parse("ship-it").unwrap(),
+            from: GoalStatus::Open,
+            to: GoalStatus::Verified,
+            reason: tricky.into(),
+        },
+        DomainEvent::CriteriaAttached {
+            goal: GoalId::parse("ship-it").unwrap(),
+            contract_id: "ab".repeat(32),
+            contract: Document(Value::object([
+                ("version", Value::int(1)),
+                (
+                    "checks",
+                    Value::array([Value::object([
+                        ("id", Value::str("tests")),
+                        ("note", Value::str(tricky)),
+                    ])]),
+                ),
+            ])),
+        },
+        DomainEvent::EvidenceRecorded {
+            id: EvidenceId::from_seq(1),
+            goal: GoalId::parse("ship-it").unwrap(),
+            run: Some(run),
+            task: Some(t1),
+            contract_id: "ab".repeat(32),
+            check: "tests".into(),
+            verdict: Verdict::Failed,
+            exit_code: Some(-1),
+            summary: tricky.into(),
+            output: tricky.into(),
+            commit: Some(sha(&"c".repeat(40))),
+            at_ms: 4_294_967_296,
         },
     ]
 }
@@ -849,6 +900,39 @@ pub enum Plant {
     Directory,
 }
 
+/// [`VerifyHarness`] over the in-memory fake of a [`World`]: the fake runner answers from its
+/// verification mode, which this harness derives from the files it was asked to place.
+pub struct MemoryVerifyHarness {
+    world: World,
+}
+
+impl MemoryVerifyHarness {
+    pub fn new(world: World) -> MemoryVerifyHarness {
+        MemoryVerifyHarness { world }
+    }
+}
+
+impl VerifyHarness for MemoryVerifyHarness {
+    fn runner(&mut self) -> Box<dyn JobRunner> {
+        self.world.ports().jobs
+    }
+
+    fn worktree(&self) -> String {
+        "/work/wt".to_string()
+    }
+
+    fn place(&mut self, present: &[&str]) {
+        // The fake cannot look at files; it fails the first mandatory check when `first.txt` is
+        // missing and passes otherwise, which is what the suite's scenarios call for.
+        let mode = if present.contains(&"first.txt") {
+            super::VerifyMode::Pass
+        } else {
+            super::VerifyMode::Fail("first.txt does not exist".to_string())
+        };
+        self.world.set_verify_mode(mode);
+    }
+}
+
 /// The medium a [`ContractFiles`] adapter works on, from the suite's point of view.
 pub trait ContractHarness {
     /// The adapter under test.
@@ -1158,4 +1242,207 @@ pub fn contract_files_contract(h: &mut dyn ContractHarness) {
     );
     h.plant(ContractFile::Result, Plant::Malformed);
     assert_invalid(h, ContractFile::Result, Plant::Malformed);
+}
+
+// ---- verification jobs --------------------------------------------------------------------------
+
+/// The medium a runner of verification jobs works on, from the suite's point of view.
+///
+/// The suite's contract has three file checks: `first` (mandatory, `first.txt` exists), `second`
+/// (mandatory, `second.txt` exists) and `optional` (not mandatory, `optional.txt` exists).
+pub trait VerifyHarness {
+    /// A fresh runner of the adapter under test.
+    fn runner(&mut self) -> Box<dyn JobRunner>;
+    /// The worktree path given to the jobs.
+    fn worktree(&self) -> String;
+    /// Makes exactly the files named in `present` (relative paths) exist in the worktree, so that
+    /// the checks of the suite's contract pass or fail accordingly.
+    fn place(&mut self, present: &[&str]);
+}
+
+/// A contract of three file-exists checks, as described on [`VerifyHarness`].
+fn verify_target(goal: &str) -> VerifyTarget {
+    use fleet_domain::value::Value;
+    use neo_verify::contract::VerificationContract;
+    let check = |id: &str, path: &str, mandatory: bool| {
+        Value::object([
+            ("id", Value::str(id)),
+            ("kind", Value::str("file")),
+            ("mandatory", Value::Bool(mandatory)),
+            ("path", Value::str(path)),
+            ("assert", Value::str("exists")),
+        ])
+    };
+    let contract = VerificationContract::from_value(&Value::object([
+        ("version", Value::int(1)),
+        (
+            "checks",
+            Value::array([
+                check("first", "first.txt", true),
+                check("second", "second.txt", true),
+                check("optional", "optional.txt", false),
+            ]),
+        ),
+    ]))
+    .unwrap();
+    VerifyTarget {
+        goal: fleet_domain::ids::GoalId::parse(goal).unwrap(),
+        contract_id: contract.id(&super::ToyDigest),
+        contract,
+    }
+}
+
+fn verify_job(h: &dyn VerifyHarness, task: &str, goals: &[&str]) -> VerifyJob {
+    VerifyJob {
+        run: run_id(),
+        task: task_id(task),
+        attempt: 3,
+        origin: VerifyOrigin::Manual,
+        worktree: h.worktree(),
+        state: WorktreeState {
+            head: sha(&"e".repeat(40)),
+            changed: Vec::new(),
+            truncated: false,
+        },
+        env: vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+        targets: goals.iter().map(|g| verify_target(g)).collect(),
+    }
+}
+
+/// Polls until `want` verification jobs finished (at most 30 seconds).
+fn collect_verified(runner: &mut dyn JobRunner, want: usize) -> Vec<VerifyDone> {
+    let started = std::time::Instant::now();
+    let mut done = Vec::new();
+    while done.len() < want {
+        for d in runner.poll() {
+            match d {
+                JobDone::Verify(v) => done.push(*v),
+                other => panic!("verify jobs contract: unexpected result {other:?}"),
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "verify jobs contract: {} of {want} results arrived within 30 seconds",
+            done.len()
+        );
+        if done.len() < want {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    done
+}
+
+/// What every runner of verification jobs must do: report on every check of every contract, in
+/// order, with the verdict its files and processes call for; echo the identity of the job; and
+/// report each job exactly once.
+pub fn verify_jobs_contract(h: &mut dyn VerifyHarness) {
+    use fleet_domain::status::Verdict;
+    let mut runner = h.runner();
+
+    // 1. Everything in place: every check passes. The result names the job it belongs to.
+    h.place(&["first.txt", "second.txt", "optional.txt"]);
+    let job = verify_job(h, "t1", &["g1"]);
+    runner.start(Job::Verify(Box::new(job.clone()))).unwrap();
+    let done = collect_verified(runner.as_mut(), 1).remove(0);
+    assert_eq!(
+        (
+            done.run.clone(),
+            done.task.clone(),
+            done.attempt,
+            done.origin
+        ),
+        (job.run.clone(), job.task.clone(), 3, VerifyOrigin::Manual),
+        "verify jobs contract: the result must echo run, task, attempt and origin"
+    );
+    assert_eq!(
+        done.commit, job.state.head,
+        "verify jobs contract: the result must carry the commit the job was given"
+    );
+    assert_eq!(
+        done.results.len(),
+        1,
+        "verify jobs contract: one result per target"
+    );
+    let result = &done.results[0];
+    assert_eq!(result.goal, job.targets[0].goal);
+    assert_eq!(result.contract_id, job.targets[0].contract_id);
+    let ids: Vec<&str> = result.reports.iter().map(|r| r.check.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["first", "second", "optional"],
+        "verify jobs contract: one report per check, in contract order"
+    );
+    assert!(
+        result.reports.iter().all(|r| r.verdict == Verdict::Passed),
+        "verify jobs contract: with every file present every check passes: {:?}",
+        result.reports
+    );
+
+    // 2. A missing file fails its check only; the other checks are still run and reported.
+    h.place(&["second.txt", "optional.txt"]);
+    runner
+        .start(Job::Verify(Box::new(verify_job(h, "t1", &["g1"]))))
+        .unwrap();
+    let done = collect_verified(runner.as_mut(), 1).remove(0);
+    let verdicts: Vec<Verdict> = done.results[0].reports.iter().map(|r| r.verdict).collect();
+    assert_eq!(
+        verdicts,
+        [Verdict::Failed, Verdict::Passed, Verdict::Passed],
+        "verify jobs contract: a failed check must not stop the others from running"
+    );
+    for r in &done.results[0].reports {
+        assert!(
+            !r.summary.contains('\n') && !r.summary.chars().any(char::is_control),
+            "verify jobs contract: a summary is one clean line: {:?}",
+            r.summary
+        );
+        assert!(
+            r.output.len() <= 70_000,
+            "verify jobs contract: output must be bounded"
+        );
+    }
+
+    // 3. Several targets: one result each, in the order given.
+    h.place(&["first.txt", "second.txt", "optional.txt"]);
+    runner
+        .start(Job::Verify(Box::new(verify_job(h, "t2", &["g1", "g2"]))))
+        .unwrap();
+    let done = collect_verified(runner.as_mut(), 1).remove(0);
+    let goals: Vec<&str> = done.results.iter().map(|r| r.goal.as_str()).collect();
+    assert_eq!(
+        goals,
+        ["g1", "g2"],
+        "verify jobs contract: targets keep their order"
+    );
+    assert!(done
+        .results
+        .iter()
+        .all(|r| r.reports.iter().all(|x| x.verdict == Verdict::Passed)));
+
+    // 4. Jobs run concurrently without mixing up their results, and each is reported once.
+    runner
+        .start(Job::Verify(Box::new(verify_job(h, "ta", &["g1"]))))
+        .unwrap();
+    runner
+        .start(Job::Verify(Box::new(verify_job(h, "tb", &["g1"]))))
+        .unwrap();
+    let mut done = collect_verified(runner.as_mut(), 2);
+    done.sort_by(|a, b| a.task.cmp(&b.task));
+    assert_eq!(
+        (done[0].task.as_str(), done[1].task.as_str()),
+        ("ta", "tb"),
+        "verify jobs contract: each result belongs to its own job"
+    );
+    assert!(
+        runner.poll().is_empty(),
+        "verify jobs contract: a result is delivered once"
+    );
+    let waited = std::time::Instant::now();
+    while runner.running() > 0 {
+        assert!(
+            waited.elapsed() < std::time::Duration::from_secs(10),
+            "verify jobs contract: running() must return to 0 after the results were collected"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }

@@ -8,10 +8,12 @@ use fleet_domain::approval::Digest;
 use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{ApprovalId, RunId, Sha, TaskId};
+use fleet_domain::ids::{ApprovalId, GoalId, RunId, Sha, TaskId};
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::{GateFormat, GateOutcome};
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
+use neo_verify::contract::{ContractId, VerificationContract};
+use neo_verify::judge::CheckReport;
 
 // ---- time -------------------------------------------------------------------------------
 
@@ -92,6 +94,19 @@ pub struct IntegrationResult {
     pub created: bool,
 }
 
+/// What a worktree looks like right now, for verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeState {
+    /// The commit checked out in the worktree.
+    pub head: Sha,
+    /// Paths that differ from the run's base commit (committed, staged, modified or untracked,
+    /// without fleet's own `.fleet` directory), relative to the worktree, at most
+    /// `neo_verify::limits::MAX_CHANGED_PATHS` of them.
+    pub changed: Vec<String>,
+    /// There were more changed paths than `changed` lists.
+    pub truncated: bool,
+}
+
 /// Version control. Every operation happens on fleet's own branches and worktrees; the user's
 /// checked-out branch and working tree are never touched.
 pub trait Vcs: Send {
@@ -134,6 +149,8 @@ pub trait Vcs: Send {
     ) -> Result<()>;
     /// True when `branch` is contained in `into`.
     fn is_merged(&self, repo: &str, branch: &str, into: &str) -> Result<bool>;
+    /// The commit and the changed paths of a task worktree, measured against `base`.
+    fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState>;
 }
 
 // ---- sessions -----------------------------------------------------------------------------
@@ -243,6 +260,56 @@ pub struct GateSpec {
     pub timeout_ms: u64,
 }
 
+/// One goal's contract to run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyTarget {
+    pub goal: GoalId,
+    pub contract_id: ContractId,
+    pub contract: VerificationContract,
+}
+
+/// Why a contract is being run: as part of reviewing a task (its result decides whether the task
+/// may complete) or because an operator asked (`fleet verify`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyOrigin {
+    Review,
+    Manual,
+}
+
+/// Runs the contracts of goals, independently of the worker, in the task's worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyJob {
+    pub run: RunId,
+    pub task: TaskId,
+    pub attempt: u32,
+    pub origin: VerifyOrigin,
+    pub worktree: String,
+    /// What the worktree looked like when the job was started (for diff constraints, and the
+    /// commit that evidence is recorded against).
+    pub state: WorktreeState,
+    /// The complete environment of every command: the worker allowlist and nothing else.
+    pub env: Vec<(String, String)>,
+    pub targets: Vec<VerifyTarget>,
+}
+
+/// What running one goal's contract produced: a report per check, in contract order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedContract {
+    pub goal: GoalId,
+    pub contract_id: ContractId,
+    pub reports: Vec<CheckReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyDone {
+    pub run: RunId,
+    pub task: TaskId,
+    pub attempt: u32,
+    pub origin: VerifyOrigin,
+    pub commit: Sha,
+    pub results: Vec<VerifiedContract>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
     Gates {
@@ -261,6 +328,8 @@ pub enum Job {
         env: Vec<(String, String)>,
         timeout_ms: u64,
     },
+    /// The contracts of the goals a task works on.
+    Verify(Box<VerifyJob>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +346,7 @@ pub enum JobDone {
         summary: String,
         output: String,
     },
+    Verify(Box<VerifyDone>),
 }
 
 /// Runs long commands off the orchestrator's thread.

@@ -26,6 +26,7 @@ pub mod pty;
 pub mod server;
 pub mod statedir;
 pub mod undo;
+pub mod verify;
 
 #[doc(hidden)]
 pub mod testutil;

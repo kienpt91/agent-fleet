@@ -4,7 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use fleet_app::testing::contracts::{
-    contract_files_contract, event_store_contract, output_logs_contract, MemoryContractHarness,
+    contract_files_contract, event_store_contract, output_logs_contract, verify_jobs_contract,
+    MemoryContractHarness, MemoryVerifyHarness,
 };
 use fleet_app::testing::World;
 
@@ -24,4 +25,10 @@ fn memory_output_logs_satisfy_the_contract() {
 fn memory_contract_files_satisfy_the_contract() {
     let mut harness = MemoryContractHarness::new(World::new());
     contract_files_contract(&mut harness);
+}
+
+#[test]
+fn memory_verify_jobs_satisfy_the_contract() {
+    let mut harness = MemoryVerifyHarness::new(World::new());
+    verify_jobs_contract(&mut harness);
 }
