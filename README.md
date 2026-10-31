@@ -1,0 +1,594 @@
+# agent-fleet
+
+**Run many coding agents in parallel, each in its own git worktree and pty, with a task DAG, supervised
+workers, decision gates, approvals and quality gates. One small, memory-bounded Rust binary: `fleet`.**
+
+> An example project. It has **not been audited** and makes **no production claims**. It runs commands you
+> configure with your user's permissions and does not sandbox them. Linux and macOS only (the macOS paths
+> type-check but were not run). Read [SECURITY.md](SECURITY.md) before using it on anything you care about.
+
+```text
+fleet plan plan.toml  ->  fleet start  ->  one worker per ready task, in .fleet-worktrees/<run>/<task>
+                                        ->  worker asks a question?   a person answers a decision gate
+                                        ->  quality gates (exit code or refcheck-json) must pass
+                                        ->  fleet merge <task>        an approval bound to the exact commit
+                                        ->  merge --no-ff into fleet/<run>/integration
+```
+
+## What it does
+
+- **Isolation.** Every task runs on its own branch `fleet/<run>/<task>` in its own git worktree under
+  `<repo>/.fleet-worktrees/`, created from the run's base commit. Your checked-out branch, index and working tree
+  are never touched. All git calls run with an empty environment and neutralized configuration (hooks, fsmonitor,
+  filters, merge drivers, ssh and credential helpers cannot run planted code).
+- **Any agent command.** A worker is a command from `fleet.toml` started in a pty with its own session and process
+  group. Its environment is an explicit allowlist; the control socket and state directory are never visible to it.
+- **A task DAG.** Dependencies, cycle rejection, a concurrency limit per run and globally, bounded automatic
+  retries (a failed worker or a failed quality gate re-runs the task with the failure text added to its brief),
+  and the work of finished dependencies is merged into a dependent's branch before it starts.
+- **Humans stay in the loop.** A worker that is blocked writes `.fleet/question.json`; fleet opens a *decision gate*
+  and resumes the task with your answer. Sensitive actions (merging, running a command a worker asked for) need an
+  *approval* bound to a SHA-256 digest of the exact action, with an expiry. Workers cannot create or grant
+  approvals, and the daemon refuses control requests that come from a worker process.
+- **Quality gates.** Configured commands run in the worktree after the worker finishes. A task completes only when
+  all pass. The `refcheck-json` format understands the report of the `refcheck` tool and fails on errors,
+  unparseable output, the wrong shape or death by signal.
+- **Supervised and recoverable.** Idle and total timeouts, TERM then KILL of the whole process group, pid-reuse
+  protection (pid *and* start time are verified before any signal), and an append-only hash-chained event log:
+  after a crash (or `kill -9`) the daemon replays the log, stops sessions that survived and re-queues their tasks.
+- **Bounded memory.** Worker output goes through a streaming sanitizer and redactor into a fixed-size ring buffer;
+  see [Memory](#memory) for measured numbers with flooding workers.
+- **A dashboard and an interactive attach.** `fleet tui` shows runs, the DAG, sanitized live output, approvals and
+  gates; `fleet attach` is a real interactive terminal into a worker with a detach key.
+
+It does not make agents smarter and it does not sandbox them. See [Limitations](#limitations).
+
+## Quick start
+
+Requirements: git 2.39+, Rust 1.95 (pinned in `rust-toolchain.toml`), Linux or macOS.
+
+```bash
+cargo build --release            # produces target/release/fleet
+mkdir -p ~/.local/state/agent-fleet
+cp examples/fleet.example.toml ~/.local/state/agent-fleet/fleet.toml   # then edit [workers.agent]
+target/release/fleet daemon      # foreground; stop it with `fleet shutdown` from another terminal
+```
+
+In another terminal:
+
+```bash
+fleet plan examples/plan.example.toml     # creates run r1 with the four tasks of the example DAG
+fleet start --run r1 --max-parallel 2
+fleet status                              # or: fleet tui
+fleet gate list                           # questions the workers asked
+fleet gate resolve g1 --answer axum
+fleet merge api                           # exits 5 and names the approval you must give
+fleet approve a1 && fleet merge api
+```
+
+`fleet daemon` reads `fleet.toml` once at start, from `--config` or from the state directory, never from a
+repository (configuration names commands to run, so a repository's contents must not be able to change it).
+
+## A real run
+
+The whole run below was produced by [`scripts/demo.sh`](scripts/demo.sh) in a throwaway container with a fake HOME
+and a fake repository. The agents are [scripted shell scripts](examples/agents/fake-agent.sh): `api` asks which HTTP
+framework to use, and `release` writes a bad changelog on its first attempt so its quality gate fails and the task is
+retried with the gate's complaint in its brief. Nothing was edited afterwards.
+
+<details>
+<summary>Full output (click to expand)</summary>
+
+```text
+
+$ /target/release/fleet plan /tmp/tmp.SIE5ya1P98/plan.toml
+plan loaded into run r1 (4 tasks)
+
+$ /target/release/fleet start --run r1 --max-parallel 2
+run r1 started
+
+$ /target/release/fleet status
+daemon pid 546 | v0.1.0 | up 2s | sessions 0/4 | undo unavailable | rss 3800 kB
+
+run r1 [active] max-parallel 2
+  objective  Add a users table, an API and docs
+  repo       /tmp/tmp.SIE5ya1P98/repo (base HEAD @ b8c865c9)
+  branch     fleet/r1/integration
+  tasks      pending 1, ready 0, running 0, review 1, completed 1, failed 0, blocked 1
+  ID       STATUS     DEPS      TRY  WORKER  NOTE
+  schema   completed  -         1    -       added the users table
+  api      blocked    schema    1    -       blocked: question g1 - Which HTTP framework should the API …
+  docs     review     schema    1    -       wrote the docs
+  release  pending    api,docs  0    -
+
+waiting for you
+gate g1 [question] r1/api: Which HTTP framework should the API use?
+  choices: axum | actix
+
+recent
+  #15 r1/api ready
+  #16 r1/docs ready
+  #17 r1/api dispatched (attempt 1)
+  #18 r1/docs dispatched (attempt 1)
+  #19 r1/api session exited
+  #20 gate g1 opened for r1/api
+  #21 r1/api blocked (question)
+  #22 r1/docs session exited
+  #23 r1/docs in review
+  #24 r1/docs committed
+
+$ /target/release/fleet gate list
+gate g1 [question] r1/api: Which HTTP framework should the API use?
+  choices: axum | actix
+
+$ /target/release/fleet gate resolve g1 --answer axum
+gate g1 resolved
+
+$ /target/release/fleet status
+daemon pid 546 | v0.1.0 | up 6s | sessions 0/4 | undo unavailable | rss 3928 kB
+
+run r1 [finished] max-parallel 2
+  objective  Add a users table, an API and docs
+  repo       /tmp/tmp.SIE5ya1P98/repo (base HEAD @ b8c865c9)
+  branch     fleet/r1/integration
+  tasks      pending 0, ready 0, running 0, review 0, completed 4, failed 0, blocked 0
+  ID       STATUS     DEPS      TRY  WORKER  NOTE
+  schema   completed  -         1    -       added the users table
+  api      completed  schema    2    -       built the API with axum
+  docs     completed  schema    1    -       wrote the docs
+  release  completed  api,docs  2    -       wrote the changelog
+
+recent
+  #40 r1/release committed
+  #41 r1/release gate changelog failed
+  #42 r1/release retry 1 queued
+  #43 r1/release note added
+  #44 r1/release dispatched (attempt 2)
+  #45 r1/release session exited
+  #46 r1/release in review
+  #47 r1/release committed
+  #48 r1/release gate changelog passed
+  #49 r1/release completed
+
+$ /target/release/fleet tail release
+agent: starting release
+agent: the gate complained, fixing the changelog
+agent: finished release
+
+$ /target/release/fleet merge schema
+fleet: merging r1/schema needs approval a1 (digest 1e4ca1677841); approve it with `fleet approve a1` and run the merge again
+run: fleet approve a1
+
+$ /target/release/fleet merge docs
+fleet: merging r1/docs needs approval a2 (digest 622a867d240a); approve it with `fleet approve a2` and run the merge again
+run: fleet approve a2
+
+$ /target/release/fleet merge api
+fleet: merging r1/api needs approval a3 (digest e487901688fc); approve it with `fleet approve a3` and run the merge again
+run: fleet approve a3
+
+$ /target/release/fleet merge release
+fleet: merging r1/release needs approval a4 (digest 4bf7760677ba); approve it with `fleet approve a4` and run the merge again
+run: fleet approve a4
+
+$ /target/release/fleet approval list
+approval a1 [merge] r1/schema pending digest 1e4ca1677841
+  git: "merge" "fleet/r1/integration" "fleet/r1/schema" "139f5187777cbea7e25874b815cb902aea53aba3"
+  decide: fleet approve a1 | fleet deny a1
+approval a2 [merge] r1/docs pending digest 622a867d240a
+  git: "merge" "fleet/r1/integration" "fleet/r1/docs" "f9ac33ab15da98da250b945fd0b5b58c05c7e1ac"
+  decide: fleet approve a2 | fleet deny a2
+approval a3 [merge] r1/api pending digest e487901688fc
+  git: "merge" "fleet/r1/integration" "fleet/r1/api" "025b5b35ee97c1532bfc3c9433dc070d1d085563"
+  decide: fleet approve a3 | fleet deny a3
+approval a4 [merge] r1/release pending digest 4bf7760677ba
+  git: "merge" "fleet/r1/integration" "fleet/r1/release" "91f410cfc3a95fa7807ff1742457a72b72cc3d18"
+  decide: fleet approve a4 | fleet deny a4
+
+$ /target/release/fleet approve a1
+approval a1 approved
+
+$ /target/release/fleet approve a2
+approval a2 approved
+
+$ /target/release/fleet approve a3
+approval a3 approved
+
+$ /target/release/fleet approve a4
+approval a4 approved
+
+$ /target/release/fleet merge schema
+merged r1/schema (fleet/r1/schema) into fleet/r1/integration at e052eb803600
+
+$ /target/release/fleet merge docs
+merged r1/docs (fleet/r1/docs) into fleet/r1/integration at e134489dab42
+
+$ /target/release/fleet merge api
+merged r1/api (fleet/r1/api) into fleet/r1/integration at b6ed843149ce
+
+$ /target/release/fleet merge release
+merged r1/release (fleet/r1/release) into fleet/r1/integration at ca3a99d07a01
+
+$ git log --oneline --graph fleet/r1/integration
+*   ca3a99d fleet: merge release into fleet/r1/integration: Write the changelog
+|\  
+| * 91f410c fleet: release - Write the changelog
+| * edb8c09 fleet: release - Write the changelog
+| *   fb1dcef Merge branch 'refs/heads/fleet/r1/docs' into fleet/r1/release
+| |\  
+* | | b6ed843 fleet: merge api into fleet/r1/integration: Build the users API
+|\| | 
+| * | 025b5b3 fleet: api - Build the users API
+* | |   e134489 fleet: merge docs into fleet/r1/integration: Document the schema
+|\ \ \  
+| | |/  
+| |/|   
+| * | f9ac33a fleet: docs - Document the schema
+| |/  
+* | e052eb8 fleet: merge schema into fleet/r1/integration: Create the users table
+|\| 
+| * 139f518 fleet: schema - Create the users table
+|/  
+* b8c865c initial commit
+
+$ git status --short   # the working tree and branch of the repository are untouched
+main
+
+$ /target/release/fleet status
+daemon pid 546 | v0.1.0 | up 6s | sessions 0/4 | undo unavailable | rss 3928 kB
+
+run r1 [finished] max-parallel 2
+  objective  Add a users table, an API and docs
+  repo       /tmp/tmp.SIE5ya1P98/repo (base HEAD @ b8c865c9)
+  branch     fleet/r1/integration
+  tasks      pending 0, ready 0, running 0, review 0, completed 4, failed 0, blocked 0
+  ID       STATUS     DEPS      TRY  WORKER  NOTE
+  schema   completed  -         1    -       added the users table
+  api      completed  schema    2    -       built the API with axum
+  docs     completed  schema    1    -       wrote the docs
+  release  completed  api,docs  2    -       wrote the changelog
+
+recent
+  #57 approval a4 approved
+  #58 approval a1 consumed
+  #59 run r1 integration branch created
+  #60 r1/schema merged
+  #61 approval a2 consumed
+  #62 r1/docs merged
+  #63 approval a3 consumed
+  #64 r1/api merged
+  #65 approval a4 consumed
+  #66 r1/release merged
+
+$ /target/release/fleet events --limit 12
+#55 approval a2 approved
+#56 approval a3 approved
+#57 approval a4 approved
+#58 approval a1 consumed
+#59 run r1 integration branch created
+#60 r1/schema merged
+#61 approval a2 consumed
+#62 r1/docs merged
+#63 approval a3 consumed
+#64 r1/api merged
+#65 approval a4 consumed
+#66 r1/release merged
+```
+
+</details>
+
+What to notice: the question became gate `g1` and the task resumed after `gate resolve`; `release` shows `TRY 2`
+because its quality gate failed once; every merge first returned exit 5 with an approval id and a digest of the
+exact merge (including the commit being merged); the repository's own branch and working tree were untouched
+(`git status --short` empty, branch still `main`).
+
+## Concepts
+
+| Term | Meaning |
+| --- | --- |
+| **Run** | One objective: a task DAG, a repository, a base commit and an integration branch. |
+| **Task** | `pending` (waiting for dependencies), `ready`, `running`, `review` (gates pending), `completed`, `failed`, `blocked` (waiting for a person, a conflict resolution or a failed dependency). |
+| **Worker** | A command from `fleet.toml` run in a pty for one attempt of a task. |
+| **Decision gate** | A question a worker (or a merge conflict) puts to a person. `fleet gate list|resolve`. |
+| **Approval** | A person's yes/no for one exact action, bound to a digest and an expiry. `fleet approve|deny`. |
+| **Quality gate** | A configured command that must pass before a task completes. |
+
+The full glossary, the layer diagram and the context map are in [docs/domain.md](docs/domain.md); the reasons for the
+main design decisions are the short ADRs in [docs/adr](docs/adr).
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending
+  pending --> ready: dependencies completed
+  ready --> running: slot free, worker started
+  running --> review: worker exited 0
+  running --> blocked: question or approval request
+  running --> ready: failed attempt, retries left
+  running --> failed: retries exhausted
+  review --> completed: every quality gate passed
+  review --> ready: a gate failed, retries left
+  blocked --> ready: answered, approved or denied
+  failed --> ready: fleet retry
+  completed --> blocked: merge conflict (decision gate)
+```
+
+## Commands
+
+```text
+fleet - run many coding agents in parallel, each in its own git worktree
+
+usage: fleet [global options] <command> [options]
+
+global options (before or after the command):
+  --state-dir <dir>   state directory (default: $XDG_STATE_HOME/agent-fleet or ~/.local/state/agent-fleet)
+  --json              print the daemon's reply (or the error) as one JSON document
+  -h, --help          show this help
+  -V, --version       show the version
+
+daemon:
+  daemon [--config <fleet.toml>]     run the daemon in the foreground
+  shutdown                           ask the daemon to stop
+  doctor [--config <fleet.toml>]     check the setup (exit 13 when something fails)
+  verify-log                         verify the event log's hash chain (exit 11 when tampered)
+
+runs and tasks:
+  run create --objective <text> --repo <path> [--base <ref>] [--id <id>] [--max-parallel N]
+  task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--id <id>]
+                                     (--spec - reads the spec from stdin, at most 16 KiB)
+  plan <file.toml|file.json> [--run <run>]
+                                     load a whole task graph (with --run: into an existing run)
+  start --run <run> [--max-parallel N]
+  status [--run <run>]               runs, tasks, gates, approvals, recent events
+  stop <task>                        stop the running worker
+  retry <task>                       run a failed or stopped task again
+  cancel <task>                      cancel a task that has not completed
+  events [--limit N]                 recent audit events
+
+working with a task (<task> is <run>/<task> or a unique task id):
+  attach <task>                      interactive terminal session of the worker
+  send <task> <text...> [--no-newline]
+  tail <task> [--follow] [--lines N]
+
+decisions:
+  gate list                          open questions and conflicts
+  gate resolve <id> --answer <text>  answer a gate (or give the answer as the rest of the line)
+  approval list                      approvals and their digests
+  approve <id> [--digest <hex>]      approve a pending action
+  deny <id> [--digest <hex>]         deny it
+
+results:
+  merge <task>                       merge a reviewed task into the integration branch
+  cleanup [--run <run>] [--branches] remove finished worktrees (and branches)
+  undo <task> [--apply]              preview or revert the last worker changes (needs agent-undo)
+
+dashboard:
+  tui                                terminal dashboard
+
+exit codes: 0 ok, 1 internal, 2 usage, 3 daemon down, 4 not found, 5 approval required,
+6 conflict, 7 invalid, 8 limit, 9 unavailable, 10 forbidden, 11 tampered, 12 timeout, 13 unhealthy
+```
+
+Everything talks to the daemon over a Unix socket with bounded newline-delimited JSON. With `--json` every command
+prints one document with a stable `schema` field (`fleet.status/1`, `fleet.gate.list/1`, `fleet.merge/1`, ...) or
+`{"schema":"fleet.error/1","error":{"code","message","subject"}}`; the exit code is the same in both modes:
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| 0 | ok | |
+| 1 | internal | unexpected I/O, git or internal failure |
+| 2 | usage | bad command line |
+| 3 | daemon_down | nothing is listening on the socket (`fleet daemon` first) |
+| 4 | not_found | unknown run, task, gate or approval |
+| 5 | approval_required | a person must decide first (the error names the approval) |
+| 6 | conflict | wrong state for the action, a merge conflict, a second daemon, an expired approval |
+| 7 | invalid | validation failed: bad name, cycle, oversized text, digest mismatch |
+| 8 | limit | a hard limit was reached |
+| 9 | unavailable | an optional feature is missing (`agent-undo`) |
+| 10 | forbidden | refused: wrong user, or a request from a worker process |
+| 11 | tampered | the event log failed its integrity check |
+| 12 | timeout | the daemon did not answer in time |
+| 13 | unhealthy | `fleet doctor` found a failing check |
+
+`fleet status --json` has the top-level keys `schema, daemon, now_ms, runs, gates, approvals, recent`; the key sets of
+the status, error and doctor documents are pinned by end-to-end tests
+([`e2e_cli.rs`](crates/fleet-cli/tests/e2e_cli.rs)).
+
+## Configuration
+
+`fleet.toml` (see [examples/fleet.example.toml](examples/fleet.example.toml); unknown keys are errors):
+
+| Section / key | Meaning | Default |
+| --- | --- | --- |
+| `[daemon] max_sessions` | concurrent worker sessions across all runs (hard cap 64) | 8 |
+| `default_worker` | worker used by tasks that name none | none |
+| `max_retries` | automatic retries per task (worker failures and failed gates); questions and daemon restarts do not use them | 2 |
+| `kill_grace_secs` | SIGTERM, then SIGKILL after this long | 5 |
+| `approval_ttl_secs` | an approval expires if nobody uses it | 900 |
+| `sensitive` | actions that always need an approval: `merge`, `external-command` | both |
+| `external_timeout_secs`, `question_grace_secs` | limit for approved commands; how long a worker that wrote a question may keep running | 600, 2 |
+| `author_name`, `author_email` | identity of commits fleet makes | `fleet` / `fleet@localhost` |
+| `ring_bytes` | output kept per session (hard cap 4 MiB) | 262144 |
+| `[env] allow` | variables copied from the daemon's environment to workers, gates, git and approved commands | `PATH HOME USER LOGNAME LANG LC_ALL LC_CTYPE TERM TZ TMPDIR` |
+| `[redact] literals, env_values, [[redact.rules]]` | extra redaction: literal strings, values of secret-looking daemon variables, `prefix` + `charset` (`alnum|hex|base64|token`) + `min_len` rules | built-in key shapes + env values |
+| `[workers.<name>]` | `command`, `args`, `env_pass`, `env_set`, `timeout_secs`, `idle_timeout_secs` | |
+| `[[gates]]` | `name`, `command`, `args`, `env_pass`, `env_set`, `format` (`exit` or `refcheck-json`), `timeout_secs` | exit, 600 s |
+
+Arguments are templates, never shell: `{brief}` (the brief, at most 16 KiB), `{task}`, `{run}`, `{worktree}` and
+`{brief_file}` are replaced inside each argument, `{{` and `}}` are literal braces. A **plan file**
+(`fleet plan file.toml|json`) names workers but cannot define commands; an optional `[run]` table creates the run.
+
+### What a worker sees and may write
+
+Environment: only the allowlist plus `FLEET_RUN`, `FLEET_TASK`, `FLEET_WORKTREE`, `FLEET_BRIEF_FILE` (and `SHELL`,
+which the pty library always adds). Working directory: its own worktree. The brief is in `.fleet/brief.md` and also
+offered as `{brief}`. Before it exits it may write, in `.fleet/`:
+
+```json
+{"version":1,"status":"done","summary":"what I did"}                                        // result.json (or "failed")
+{"version":1,"kind":"question","text":"Which framework?","choices":["axum","actix"]}        // question.json: a decision gate
+{"version":1,"kind":"approval","text":"why","action":{"command":"/usr/bin/publish","args":["--tag","x"]}}   // an approval request
+```
+
+These files are read with lstat + `O_NOFOLLOW|O_NONBLOCK` checks, size caps and schema validation. An approved
+command is run by the *daemon*, exactly as approved, with the allowlisted environment; its result goes into the task's
+next brief. Uncommitted changes are committed by fleet (never with hooks, `--no-verify`).
+
+## Dashboard
+
+`fleet tui` (keys: `j/k` move, `Tab` focus, `Enter` attach or answer, `a`/`d` approve or deny the selected approval,
+`s` stop, `t` retry, `m` merge, `?` help). A real screen from the demo's status document, rendered into a headless
+buffer by the example in [crates/fleet-cli/examples/tui_screenshot.rs](crates/fleet-cli/examples/tui_screenshot.rs)
+(the same rendering code the terminal uses):
+
+```text
+fleet 0.1.0 | runs 1 | pend 1 rdy 0 run 1 rev 0 ok 1 fail 0 blk 1 | sess 1/4 | undo off | rss 3M
+┌Tasks (4)───────────────────────────────────────┐┌Output r1/schema──────────────────────────────────────────┐
+│  TASK       STATUS    DEPS     TITLE           ││Create the users table attempt 1                          │
+│> r1/schema  completed -        Create the users││summary: added the users table                            │
+│  r1/api     blocked   <schema  Build the users ││gate changelog pass exit code 0                           │
+│  r1/docs    running   <schema  Document the sch││agent: starting schema                                    │
+│  r1/release pending   <api,doc Write the change││agent: finished schema                                    │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+│                                                ││                                                          │
+└────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
+┌Approvals (0)───────────────────────────────────────────────────┐┌Decisions (1)─────────────────────────────┐
+│none pending                                                    ││> g1 r1/api Which HTTP framework should th│
+│                                                                ││                                          │
+│                                                                ││                                          │
+│                                                                ││                                          │
+│                                                                ││                                          │
+└────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
+q quit  j/k move  Tab focus  Enter attach/answer  a/d approve/deny  s stop  t retry  m merge  r refresh  ? hel
+```
+
+## Architecture
+
+Domain-driven layers in a cargo workspace; the compiler enforces the dependency rule and an architecture test checks
+the manifests.
+
+| Crate | Layer | Depends on |
+| --- | --- | --- |
+| `fleet-domain` | pure rules: runs/tasks (aggregate), decision gates, approvals, quality judgement, supervision rules, sanitizer, redactor, output buffer, events, hash chain | `std` only |
+| `fleet-app` | use cases (`Orchestrator`), commands, read models, port traits, in-memory fakes and port contract suites | `fleet-domain` |
+| `fleet-infra` | adapters: git, ptys, files, event log, job runner, sockets, TOML, daemon wiring | app, domain |
+| `fleet-cli` | the `fleet` binary: argument parsing, rendering, dashboard, attach | all |
+
+State is event-sourced: every change is a domain event, appended to a hash-chained log before it is applied;
+a restart replays the log. Time, hashing and ids reach the domain only through arguments and small traits, so the
+domain performs no I/O. See [docs/domain.md](docs/domain.md) and [docs/adr](docs/adr).
+
+## Tests
+
+924 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+
+| Layer | What is tested | Tests |
+| --- | --- | --- |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals, quality judgement (`refcheck-json` edge cases), supervision and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain | 223 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals, merging and conflicts, recovery and orphan reconciliation, quality gates; plus the port contract suites against the fakes | 212 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, symlink/FIFO/oversize worker files, pty sessions, process identity, hash-chained log, sockets, config) and the same contract suites against the real file adapters | 285 |
+| Soak | bounded memory with flooding workers | 1 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules | 203 |
+
+Run them layer by layer inside the development container (see [Development](#development)):
+`scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
+the git and pty behaviour is tested against real git and real ptys, and the end-to-end tests drive the real binary.
+
+### Coverage
+
+Measured for real with rustc's source-based instrumentation (`-C instrument-coverage`) and `llvm-profdata`/`llvm-cov`
+from the official `llvm-tools` component (`scripts/coverage.sh`, no third-party coverage crate). It counts library and
+binary code, excluding the unit-test modules inside source files, `tests/`, examples, the in-memory fakes and test
+helpers:
+
+```text
+layer               lines  covered  percent
+domain               3243     3126    96.4%
+application          1818     1690    93.0%
+infrastructure       3065     2791    91.1%
+cli                  2420     2145    88.6%
+overall             10546     9752    92.5%
+```
+
+Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
+(`tui/mod.rs`, about a quarter covered) and the interactive part of `attach.rs` need a real tty and are not exercised
+by the automated tests (their pure parts, the model, key handling, rendering and input scanning, are); the recovery
+tests kill the daemon with SIGKILL, which writes no coverage profile, so the crash paths count as covered only through
+the application-layer tests of the same logic.
+
+## Memory
+
+`crates/fleet-infra/tests/soak.rs` runs the daemon in the test process with 8 workers that print as fast as their
+terminals allow (output with escape sequences, a bidi override and a token-shaped string, so sanitizing and redaction
+run on every byte) and samples the process's resident memory from `/proc/self/statm` every 500 ms. Each session's ring
+buffer is capped (64 KiB in the test). A 120 second run in release mode, in the Linux container:
+
+```text
+soak: 8 workers x 120s, 10616 MiB of terminal output (88 MiB/s), rss start 4060 kB, steady min 5580 kB / max 6712 kB / first 5708 kB, growth after warm-up 1004 kB, 236 samples
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.59s
+```
+
+Memory is flat after the buffers fill: it did not grow with the volume of output (about 10 GiB went through the
+daemon). The test fails if memory grows by more than 4 MiB after warm-up. By default it runs 20 seconds;
+`FLEET_SOAK_SECS=120 cargo test --release -p fleet-infra --test soak -- --nocapture` reproduces the numbers above
+(your throughput will differ). Bounds elsewhere: messages 64 KiB, frames 32 KiB, files read from workers 64 KiB,
+gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 64 connections.
+
+## Limitations
+
+- Workers are not sandboxed: they run as you. fleet limits what they share and what they can make the daemon do.
+- The origin check that keeps workers off the control socket is best effort (peer process ancestry); run workers under
+  another user for a hard guarantee. Approvals bind what *fleet* runs, not what a worker does on its own.
+- Redaction is pattern based; the audit log is tamper evident, not tamper proof.
+- SIGINT/SIGTERM are not handled (that needs `unsafe` or another dependency): they stop the daemon at once and the next
+  start reconciles. `fleet shutdown` is the graceful way.
+- macOS: the code type-checks for `aarch64-apple-darwin` but was **not run**; pty, peer-credential and `ps`-based
+  process-identity behaviour there is unverified. Windows is not supported.
+- Not verified here: real coding agents (only scripted ones), very large repositories, concurrent daemons on
+  network file systems, and any adversary that can already run code as your user.
+
+The full list, the threat model and the dependency policy are in [SECURITY.md](SECURITY.md).
+
+## Verification
+
+What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
+dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, the test suites above, the release build, the 120 second soak, `scripts/demo.sh`, and
+`check-crates-age` (every locked crate version published on or before 2026-10-24: 0 too new). A secret scan of the
+working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
+found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
+
+## Development
+
+Build and test without installing a toolchain: build the development image once, then run commands in a throwaway
+container with the repository mounted (the cargo registry and target directory live in docker volumes):
+
+```bash
+docker build -f docker/Dockerfile.dev -t fleet-dev docker/
+docker volume create fleet-cargo; docker volume create fleet-target
+docker run --rm -u 0 -v fleet-cargo:/cargo -v fleet-target:/target fleet-dev chown "$(id -u):$(id -g)" /cargo /target
+run() { docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -v fleet-cargo:/cargo -v fleet-target:/target -w /work \
+  -e HOME=/tmp/home -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target ${DOCKER_NET:+--network=$DOCKER_NET} fleet-dev sh -c "$*"; }
+run 'cargo fetch --locked'                       # needs network, once
+DOCKER_NET=none run 'cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings'
+DOCKER_NET=none run 'scripts/test-layers.sh'     # layered suites
+DOCKER_NET=none run 'scripts/coverage.sh'        # coverage per layer
+DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/demo.sh /target/release/fleet'
+```
+
+Layout: `crates/fleet-domain`, `crates/fleet-app`, `crates/fleet-infra`, `crates/fleet-cli`, `docs/`,
+`examples/`, `scripts/`, `docker/`.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Copyright (c) 2026 Kien Phan.
