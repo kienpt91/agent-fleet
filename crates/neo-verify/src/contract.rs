@@ -975,6 +975,133 @@ pub(crate) mod tests {
         );
     }
 
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % bound.max(1)
+        }
+    }
+
+    fn random_value(rng: &mut Lcg, depth: usize) -> Value {
+        let words = [
+            "id", "kind", "command", "file", "diff", "checks", "version", "/bin/sh", "a/b", "**",
+            "", "\u{1b}",
+        ];
+        match rng.next(if depth == 0 { 5 } else { 7 }) {
+            0 => Value::Null,
+            1 => Value::Bool(rng.next(2) == 0),
+            2 => Value::int(rng.next(300) as i64 - 20),
+            3 => Value::Float(rng.next(100) as f64 / 7.0),
+            4 => Value::str(words[rng.next(words.len())]),
+            5 => Value::array((0..rng.next(4)).map(|_| random_value(rng, depth - 1))),
+            _ => Value::object(
+                (0..rng.next(5))
+                    .map(|_| (words[rng.next(words.len())], random_value(rng, depth - 1))),
+            ),
+        }
+    }
+
+    /// A contract the parser accepts, built field by field from random choices.
+    fn random_contract(rng: &mut Lcg) -> Value {
+        let checks = (0..1 + rng.next(5)).map(|i| {
+            let id = Value::str(format!("c{i}"));
+            let mut pairs = vec![
+                ("id", id),
+                ("mandatory", Value::Bool(i == 0 || rng.next(2) == 0)),
+            ];
+            match rng.next(4) {
+                0 => {
+                    pairs.push(("kind", Value::str("command")));
+                    pairs.push(("program", Value::str("/bin/true")));
+                    pairs.push((
+                        "args",
+                        Value::array((0..rng.next(3)).map(|n| Value::str(format!("a{n}")))),
+                    ));
+                    if rng.next(2) == 0 {
+                        pairs.push(("expect_exit", Value::int(rng.next(256) as i64)));
+                    }
+                    if rng.next(2) == 0 {
+                        pairs.push(("timeout_ms", Value::int(100 + rng.next(5000) as i64)));
+                    }
+                }
+                1 => {
+                    pairs.push(("kind", Value::str("refcheck-json")));
+                    pairs.push(("program", Value::str("/usr/bin/refcheck")));
+                }
+                2 => {
+                    pairs.push(("kind", Value::str("file")));
+                    pairs.push(("path", Value::str(format!("d{}/f.txt", rng.next(3)))));
+                    match rng.next(3) {
+                        0 => pairs.push(("assert", Value::str("exists"))),
+                        1 => {
+                            pairs.push(("assert", Value::str("contains")));
+                            pairs.push(("value", Value::str("needle")));
+                        }
+                        _ => {
+                            pairs.push(("assert", Value::str("sha256")));
+                            pairs.push(("value", Value::str("ab".repeat(32))));
+                        }
+                    }
+                }
+                _ => {
+                    pairs.push(("kind", Value::str("diff")));
+                    pairs.push((
+                        "allow",
+                        Value::array(
+                            (0..1 + rng.next(3)).map(|n| Value::str(format!("src{n}/**"))),
+                        ),
+                    ));
+                }
+            }
+            Value::object(pairs)
+        });
+        Value::object([("version", Value::int(1)), ("checks", Value::array(checks))])
+    }
+
+    #[test]
+    fn random_valid_contracts_round_trip_through_their_canonical_form() {
+        let mut rng = Lcg(11);
+        for _ in 0..300 {
+            let doc = random_contract(&mut rng);
+            let c = VerificationContract::from_value(&doc)
+                .unwrap_or_else(|e| panic!("{e}: {}", doc.canonical()));
+            let again = VerificationContract::from_value(&c.to_value()).unwrap();
+            assert_eq!(again, c);
+            assert_eq!(again.canonical(), c.canonical());
+            assert_eq!(again.id(&Toy), c.id(&Toy));
+        }
+    }
+
+    #[test]
+    fn arbitrary_documents_never_panic_and_whatever_is_accepted_is_canonical() {
+        let mut rng = Lcg(5);
+        let mut accepted = 0;
+        for _ in 0..3000 {
+            let doc = random_value(&mut rng, 4);
+            if let Ok(c) = VerificationContract::from_value(&doc) {
+                accepted += 1;
+                assert_eq!(VerificationContract::from_value(&c.to_value()).unwrap(), c);
+            }
+        }
+        // mutate valid contracts: drop, add or retype one field; strictness must hold
+        for _ in 0..300 {
+            let mut doc = random_contract(&mut rng);
+            if let Value::Object(map) = &mut doc {
+                if let Some(Value::Array(checks)) = map.get_mut("checks") {
+                    if let Some(Value::Object(check)) = checks.first_mut() {
+                        check.insert("surprise".into(), Value::Null);
+                    }
+                }
+            }
+            assert!(VerificationContract::from_value(&doc).is_err());
+        }
+        assert!(accepted < 3000);
+    }
+
     fn evidence(seq: u64, contract: &ContractId, check: &str, verdict: Verdict) -> Evidence {
         Evidence::from_parts(
             EvidenceId::from_seq(seq),
