@@ -1,0 +1,18 @@
+[package]
+name = "fleet-domain"
+description = "Pure domain layer of agent-fleet: entities, value objects, aggregates, domain events. Depends on std only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "fleet_domain"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
