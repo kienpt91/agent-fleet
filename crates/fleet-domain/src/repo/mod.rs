@@ -10,5 +10,6 @@ pub mod markdown;
 pub mod path;
 pub mod tree;
 pub mod view;
+pub mod worddiff;
 
 pub use path::RepoPath;

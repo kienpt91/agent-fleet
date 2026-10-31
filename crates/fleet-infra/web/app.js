@@ -2572,8 +2572,10 @@
     const frag = String(location.hash || '');
     const m = /(?:^|[#&?])token=([0-9a-f]{64})(?![0-9a-f])/.exec(frag);
     const nx = /(?:^|[#&?])next=([^&]*)/.exec(frag);
-    // A route to open after the login. Plain path characters only, never a protocol-relative form.
-    const next = nx && /^\/[A-Za-z0-9._~\/-]{0,200}$/.test(nx[1]) && nx[1].slice(0, 2) !== '//' ? nx[1] : '/runs';
+    // A route to open after the login, percent-encoded so that a workbench deep link (with its query) fits
+    // in the fragment. After decoding: plain path and query characters only, never a protocol-relative form.
+    const nextRaw = nx && /^[A-Za-z0-9._~\/%-]{1,600}$/.test(nx[1]) ? safeDecode(nx[1]) : '';
+    const next = /^\/[A-Za-z0-9._~\/?&=-]{0,300}$/.test(nextRaw) && nextRaw.slice(0, 2) !== '//' ? nextRaw : '/runs';
     let res = null;
     let authed = false;
     if (m) {

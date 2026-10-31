@@ -13,6 +13,7 @@ use super::limits::{
 };
 use super::path::RepoPath;
 use super::tree::{display_text, EntryKind};
+use super::worddiff::{changed_ranges, WordBudget};
 use crate::ids::Sha;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +157,8 @@ pub struct DiffBudget {
     pub text_left: usize,
     pub hunks_per_file: usize,
     pub lines_per_file: usize,
+    /// What may still be spent on marking changed words.
+    pub words: WordBudget,
 }
 
 impl Default for DiffBudget {
@@ -165,6 +168,7 @@ impl Default for DiffBudget {
             text_left: MAX_DIFF_TEXT_BYTES,
             hunks_per_file: MAX_DIFF_HUNKS_PER_FILE,
             lines_per_file: MAX_DIFF_LINES_PER_FILE,
+            words: WordBudget::default(),
         }
     }
 }
@@ -371,6 +375,7 @@ pub fn parse_file_patch(chunk: &[u8], budget: &mut DiffBudget) -> FilePatch {
             {
                 patch.truncated = true;
                 if !hunk.lines.is_empty() {
+                    mark_words(&mut hunk, &mut budget.words);
                     patch.hunks.push(hunk);
                 }
                 break 'hunks;
@@ -413,9 +418,55 @@ pub fn parse_file_patch(chunk: &[u8], budget: &mut DiffBudget) -> FilePatch {
             }
             hunk.lines.push(line);
         }
+        mark_words(&mut hunk, &mut budget.words);
         patch.hunks.push(hunk);
     }
     patch
+}
+
+/// Most line pairs of one run of removed and added lines that are compared word by word.
+const MAX_PAIRS_PER_RUN: usize = 64;
+
+/// Marks the changed words of each pair made of the i-th removed line and the i-th added line of
+/// a run of removals followed by additions (the usual shape of an edited line).
+fn mark_words(hunk: &mut Hunk, budget: &mut WordBudget) {
+    let mut i = 0usize;
+    while i < hunk.lines.len() {
+        let dels = hunk
+            .lines
+            .iter()
+            .skip(i)
+            .take_while(|l| l.kind == LineKind::Del)
+            .count();
+        if dels == 0 {
+            i += 1;
+            continue;
+        }
+        let adds = hunk
+            .lines
+            .iter()
+            .skip(i + dels)
+            .take_while(|l| l.kind == LineKind::Add)
+            .count();
+        for p in 0..dels.min(adds).min(MAX_PAIRS_PER_RUN) {
+            if budget.work_left == 0 {
+                return;
+            }
+            let (di, ai) = (i + p, i + dels + p);
+            let (Some(old), Some(new)) = (hunk.lines.get(di), hunk.lines.get(ai)) else {
+                continue;
+            };
+            if let Some((o, n)) = changed_ranges(&old.text, &new.text, budget) {
+                if let Some(l) = hunk.lines.get_mut(di) {
+                    l.marks = o;
+                }
+                if let Some(l) = hunk.lines.get_mut(ai) {
+                    l.marks = n;
+                }
+            }
+        }
+        i += dels + adds;
+    }
 }
 
 // ---- assembling a file -----------------------------------------------------------------------
@@ -934,5 +985,47 @@ mod tests {
         assert_eq!(LineKind::Add.as_str(), "add");
         assert_eq!(LineKind::Del.as_str(), "del");
         assert_eq!(FILE_LIMIT, MAX_DIFF_FILES);
+    }
+
+    #[test]
+    fn edited_lines_get_word_marks_and_the_work_is_bounded() {
+        let p = parse("diff --git a/x b/x\n@@ -1,2 +1,2 @@\n-let a = foo(1);\n-keep old\n+let a = bar(1);\n+keep new\n");
+        let l = &p.hunks[0].lines;
+        assert_eq!(l[0].marks, vec![(8, 11)]);
+        assert_eq!(l[2].marks, vec![(8, 11)]);
+        assert_eq!(l[1].marks, vec![(5, 8)]);
+        // context lines and unpaired lines carry no marks
+        let q = parse("diff --git a/x b/x\n@@ -1,2 +1,3 @@\n ctx\n-a b\n+a c\n+extra\n");
+        assert!(q.hunks[0].lines[0].marks.is_empty() && q.hunks[0].lines[3].marks.is_empty());
+        // thousands of similar long lines never spend more than the budget
+        let mut patch = String::from("diff --git a/x b/x\n@@ -1,3000 +1,3000 @@\n");
+        let base: String = (0..300).map(|i| format!("w{i} ")).collect();
+        let other: String = (0..300)
+            .map(|i| {
+                if i % 4 == 0 {
+                    format!("z{i} ")
+                } else {
+                    format!("w{i} ")
+                }
+            })
+            .collect();
+        for _ in 0..1500 {
+            patch.push_str(&format!("-{base}\n"));
+        }
+        for _ in 0..1500 {
+            patch.push_str(&format!("+{other}\n"));
+        }
+        let mut b = DiffBudget::default();
+        let start = std::time::Instant::now();
+        let big = parse_file_patch(patch.as_bytes(), &mut b);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(b.words.work_left < super::super::worddiff::WORK_PER_DIFF);
+        let marked = big
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter(|l| !l.marks.is_empty())
+            .count();
+        assert!(marked <= 2 * 64, "{marked}");
     }
 }
