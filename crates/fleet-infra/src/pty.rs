@@ -49,6 +49,8 @@ pub struct SessionIo {
     subscriber: Mutex<Option<SyncSender<Vec<u8>>>>,
     eof: AtomicBool,
     attach_dropped: AtomicU64,
+    /// Raw bytes read from all sessions of the daemon (shared with the registry).
+    total_bytes: Arc<AtomicU64>,
 }
 
 impl SessionIo {
@@ -60,6 +62,8 @@ impl SessionIo {
     fn ingest(&self, raw: &[u8]) {
         self.last_output_ms
             .store(self.elapsed_ms(), Ordering::Relaxed);
+        self.total_bytes
+            .fetch_add(raw.len() as u64, Ordering::Relaxed);
         {
             let mut sub = lock(&self.subscriber);
             if let Some(tx) = sub.as_ref() {
@@ -137,25 +141,33 @@ impl SessionIo {
 }
 
 /// Lookup of live sessions' terminals, shared with the control socket (which runs on other
-/// threads than the orchestrator).
+/// threads than the orchestrator), plus a counter of all output bytes ever read.
 #[derive(Clone, Default)]
-pub struct SessionRegistry(Arc<Mutex<BTreeMap<u64, Arc<SessionIo>>>>);
+pub struct SessionRegistry {
+    sessions: Arc<Mutex<BTreeMap<u64, Arc<SessionIo>>>>,
+    total_bytes: Arc<AtomicU64>,
+}
 
 impl SessionRegistry {
+    /// Raw terminal bytes read from every session since the daemon started.
+    pub fn output_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn get(&self, id: SessionId) -> Option<Arc<SessionIo>> {
-        lock(&self.0).get(&id.0).cloned()
+        lock(&self.sessions).get(&id.0).cloned()
     }
 
     fn insert(&self, id: SessionId, io: Arc<SessionIo>) {
-        lock(&self.0).insert(id.0, io);
+        lock(&self.sessions).insert(id.0, io);
     }
 
     fn remove(&self, id: SessionId) {
-        lock(&self.0).remove(&id.0);
+        lock(&self.sessions).remove(&id.0);
     }
 
     pub fn len(&self) -> usize {
-        lock(&self.0).len()
+        lock(&self.sessions).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -304,6 +316,7 @@ impl SessionHost for PtySessionHost {
             subscriber: Mutex::new(None),
             eof: AtomicBool::new(false),
             attach_dropped: AtomicU64::new(0),
+            total_bytes: Arc::clone(&self.registry.total_bytes),
         });
         let reader_io = Arc::clone(&io);
         let spawned_thread = std::thread::Builder::new()

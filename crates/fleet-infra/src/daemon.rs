@@ -103,7 +103,11 @@ fn process_env() -> Vec<(String, String)> {
 /// Reads configuration from the explicit path, else from `<state>/fleet.toml` when it exists,
 /// else uses defaults. The repository is never consulted: configuration is code, and a
 /// repository's contents are not trusted to name commands.
-fn load_config(opts: &DaemonOptions, layout: &StateLayout, env: Vec<(String, String)>) -> Result<crate::config_file::LoadedConfig> {
+fn load_config(
+    opts: &DaemonOptions,
+    layout: &StateLayout,
+    env: Vec<(String, String)>,
+) -> Result<crate::config_file::LoadedConfig> {
     match &opts.config_path {
         Some(p) => crate::config_file::load_config(p, env),
         None => {
@@ -124,7 +128,10 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     let env = process_env();
     let loaded = load_config(&opts, &layout, env.clone())?;
     let app: AppConfig = loaded.app;
-    let path_env = env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());
+    let path_env = env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone());
     let undo_env: Vec<(String, String)> = env
         .iter()
         .filter(|(k, _)| matches!(k.as_str(), "HOME" | "LANG" | "TMPDIR" | "USER"))
@@ -134,7 +141,10 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     let registry = SessionRegistry::default();
     let ports = Ports {
         clock: Box::new(SystemClock),
-        store: Box::new(FileEventStore::open(&layout.events, Box::new(Sha256Digest))?),
+        store: Box::new(FileEventStore::open(
+            &layout.events,
+            Box::new(Sha256Digest),
+        )?),
         vcs: Box::new(GitVcs::new(env.clone(), app.env.clone())),
         sessions: Box::new(PtySessionHost::new(
             loaded.ring_bytes,
@@ -198,7 +208,12 @@ pub fn run_daemon(opts: DaemonOptions) -> Result<()> {
     Ok(())
 }
 
-fn engine_loop(mut orch: Orchestrator, rx: Receiver<EngineMsg>, stop: &AtomicBool, kill_grace_ms: u64) {
+fn engine_loop(
+    mut orch: Orchestrator,
+    rx: Receiver<EngineMsg>,
+    stop: &AtomicBool,
+    kill_grace_ms: u64,
+) {
     let mut shutdown_deadline: Option<Instant> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -217,8 +232,11 @@ fn engine_loop(mut orch: Orchestrator, rx: Receiver<EngineMsg>, stop: &AtomicBoo
         }
         orch.tick();
         if orch.shutdown_requested() {
-            let deadline = *shutdown_deadline
-                .get_or_insert_with(|| Instant::now() + Duration::from_millis(kill_grace_ms.saturating_mul(2)) + SHUTDOWN_EXTRA);
+            let deadline = *shutdown_deadline.get_or_insert_with(|| {
+                Instant::now()
+                    + Duration::from_millis(kill_grace_ms.saturating_mul(2))
+                    + SHUTDOWN_EXTRA
+            });
             if orch.live_count() == 0 || Instant::now() >= deadline {
                 break;
             }
@@ -240,9 +258,12 @@ impl DaemonHandler {
         self.tx
             .send(build(reply_tx))
             .map_err(|_| FleetError::internal("the daemon is shutting down"))?;
-        reply_rx
-            .recv_timeout(ENGINE_REPLY_TIMEOUT)
-            .map_err(|_| FleetError::new(fleet_domain::error::ErrorCode::Timeout, "the daemon did not answer in time"))
+        reply_rx.recv_timeout(ENGINE_REPLY_TIMEOUT).map_err(|_| {
+            FleetError::new(
+                fleet_domain::error::ErrorCode::Timeout,
+                "the daemon did not answer in time",
+            )
+        })
     }
 
     /// Refuses requests from a worker or from anything it started. Workers run as the same user
@@ -267,7 +288,10 @@ impl DaemonHandler {
     fn check_repo(&self, cmd: &Command) -> Result<()> {
         let repo = match cmd {
             Command::CreateRun(args) => Some(args.repo.as_str()),
-            Command::LoadPlan { new_run: Some(args), .. } => Some(args.repo.as_str()),
+            Command::LoadPlan {
+                new_run: Some(args),
+                ..
+            } => Some(args.repo.as_str()),
             _ => None,
         };
         match repo {
@@ -279,20 +303,23 @@ impl DaemonHandler {
     fn convert(&self, reply: Reply, size: Option<(u16, u16)>) -> Result<HandlerReply> {
         match reply {
             Reply::Data(v) => Ok(HandlerReply::Data(self.decorate(v))),
-            Reply::Input { session, bytes, data } => {
-                let io = self
-                    .registry
-                    .get(session)
-                    .ok_or_else(|| FleetError::conflict("the session ended before the input could be delivered"))?;
-                io.write_input(&bytes)
-                    .map_err(|e| FleetError::internal(format!("could not write to the session: {e}")))?;
+            Reply::Input {
+                session,
+                bytes,
+                data,
+            } => {
+                let io = self.registry.get(session).ok_or_else(|| {
+                    FleetError::conflict("the session ended before the input could be delivered")
+                })?;
+                io.write_input(&bytes).map_err(|e| {
+                    FleetError::internal(format!("could not write to the session: {e}"))
+                })?;
                 Ok(HandlerReply::Data(data))
             }
             Reply::Attach { session, data } => {
-                let io = self
-                    .registry
-                    .get(session)
-                    .ok_or_else(|| FleetError::conflict("the session ended before it could be attached"))?;
+                let io = self.registry.get(session).ok_or_else(|| {
+                    FleetError::conflict("the session ended before it could be attached")
+                })?;
                 if let Some((cols, rows)) = size {
                     // The resize makes the agent redraw its screen for the attaching terminal.
                     let _ = io.resize(cols, rows);
@@ -315,8 +342,14 @@ impl DaemonHandler {
                         crate::memory::rss_kb().map_or(Value::Null, Value::int),
                     );
                     daemon.insert(
+                        "output_bytes".to_string(),
+                        Value::int(self.registry.output_bytes()),
+                    );
+                    daemon.insert(
                         "uptime_ms".to_string(),
-                        Value::int(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        Value::int(
+                            u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
                     );
                 }
             }
@@ -336,8 +369,15 @@ impl RequestHandler for DaemonHandler {
         self.reject_worker_origin(peer)?;
         let command = parse_command(cmd, &args)?;
         self.check_repo(&command)?;
-        let size = if matches!(command, Command::Attach { .. }) { term_size(&args) } else { None };
-        let reply = self.ask(|reply| EngineMsg::Call { cmd: command, reply })??;
+        let size = if matches!(command, Command::Attach { .. }) {
+            term_size(&args)
+        } else {
+            None
+        };
+        let reply = self.ask(|reply| EngineMsg::Call {
+            cmd: command,
+            reply,
+        })??;
         self.convert(reply, size)
     }
 }
