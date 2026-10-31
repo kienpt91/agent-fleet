@@ -5,13 +5,14 @@
 //! digest binding of approvals and the approval flow of merges are the daemon's own, not a second
 //! implementation.
 
-use super::auth::{self, Presented, Verdict};
+use super::auth::{self, ClientKey, Presented, Verdict, SESSION_HEADER};
 use super::http::{Method, Request, Response};
 use super::{assets, host_allowed, url_host, Shared};
 use crate::eventlog::VerifyReport;
 use crate::json;
 use crate::statedir::tokens_equal;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
+use fleet_domain::ids::is_invisible;
 use fleet_domain::limits::{MAX_ANSWER, MAX_SEND_BYTES};
 use fleet_domain::value::Value;
 use std::collections::BTreeMap;
@@ -28,6 +29,8 @@ pub(crate) enum Outcome {
 
 /// A validated request for an event stream. The slot keeps the stream counted while it lives.
 pub(crate) struct StreamPlan {
+    /// The session the stream was opened with; the stream ends when it does.
+    session: Option<String>,
     task: String,
     since: Option<u64>,
     first: Value,
@@ -179,7 +182,12 @@ fn refuse(status: u16, code: ErrorCode, message: &str) -> Outcome {
 }
 
 /// Handles one parsed request.
-pub(crate) fn handle(shared: &Arc<Shared>, req: &Request, now: Instant) -> Outcome {
+pub(crate) fn handle(
+    shared: &Arc<Shared>,
+    req: &Request,
+    client: ClientKey,
+    now: Instant,
+) -> Outcome {
     // 1. Host: the only defence against DNS rebinding, so it runs before anything else.
     let Some(host) = req.header("host") else {
         return refuse(421, ErrorCode::Forbidden, "a Host header is required");
@@ -230,16 +238,18 @@ pub(crate) fn handle(shared: &Arc<Shared>, req: &Request, now: Instant) -> Outco
     }
 
     if route == Route::Login {
-        return login(shared, req, host, site.is_some(), now);
+        return login(shared, req, host, site.is_some(), client, now);
     }
 
     // authentication
-    let presented = match (req.header("authorization"), req.header("cookie")) {
+    // Credentials travel in headers only. A `Cookie` header is never read: cookies are not
+    // isolated by port, so a browser sends them to every server on this host.
+    let presented = match (req.header("authorization"), req.header(SESSION_HEADER)) {
         (Some(h), _) => Presented::Bearer(auth::bearer_token(h).unwrap_or("")),
-        (None, Some(c)) => auth::session_cookie(c).map_or(Presented::Nothing, Presented::Cookie),
+        (None, Some(s)) => auth::session_id(s).map_or(Presented::Nothing, Presented::Session),
         (None, None) => Presented::Nothing,
     };
-    let verdict = shared.auth.check(presented, now);
+    let verdict = shared.auth.check(presented, client, now);
     let csrf = match &verdict {
         Verdict::Bearer => None,
         Verdict::Session { csrf } => Some(csrf.as_str()),
@@ -251,7 +261,11 @@ pub(crate) fn handle(shared: &Arc<Shared>, req: &Request, now: Instant) -> Outco
             )
         }
         Verdict::Rejected => {
-            return refuse(401, ErrorCode::Forbidden, "the credentials were not accepted")
+            return refuse(
+                401,
+                ErrorCode::Forbidden,
+                "the credentials were not accepted (a session that ended needs a new login)",
+            )
         }
         Verdict::Locked { retry_after_secs } => return locked(*retry_after_secs),
     };
@@ -282,7 +296,7 @@ fn locked(retry_after_secs: u64) -> Outcome {
 
 /// What a state-changing request must show: it came from the dashboard's own origin, it is JSON
 /// (which a cross-site form cannot send without a preflight) and, when it is authenticated by the
-/// ambient cookie, it carries the session's CSRF token.
+/// session, it carries the session's CSRF token.
 fn check_state_change(
     req: &Request,
     host: &str,
@@ -294,7 +308,7 @@ fn check_state_change(
         Some(origin) if origin.eq_ignore_ascii_case(&expected) => {}
         Some(_) => return forbidden("the Origin of this request is not the dashboard"),
         // Browsers always send Origin on a POST; a request without one is a script with the
-        // token in hand, which is fine, but never a cookie session.
+        // token in hand, which is fine, but never a browser session.
         None if csrf.is_none() && req.header("sec-fetch-site").is_none() => {}
         None => return forbidden("the Origin header is required"),
     }
@@ -479,16 +493,25 @@ fn pass(map: Vec<(&'static str, Value)>) -> Value {
     Value::object(map)
 }
 
-fn session_document(shared: &Shared, csrf: Option<&str>) -> Value {
+/// `session` is given only in the reply to a login: the id is a credential and is not echoed.
+fn session_document(shared: &Shared, session: Option<&str>, csrf: Option<&str>) -> Value {
     Value::object([
         ("schema", Value::str("fleet.web.session/1")),
+        ("session", session.map_or(Value::Null, Value::str)),
         ("csrf", csrf.map_or(Value::Null, Value::str)),
         ("version", Value::str(crate::daemon::VERSION)),
         ("bind", Value::str(url_host(shared.bound))),
     ])
 }
 
-fn login(shared: &Arc<Shared>, req: &Request, host: &str, browser: bool, now: Instant) -> Outcome {
+fn login(
+    shared: &Arc<Shared>,
+    req: &Request,
+    host: &str,
+    browser: bool,
+    client: ClientKey,
+    now: Instant,
+) -> Outcome {
     // A browser sends Origin on every POST; a script with the token may leave it out.
     let origin = req.header("origin");
     let expected = format!("http://{host}");
@@ -514,19 +537,13 @@ fn login(shared: &Arc<Shared>, req: &Request, host: &str, browser: bool, now: In
         Err(r) => return Outcome::Reply(r),
     };
     let token = body.get("token").and_then(Value::as_str).unwrap_or("");
-    match shared.auth.login(token, now) {
-        Ok((id, csrf)) => Outcome::Reply(ok_value_with_cookie(
-            &session_document(shared, Some(&csrf)),
-            &id,
-            shared.auth.cookie_max_age(),
-        )),
+    match shared.auth.login(token, client, now) {
+        Ok((id, csrf)) => {
+            Outcome::Reply(ok_value(&session_document(shared, Some(&id), Some(&csrf))))
+        }
         Err(Verdict::Locked { retry_after_secs }) => locked(retry_after_secs),
         Err(_) => refuse(401, ErrorCode::Forbidden, "the token was not accepted"),
     }
-}
-
-fn ok_value_with_cookie(v: &Value, id: &str, max_age: u64) -> Response {
-    ok_value(v).with_header("Set-Cookie", &auth::set_cookie(id, max_age))
 }
 
 fn run_route(
@@ -543,19 +560,17 @@ fn run_route(
                 Verdict::Session { csrf } => Some(csrf.as_str()),
                 _ => None,
             };
-            respond(session_document(shared, csrf))
+            respond(session_document(shared, None, csrf))
         }
         Route::Logout => {
             parse_body(req, &[])?;
-            let mut r = ok_value(&Value::object([
+            if let Some(id) = req.header(SESSION_HEADER).and_then(auth::session_id) {
+                shared.auth.logout(id);
+            }
+            respond(Value::object([
                 ("schema", Value::str("fleet.web.logout/1")),
                 ("ok", Value::Bool(true)),
-            ]));
-            if let Some(id) = req.header("cookie").and_then(auth::session_cookie) {
-                shared.auth.logout(id);
-                r = r.with_header("Set-Cookie", &auth::clear_cookie());
-            }
-            Ok(Reply::Response(r))
+            ]))
         }
         Route::Status => {
             let q = parse_query(&req.query, &["run"])?;
@@ -590,7 +605,7 @@ fn run_route(
             }
             respond(call(shared, "task.tail", pass(args))?)
         }
-        Route::Stream => open_stream(shared, req).map(Reply::Stream),
+        Route::Stream => open_stream(shared, req, verdict).map(Reply::Stream),
         Route::GateResolve => {
             let body = parse_body(req, &[req_str("id", 40), req_str("answer", MAX_ANSWER)])?;
             respond(call(shared, "gate.resolve", body)?)
@@ -627,6 +642,20 @@ fn run_route(
                     },
                 ],
             )?;
+            // What the operator types goes to a terminal program as keystrokes. Escape sequences,
+            // carriage returns, backspaces and invisible characters are not typing: they would
+            // let pasted text drive the terminal or hide what it does.
+            let text = body.get("text").and_then(Value::as_str).unwrap_or("");
+            if text
+                .chars()
+                .any(|c| (c.is_control() && c != '\n' && c != '\t') || is_invisible(c))
+            {
+                return Err(error_response(
+                    400,
+                    ErrorCode::Invalid,
+                    "`text` contains control or invisible characters (only tab and line breaks are allowed)",
+                ));
+            }
             respond(call(shared, "task.send", body)?)
         }
         Route::Merge => {
@@ -638,7 +667,11 @@ fn run_route(
 
 // ---- server-sent events ----
 
-fn open_stream(shared: &Arc<Shared>, req: &Request) -> std::result::Result<StreamPlan, Response> {
+fn open_stream(
+    shared: &Arc<Shared>,
+    req: &Request,
+    verdict: &Verdict,
+) -> std::result::Result<StreamPlan, Response> {
     let q = parse_query(&req.query, &["task", "since"])?;
     let task = q
         .get("task")
@@ -676,7 +709,15 @@ fn open_stream(shared: &Arc<Shared>, req: &Request) -> std::result::Result<Strea
         args.push(("since", Value::int(n)));
     }
     let first = call(shared, "task.tail", pass(args))?;
+    let session = match verdict {
+        Verdict::Session { .. } => req
+            .header(SESSION_HEADER)
+            .and_then(auth::session_id)
+            .map(str::to_string),
+        _ => None,
+    };
     Ok(StreamPlan {
+        session,
         task,
         since,
         first,
@@ -778,6 +819,18 @@ pub(crate) fn stream_task(shared: &Shared, stream: &mut TcpStream, plan: &Stream
                 &Value::object([("reason", Value::str("the session has ended"))]),
             );
             return;
+        }
+        // A stream is authenticated when it opens; it must not outlive its session.
+        if let Some(id) = &plan.session {
+            if !shared.auth.session_alive(id, Instant::now()) {
+                let _ = sse_event(
+                    stream,
+                    "end",
+                    None,
+                    &Value::object([("reason", Value::str("the session has ended"))]),
+                );
+                return;
+            }
         }
         if shared.stop.load(Ordering::Acquire)
             || started.elapsed() >= limits.stream_lifetime

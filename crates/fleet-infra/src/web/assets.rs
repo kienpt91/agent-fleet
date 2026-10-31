@@ -66,8 +66,9 @@ mod tests {
         "setInterval(\"",
         "setInterval('",
         "localStorage",
-        "sessionStorage",
         "document.cookie",
+        // EventSource cannot send the session header; the stream is read with fetch instead
+        "EventSource",
         "import(",
         "importScripts",
         "XMLHttpRequest",
@@ -91,6 +92,26 @@ mod tests {
     fn the_script_sends_the_csrf_header_and_the_digest() {
         assert!(APP_JS.contains("X-CSRF-Token"));
         assert!(APP_JS.contains("digest"));
+    }
+
+    /// The credential is a header held in the page, never a cookie: cookies are not isolated by
+    /// port and would travel to every other server on the host.
+    #[test]
+    fn the_script_keeps_the_session_in_a_header_and_in_session_storage_only() {
+        assert!(APP_JS.contains("X-Fleet-Session"));
+        assert!(!APP_JS.to_ascii_lowercase().contains("cookie"));
+        assert!(
+            !APP_JS.contains("credentials: 'include'")
+                && !APP_JS.contains("credentials: \"include\"")
+        );
+        assert!(APP_JS.contains("credentials: 'omit'"));
+        // the only thing ever stored is the session under one key, only in sessionStorage
+        for line in APP_JS.lines().filter(|l| l.contains("sessionStorage")) {
+            assert!(
+                line.contains("fleet.session") || line.contains("STORE_KEY"),
+                "{line}"
+            );
+        }
     }
 
     #[test]

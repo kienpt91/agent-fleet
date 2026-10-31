@@ -19,6 +19,11 @@
   const TAIL_MAX = 65536;
   const SVG_NS = 'http:' + '//www.w3.org/2000/svg';
   const NOT_LOGGED_IN = 'Not logged in. Open the login URL printed by `fleet daemon --web` in its terminal.';
+  const MAX_PENDING = 1048576; // undecoded stream bytes (one frame) we are willing to hold
+  const RECONNECT_MS = 1000;
+  const RETRY_MS = 3000;
+  const MAX_STREAM_RETRIES = 5;
+  const ID_RE = /^[0-9a-f]{64}$/;
 
   const KNOWN = new Set([
     'pending', 'ready', 'running', 'review', 'completed', 'failed', 'blocked',
@@ -33,6 +38,7 @@
   const CTRL_MULTI = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u00ad\u061c\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g;
 
   let csrf = null;
+  let session = null;
   let loggedOut = false;
   let lastStatus = null;
   let lastParam = null;
@@ -180,7 +186,7 @@
   // ------------------------------------------------------------------- api
 
   async function api(method, path, body) {
-    const opts = { method: method, credentials: 'same-origin', cache: 'no-store', headers: {} };
+    const opts = { method: method, credentials: 'omit', cache: 'no-store', headers: authHeaders() };
     if (method === 'POST') {
       opts.headers['Content-Type'] = 'application/json';
       if (csrf !== null) {
@@ -205,6 +211,53 @@
       retryAfter = resp.headers.get('Retry-After');
     }
     return { ok: !!resp.ok, status: resp.status, data: data, networkError: false, retryAfter: retryAfter };
+  }
+
+  // The session id and the CSRF token are sent as request headers only, never as ambient browser
+  // credentials. They are kept in this tab's session storage so a reload keeps the login.
+  function authHeaders() {
+    const h = {};
+    if (session !== null) {
+      h['X-Fleet-Session'] = session;
+    }
+    return h;
+  }
+
+  function validId(v) {
+    return typeof v === 'string' && ID_RE.test(v);
+  }
+
+  function saveSession() {
+    try {
+      sessionStorage.setItem('fleet.session', JSON.stringify({ session: session, csrf: csrf }));
+    } catch (e) {
+      setLine('Could not keep the login for a reload.');
+    }
+  }
+
+  function loadSession() {
+    try {
+      const raw = sessionStorage.getItem('fleet.session');
+      const d = raw === null ? null : JSON.parse(raw);
+      if (d && validId(d.session) && validId(d.csrf)) {
+        session = d.session;
+        csrf = d.csrf;
+        return true;
+      }
+    } catch (e) {
+      return false;
+    }
+    return false;
+  }
+
+  function clearSession() {
+    session = null;
+    csrf = null;
+    try {
+      sessionStorage.removeItem('fleet.session');
+    } catch (e) {
+      setLine('Could not clear the stored login.');
+    }
   }
 
   function errText(res) {
@@ -288,7 +341,7 @@
 
   function showLoggedOut(message) {
     loggedOut = true;
-    csrf = null;
+    clearSession();
     if (pollTimer !== null) {
       clearTimeout(pollTimer);
       pollTimer = null;
@@ -808,9 +861,9 @@
     let gen = 0;
     let out = '';
     let nextOff = 0;
-    let es = null;
+    let abortCtl = null;
     let tailDone = false;
-    let needFalse = false;
+    let halted = false;
     let flushTimer = null;
     let fieldsSig = null;
 
@@ -846,32 +899,45 @@
     }
 
     function closeStream() {
-      if (es) {
-        es.close();
-        es = null;
+      if (abortCtl !== null) {
+        abortCtl.abort();
       }
     }
 
     function openStream() {
-      if (es || stopped) {
+      if (abortCtl !== null || stopped) {
         return;
       }
-      const src = new EventSource('/api/stream?task=' + enc(ref) + '&since=' + enc(nextOff));
-      es = src;
-      note('Streaming live output.');
-      src.addEventListener('output', function (ev) {
-        if (es !== src) {
-          return;
+      abortCtl = new AbortController();
+      runStream(abortCtl);
+    }
+
+    function sleep(ms, signal) {
+      return new Promise(function (resolve) {
+        const t = setTimeout(done, ms);
+        function done() {
+          clearTimeout(t);
+          signal.removeEventListener('abort', done);
+          resolve();
         }
-        let d = null;
-        try {
-          d = JSON.parse(ev.data);
-        } catch (e) {
-          return;
-        }
-        if (!d) {
-          return;
-        }
+        signal.addEventListener('abort', done);
+      });
+    }
+
+    let endReason = '';
+
+    // Returns 'end' or 'limit' when the frame ends this connection, otherwise null.
+    function handleEvent(type, data) {
+      let d = null;
+      try {
+        d = JSON.parse(data);
+      } catch (e) {
+        return null;
+      }
+      if (!d || typeof d !== 'object') {
+        return null;
+      }
+      if (type === 'output') {
         if (typeof d.next === 'number') {
           nextOff = d.next;
         }
@@ -879,39 +945,175 @@
           lostNote.classList.remove('hidden');
         }
         append(d.text);
-        note('Streaming live output.');
-      });
-      src.addEventListener('end', function (ev) {
-        if (es !== src) {
-          return;
+        return null;
+      }
+      if (type === 'end') {
+        endReason = typeof d.reason === 'string' ? d.reason : '';
+        return 'end';
+      }
+      if (type === 'limit') {
+        if (typeof d.next === 'number') {
+          nextOff = d.next;
         }
-        let reason = '';
-        try {
-          reason = JSON.parse(ev.data).reason;
-        } catch (e) {
-          reason = '';
+        return 'limit';
+      }
+      return null;
+    }
+
+    // One connection. Resolves to 'end', 'limit', 'closed' (body ended without an end event),
+    // 'overflow', 'auth' or 'error'.
+    async function readStream(ac, reconnecting) {
+      const headers = authHeaders();
+      headers.Accept = 'text/event-stream';
+      if (reconnecting) {
+        headers['Last-Event-ID'] = String(nextOff);
+      }
+      let resp;
+      try {
+        resp = await fetch('/api/stream?task=' + enc(ref) + '&since=' + enc(nextOff), {
+          method: 'GET',
+          credentials: 'omit',
+          cache: 'no-store',
+          headers: headers,
+          signal: ac.signal
+        });
+      } catch (e) {
+        return 'error';
+      }
+      if (resp.status === 401) {
+        return 'auth';
+      }
+      if (!resp.ok || !resp.body || typeof resp.body.getReader !== 'function') {
+        return 'error';
+      }
+      note('Streaming live output.');
+      let frame = { type: '', id: null, data: [], size: 0 };
+      function feed(line) {
+        if (line === '') {
+          const f = frame;
+          frame = { type: '', id: null, data: [], size: 0 };
+          if (f.id !== null) {
+            nextOff = f.id;
+          }
+          return f.data.length ? handleEvent(f.type, f.data.join('\n')) : null;
         }
-        src.close();
-        es = null;
-        needFalse = true;
-        note('Session ended' + (reason ? ': ' + clean(reason, { max: 200 }) : '.'));
-      });
-      src.addEventListener('limit', function () {
-        if (es === src) {
-          note('Reconnecting.');
+        if (line.charCodeAt(0) === 58) {
+          return null;
         }
-      });
-      src.onerror = function () {
-        if (es !== src) {
-          return;
+        const i = line.indexOf(':');
+        const field = i < 0 ? line : line.slice(0, i);
+        let value = i < 0 ? '' : line.slice(i + 1);
+        if (value.charCodeAt(0) === 32) {
+          value = value.slice(1);
         }
-        if (src.readyState === 2) {
-          es = null;
-          note('Stream closed by the server or the browser.');
-        } else {
-          note('Stream interrupted, the browser will retry.');
+        if (field === 'event') {
+          frame.type = value;
+        } else if (field === 'data') {
+          frame.size += value.length + 1;
+          if (frame.size > MAX_PENDING) {
+            return 'overflow';
+          }
+          frame.data.push(value);
+        } else if (field === 'id' && /^[0-9]{1,15}$/.test(value)) {
+          frame.id = Number(value);
         }
-      };
+        return null;
+      }
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      const re = /\r\n|\n|\r/g;
+      let buf = '';
+      let result = 'closed';
+      try {
+        outer: for (;;) {
+          const r = await reader.read();
+          if (r.done) {
+            break;
+          }
+          buf += dec.decode(r.value, { stream: true });
+          let pos = 0;
+          for (;;) {
+            re.lastIndex = pos;
+            const m = re.exec(buf);
+            if (m === null || (m[0] === '\r' && m.index + 1 === buf.length)) {
+              break;
+            }
+            const line = buf.slice(pos, m.index);
+            pos = m.index + m[0].length;
+            const sig = feed(line);
+            if (sig !== null) {
+              result = sig;
+              break outer;
+            }
+          }
+          buf = buf.slice(pos);
+          if (buf.length > MAX_PENDING) {
+            result = 'overflow';
+            break;
+          }
+        }
+      } catch (e) {
+        result = 'error';
+      }
+      try {
+        const p = reader.cancel();
+        if (p && typeof p.catch === 'function') {
+          p.catch(function () {});
+        }
+      } catch (e) {
+        setLine('Could not close the stream reader.');
+      }
+      return result;
+    }
+
+    // Keeps one connection at a time for this view until it ends, fails for good or is aborted.
+    async function runStream(ac) {
+      let failures = 0;
+      let reconnecting = false;
+      try {
+        for (;;) {
+          const r = await readStream(ac, reconnecting);
+          if (ac.signal.aborted) {
+            return;
+          }
+          if (r === 'end') {
+            halted = true;
+            note('Session ended' + (endReason ? ': ' + clean(endReason, { max: 200 }) : '.'));
+            return;
+          }
+          if (r === 'auth') {
+            showLoggedOut(NOT_LOGGED_IN);
+            return;
+          }
+          if (r === 'overflow') {
+            halted = true;
+            note('Live output stopped: the server sent more than 1 MiB without a complete frame.');
+            return;
+          }
+          if (r === 'error') {
+            failures += 1;
+            if (failures > MAX_STREAM_RETRIES) {
+              halted = true;
+              note('Live output stopped after ' + MAX_STREAM_RETRIES + ' failed retries.');
+              return;
+            }
+            note('Stream interrupted, retrying in 3 s (' + failures + ' of ' + MAX_STREAM_RETRIES + ').');
+            await sleep(RETRY_MS, ac.signal);
+          } else {
+            failures = 0;
+            note('Reconnecting.');
+            await sleep(RECONNECT_MS, ac.signal);
+          }
+          if (ac.signal.aborted) {
+            return;
+          }
+          reconnecting = true;
+        }
+      } finally {
+        if (abortCtl === ac) {
+          abortCtl = null;
+        }
+      }
     }
 
     async function initOutput() {
@@ -1053,11 +1255,11 @@
         mergeBtn.disabled = !(t.status === 'completed' && t.merged === null);
         sendBox.classList.toggle('hidden', !t.live);
         if (t.live) {
-          if (tailDone && !es && !needFalse) {
+          if (tailDone && abortCtl === null && !halted) {
             openStream();
           }
         } else {
-          needFalse = false;
+          halted = false;
         }
       },
       stop: function () {
@@ -1459,20 +1661,39 @@
         }
       });
     }
-    const m = /(?:^|[#&?])token=([0-9a-f]{64})(?![0-9a-f])/.exec(String(location.hash || ''));
-    let res;
+    const frag = String(location.hash || '');
+    const m = /(?:^|[#&?])token=([0-9a-f]{64})(?![0-9a-f])/.exec(frag);
+    const nx = /(?:^|[#&?])next=([^&]*)/.exec(frag);
+    // A route to open after the login. Plain path characters only, never a protocol-relative form.
+    const next = nx && /^\/[A-Za-z0-9._~\/-]{0,200}$/.test(nx[1]) && nx[1].slice(0, 2) !== '//' ? nx[1] : '/runs';
+    let res = null;
+    let authed = false;
     if (m) {
+      clearSession();
       res = await api('POST', '/api/login', { token: m[1] });
-      history.replaceState(null, '', location.pathname);
-    } else {
+      const ok = res.ok && res.data && validId(res.data.session) && validId(res.data.csrf);
+      // The token never stays in the address bar; a successful login lands on the requested route.
+      history.replaceState(null, '', ok ? location.pathname + '#' + next : location.pathname);
+      if (ok) {
+        session = res.data.session;
+        csrf = res.data.csrf;
+        saveSession();
+        authed = true;
+      }
+    } else if (loadSession()) {
       res = await api('GET', '/api/session');
+      if (res.ok && res.data && validId(res.data.csrf)) {
+        csrf = res.data.csrf;
+        saveSession();
+        authed = true;
+      } else if (res.status === 401) {
+        clearSession();
+      }
     }
-    if (res.ok && res.data && typeof res.data.csrf === 'string') {
-      csrf = res.data.csrf;
-    } else {
+    if (!authed) {
       loggedOut = true;
       let text;
-      if (res.status === 401 && !m) {
+      if (res === null || (res.status === 401 && !m)) {
         text = NOT_LOGGED_IN;
       } else if (res.status === 429) {
         text = errText(res);

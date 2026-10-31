@@ -227,7 +227,7 @@ impl Running {
         read_response(&mut s)
     }
 
-    /// Logs in with the token the way the page does; returns (cookie header value, csrf).
+    /// Logs in with the token the way the page does; returns (session id, csrf).
     fn login(&self) -> (String, String) {
         let resp = self.request(
             "POST",
@@ -239,20 +239,24 @@ impl Running {
             Some(&format!("{{\"token\":\"{}\"}}", self.token)),
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
-        let set = resp.header("set-cookie").expect("a session cookie");
-        let cookie = set.split(';').next().unwrap().to_string();
+        assert!(resp.header("set-cookie").is_none(), "no cookie is ever set");
         let doc = parse(&resp.body);
+        let session = doc
+            .get("session")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
         let csrf = doc.get("csrf").and_then(Value::as_str).unwrap().to_string();
-        (cookie, csrf)
+        (session, csrf)
     }
 
-    /// A POST the way the page sends it: cookie, Origin, CSRF header, JSON.
-    fn post_session(&self, path: &str, cookie: &str, csrf: &str, body: &str) -> Resp {
+    /// A POST the way the page sends it: session header, Origin, CSRF header, JSON.
+    fn post_session(&self, path: &str, session: &str, csrf: &str, body: &str) -> Resp {
         self.request(
             "POST",
             path,
             &[
-                ("Cookie", cookie),
+                ("X-Fleet-Session", session),
                 ("Origin", &self.origin()),
                 ("X-CSRF-Token", csrf),
                 ("Content-Type", "application/json"),
@@ -545,7 +549,48 @@ fn failed_credentials_lock_authentication_and_the_lock_applies_to_the_right_toke
 }
 
 #[test]
-fn login_issues_an_httponly_samesite_cookie_that_is_not_the_token() {
+fn a_lockout_does_not_cut_off_a_logged_in_session_and_unknown_sessions_are_not_failures() {
+    let r = Running::with(WebLimits {
+        auth: AuthLimits {
+            max_failures: 3,
+            failure_window: Duration::from_secs(60),
+            lockout: Duration::from_secs(30),
+            ..AuthLimits::default()
+        },
+        ..fast_limits()
+    });
+    let (session, csrf) = r.login();
+    // a stale tab, a restarted daemon or a reload with an old id is not an attack
+    for _ in 0..10 {
+        let resp = r.get("/api/status", &[("X-Fleet-Session", &"0".repeat(64))]);
+        assert_eq!(resp.status, 401);
+    }
+    assert_eq!(
+        r.get_bearer("/api/status").status,
+        200,
+        "not locked by unknown sessions"
+    );
+    // wrong tokens (guessing) do lock the token paths ...
+    for _ in 0..3 {
+        assert_eq!(
+            r.get("/api/status", &[("Authorization", "Bearer wrong")])
+                .status,
+            401
+        );
+    }
+    assert_eq!(r.get_bearer("/api/status").status, 429);
+    // ... but the operator's session keeps working: reads and decisions
+    assert_eq!(
+        r.get("/api/status", &[("X-Fleet-Session", &session)])
+            .status,
+        200
+    );
+    let resp = r.post_session("/api/merge", &session, &csrf, "{\"task\":\"r1/a\"}");
+    assert_eq!(resp.status, 200, "{}", resp.body);
+}
+
+#[test]
+fn login_issues_a_session_id_in_the_body_and_never_a_cookie() {
     let r = Running::start();
     let resp = r.request(
         "POST",
@@ -558,19 +603,9 @@ fn login_issues_an_httponly_samesite_cookie_that_is_not_the_token() {
     );
     assert_eq!(resp.status, 200);
     assert_hardened(&resp);
-    let set = resp.header("set-cookie").unwrap();
-    for part in [
-        "fleet_session=",
-        "HttpOnly",
-        "SameSite=Strict",
-        "Path=/",
-        "Max-Age=",
-    ] {
-        assert!(set.contains(part), "{set}");
-    }
     assert!(
-        !set.contains(&r.token),
-        "the cookie is a separate random session id"
+        resp.header("set-cookie").is_none(),
+        "a cookie would travel to every other port of this host"
     );
     assert!(!resp.body.contains(&r.token));
     let doc = parse(&resp.body);
@@ -579,15 +614,71 @@ fn login_issues_an_httponly_samesite_cookie_that_is_not_the_token() {
         Some("fleet.web.session/1")
     );
     let csrf = doc.get("csrf").and_then(Value::as_str).unwrap();
-    assert_eq!(csrf.len(), 64);
-    assert_ne!(csrf, r.token);
-    // the cookie authenticates reads without any other header
-    let (cookie, _) = r.login();
-    let status = r.get("/api/status", &[("Cookie", &cookie)]);
+    let id = doc.get("session").and_then(Value::as_str).unwrap();
+    for v in [csrf, id] {
+        assert_eq!(v.len(), 64);
+        assert!(v.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(v, r.token);
+    }
+    assert_ne!(csrf, id);
+    // the session header authenticates reads without any other header
+    let (session, _) = r.login();
+    let status = r.get("/api/status", &[("X-Fleet-Session", &session)]);
     assert_eq!(status.status, 200);
-    let session = r.get("/api/session", &[("Cookie", &cookie)]);
-    assert_eq!(session.status, 200);
-    assert_eq!(session.body.matches(&r.token).count(), 0);
+    let doc = r.get("/api/session", &[("X-Fleet-Session", &session)]);
+    assert_eq!(doc.status, 200);
+    let doc = parse(&doc.body);
+    assert_eq!(
+        doc.get("csrf").and_then(Value::as_str).map(str::len),
+        Some(64)
+    );
+    assert!(
+        doc.get("session").unwrap().is_null(),
+        "the id is not echoed"
+    );
+    assert_eq!(resp.body.matches(&r.token).count(), 0);
+}
+
+#[test]
+fn a_session_id_sent_as_a_cookie_is_not_a_credential() {
+    let r = Running::start();
+    let (session, csrf) = r.login();
+    let cookie = format!("fleet_session={session}");
+    // reads
+    let resp = r.get("/api/status", &[("Cookie", &cookie)]);
+    assert_eq!(resp.status, 401, "{}", resp.body);
+    assert_eq!(r.get("/api/session", &[("Cookie", &cookie)]).status, 401);
+    assert_eq!(
+        r.get("/api/stream?task=r1%2Fa", &[("Cookie", &cookie)])
+            .status,
+        401
+    );
+    // and writes, even with the right CSRF token and Origin, which is all a program that got hold
+    // of an old-style cookie could add
+    let resp = r.request(
+        "POST",
+        "/api/send",
+        &[
+            ("Cookie", &cookie),
+            ("Origin", &r.origin()),
+            ("X-CSRF-Token", &csrf),
+            ("Content-Type", "application/json"),
+        ],
+        Some("{\"task\":\"r1/a\",\"text\":\"x\"}"),
+    );
+    assert_eq!(resp.status, 401, "{}", resp.body);
+    // the session itself is still good, as a header
+    assert_eq!(
+        r.get("/api/status", &[("X-Fleet-Session", &session)])
+            .status,
+        200
+    );
+    assert!(
+        r.fake.call_names().iter().all(|n| n == "status"),
+        "{:?}",
+        r.fake.call_names()
+    );
+    assert_eq!(r.fake.calls().len(), 1);
 }
 
 #[test]
@@ -666,12 +757,20 @@ fn login_rejects_wrong_tokens_bad_origins_and_bad_bodies() {
 #[test]
 fn logout_ends_the_session() {
     let r = Running::start();
-    let (cookie, csrf) = r.login();
-    assert_eq!(r.get("/api/status", &[("Cookie", &cookie)]).status, 200);
-    let out = r.post_session("/api/logout", &cookie, &csrf, "{}");
+    let (session, csrf) = r.login();
+    assert_eq!(
+        r.get("/api/status", &[("X-Fleet-Session", &session)])
+            .status,
+        200
+    );
+    let out = r.post_session("/api/logout", &session, &csrf, "{}");
     assert_eq!(out.status, 200);
-    assert!(out.header("set-cookie").unwrap().contains("Max-Age=0"));
-    assert_eq!(r.get("/api/status", &[("Cookie", &cookie)]).status, 401);
+    assert!(out.header("set-cookie").is_none());
+    assert_eq!(
+        r.get("/api/status", &[("X-Fleet-Session", &session)])
+            .status,
+        401
+    );
 }
 
 // ---------- CSRF, Origin, Sec-Fetch-Site, content type ----------
@@ -679,7 +778,7 @@ fn logout_ends_the_session() {
 #[test]
 fn state_changing_requests_need_origin_csrf_token_and_json() {
     let r = Running::start();
-    let (cookie, csrf) = r.login();
+    let (session, csrf) = r.login();
     let body = "{\"task\":\"r1/a\",\"text\":\"hi\"}";
     let origin = r.origin();
     let json_header = ("Content-Type", "application/json");
@@ -688,21 +787,29 @@ fn state_changing_requests_need_origin_csrf_token_and_json() {
     let resp = r.request(
         "POST",
         "/api/send",
-        &[("Cookie", &cookie), ("Origin", &origin), json_header],
+        &[
+            ("X-Fleet-Session", &session),
+            ("Origin", &origin),
+            json_header,
+        ],
         Some(body),
     );
     assert_eq!(resp.status, 403);
     // wrong CSRF header
-    let resp = r.post_session("/api/send", &cookie, &"0".repeat(64), body);
+    let resp = r.post_session("/api/send", &session, &"0".repeat(64), body);
     assert_eq!(resp.status, 403);
     // the bearer token is not a CSRF token
-    let resp = r.post_session("/api/send", &cookie, &r.token, body);
+    let resp = r.post_session("/api/send", &session, &r.token, body);
     assert_eq!(resp.status, 403);
-    // no Origin with a cookie session
+    // no Origin with a session
     let resp = r.request(
         "POST",
         "/api/send",
-        &[("Cookie", &cookie), ("X-CSRF-Token", &csrf), json_header],
+        &[
+            ("X-Fleet-Session", &session),
+            ("X-CSRF-Token", &csrf),
+            json_header,
+        ],
         Some(body),
     );
     assert_eq!(resp.status, 403);
@@ -718,7 +825,7 @@ fn state_changing_requests_need_origin_csrf_token_and_json() {
             "POST",
             "/api/send",
             &[
-                ("Cookie", &cookie),
+                ("X-Fleet-Session", &session),
                 ("Origin", bad),
                 ("X-CSRF-Token", &csrf),
                 json_header,
@@ -733,7 +840,7 @@ fn state_changing_requests_need_origin_csrf_token_and_json() {
             "POST",
             "/api/send",
             &[
-                ("Cookie", &cookie),
+                ("X-Fleet-Session", &session),
                 ("Origin", &origin),
                 ("X-CSRF-Token", &csrf),
                 ("Sec-Fetch-Site", site),
@@ -755,7 +862,7 @@ fn state_changing_requests_need_origin_csrf_token_and_json() {
             "POST",
             "/api/send",
             &[
-                ("Cookie", &cookie),
+                ("X-Fleet-Session", &session),
                 ("Origin", &origin),
                 ("X-CSRF-Token", &csrf),
                 ("Content-Type", ct),
@@ -768,7 +875,7 @@ fn state_changing_requests_need_origin_csrf_token_and_json() {
         "POST",
         "/api/send",
         &[
-            ("Cookie", &cookie),
+            ("X-Fleet-Session", &session),
             ("Origin", &origin),
             ("X-CSRF-Token", &csrf),
         ],
@@ -781,13 +888,13 @@ fn state_changing_requests_need_origin_csrf_token_and_json() {
     );
 
     // the real thing
-    let resp = r.post_session("/api/send", &cookie, &csrf, body);
+    let resp = r.post_session("/api/send", &session, &csrf, body);
     assert_eq!(resp.status, 200, "{}", resp.body);
     let resp = r.request(
         "POST",
         "/api/send",
         &[
-            ("Cookie", &cookie),
+            ("X-Fleet-Session", &session),
             ("Origin", &origin),
             ("X-CSRF-Token", &csrf),
             ("Sec-Fetch-Site", "same-origin"),
@@ -931,6 +1038,42 @@ fn bodies_are_validated_strictly_and_rejected_before_the_daemon_sees_them() {
 }
 
 #[test]
+fn text_sent_to_a_worker_may_not_carry_terminal_control_characters() {
+    let r = Running::start();
+    // what a pasted escape sequence, a carriage return or a bidi override could do to a terminal
+    // program that reads the input
+    for text in [
+        "a\u{1b}[31mb",
+        "a\u{1b}]0;title\u{7}",
+        "line\rtwo",
+        "a\u{3}b",
+        "a\u{8}b",
+        "a\u{7f}b",
+        "a\u{202e}b",
+        "a\u{200b}b",
+        "a\u{85}b",
+    ] {
+        let body = format!(
+            "{{\"task\":\"r1/a\",\"text\":{}}}",
+            fleet_infra::json::to_line(&Value::str(text))
+        );
+        let resp = r.post_bearer("/api/send", &body);
+        assert_eq!(resp.status, 400, "{text:?}");
+        assert_eq!(resp.error_code(), "invalid");
+    }
+    assert!(r.fake.calls().is_empty());
+    // ordinary text, tabs, line breaks and non-ASCII letters are fine
+    let ok = "ls -la\tdone\nnaïve 日本語";
+    let body = format!(
+        "{{\"task\":\"r1/a\",\"text\":{}}}",
+        fleet_infra::json::to_line(&Value::str(ok))
+    );
+    assert_eq!(r.post_bearer("/api/send", &body).status, 200);
+    let calls = r.fake.calls();
+    assert_eq!(calls[0].1.get("text").and_then(Value::as_str), Some(ok));
+}
+
+#[test]
 fn query_strings_are_validated_too() {
     let r = Running::start();
     for q in [
@@ -1068,7 +1211,7 @@ fn health_and_log_documents_are_cached_and_report_tampering() {
 // ---------- admission (worker origin) ----------
 
 #[test]
-fn a_refused_process_gets_403_before_its_request_is_even_read_and_never_reaches_the_daemon() {
+fn a_refused_process_gets_403_and_its_request_never_reaches_the_daemon() {
     let r = Running::start();
     r.fake.deny.store(true, Ordering::SeqCst);
     // the token is right, the Host is right: the process itself is what is refused
@@ -1082,11 +1225,18 @@ fn a_refused_process_gets_403_before_its_request_is_even_read_and_never_reaches_
         403
     );
     assert_eq!(r.get("/", &[]).status, 403, "even the static page");
-    // nothing sent at all: the refusal still arrives (the check does not wait for a request)
-    let mut s = TcpStream::connect(r.addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let resp = read_response(&mut s);
-    assert_eq!(resp.status, 403);
+    // a login with the right token gets no session
+    let login = r.request(
+        "POST",
+        "/api/login",
+        &[
+            ("Origin", &r.origin()),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&format!("{{\"token\":\"{}\"}}", r.token)),
+    );
+    assert_eq!(login.status, 403);
+    assert!(!login.body.contains("\"session\""), "{}", login.body);
     assert!(r.fake.calls().is_empty());
     // the pid the backend was asked about is this test process (the client end of the socket)
     let pids = r.fake.admitted_pids.lock().unwrap().clone();
@@ -1097,6 +1247,60 @@ fn a_refused_process_gets_403_before_its_request_is_even_read_and_never_reaches_
     // and the same process is served once it is no longer refused
     r.fake.deny.store(false, Ordering::SeqCst);
     assert_eq!(r.get_bearer("/api/status").status, 200);
+}
+
+#[test]
+fn a_session_id_carried_to_a_refused_process_is_useless_there() {
+    // admission runs on every connection, whatever credential it carries
+    let r = Running::start();
+    let (session, _) = r.login();
+    assert_eq!(
+        r.get("/api/status", &[("X-Fleet-Session", &session)])
+            .status,
+        200
+    );
+    r.fake.deny.store(true, Ordering::SeqCst);
+    let resp = r.get("/api/status", &[("X-Fleet-Session", &session)]);
+    assert_eq!(resp.status, 403);
+    assert_eq!(r.fake.call_names(), vec!["status"]);
+}
+
+#[test]
+fn a_connection_that_sends_nothing_costs_no_lookup_and_is_cut_off_quickly() {
+    let r = Running::with(WebLimits {
+        http: Limits {
+            first_byte_deadline: Duration::from_millis(300),
+            ..fast_limits().http
+        },
+        ..fast_limits()
+    });
+    let started = Instant::now();
+    let mut idle: Vec<TcpStream> = (0..5)
+        .map(|_| TcpStream::connect(r.addr).unwrap())
+        .collect();
+    for s in &mut idle {
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let resp = read_response(s);
+        assert_eq!(resp.status, 408);
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        r.fake.admitted_pids.lock().unwrap().is_empty(),
+        "the process table was never read for connections that sent nothing"
+    );
+    r.wait_active(0);
+    // a client that sends its first byte in time gets the longer deadline for the rest
+    let mut s = TcpStream::connect(r.addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET / HT").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    s.write_all(format!("TP/1.1\r\nHost: {}\r\n\r\n", r.host()).as_bytes())
+        .unwrap();
+    assert_eq!(read_response(&mut s).status, 200);
 }
 
 // ---------- malformed and oversized input ----------
@@ -1126,7 +1330,7 @@ fn malformed_requests_get_an_error_and_the_server_keeps_serving() {
         ("many headers", many_headers.into_bytes(), 431),
         ("non ascii header", format!("GET / HTTP/1.1\r\nHost: {host}\r\nX: caf\u{e9}\r\n\r\n").into_bytes(), 400),
         ("duplicate host", format!("GET / HTTP/1.1\r\nHost: {host}\r\nHost: {host}\r\n\r\n").into_bytes(), 400),
-        ("duplicate cookie", format!("GET / HTTP/1.1\r\nHost: {host}\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n").into_bytes(), 400),
+        ("duplicate session header", format!("GET / HTTP/1.1\r\nHost: {host}\r\nX-Fleet-Session: a\r\nX-Fleet-Session: b\r\n\r\n").into_bytes(), 400),
         ("bad content length", format!("POST /api/send HTTP/1.1\r\nHost: {host}\r\nContent-Length: ten\r\n\r\n").into_bytes(), 400),
         ("two content lengths", format!("POST /api/send HTTP/1.1\r\nHost: {host}\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}").into_bytes(), 400),
         ("chunked", format!("POST /api/send HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n").into_bytes(), 501),
@@ -1308,13 +1512,21 @@ struct Sse {
 }
 
 impl Sse {
+    /// Opens a stream authenticated with the bearer token.
     fn open(r: &Running, path: &str, extra: &[(&str, &str)]) -> Sse {
+        let (k, v) = r.bearer();
+        let mut headers = vec![(k.as_str(), v.as_str())];
+        headers.extend_from_slice(extra);
+        Sse::open_as(r, path, &headers)
+    }
+
+    /// Opens a stream with exactly the given headers as credentials.
+    fn open_as(r: &Running, path: &str, extra: &[(&str, &str)]) -> Sse {
         let mut s = TcpStream::connect(r.addr).unwrap();
         s.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
-        let (k, v) = r.bearer();
         let mut req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\n{k}: {v}\r\nAccept: text/event-stream\r\n",
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n",
             r.host()
         );
         for (a, b) in extra {
@@ -1442,6 +1654,64 @@ fn an_event_stream_delivers_output_then_end_and_closes() {
         assert_eq!(a.get("max").and_then(Value::as_u64), Some(16 * 1024));
     }
     r.wait_active(0);
+}
+
+#[test]
+fn a_stream_opened_with_a_session_ends_when_the_session_is_revoked() {
+    let r = Running::start();
+    script_tail(&r, vec![tail_reply("a", 1, true, false)]);
+    let (session, csrf) = r.login();
+    let mut sse = Sse::open_as(
+        &r,
+        "/api/stream?task=r1%2Fa",
+        &[("X-Fleet-Session", &session)],
+    );
+    assert!(
+        sse.read_until(Duration::from_secs(5), |b| b.contains("event: output")),
+        "{}",
+        sse.buf
+    );
+    let out = r.post_session("/api/logout", &session, &csrf, "{}");
+    assert_eq!(out.status, 200);
+    assert!(
+        sse.read_until(Duration::from_secs(5), |b| b.contains("event: end")),
+        "{}",
+        sse.buf
+    );
+    assert!(sse.closed_within(Duration::from_secs(2)));
+    let end = sse.events().pop().unwrap();
+    assert_eq!(end.0, "end");
+    assert!(end
+        .1
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("session"));
+    r.wait_active(0);
+}
+
+#[test]
+fn a_stream_ends_when_its_session_expires() {
+    let r = Running::with(WebLimits {
+        auth: AuthLimits {
+            session_lifetime: Duration::from_millis(600),
+            ..quiet_auth()
+        },
+        ..fast_limits()
+    });
+    script_tail(&r, vec![tail_reply("a", 1, true, false)]);
+    let (session, _) = r.login();
+    let mut sse = Sse::open_as(
+        &r,
+        "/api/stream?task=r1%2Fa",
+        &[("X-Fleet-Session", &session)],
+    );
+    assert!(
+        sse.read_until(Duration::from_secs(5), |b| b.contains("event: end")),
+        "{}",
+        sse.buf
+    );
+    assert!(sse.closed_within(Duration::from_secs(2)));
 }
 
 #[test]

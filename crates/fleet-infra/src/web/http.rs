@@ -22,6 +22,9 @@ pub struct Limits {
     pub max_body: usize,
     /// The whole request (head and body) must arrive within this long of the accept.
     pub request_deadline: Duration,
+    /// The first byte must arrive within this long of the accept: a connection that sends nothing
+    /// holds a slot and a thread for no more than this.
+    pub first_byte_deadline: Duration,
     /// A client that does not read its response is dropped after this long (per write).
     pub write_timeout: Duration,
 }
@@ -34,6 +37,7 @@ impl Default for Limits {
             max_headers: 40,
             max_body: 16 * 1024,
             request_deadline: Duration::from_secs(10),
+            first_byte_deadline: Duration::from_secs(3),
             write_timeout: Duration::from_secs(10),
         }
     }
@@ -109,7 +113,7 @@ const SINGLETON_HEADERS: &[&str] = &[
     "content-length",
     "content-type",
     "authorization",
-    "cookie",
+    "x-fleet-session",
     "origin",
     "sec-fetch-site",
     "x-csrf-token",
@@ -171,12 +175,15 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Reads one request. `deadline` covers the whole request.
+/// Reads one request. `accepted` is when the connection was accepted: the first byte is due
+/// `first_byte_deadline` after it and the whole request `request_deadline` after it.
 pub fn read_request(
     stream: &mut TcpStream,
     limits: &Limits,
-    deadline: Instant,
+    accepted: Instant,
 ) -> Result<Request, HttpError> {
+    let deadline = accepted + limits.request_deadline;
+    let first_byte = (accepted + limits.first_byte_deadline).min(deadline);
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
     let head_end = loop {
@@ -198,7 +205,8 @@ pub fn read_request(
                 .saturating_sub(buf.len())
                 .max(1),
         );
-        let n = read_until_deadline(stream, chunk.get_mut(..want).unwrap_or(&mut []), deadline)?;
+        let due = if buf.is_empty() { first_byte } else { deadline };
+        let n = read_until_deadline(stream, chunk.get_mut(..want).unwrap_or(&mut []), due)?;
         if n == usize::MAX {
             continue;
         }
@@ -503,7 +511,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(400));
         });
         let (mut s, _) = listener.accept().unwrap();
-        let r = read_request(&mut s, &limits, Instant::now() + Duration::from_millis(300));
+        let limits = Limits {
+            request_deadline: Duration::from_millis(300),
+            first_byte_deadline: Duration::from_millis(300),
+            ..limits
+        };
+        let r = read_request(&mut s, &limits, Instant::now());
         writer.join().unwrap();
         r
     }
@@ -567,7 +580,7 @@ mod tests {
         for name in [
             "Host",
             "Origin",
-            "Cookie",
+            "X-Fleet-Session",
             "Authorization",
             "Content-Length",
         ] {
@@ -628,6 +641,32 @@ mod tests {
         assert_eq!(
             parse(no_end_of_line.as_bytes(), small).unwrap_err().status,
             414
+        );
+    }
+
+    #[test]
+    fn a_cookie_header_is_not_special_and_may_repeat() {
+        let r = ok("GET / HTTP/1.1\r\nHost: h\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n");
+        assert_eq!(r.method, Method::Get);
+    }
+
+    #[test]
+    fn a_connection_that_sends_nothing_times_out_at_the_first_byte_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _idle = TcpStream::connect(addr).unwrap();
+        let (mut s, _) = listener.accept().unwrap();
+        let limits = Limits {
+            first_byte_deadline: Duration::from_millis(150),
+            ..Limits::default()
+        };
+        let started = Instant::now();
+        let e = read_request(&mut s, &limits, Instant::now()).unwrap_err();
+        assert_eq!(e.status, 408);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
         );
     }
 

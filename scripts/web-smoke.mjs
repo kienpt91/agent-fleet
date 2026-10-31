@@ -1,6 +1,6 @@
 // Smoke test of the dashboard script in crates/fleet-infra/web/app.js.
 // No dependencies. It runs the real script in a vm context against a small fake DOM, a fake
-// fetch and a fake EventSource. Run it from the repository root: node scripts/web-smoke.mjs
+// fetch with a streaming body and a fake session storage. Run it from the repository root: node scripts/web-smoke.mjs
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +30,9 @@ const BIDI = 'safe\u202egnp.exe';
 const TOKEN = '0123456789abcdef'.repeat(4);
 const DIGEST = 'ab'.repeat(32);
 const DIGEST2 = 'cd'.repeat(32);
+const SESSION = '5e'.repeat(32);
+const CSRF = 'c5'.repeat(32);
+const CSRF2 = 'd6'.repeat(32);
 
 // ----------------------------------------------------------------- fake DOM
 
@@ -197,7 +200,9 @@ function buildEnv(opts) {
     timers: [],
     nextTimer: 1,
     calls: [],
-    sources: [],
+    streams: [],
+    unauth: [],
+    storageKeys: new Set(),
     created: [],
     maxStatusInflight: 0,
     statusInflight: 0,
@@ -213,7 +218,9 @@ function buildEnv(opts) {
         mergeStatus: 409,
         logOk: true,
         statusGate: null,
-        eventCount: 600
+        eventCount: 600,
+        streamStatus: 200,
+        streamThrow: 0
       },
       opts.server || {}
     )
@@ -316,27 +323,81 @@ function buildEnv(opts) {
     env.timers = env.timers.filter((t) => t.id !== id);
   };
 
-  class FakeES {
-    constructor(url) {
-      this.url = url;
-      this.readyState = 1;
-      this.closed = false;
-      this.ls = new Map();
-      this.onerror = null;
-      env.sources.push(this);
+  class FakeStream {
+    constructor(call, signal) {
+      this.call = call;
+      this.signal = signal;
+      this.queue = [];
+      this.waiter = null;
+      this.done = false;
+      this.failed = false;
+      this.cancelled = false;
+      signal.addEventListener('abort', () => this.wake());
     }
-    addEventListener(type, fn) {
-      if (!this.ls.has(type)) this.ls.set(type, []);
-      this.ls.get(type).push(fn);
+    wake() {
+      const w = this.waiter;
+      this.waiter = null;
+      if (w) w();
     }
-    close() {
-      this.closed = true;
-      this.readyState = 2;
+    push(data) {
+      this.queue.push(typeof data === 'string' ? new TextEncoder().encode(data) : data);
+      this.wake();
     }
-    emit(type, data) {
-      (this.ls.get(type) || []).slice().forEach((fn) => fn({ data: JSON.stringify(data) }));
+    frame(event, data, id) {
+      this.push((id === undefined ? '' : 'id: ' + id + '\n') + 'event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+    }
+    finish() {
+      this.done = true;
+      this.wake();
+    }
+    fail() {
+      this.failed = true;
+      this.wake();
+    }
+    reader() {
+      const self = this;
+      return {
+        read() {
+          return new Promise((resolve, reject) => {
+            const attempt = () => {
+              if (self.signal.aborted) reject(new Error('aborted'));
+              else if (self.failed) reject(new Error('connection reset'));
+              else if (self.queue.length) resolve({ value: self.queue.shift(), done: false });
+              else if (self.done) resolve({ value: undefined, done: true });
+              else self.waiter = attempt;
+            };
+            attempt();
+          });
+        },
+        cancel() {
+          self.cancelled = true;
+          return Promise.resolve();
+        }
+      };
     }
   }
+
+  const storage = { data: new Map() };
+  if (opts.stored === true) {
+    storage.data.set('fleet.session', JSON.stringify({ session: SESSION, csrf: CSRF }));
+  } else if (typeof opts.stored === 'string') {
+    storage.data.set('fleet.session', opts.stored);
+  }
+  env.storage = storage;
+  const sessionStorage = {
+    getItem(k) {
+      env.storageKeys.add(k);
+      return storage.data.has(k) ? storage.data.get(k) : null;
+    },
+    setItem(k, v) {
+      env.storageKeys.add(k);
+      storage.data.set(k, String(v));
+    },
+    removeItem(k) {
+      env.storageKeys.add(k);
+      storage.data.delete(k);
+    }
+  };
 
   const status = () => statusDoc(env);
   async function fetchF(url, init) {
@@ -344,10 +405,11 @@ function buildEnv(opts) {
     const call = {
       url: String(url),
       method: init.method || 'GET',
-      headers: init.headers || {},
+      headers: Object.assign({}, init.headers),
       body: init.body === undefined ? null : init.body,
       credentials: init.credentials,
-      cache: init.cache
+      cache: init.cache,
+      signal: init.signal
     };
     env.calls.push(call);
     const path = call.url.split('?')[0];
@@ -360,15 +422,39 @@ function buildEnv(opts) {
       code = c;
       body = { schema: 'fleet.error/1', error: { code: msg.code || 'error', message: msg.message || msg, subject: subject || null } };
     };
-    if (path === '/api/session') {
+    const authFail = path !== '/api/login' && call.headers['X-Fleet-Session'] !== SESSION;
+    if (authFail) {
+      env.unauth.push(call.url);
+      err(401, { code: 'unauthorized', message: 'missing or wrong session header' });
+    } else if (path === '/api/stream') {
+      if (S.streamThrow > 0) {
+        S.streamThrow -= 1;
+        throw new Error('network down');
+      }
+      if (S.streamStatus !== 200) {
+        err(S.streamStatus, { code: 'stream', message: 'stream refused' });
+      } else {
+        const stream = new FakeStream(call, init.signal);
+        env.streams.push(stream);
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          body: { getReader: () => stream.reader() },
+          json: async () => {
+            throw new Error('not json');
+          }
+        };
+      }
+    } else if (path === '/api/session') {
       if (S.sessionStatus === 401) err(401, { code: 'unauthorized', message: 'no session' });
-      else body = { schema: 'fleet.web.session/1', csrf: 'csrf-session', version: '0.1.0', bind: '127.0.0.1:7878' };
+      else body = { schema: 'fleet.web.session/1', session: null, csrf: CSRF2, version: '0.1.0', bind: '127.0.0.1:7878' };
     } else if (path === '/api/login') {
       if (S.loginStatus === 429) {
         err(429, { code: 'rate_limited', message: 'slow down' });
         headers = { 'retry-after': '17' };
       } else if (S.loginStatus === 401) err(401, { code: 'unauthorized', message: 'bad token' });
-      else body = { schema: 'fleet.web.session/1', csrf: 'csrf-login', version: '0.1.0', bind: '127.0.0.1:7878' };
+      else body = { schema: 'fleet.web.session/1', session: SESSION, csrf: CSRF, version: '0.1.0', bind: '127.0.0.1:7878' };
     } else if (path === '/api/logout') {
       body = { schema: 'fleet.web.logout/1', ok: true };
     } else if (path === '/api/status') {
@@ -462,7 +548,9 @@ function buildEnv(opts) {
     location,
     history,
     fetch: fetchF,
-    EventSource: FakeES,
+    sessionStorage,
+    AbortController,
+    TextDecoder,
     setTimeout: setTimeoutF,
     clearTimeout: clearTimer,
     setInterval: setIntervalF,
@@ -474,6 +562,7 @@ function buildEnv(opts) {
   env.view = registry.get('view');
   env.text = (id) => registry.get(id).textContent;
   env.posts = () => env.calls.filter((c) => c.method === 'POST' && c.url !== '/api/login');
+  env.openStreams = () => env.streams.filter((s) => !s.signal.aborted && !s.cancelled && !s.done && !s.failed);
   env.statusCalls = () => env.calls.filter((c) => c.url.startsWith('/api/status'));
   return env;
 }
@@ -617,9 +706,12 @@ function staticChecks() {
     'innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write', 'eval(', 'new Function',
     "setAttribute('style'", 'setAttribute("style"', '.style.cssText', 'javascript:', 'srcdoc',
     'createContextualFragment', 'DOMParser', 'Function(', 'setTimeout("', "setTimeout('", 'setInterval("', "setInterval('",
-    'localStorage', 'sessionStorage', 'document.cookie', '.href', '.src ='
+    'localStorage', 'EventSource', 'cookie', '.href', '.src ='
   ];
   banned.forEach((b) => check(!APP.includes(b), 'app.js does not contain ' + b));
+  check(APP.includes('X-Fleet-Session') && APP.includes('X-CSRF-Token'), 'app.js sends the session and CSRF headers');
+  const storageLines = APP.split('\n').filter((l) => l.includes('sessionStorage'));
+  check(storageLines.length > 0 && storageLines.every((l) => l.includes("'fleet.session'")), 'sessionStorage is only used with the key fleet.session');
   check(!/https?:\/\//.test(APP) && !/https?:\/\//.test(HTML) && !/https?:\/\//.test(CSS), 'no absolute URL in the assets');
   check(HTML.startsWith('<!doctype html>'), 'doctype');
   check(HTML.includes('<meta charset=utf-8>'), 'charset');
@@ -645,11 +737,15 @@ async function mainFlow() {
   check(login.method === 'POST' && login.url === '/api/login', 'login is the first request');
   check(login.headers['Content-Type'] === 'application/json', 'login content type');
   check(JSON.parse(login.body).token === TOKEN, 'login body carries the token');
-  check(login.credentials === 'same-origin' && login.cache === 'no-store', 'login fetch options');
-  check(env.replaced.length === 1 && env.replaced[0][0] === null && env.replaced[0][2] === '/', 'fragment removed with replaceState(null, "", pathname)');
-  check(env.location.hash === '', 'location hash is empty after login');
+  check(login.credentials === 'omit' && login.cache === 'no-store' && !('X-Fleet-Session' in login.headers), 'login fetch options: no ambient credentials, no session header yet');
+  check(env.replaced.length === 1 && env.replaced[0][0] === null && env.replaced[0][2] === '/#/runs', 'fragment replaced with replaceState(null, "", pathname + "#/runs")');
+  check(env.location.hash === '#/runs' && !env.location.hash.includes('token') && !env.location.hash.includes(TOKEN), 'location holds no token after login and shows the default route');
   check(!env.calls.some((c) => c.url === '/api/session'), 'no session call after a login');
-  check(env.calls.every((c) => c.credentials === 'same-origin' && c.cache === 'no-store'), 'every fetch uses same-origin credentials and no-store');
+  check(env.calls.every((c) => c.credentials === 'omit' && c.cache === 'no-store'), 'no request relies on ambient credentials; all use no-store');
+  check(env.calls.slice(1).every((c) => c.headers['X-Fleet-Session'] === SESSION) && env.unauth.length === 0, 'every request after the login carries X-Fleet-Session');
+  const stored = JSON.parse(env.storage.data.get('fleet.session'));
+  check(env.storage.data.size === 1 && stored.session === SESSION && stored.csrf === CSRF && Object.keys(stored).length === 2, 'session storage holds only session and csrf under fleet.session');
+  check(env.storageKeys.size === 1 && env.storageKeys.has('fleet.session'), 'no other storage key is used');
 
   // runs view
   check(env.statusCalls().length >= 1 && env.statusCalls()[0].url === '/api/status', 'status polled without run on the runs page');
@@ -690,7 +786,7 @@ async function mainFlow() {
   check(env.location.hash === '#/task/r1/api', 'box click opens the task page');
   const tail = env.calls.find((c) => c.url.startsWith('/api/tail'));
   check(tail.url === '/api/tail?task=r1%2Fapi&since=0&max=65536', 'tail url is encoded');
-  check(env.sources.length === 0, 'no EventSource for a task that is not live');
+  check(env.streams.length === 0, 'no stream for a task that is not live');
   const pre = find(env, (n) => n.hasClass('output'))[0];
   await env.advance(100);
   check(pre.textContent.includes('stored ' + IMG), 'stored output is text');
@@ -712,38 +808,84 @@ async function mainFlow() {
   await settle();
   const mergePost = env.posts().find((c) => c.url === '/api/merge');
   check(!!mergePost, 'second click posts the merge');
-  check(mergePost.headers['X-CSRF-Token'] === 'csrf-login' && mergePost.headers['Content-Type'] === 'application/json', 'merge carries the CSRF header');
+  check(mergePost.headers['X-CSRF-Token'] === CSRF && mergePost.headers['X-Fleet-Session'] === SESSION && mergePost.headers['Content-Type'] === 'application/json', 'merge carries the CSRF and session headers');
   check(JSON.parse(mergePost.body).task === 'r1/api', 'merge body');
   check(allText(env).includes('Merge needs approval a1: approve it in the Decisions page, then press Merge again.'), 'approval_required message');
 
-  // live task: stream, send box, output bound
+  // live task: fetch based stream, send box, output bound
   env.location.hash = '#/task/r1/web';
   await env.advance(100);
-  check(env.sources.length === 1 && env.sources[0].url === '/api/stream?task=r1%2Fweb&since=12', 'stream opened after the tail, from its offset');
-  const es = env.sources[0];
+  check(env.streams.length === 1 && env.streams[0].call.url === '/api/stream?task=r1%2Fweb&since=12', 'stream opened after the tail, from its offset');
+  const s1 = env.streams[0];
+  check(s1.call.headers['X-Fleet-Session'] === SESSION, 'stream request carries the session header');
+  check(s1.call.headers['Last-Event-ID'] === undefined, 'first stream request has no Last-Event-ID');
+  check(s1.call.credentials === 'omit' && s1.call.method === 'GET' && !!s1.call.signal, 'stream request: no ambient credentials, abortable');
   const pre2 = find(env, (n) => n.hasClass('output'))[0];
   check(find(env, (n) => n.hasClass('send'))[0].hasClass('hidden') === false, 'send box visible for a live task');
   check(buttons(env, 'Merge')[0].disabled === true, 'merge disabled for a running task');
-  es.emit('output', { text: ESC + ' ' + IMG + ' ' + BIDI + '\n', next: 40, lost: false });
+
+  // a frame split across two chunks, inside a multi-byte character
+  const euro = new TextEncoder().encode('id: 20\nevent: output\ndata: ' + JSON.stringify({ text: 'split-\u20ac-ok', next: 20, lost: false }) + '\n\n');
+  const cut = euro.indexOf(0xe2) + 1;
+  s1.push(euro.slice(0, cut));
+  await env.advance(100);
+  check(!pre2.textContent.includes('split'), 'a partial frame is not shown yet');
+  s1.push(euro.slice(cut));
+  await env.advance(100);
+  check(pre2.textContent.includes('split-\u20ac-ok'), 'a frame split across two chunks parses');
+
+  // comments, unknown events and CRLF line endings
+  s1.push(': keep-alive\r\n\r\n');
+  s1.push('event: ping\ndata: {}\n\n');
+  s1.push('id: 40\r\nevent: output\r\ndata: ' + JSON.stringify({ text: ESC + ' ' + IMG + ' ' + BIDI + '\n', next: 40, lost: false }) + '\r\n\r\n');
   await env.advance(100);
   check(pre2.textContent.includes('[U+001B][31mred'), 'live output shows ESC visibly');
   check(pre2.textContent.includes(IMG), 'live output keeps markup as text');
   check(!/[\u202a-\u202e\u001b]/.test(pre2.textContent), 'live output has no raw ESC or bidi controls');
   const chunk = 'A'.repeat(100000);
   for (let i = 0; i < 5; i++) {
-    es.emit('output', { text: chunk, next: 100 + i, lost: false });
+    s1.frame('output', { text: chunk, next: 100 + i, lost: false }, 100 + i);
   }
-  es.emit('output', { text: 'END-MARK', next: 999, lost: true });
+  s1.frame('output', { text: 'END-MARK', next: 999, lost: true }, 999);
   const writesBefore = pre2.textWrites;
   await env.advance(100);
   check(pre2.textContent.length === 262144, 'live output is bounded to 256 KiB (got ' + pre2.textContent.length + ')');
   check(pre2.textContent.endsWith('END-MARK'), 'the tail of the output is kept');
   check(pre2.textWrites - writesBefore === 1, 'output writes are coalesced');
   check(!find(env, (n) => n.hasClass('notice') && n.hasClass('small'))[0].hasClass('hidden'), 'lost output shows a notice');
-  es.onerror();
-  check(find(env, (n) => n.tagName === 'p' && n.textContent.includes('retry')).length === 1, 'stream error shows a notice');
-  es.emit('limit', {});
+
+  // limit: reconnect after 1 s, resuming from the last id
+  s1.frame('limit', { next: 1000 }, 1000);
+  await env.advance(100);
   check(find(env, (n) => n.tagName === 'p' && n.textContent === 'Reconnecting.').length === 1, 'limit shows reconnecting');
+  check(env.streams.length === 1, 'no reconnect before one second');
+  await env.advance(1000);
+  check(env.streams.length === 2, 'limit reconnects after one second');
+  const s2 = env.streams[1];
+  check(s2.call.headers['Last-Event-ID'] === '1000' && s2.call.url === '/api/stream?task=r1%2Fweb&since=1000', 'the resumed request carries Last-Event-ID and since');
+  check(s2.call.headers['X-Fleet-Session'] === SESSION, 'the resumed request carries the session header');
+  check(s1.cancelled === true, 'the old stream body was cancelled');
+  check(env.openStreams().length === 1, 'never two open streams for one view');
+
+  // a failed connection is retried after 3 s, resuming from the last id
+  s2.frame('output', { text: 'TAIL2', next: 1004, lost: false }, 1004);
+  await env.advance(100);
+  s2.fail();
+  await env.advance(100);
+  check(find(env, (n) => n.tagName === 'p' && n.textContent.includes('retrying in 3 s (1 of 5)')).length === 1, 'stream error shows a notice');
+  await env.advance(2000);
+  check(env.streams.length === 2, 'no retry before three seconds');
+  await env.advance(1100);
+  check(env.streams.length === 3, 'a failed stream is retried');
+  const s3 = env.streams[2];
+  check(s3.call.headers['Last-Event-ID'] === '1004', 'the retry resumes from the last id');
+
+  // a body that ends without an end event is reconnected
+  s3.finish();
+  await env.advance(1100);
+  check(env.streams.length === 4, 'a body that ends without an end event reconnects after one second');
+  const s4 = env.streams[3];
+  check(s4.call.headers['Last-Event-ID'] === '1004' && env.openStreams().length === 1, 'reconnect resumes and never overlaps');
 
   // send
   const input = find(env, (n) => n.tagName === 'input' && n.getAttribute('type') === 'text')[0];
@@ -760,24 +902,26 @@ async function mainFlow() {
   send.dispatch('click');
   await settle();
   const sendPost = env.posts().find((c) => c.url === '/api/send');
-  check(!!sendPost && sendPost.headers['X-CSRF-Token'] === 'csrf-login', 'send carries the CSRF header');
+  check(!!sendPost && sendPost.headers['X-CSRF-Token'] === CSRF && sendPost.headers['X-Fleet-Session'] === SESSION, 'send carries the CSRF and session headers');
   check(JSON.stringify(JSON.parse(sendPost.body)) === JSON.stringify({ task: 'r1/web', text: 'yes please', newline: true }), 'send body');
 
-  // end of session closes the stream
-  es.emit('end', { reason: 'exited' });
-  check(es.closed === true, 'end closes the EventSource');
+  // an end event stops the stream for good
+  s4.frame('end', { reason: 'exited' }, 1010);
+  await env.advance(100);
+  check(s4.cancelled === true, 'end closes the stream');
   check(allText(env).includes('Session ended: exited'), 'end shows session ended');
   assertSafe(env, 'task web');
+  await env.advance(5000);
+  check(env.streams.length === 4 && env.openStreams().length === 0, 'no reconnect after an end event');
 
-  // leaving the task view closes a stream
-  await env.advance(2100);
+  // leaving the task view aborts the stream
   env.location.hash = '#/task/r1/web';
   await env.advance(100);
-  const es2 = env.sources[env.sources.length - 1];
-  check(es2 !== es && !es2.closed, 'second visit opens a second stream');
+  const s5 = env.streams[env.streams.length - 1];
+  check(env.streams.length === 5 && !s5.signal.aborted, 'second visit opens a second stream');
   env.location.hash = '#/runs';
   await env.advance(100);
-  check(es2.closed === true, 'leaving the task view closes the stream');
+  check(s5.signal.aborted === true, 'leaving the task view aborts the stream');
 
   // decisions
   env.location.hash = '#/decisions';
@@ -792,7 +936,7 @@ async function mainFlow() {
   resolve.dispatch('click');
   await settle();
   const gp = env.posts().find((c) => c.url === '/api/gate/resolve');
-  check(!!gp && gp.headers['X-CSRF-Token'] === 'csrf-login', 'resolve carries the CSRF header');
+  check(!!gp && gp.headers['X-CSRF-Token'] === CSRF, 'resolve carries the CSRF header');
   check(JSON.stringify(JSON.parse(gp.body)) === JSON.stringify({ id: 'g1', answer: 'main' }), 'resolve body');
   const blocks = find(env, (n) => n.tagName === 'pre');
   check(blocks.some((b) => b.textContent === '/usr/bin/tool --flag "two words" ' + SCRIPT + ' safe[U+202E]gnp.exe'), 'exact display text in a monospaced block');
@@ -807,7 +951,7 @@ async function mainFlow() {
   approve.dispatch('click');
   await settle();
   const ap = env.posts().find((c) => c.url === '/api/approval/decide');
-  check(!!ap && ap.headers['X-CSRF-Token'] === 'csrf-login', 'approve carries the CSRF header');
+  check(!!ap && ap.headers['X-CSRF-Token'] === CSRF, 'approve carries the CSRF header');
   check(JSON.stringify(JSON.parse(ap.body)) === JSON.stringify({ id: 'a1', approve: true, digest: DIGEST }), 'approve body has the displayed digest');
   const deny = buttons(env, 'Deny')[0];
   deny.dispatch('click');
@@ -819,7 +963,7 @@ async function mainFlow() {
 
   // every POST except the login has the CSRF token and JSON content type
   env.posts().filter((c) => c.url !== '/api/login').forEach((c) => {
-    check(c.headers['X-CSRF-Token'] === 'csrf-login' && c.headers['Content-Type'] === 'application/json', 'POST ' + c.url + ' carries CSRF and content type');
+    check(c.headers['X-CSRF-Token'] === CSRF && c.headers['X-Fleet-Session'] === SESSION && c.headers['Content-Type'] === 'application/json', 'POST ' + c.url + ' carries CSRF, session and content type');
   });
 
   // events: bounded list, chain status, polling every 5 s
@@ -875,16 +1019,22 @@ async function mainFlow() {
   n0 = env.statusCalls().length;
   await env.advance(10000);
   check(env.statusCalls().length === n0, 'no polling after the session ended');
+  check(env.storage.data.has('fleet.session') === false, 'a 401 clears the stored session');
+  check(env.unauth.length === 0, 'the server never saw a request without the session header');
 
   check(violations.length === 0, 'no unsafe DOM API was used: ' + violations.join(', '));
 }
 
 async function sessionFlow() {
-  const env = await boot({ hash: '' });
-  check(env.calls[0].url === '/api/session' && env.calls[0].method === 'GET', 'without a fragment the session is asked');
+  const env = await boot({ hash: '', stored: true });
+  const first = env.calls[0];
+  check(first.url === '/api/session' && first.method === 'GET' && first.headers['X-Fleet-Session'] === SESSION && first.credentials === 'omit', 'a stored session is validated with the session header');
   check(!env.calls.some((c) => c.url === '/api/login'), 'no login without a fragment');
   check(env.replaced.length === 0, 'history untouched without a fragment');
-  check(allText(env).includes('ship '), 'runs view rendered from a cookie session');
+  check(allText(env).includes('ship '), 'runs view rendered from a stored session');
+  const stored = JSON.parse(env.storage.data.get('fleet.session'));
+  check(stored.session === SESSION && stored.csrf === CSRF2 && Object.keys(stored).length === 2, 'the refreshed csrf token is stored with the session');
+  check(env.unauth.length === 0 && env.calls.every((c) => c.headers['X-Fleet-Session'] === SESSION), 'every request carries X-Fleet-Session');
   // logout
   const lo = env.registry.get('logout');
   lo.dispatch('click');
@@ -892,14 +1042,23 @@ async function sessionFlow() {
   lo.dispatch('click');
   await settle();
   const post = env.posts().find((c) => c.url === '/api/logout');
-  check(!!post && post.headers['X-CSRF-Token'] === 'csrf-session' && post.body === '{}', 'logout is a CSRF-protected POST');
+  check(!!post && post.headers['X-CSRF-Token'] === CSRF2 && post.headers['X-Fleet-Session'] === SESSION && post.body === '{}', 'logout is a CSRF-protected POST with the session header');
   check(allText(env).includes('Logged out.'), 'logout message');
+  check(env.storage.data.size === 0, 'logout clears the stored session');
 }
 
+const NOT_LOGGED_IN = 'Not logged in. Open the login URL printed by `fleet daemon --web` in its terminal.';
+
 async function notLoggedIn() {
-  const env = await boot({ hash: '', server: { sessionStatus: 401 } });
-  check(allText(env) === 'Not logged in. Open the login URL printed by `fleet daemon --web` in its terminal.', 'plain not-logged-in message');
-  check(env.statusCalls().length === 0, 'no polling without a session');
+  const env = await boot({ hash: '' });
+  check(allText(env) === NOT_LOGGED_IN, 'plain not-logged-in message');
+  check(env.calls.length === 0, 'nothing stored and no fragment: no request at all');
+  const env2 = await boot({ hash: '', stored: true, server: { sessionStatus: 401 } });
+  check(allText(env2) === NOT_LOGGED_IN, 'a rejected stored session shows the not-logged-in message');
+  check(env2.storage.data.size === 0, 'a 401 clears the stored session');
+  check(env2.statusCalls().length === 0, 'no polling without a session');
+  const env3 = await boot({ hash: '', stored: '{"session":"nope","csrf":1}' });
+  check(allText(env3) === NOT_LOGGED_IN && env3.calls.length === 0, 'a malformed stored session is ignored');
 }
 
 async function rateLimited() {
@@ -907,11 +1066,69 @@ async function rateLimited() {
   check(allText(env).includes('17 seconds'), 'Retry-After shown for a rate limited login');
   check(env.replaced.length === 1, 'fragment removed even when the login fails');
   check(env.statusCalls().length === 0, 'no polling after a failed login');
+  check(env.storage.data.size === 0, 'nothing is stored after a failed login');
   const env2 = await boot({ hash: '#token=' + TOKEN, server: { loginStatus: 401 } });
   check(allText(env2).includes('bad token'), 'login failure shows the server message');
   check(env2.replaced.length === 1 && env2.location.hash === '', 'fragment removed after a rejected token');
   const env3 = await boot({ hash: '#token=nothex' });
-  check(env3.calls[0].url === '/api/session', 'a malformed token is not sent to the server');
+  check(env3.calls.length === 0 && allText(env3) === NOT_LOGGED_IN, 'a malformed token is not sent to the server');
+}
+
+async function nextRoute() {
+  const valid = ['/decisions', '/events', '/health', '/run/r1', '/task/r1/api', '/runs'];
+  for (const n of valid) {
+    const env = await boot({ hash: '#token=' + TOKEN + '&next=' + n });
+    check(env.replaced.length === 1 && env.replaced[0][2] === '/#' + n, 'valid next ' + n + ' becomes the hash');
+    check(env.location.hash === '#' + n && !env.location.hash.includes('token'), 'token removed, route ' + n + ' kept in the location');
+    check(JSON.parse(env.calls[0].body).token === TOKEN && env.calls[0].body.indexOf('next') < 0, 'next is not sent to the server');
+  }
+  const env = await boot({ hash: '#token=' + TOKEN + '&next=/run/r1' });
+  check(find(env, (n) => n.hasClass('dag')).length === 1, 'the router shows the requested run view after the login');
+  check(env.statusCalls()[0].url === '/api/status?run=r1', 'the first status request is for the requested run');
+  const env2 = await boot({ hash: '#next=/events&token=' + TOKEN });
+  check(env2.location.hash === '#/events' && find(env2, (n) => n.hasClass('events')).length === 1, 'next may come before the token');
+  const bad = ['//evil', '/a<b', '/a:b', '/a%2Fb', '/a?b', '/' + 'a'.repeat(201), 'run/r1', '', '/a b', '//'];
+  for (const n of bad) {
+    const e = await boot({ hash: '#token=' + TOKEN + '&next=' + n });
+    check(e.replaced.length === 1 && e.replaced[0][2] === '/#/runs', 'invalid next ' + JSON.stringify(n.slice(0, 12)) + ' falls back to /runs');
+    check(e.location.hash === '#/runs' && !e.location.hash.includes('token'), 'token removed after an invalid next');
+  }
+  const bound = await boot({ hash: '#token=' + TOKEN + '&next=/' + 'a'.repeat(200) });
+  check(bound.location.hash === '#/' + 'a'.repeat(200), 'next of 200 characters after the slash is accepted');
+  const failed = await boot({ hash: '#token=' + TOKEN + '&next=/run/r1', server: { loginStatus: 401 } });
+  check(failed.replaced.length === 1 && failed.replaced[0][2] === '/' && failed.location.hash === '', 'a failed login drops the fragment and does not follow next');
+}
+
+async function streamRetries() {
+  const env = await boot({ hash: '#/task/r1/web', stored: true, server: { streamThrow: 1000 } });
+  await env.advance(40000);
+  const attempts = env.calls.filter((c) => c.url.startsWith('/api/stream'));
+  check(attempts.length === 6, 'one attempt and five retries, then the stream gives up (got ' + attempts.length + ')');
+  check(allText(env).includes('Live output stopped after 5 failed retries.'), 'giving up is shown');
+  await env.advance(20000);
+  check(env.calls.filter((c) => c.url.startsWith('/api/stream')).length === 6, 'no further stream attempts after giving up');
+  check(env.unauth.length === 0, 'stream attempts carry the session header');
+}
+
+async function streamOverflow() {
+  const env = await boot({ hash: '#/task/r1/web', stored: true });
+  await env.advance(100);
+  const s = env.streams[0];
+  s.push('data: ' + 'x'.repeat(1100000));
+  await env.advance(100);
+  check(allText(env).includes('more than 1 MiB'), 'an oversized pending frame stops the stream with a notice');
+  check(s.cancelled === true, 'the oversized stream is cancelled');
+  await env.advance(10000);
+  check(env.streams.length === 1, 'no reconnect after an oversized frame');
+}
+
+async function streamAuth() {
+  const env = await boot({ hash: '#/task/r1/web', stored: true, server: { streamStatus: 401 } });
+  await env.advance(100);
+  check(allText(env) === NOT_LOGGED_IN, 'HTTP 401 on the stream shows the not-logged-in message');
+  check(env.storage.data.size === 0, 'HTTP 401 on the stream clears the stored session');
+  await env.advance(10000);
+  check(env.calls.filter((c) => c.url.startsWith('/api/stream')).length === 1 && env.statusCalls().length <= 1, 'nothing is retried after a 401');
 }
 
 staticChecks();
@@ -919,5 +1136,9 @@ await mainFlow();
 await sessionFlow();
 await notLoggedIn();
 await rateLimited();
+await nextRoute();
+await streamRetries();
+await streamOverflow();
+await streamAuth();
 check(violations.length === 0, 'no unsafe DOM API was used: ' + violations.join(', '));
 console.log('web-smoke: ok (' + checks + ' checks)');

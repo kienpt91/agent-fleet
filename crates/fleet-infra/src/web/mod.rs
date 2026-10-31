@@ -61,6 +61,9 @@ pub struct WebLimits {
     pub auth: AuthLimits,
     /// Open connections, event streams included.
     pub max_connections: usize,
+    /// Open connections from one remote (non-loopback) address. Local processes share an address,
+    /// so they are bounded by `max_connections` and by the deadlines only.
+    pub max_per_remote_ip: usize,
     /// Open event streams.
     pub max_streams: usize,
     /// An event stream ends (and the browser reconnects) after this long.
@@ -83,6 +86,7 @@ impl Default for WebLimits {
             http: Limits::default(),
             auth: AuthLimits::default(),
             max_connections: 32,
+            max_per_remote_ip: 8,
             max_streams: 4,
             stream_lifetime: Duration::from_secs(600),
             stream_bytes: 4 * 1024 * 1024,
@@ -99,6 +103,9 @@ pub struct WebOptions {
     pub addr: SocketAddr,
     /// Allows binding an address that is not loopback. The caller prints a warning.
     pub allow_remote: bool,
+    /// Print the login URL even when stderr is not a terminal (it would then end up in whatever
+    /// file, pipe or journal stderr goes to, where any process of the same user can read it).
+    pub print_login_url: bool,
     pub limits: WebLimits,
 }
 
@@ -107,6 +114,7 @@ impl WebOptions {
         WebOptions {
             addr,
             allow_remote,
+            print_login_url: false,
             limits: WebLimits::default(),
         }
     }
@@ -206,6 +214,7 @@ pub(crate) struct Shared {
     pub streams_active: AtomicUsize,
     next_id: AtomicU64,
     open: Mutex<HashMap<u64, TcpStream>>,
+    per_remote: Mutex<HashMap<IpAddr, usize>>,
     health: Cached,
     log: Cached,
 }
@@ -226,12 +235,38 @@ impl Shared {
 struct ConnGuard {
     shared: Arc<Shared>,
     id: u64,
+    /// The remote address this connection is counted against, if it has one.
+    remote: Option<IpAddr>,
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         lock(&self.shared.open).remove(&self.id);
+        if let Some(ip) = self.remote {
+            release_remote(&self.shared.per_remote, ip);
+        }
         self.shared.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Counts a connection from a remote address; false when the address already has `max` open.
+fn claim_remote(table: &Mutex<HashMap<IpAddr, usize>>, ip: IpAddr, max: usize) -> bool {
+    let mut t = lock(table);
+    let n = t.entry(ip).or_insert(0);
+    if *n >= max {
+        return false;
+    }
+    *n += 1;
+    true
+}
+
+fn release_remote(table: &Mutex<HashMap<IpAddr, usize>>, ip: IpAddr) {
+    let mut t = lock(table);
+    if let Some(n) = t.get_mut(&ip) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            t.remove(&ip);
+        }
     }
 }
 
@@ -270,6 +305,7 @@ impl WebServer {
             streams_active: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
             open: Mutex::new(HashMap::new()),
+            per_remote: Mutex::new(HashMap::new()),
             health: Cached::new(),
             log: Cached::new(),
         });
@@ -325,13 +361,33 @@ impl WebServer {
 
     fn dispatch(&self, stream: TcpStream) {
         let prior = self.shared.active.fetch_add(1, Ordering::AcqRel);
-        let guard = ConnGuard {
+        let mut guard = ConnGuard {
             shared: Arc::clone(&self.shared),
             id: self.shared.next_id.fetch_add(1, Ordering::Relaxed),
+            remote: None,
         };
         if prior >= self.shared.limits.max_connections {
             refuse_quickly(stream, 503, ErrorCode::Limit, "too many connections");
             return;
+        }
+        if let Ok(peer) = stream.peer_addr() {
+            let ip = peer.ip().to_canonical();
+            if !ip.is_loopback() {
+                if !claim_remote(
+                    &self.shared.per_remote,
+                    ip,
+                    self.shared.limits.max_per_remote_ip,
+                ) {
+                    refuse_quickly(
+                        stream,
+                        503,
+                        ErrorCode::Limit,
+                        "too many connections from this address",
+                    );
+                    return;
+                }
+                guard.remote = Some(ip);
+            }
         }
         if stream.set_nonblocking(false).is_err() {
             return;
@@ -447,14 +503,11 @@ fn serve_connection(stream: &mut TcpStream, guard: &ConnGuard) {
     let (Ok(peer), Ok(local)) = (stream.peer_addr(), stream.local_addr()) else {
         return;
     };
-    if let Err(e) = admit(shared, peer, local) {
-        let r = routes::error_response(403, e.code, &e.message);
-        let _ = r.write_to(stream);
-        finish(stream);
-        return;
-    }
-    let deadline = accepted + shared.limits.http.request_deadline;
-    let request = match read_request(stream, &shared.limits.http, deadline) {
+    // The request is read first, under the deadlines, and only then is the process behind the
+    // connection looked up (a scan of the process table that a connection which never sends
+    // anything must not be able to cause). Nothing is acted on before the lookup: a refused
+    // process gets 403 for whatever it sent, and the request never reaches the daemon.
+    let request = match read_request(stream, &shared.limits.http, accepted) {
         Ok(r) => r,
         Err(e) => {
             let _ = http_error_response(&e).write_to(stream);
@@ -462,7 +515,14 @@ fn serve_connection(stream: &mut TcpStream, guard: &ConnGuard) {
             return;
         }
     };
-    match routes::handle(shared, &request, Instant::now()) {
+    if let Err(e) = admit(shared, peer, local) {
+        let r = routes::error_response(403, e.code, &e.message);
+        let _ = r.write_to(stream);
+        finish(stream);
+        return;
+    }
+    let client = auth::ClientKey::of(peer.ip());
+    match routes::handle(shared, &request, client, Instant::now()) {
         routes::Outcome::Reply(r) => {
             let _ = r.write_to(stream);
             finish(stream);
@@ -679,6 +739,28 @@ mod tests {
         let e = judge_holders(&[2], judge, gone).unwrap_err();
         assert!(e.message.contains("exited"), "{}", e.message);
         assert!(judge_holders(&[], ok, alive).is_err());
+    }
+
+    #[test]
+    fn connections_from_one_remote_address_are_counted_and_released() {
+        let table = Mutex::new(HashMap::new());
+        let a: IpAddr = "203.0.113.5".parse().unwrap();
+        let b: IpAddr = "203.0.113.6".parse().unwrap();
+        assert!(claim_remote(&table, a, 2));
+        assert!(claim_remote(&table, a, 2));
+        assert!(!claim_remote(&table, a, 2), "the third is refused");
+        assert!(
+            claim_remote(&table, b, 2),
+            "another address has its own count"
+        );
+        release_remote(&table, a);
+        assert!(claim_remote(&table, a, 2), "a slot came free");
+        release_remote(&table, a);
+        release_remote(&table, a);
+        release_remote(&table, b);
+        assert!(lock(&table).is_empty(), "no entry is left behind");
+        release_remote(&table, a);
+        assert!(lock(&table).is_empty());
     }
 
     #[test]
