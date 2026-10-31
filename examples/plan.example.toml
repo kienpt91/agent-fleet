@@ -1,0 +1,27 @@
+# A task DAG for `fleet plan examples/plan.example.toml` (a [run] table creates the run).
+
+[run]
+objective = "Add a users table, an API and docs"
+repo = "."                    # made absolute by the CLI
+max_parallel = 2
+
+[[tasks]]
+id = "schema"
+title = "Create the users table"
+spec = "Add db/schema.sql with a users table."
+
+[[tasks]]
+id = "api"
+title = "Build the users API"
+spec = "Expose the users table over HTTP."
+after = ["schema"]
+
+[[tasks]]
+id = "docs"
+title = "Document the schema"
+after = ["schema"]
+
+[[tasks]]
+id = "release"
+title = "Write the changelog"
+after = ["api", "docs"]

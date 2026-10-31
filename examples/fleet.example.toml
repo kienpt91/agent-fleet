@@ -1,0 +1,45 @@
+# Example daemon configuration. Read once at `fleet daemon` start; never from a repository.
+
+[daemon]
+max_sessions = 4              # concurrent worker sessions across all runs (hard cap 64)
+default_worker = "agent"
+max_retries = 2               # automatic retries per task (worker failures and failed quality gates)
+kill_grace_secs = 5           # SIGTERM, then SIGKILL after this long
+approval_ttl_secs = 900       # an approval expires if nobody uses it
+sensitive = ["merge", "external-command"]   # actions that always need an approval
+# ring_bytes = 262144         # output kept per session (hard cap 4 MiB)
+
+[env]
+# Variables workers, gates and git receive from the daemon's own environment. Nothing else is inherited.
+allow = ["PATH", "HOME", "USER", "LANG", "TERM"]
+
+[redact]
+# Extra patterns removed from stored output, besides the built-in key shapes.
+literals = []
+env_values = true             # also redact values of secret-looking variables of the daemon
+
+[[redact.rules]]
+name = "internal-token"
+prefix = "int_"
+charset = "alnum"
+min_len = 24
+
+[workers.agent]
+command = "my-agent"          # looked up on the worker's PATH
+args = ["--dir", "{worktree}", "--task", "{task}", "{brief}"]   # placeholders: {brief} {task} {worktree} {run} {brief_file}
+env_pass = []                 # extra variable names to pass through, e.g. an API key variable
+timeout_secs = 1800
+idle_timeout_secs = 300
+
+[[gates]]
+name = "tests"
+command = "cargo"
+args = ["test", "--quiet"]
+timeout_secs = 900
+
+[[gates]]
+name = "refcheck"
+command = "refcheck"
+args = ["check", "--json"]
+format = "refcheck-json"
+timeout_secs = 120
