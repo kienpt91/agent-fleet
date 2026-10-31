@@ -28,8 +28,10 @@ fleet plan plan.toml  ->  fleet start  ->  one worker per ready task, in .fleet-
   and the work of finished dependencies is merged into a dependent's branch before it starts.
 - **Humans stay in the loop.** A worker that is blocked writes `.fleet/question.json`; fleet opens a *decision gate*
   and resumes the task with your answer. Sensitive actions (merging, running a command a worker asked for) need an
-  *approval* bound to a SHA-256 digest of the exact action, with an expiry. Workers cannot create or grant
-  approvals, and the daemon refuses control requests that come from a worker process.
+  *approval* bound to a SHA-256 digest of the exact action, with an expiry, used once (an approved command is never run
+  twice, not even across a daemon restart). Workers cannot create or grant approvals through the daemon's interfaces: the
+  control socket needs a per-run token they never receive and refuses peers that are, or descend from, a worker or that
+  cannot be identified. That is defence in depth, not a boundary against a hostile same-user process (see Limitations).
 - **Quality gates.** Configured commands run in the worktree after the worker finishes. A task completes only when
   all pass. The `refcheck-json` format understands the report of the `refcheck` tool and fails on errors,
   unparseable output, the wrong shape or death by signal.
@@ -81,18 +83,18 @@ retried with the gate's complaint in its brief. Nothing was edited afterwards.
 
 ```text
 
-$ /target/release/fleet plan /tmp/tmp.SIE5ya1P98/plan.toml
+$ /target/release/fleet plan /tmp/tmp.rlHRSVIR8Q/plan.toml
 plan loaded into run r1 (4 tasks)
 
 $ /target/release/fleet start --run r1 --max-parallel 2
 run r1 started
 
 $ /target/release/fleet status
-daemon pid 546 | v0.1.0 | up 2s | sessions 0/4 | undo unavailable | rss 3800 kB
+daemon pid 21 | v0.1.0 | up 2s | sessions 0/4 | undo unavailable | rss 3744 kB
 
 run r1 [active] max-parallel 2
   objective  Add a users table, an API and docs
-  repo       /tmp/tmp.SIE5ya1P98/repo (base HEAD @ b8c865c9)
+  repo       /tmp/tmp.rlHRSVIR8Q/repo (base HEAD @ d3407e08)
   branch     fleet/r1/integration
   tasks      pending 1, ready 0, running 0, review 1, completed 1, failed 0, blocked 1
   ID       STATUS     DEPS      TRY  WORKER  NOTE
@@ -125,11 +127,11 @@ $ /target/release/fleet gate resolve g1 --answer axum
 gate g1 resolved
 
 $ /target/release/fleet status
-daemon pid 546 | v0.1.0 | up 6s | sessions 0/4 | undo unavailable | rss 3928 kB
+daemon pid 21 | v0.1.0 | up 6s | sessions 0/4 | undo unavailable | rss 3872 kB
 
 run r1 [finished] max-parallel 2
   objective  Add a users table, an API and docs
-  repo       /tmp/tmp.SIE5ya1P98/repo (base HEAD @ b8c865c9)
+  repo       /tmp/tmp.rlHRSVIR8Q/repo (base HEAD @ d3407e08)
   branch     fleet/r1/integration
   tasks      pending 0, ready 0, running 0, review 0, completed 4, failed 0, blocked 0
   ID       STATUS     DEPS      TRY  WORKER  NOTE
@@ -156,33 +158,33 @@ agent: the gate complained, fixing the changelog
 agent: finished release
 
 $ /target/release/fleet merge schema
-fleet: merging r1/schema needs approval a1 (digest 1e4ca1677841); approve it with `fleet approve a1` and run the merge again
+fleet: merging r1/schema needs approval a1 (digest 06fc129ce711); approve it with `fleet approve a1` and run the merge again
 run: fleet approve a1
 
 $ /target/release/fleet merge docs
-fleet: merging r1/docs needs approval a2 (digest 622a867d240a); approve it with `fleet approve a2` and run the merge again
+fleet: merging r1/docs needs approval a2 (digest e81233c20988); approve it with `fleet approve a2` and run the merge again
 run: fleet approve a2
 
 $ /target/release/fleet merge api
-fleet: merging r1/api needs approval a3 (digest e487901688fc); approve it with `fleet approve a3` and run the merge again
+fleet: merging r1/api needs approval a3 (digest b257e4bc36d0); approve it with `fleet approve a3` and run the merge again
 run: fleet approve a3
 
 $ /target/release/fleet merge release
-fleet: merging r1/release needs approval a4 (digest 4bf7760677ba); approve it with `fleet approve a4` and run the merge again
+fleet: merging r1/release needs approval a4 (digest 6d34035e6a10); approve it with `fleet approve a4` and run the merge again
 run: fleet approve a4
 
 $ /target/release/fleet approval list
-approval a1 [merge] r1/schema pending digest 1e4ca1677841
-  git: "merge" "fleet/r1/integration" "fleet/r1/schema" "139f5187777cbea7e25874b815cb902aea53aba3"
+approval a1 [merge] r1/schema pending digest 06fc129ce711
+  git: "merge" "fleet/r1/integration" "fleet/r1/schema" "1a5f8b9929514c59c2260b2a5768a8db0374f3e5"
   decide: fleet approve a1 | fleet deny a1
-approval a2 [merge] r1/docs pending digest 622a867d240a
-  git: "merge" "fleet/r1/integration" "fleet/r1/docs" "f9ac33ab15da98da250b945fd0b5b58c05c7e1ac"
+approval a2 [merge] r1/docs pending digest e81233c20988
+  git: "merge" "fleet/r1/integration" "fleet/r1/docs" "0c42491fa129095f028efa19836116fdbe4f9bec"
   decide: fleet approve a2 | fleet deny a2
-approval a3 [merge] r1/api pending digest e487901688fc
-  git: "merge" "fleet/r1/integration" "fleet/r1/api" "025b5b35ee97c1532bfc3c9433dc070d1d085563"
+approval a3 [merge] r1/api pending digest b257e4bc36d0
+  git: "merge" "fleet/r1/integration" "fleet/r1/api" "09ac132d23f09e5077aea5430bd821ccf7625d93"
   decide: fleet approve a3 | fleet deny a3
-approval a4 [merge] r1/release pending digest 4bf7760677ba
-  git: "merge" "fleet/r1/integration" "fleet/r1/release" "91f410cfc3a95fa7807ff1742457a72b72cc3d18"
+approval a4 [merge] r1/release pending digest 6d34035e6a10
+  git: "merge" "fleet/r1/integration" "fleet/r1/release" "74564da74758b3d5ff4fc5ef9d796407e90e7b6c"
   decide: fleet approve a4 | fleet deny a4
 
 $ /target/release/fleet approve a1
@@ -198,48 +200,48 @@ $ /target/release/fleet approve a4
 approval a4 approved
 
 $ /target/release/fleet merge schema
-merged r1/schema (fleet/r1/schema) into fleet/r1/integration at e052eb803600
+merged r1/schema (fleet/r1/schema) into fleet/r1/integration at 1403c660262b
 
 $ /target/release/fleet merge docs
-merged r1/docs (fleet/r1/docs) into fleet/r1/integration at e134489dab42
+merged r1/docs (fleet/r1/docs) into fleet/r1/integration at 694a4e9418c2
 
 $ /target/release/fleet merge api
-merged r1/api (fleet/r1/api) into fleet/r1/integration at b6ed843149ce
+merged r1/api (fleet/r1/api) into fleet/r1/integration at efedd2c8bb7e
 
 $ /target/release/fleet merge release
-merged r1/release (fleet/r1/release) into fleet/r1/integration at ca3a99d07a01
+merged r1/release (fleet/r1/release) into fleet/r1/integration at 341343a10f24
 
 $ git log --oneline --graph fleet/r1/integration
-*   ca3a99d fleet: merge release into fleet/r1/integration: Write the changelog
+*   341343a fleet: merge release into fleet/r1/integration: Write the changelog
 |\  
-| * 91f410c fleet: release - Write the changelog
-| * edb8c09 fleet: release - Write the changelog
-| *   fb1dcef Merge branch 'refs/heads/fleet/r1/docs' into fleet/r1/release
+| * 74564da fleet: release - Write the changelog
+| * 9b0ca70 fleet: release - Write the changelog
+| *   27b2266 Merge branch 'refs/heads/fleet/r1/docs' into fleet/r1/release
 | |\  
-* | | b6ed843 fleet: merge api into fleet/r1/integration: Build the users API
+* | | efedd2c fleet: merge api into fleet/r1/integration: Build the users API
 |\| | 
-| * | 025b5b3 fleet: api - Build the users API
-* | |   e134489 fleet: merge docs into fleet/r1/integration: Document the schema
+| * | 09ac132 fleet: api - Build the users API
+* | |   694a4e9 fleet: merge docs into fleet/r1/integration: Document the schema
 |\ \ \  
 | | |/  
 | |/|   
-| * | f9ac33a fleet: docs - Document the schema
+| * | 0c42491 fleet: docs - Document the schema
 | |/  
-* | e052eb8 fleet: merge schema into fleet/r1/integration: Create the users table
+* | 1403c66 fleet: merge schema into fleet/r1/integration: Create the users table
 |\| 
-| * 139f518 fleet: schema - Create the users table
+| * 1a5f8b9 fleet: schema - Create the users table
 |/  
-* b8c865c initial commit
+* d3407e0 initial commit
 
 $ git status --short   # the working tree and branch of the repository are untouched
 main
 
 $ /target/release/fleet status
-daemon pid 546 | v0.1.0 | up 6s | sessions 0/4 | undo unavailable | rss 3928 kB
+daemon pid 21 | v0.1.0 | up 6s | sessions 0/4 | undo unavailable | rss 3872 kB
 
 run r1 [finished] max-parallel 2
   objective  Add a users table, an API and docs
-  repo       /tmp/tmp.SIE5ya1P98/repo (base HEAD @ b8c865c9)
+  repo       /tmp/tmp.rlHRSVIR8Q/repo (base HEAD @ d3407e08)
   branch     fleet/r1/integration
   tasks      pending 0, ready 0, running 0, review 0, completed 4, failed 0, blocked 0
   ID       STATUS     DEPS      TRY  WORKER  NOTE
@@ -490,15 +492,15 @@ domain performs no I/O. See [docs/domain.md](docs/domain.md) and [docs/adr](docs
 
 ## Tests
 
-924 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1033 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals, quality judgement (`refcheck-json` edge cases), supervision and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain | 223 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals, merging and conflicts, recovery and orphan reconciliation, quality gates; plus the port contract suites against the fakes | 212 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, symlink/FIFO/oversize worker files, pty sessions, process identity, hash-chained log, sockets, config) and the same contract suites against the real file adapters | 285 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding), quality judgement (`refcheck-json` edge cases), supervision and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy | 249 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates; plus the port contract suites against the fakes | 228 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config) and the same contract suites against the real file adapters | 344 |
 | Soak | bounded memory with flooding workers | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules | 203 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules | 211 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -513,11 +515,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               3243     3126    96.4%
-application          1818     1690    93.0%
-infrastructure       3065     2791    91.1%
-cli                  2420     2145    88.6%
-overall             10546     9752    92.5%
+domain               3381     3266    96.6%
+application          1845     1726    93.6%
+infrastructure       3482     3176    91.2%
+cli                  2435     2160    88.7%
+overall             11143    10328    92.7%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -534,12 +536,11 @@ run on every byte) and samples the process's resident memory from `/proc/self/st
 buffer is capped (64 KiB in the test). A 120 second run in release mode, in the Linux container:
 
 ```text
-soak: 8 workers x 120s, 10616 MiB of terminal output (88 MiB/s), rss start 4060 kB, steady min 5580 kB / max 6712 kB / first 5708 kB, growth after warm-up 1004 kB, 236 samples
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.59s
+soak: 8 workers x 120s, 32562 MiB of terminal output (271 MiB/s), rss start 4372 kB, steady min 6096 kB / max 6944 kB / first 6208 kB, growth after warm-up 736 kB, 240 samples
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.54s
 ```
 
-Memory is flat after the buffers fill: it did not grow with the volume of output (about 10 GiB went through the
-daemon). The test fails if memory grows by more than 4 MiB after warm-up. By default it runs 20 seconds;
+Memory is flat after the buffers fill: it did not grow with the volume of output (about 32 GiB went through the daemon). The test fails if memory grows by more than 4 MiB after warm-up. By default it runs 20 seconds;
 `FLEET_SOAK_SECS=120 cargo test --release -p fleet-infra --test soak -- --nocapture` reproduces the numbers above
 (your throughput will differ). Bounds elsewhere: messages 64 KiB, frames 32 KiB, files read from workers 64 KiB,
 gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 64 connections.
@@ -547,9 +548,16 @@ gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 6
 ## Limitations
 
 - Workers are not sandboxed: they run as you. fleet limits what they share and what they can make the daemon do.
-- The origin check that keeps workers off the control socket is best effort (peer process ancestry); run workers under
-  another user for a hard guarantee. Approvals bind what *fleet* runs, not what a worker does on its own.
-- Redaction is pattern based; the audit log is tamper evident, not tamper proof.
+- The control plane (per-run token, fail-closed peer admission, hidden default state directory) keeps workers off the
+  socket in practice, but a worker is the same user: it can read `/proc` and the token file, detach from its process
+  tree and connect as a plain process of yours. Run workers under another user, in a container or in a VM for a hard
+  guarantee. Approvals bind what *fleet* runs (the merge commit; an absolute command path and its arguments), not what
+  a worker does on its own, and an approved command runs in the worker's worktree, so approve only commands that do not
+  execute files from their working directory.
+- Redaction is pattern based and covers terminal, gate and command output and worker-written summaries and questions;
+  the audit log is tamper evident, not tamper proof (deleting both log files erases history).
+- Some git work (committing a worker's output, merges) runs synchronously on the engine thread; a pathological worktree
+  can stall supervision for up to the git timeout. Workers have no CPU, memory, process or disk limits.
 - SIGINT/SIGTERM are not handled (that needs `unsafe` or another dependency): they stop the daemon at once and the next
   start reconciles. `fleet shutdown` is the graceful way.
 - macOS: the code type-checks for `aarch64-apple-darwin` but was **not run**; pty, peer-credential and `ps`-based

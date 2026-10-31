@@ -34,15 +34,15 @@ What the design tries to guarantee, and where it is tested:
 
 | Property | How | Tests |
 | --- | --- | --- |
-| A worker cannot grant itself an approval or answer a gate | Only the daemon creates approvals (merges, or from a worker's `question.json`); only control requests decide them; requests from a worker process or a descendant of one are refused (peer pid ancestry); workers get no socket path, no state dir and an allowlisted environment | `e2e_security.rs`, `fleet-domain` approval tests, `fleet-app` decisions tests, `fleet-infra::pty` environment test |
-| An approval covers one exact action | SHA-256 digest of (tool, command, arguments, task id); merge approvals include the commit being merged; expiry; single use; the digest is recomputed at use | `fleet-domain::approval`, `fleet-app/tests/merging.rs`, `e2e_security.rs` |
-| Worker output cannot attack the terminal or the logs | Streaming sanitizer: every escape sequence removed, controls and invisible Unicode made visible, `\r` becomes a line break; separate passthrough filter for `attach` that drops OSC/DCS/APC/queries; redaction of key shapes, configured rules and secret-looking daemon variables before storage | `fleet-domain::sanitize`, `redact`, `output`; `fleet-infra::pty`; soak test |
+| A worker is kept off the control plane (best effort, see limitations) | Only the daemon creates approvals (merges, or from a worker's `question.json`); decisions need a control request. Three independent checks: (1) a per-run 256-bit capability token in `control/token` (0600, fresh at every daemon start) that every request except `ping` must carry, compared in constant time; (2) at accept, before any request is read, the peer process must be identified and must not be a worker or a descendant of one: an unknown pid, a process that is already gone or an unreadable ancestry all deny (fail closed), the decision is bound to the connection and the request is checked again; (3) workers get an allowlisted environment with no socket path, state directory or token, and `XDG_STATE_HOME` is forced to a per-task directory so a habitual `fleet` call finds no daemon | `fleet-infra::server`/`client`/`daemon` tests (token, fail-closed admit, pipelined requests), `e2e_security.rs` |
+| An approval covers one exact action, once | SHA-256 digest of (tool, command, arguments, task id); the digest is recomputed at use. Merge approvals include the exact commit and the merge is performed on that commit (the branch is verified to still point at it, otherwise nothing is merged). An approval is consumed when the action *starts* (recorded before the command is launched), so a daemon restart never runs it again; a command that was running when the daemon stopped is reported as `interrupted, outcome unknown`. Worker-requested commands must be absolute paths that lie outside the worktree and its repository; their working directory is the worker's worktree (see limitations). Approvals expire | `fleet-domain::approval`, `fleet-domain::fleet`, `fleet-app/tests/{merging,decisions,recovery}.rs`, `fleet-infra::git`, `fleet-infra::jobs`, `e2e_security.rs` |
+| Worker output cannot attack the terminal or the logs | Streaming sanitizer: every escape sequence removed, controls and invisible Unicode made visible, `\r` becomes a line break; separate passthrough filter for `attach` that drops OSC/DCS/APC/queries; redaction of key shapes, configured rules and secret-looking daemon variables before storage, applied to terminal output, quality-gate output, approved-command output and the text of a worker's `result.json`/`question.json` (summary, question, choices). The exact command and arguments of an approval request are not altered (the digest binds them) and are shown to the person deciding. Worker text that reaches another agent's brief is flattened or quoted so it cannot pose as fleet's own statements | `fleet-domain::sanitize`, `redact`, `output`, `brief`; `fleet-infra::pty`, `jobs`, `contract_fs`; soak test |
 | Memory stays bounded | Ring buffer per session with a hard cap; line cap; caps on messages, frames, files, connections, sessions, runs, tasks, notes, gate output, event log size | `fleet-domain::output`, `fleet-infra/tests/soak.rs`, limits tests in every adapter |
 | Reading worker-written files cannot hang or leak | lstat + `O_NOFOLLOW|O_NONBLOCK` + fstat re-check + size cap; `.fleet` opened relative to the worktree with `openat`; FIFOs, symlinks, directories and oversize files are rejected | `fleet-infra::fsx`, `contract_fs`, `e2e_security.rs` |
 | git never runs code planted in a worktree | Empty environment + allowlist; `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null`; `-c` flags that disable hooks, fsmonitor, pager, editor, ssh, credential helpers, signing; per-key overrides for filters, textconv, merge drivers, pagers; `--no-verify`; names validated before they reach a command line | `fleet-infra::git` (one test per vector with a sentinel env var and marker file), `e2e_security.rs` |
 | Isolation of the user's checkout | Work happens on `fleet/<run>/<task>` branches in `<repo>/.fleet-worktrees`; the user's branch, index and working tree are never touched; the integration branch has its own worktree | `fleet-infra::git`, `e2e_flow.rs` |
-| Tamper-evident audit log | Hash chain over canonical event text plus a head file; truncation, edits, deletions and reordering are detected at start and by `fleet verify-log` | `fleet-domain::chain`, `fleet-infra::eventlog`, `e2e_recovery.rs` |
-| No signal reaches the wrong process | Pid plus process start time must match before any signal; only a process group leader is signalled as a group; orphans of an earlier daemon run are checked the same way | `fleet-domain::supervision`, `fleet-infra::procid`, `fleet-infra::pty` |
+| Tamper-evident audit log | Hash chain over canonical event text plus a head file created together with the log; truncation, edits, deletions and reordering are detected at start and by `fleet verify-log`; a log with records but no head file is refused. Deleting *both* files starts a fresh history and is not detected | `fleet-domain::chain`, `fleet-infra::eventlog`, `e2e_recovery.rs` |
+| No signal reaches the wrong process | Pid plus process start time (on Linux scoped by the boot id) must match before any signal; only a process group leader is signalled as a group; orphans of an earlier daemon run are checked the same way | `fleet-domain::supervision`, `fleet-infra::procid`, `fleet-infra::pty` |
 | Control socket hygiene | 0700 directory (owner checked, symlinks refused), 0600 socket, `SO_PEERCRED`/`LOCAL_PEERCRED` uid check, flock-based single daemon, stale socket detection, bounded JSON lines, bounded frames, connection cap | `fleet-infra::server`, `statedir`, `client`, `e2e_security.rs` |
 
 ## Known limitations (read these)
@@ -51,21 +51,44 @@ What the design tries to guarantee, and where it is tested:
   `.git` directory, start any program and open network connections. fleet limits what it *shares*
   (environment, socket, state directory) and what it can make *the daemon* do, not what the worker can do to
   your files. Use a container, a VM or another user for real isolation.
-- **The origin check is best effort.** Control requests whose peer process is a worker, or a descendant of one,
-  are refused. A process that detaches completely from the worker's tree (double fork and `setsid`) and
-  discovers the socket path can connect as the same user. Where the platform offers no peer credentials the
-  0700 directory is the only barrier. Run workers under a different user for a hard guarantee.
-- **Approvals bind what fleet executes, not what a worker does.** For a merge or an approved external command
-  the daemon runs exactly the approved action. A worker that asks "may I push?" and then pushes anyway is not
-  stopped: it can do anything its own permissions allow.
-- **Redaction is pattern based.** It removes built-in key shapes, your configured rules/literals and values of
-  daemon variables whose names look secret. A secret that matches none of these is stored as printed.
-- **The audit log is tamper evident, not tamper proof.** Whoever can rewrite both `events.log` and `events.head`
-  can forge a consistent history.
+- **The control plane is not a security boundary against a hostile same-user process.** Workers run as you. fleet makes
+  accidental and casual access fail (no socket path, state directory or token in a worker's environment or worktree,
+  `XDG_STATE_HOME` redirected, per-run token required, peer ancestry checked at accept and per request, unknown peers
+  denied), but a worker can read `/proc/<daemon pid>/cmdline` and the 0600 token file as the same user, then detach
+  from its process tree (`setsid`, `systemd-run --user`, `at`, a terminal multiplexer) and connect as a plain process of
+  yours. Only running workers under a different user, in a container or in a VM closes that gap. Where the platform
+  exposes no peer credentials the 0700 directory and the token are the only barriers.
+- **Approvals bind what fleet executes, not what a worker does.** For a merge or an approved external command the daemon
+  runs exactly the approved action (merge: the approved commit; command: the approved absolute path and arguments). A
+  worker that asks "may I push?" and then pushes anyway is not stopped. An approved command runs with the worker's
+  worktree as its working directory, so a command that executes files from its working directory (`make`, `npm run`,
+  `git` with repository configuration, a script that sources `./env`) executes whatever the worker left there:
+  approve only commands that do not. The worktree contents are not part of the digest.
+- **Redaction is pattern based.** It removes built-in key shapes, your configured rules and literals and values of daemon
+  variables whose names look secret, from terminal output, gate output, approved-command output and worker-written
+  summaries and questions. A secret that matches none of these is stored as printed. Error text from git and the
+  approval request text a worker wrote (command, arguments) are not redacted.
+- **The audit log is tamper evident, not tamper proof.** Whoever can rewrite both `events.log` and `events.head`, or delete
+  both, can forge or erase history. The head file lives next to the log, so it cannot anchor the log against an attacker
+  with write access to the state directory.
 - **Quality gates run on the tree the worker edited.** A worker can influence a gate (for example by editing the
   gate's script if it lives in the repository). Keep gate commands outside the repository.
 - **A path-planted git driver can race.** A merge driver or filter planted by a *concurrently running* worker
   between the config listing and the git command is not overridden; it still runs with the allowlisted environment only.
+- **The engine thread runs some git commands synchronously.** Committing a worker's output at review time and merging
+  (including bringing dependency branches into a task's branch) run `git` on the single engine thread, each call with
+  a 120 second timeout. A worker that leaves a pathological tree (millions of files) can stall supervision, approval
+  expiry and request handling for that long. Not changed: moving these into background jobs would need a larger
+  redesign of the review flow; limit worktree sizes with your own gates.
+- **No resource limits for workers.** fleet sets no `RLIMIT_*`, cgroup or disk quota on workers (that needs `unsafe` or a
+  sandbox), so a worker can fill the disk, fork without bound or use all memory.
+- **Worker text in briefs.** Worker summaries, questions and tool output are flattened or quoted before they reach the brief
+  of another task, so they cannot start headings or imitate fleet's notes, but a language model reading them can still
+  be influenced by their content (prompt injection between tasks is possible by nature).
+- **agent-undo is resolved once.** The optional `agent-undo` binary is looked up at daemon start in absolute `PATH` entries
+  only, stored as a canonical absolute path and refused at every call if it lies inside the worktree or its repository;
+  it runs with working directory `/`. A binary that an attacker can already replace in a trusted `PATH` directory is
+  not defended against.
 - **No SIGINT/SIGTERM handler.** Catching signals needs `unsafe` or another dependency. Stopping the daemon with a
   signal ends it immediately; workers lose their terminals and the next daemon start reconciles them. Use
   `fleet shutdown` for a graceful stop.
