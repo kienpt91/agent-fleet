@@ -13,6 +13,7 @@ pub mod config_file;
 pub mod contract_fs;
 pub mod daemon;
 pub mod digest;
+pub mod doctor;
 pub mod eventlog;
 pub mod fsx;
 pub mod git;

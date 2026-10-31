@@ -12,7 +12,6 @@
 pub mod args;
 pub mod attach;
 pub mod commands;
-pub mod doctor;
 pub mod render;
 pub mod tui;
 

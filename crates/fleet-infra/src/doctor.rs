@@ -1,22 +1,41 @@
-//! `fleet doctor`: a checklist of everything fleet depends on.
+//! `fleet doctor` and the web dashboard's health panel: a checklist of everything fleet depends on.
 //!
 //! Only `fail` makes the command exit unhealthy. Things that are merely absent (daemon not
 //! running, no config file, no undo tool) are `info`.
 
-use crate::render::{clean, multiline};
+use crate::client::Client;
+use crate::config_file::load_config;
+use crate::eventlog::verify_file;
+use crate::git::check_git_version;
+use crate::server::verify_socket_permissions;
+use crate::statedir::{verify_token_file, StateLayout};
+use crate::undo::AgentUndo;
 use fleet_app::ports::UndoTool;
 use fleet_domain::error::ErrorCode;
+use fleet_domain::sanitize::sanitize_text;
 use fleet_domain::value::Value;
-use fleet_infra::client::Client;
-use fleet_infra::config_file::load_config;
-use fleet_infra::eventlog::verify_file;
-use fleet_infra::git::check_git_version;
-use fleet_infra::server::verify_socket_permissions;
-use fleet_infra::statedir::{verify_token_file, StateLayout};
-use fleet_infra::undo::AgentUndo;
 use std::fmt::Write as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+/// Single-line, terminal-safe text.
+fn clean(s: &str) -> String {
+    sanitize_text(s.as_bytes())
+        .chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Multi-line, terminal-safe text.
+fn multiline(s: &str) -> String {
+    sanitize_text(s.as_bytes())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -386,7 +405,7 @@ fn check_pty() -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_infra::testutil::TempDir;
+    use crate::testutil::TempDir;
 
     fn chmod(p: &Path, mode: u32) {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -500,7 +519,7 @@ mod tests {
         // nothing there: the daemon is simply not running
         assert_eq!(check_token(&token, &socket).status, Status::Info);
         // a token without a socket is a leftover of a daemon that did not clean up
-        let secret = fleet_infra::statedir::create_token_file(&token).unwrap();
+        let secret = crate::statedir::create_token_file(&token).unwrap();
         let c = check_token(&token, &socket);
         assert_eq!(c.status, Status::Info);
         assert!(c.detail.contains("not running"), "{}", c.detail);
@@ -528,7 +547,7 @@ mod tests {
         let t = TempDir::new("doc-token-secret");
         let socket = t.join("fleet.sock");
         let token = t.join("token");
-        let secret = fleet_infra::statedir::create_token_file(&token).unwrap();
+        let secret = crate::statedir::create_token_file(&token).unwrap();
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         for mode in [0o600, 0o644] {
             chmod(&token, mode);

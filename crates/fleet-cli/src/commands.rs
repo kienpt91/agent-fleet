@@ -6,7 +6,6 @@
 //! trait so tests can script replies and assert the exact requests.
 
 use crate::args::Parsed;
-use crate::doctor::{self, DoctorInput};
 use crate::render;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::show;
@@ -15,6 +14,7 @@ use fleet_domain::value::Value;
 use fleet_infra::client::Client;
 use fleet_infra::config_file::load_plan;
 use fleet_infra::daemon::{run_daemon, DaemonOptions};
+use fleet_infra::doctor::{self, DoctorInput};
 use fleet_infra::eventlog::verify_file;
 use fleet_infra::statedir::{resolve_state_dir, StateLayout};
 use std::io::{Read, Write};
