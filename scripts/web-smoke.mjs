@@ -36,7 +36,8 @@ const CSRF2 = 'd6'.repeat(32);
 
 // ----------------------------------------------------------------- fake DOM
 
-const FORBIDDEN_ATTR = /^(style|href|src|srcdoc|on.*)$/i;
+const FORBIDDEN_ATTR = /^(style|src|srcdoc|on.*)$/i;
+const HREF_OK = /^#\/(goal|task)\/[A-Za-z0-9._-]{1,40}(\/[A-Za-z0-9._-]{1,40})?$|^#\/goals$/;
 
 class FakeText {
   constructor(data) {
@@ -104,8 +105,8 @@ class FakeElement {
     };
   }
   setAttribute(k, v) {
-    if (FORBIDDEN_ATTR.test(k)) {
-      violations.push('setAttribute ' + k);
+    if (FORBIDDEN_ATTR.test(k) || (k.toLowerCase() === 'href' && !HREF_OK.test(String(v)))) {
+      violations.push('setAttribute ' + k + ' ' + String(v).slice(0, 40));
     }
     this.attrs.set(k, String(v));
   }
@@ -201,6 +202,7 @@ function buildEnv(opts) {
     nextTimer: 1,
     calls: [],
     streams: [],
+    goalFetches: [],
     unauth: [],
     storageKeys: new Set(),
     created: [],
@@ -220,7 +222,9 @@ function buildEnv(opts) {
         statusGate: null,
         eventCount: 600,
         streamStatus: 200,
-        streamThrow: 0
+        streamThrow: 0,
+        goalsStatus: 200,
+        goalCount: 4
       },
       opts.server || {}
     )
@@ -507,6 +511,15 @@ function buildEnv(opts) {
     } else if (path === '/api/merge') {
       if (S.mergeStatus === 409) err(409, { code: 'approval_required', message: 'needs approval' }, 'a1');
       else body = { schema: 'fleet.merge/1', task: 'r1/api', branch: 'fleet/r1/api', integration_branch: 'fleet/r1/integration', merge_sha: 'f'.repeat(40) };
+    } else if (path === '/api/goals') {
+      if (S.goalsStatus !== 200) err(S.goalsStatus, { code: 'goals', message: 'goals unavailable' });
+      else body = goalsDoc(S.goalCount);
+    } else if (path === '/api/remaining') {
+      body = remainingDoc();
+    } else if (path === '/api/goal') {
+      const gid = query.get('id');
+      env.goalFetches.push(gid);
+      body = goalShowDoc(gid);
     } else {
       err(404, { code: 'not_found', message: 'no such endpoint' });
     }
@@ -581,6 +594,66 @@ async function boot(opts) {
 }
 
 // ------------------------------------------------------------- canned data
+
+const COMMIT = 'a1'.repeat(20);
+const TREE = 'b2'.repeat(20);
+const CONTRACT_ID = 'c3'.repeat(20);
+
+function goalsDoc(count) {
+  const base = [
+    { id: 'g1', parent: null, title: 'Ship ' + IMG, status: 'in_progress', reason: 'because ' + ESC, depth: 0, children: 2, contract: 'pending', contract_id: CONTRACT_ID, evidence: 3,
+      tasks: [{ task: 'r1/api', status: 'completed', verification: 'verified' }, { task: 'r1/web', status: 'review', verification: 'unverified' }, { task: 'not a ref<x>', status: 'pending', verification: 'failed' }] },
+    { id: 'g2', parent: 'g1', title: 'Child ' + SCRIPT, status: 'open', reason: '', depth: 1, children: 0, contract: 'none', contract_id: null, evidence: 0, tasks: [{ task: 'r1/ui', status: 'pending', verification: 'none' }] },
+    { id: 'g3', parent: 'g1', title: 'Done ' + BIDI, status: 'verified', reason: '', depth: 1, children: 0, contract: 'passed', contract_id: CONTRACT_ID, evidence: 1, tasks: [] },
+    { id: 'bad id<x>', parent: null, title: 'Weird ' + IMG, status: 'abandoned', reason: 'dropped', depth: 0, children: 0, contract: 'mystery', contract_id: null, evidence: 0, tasks: [] }
+  ];
+  const goals = base.slice();
+  for (let i = 4; i < count; i++) {
+    goals.push({ id: 'm' + i, parent: null, title: 'Many ' + i, status: 'open', reason: '', depth: 0, children: 0, contract: 'pending', contract_id: null, evidence: 1, tasks: [{ task: 'r1/api', status: 'completed', verification: 'pending' }] });
+  }
+  const verified = goals.filter((g) => g.status === 'verified').length;
+  const abandoned = goals.filter((g) => g.status === 'abandoned').length;
+  return { schema: 'fleet.goals.list/1', total: goals.length, verified, abandoned, goals };
+}
+
+function remainingDoc() {
+  return {
+    schema: 'fleet.goals.remaining/1',
+    total: 4,
+    verified: 1,
+    abandoned: 1,
+    open_leaves: [goalsDoc(4).goals[1]],
+    blockers: [
+      { kind: 'goal', goal: 'g1', title: 'Blocked ' + IMG, detail: SCRIPT + '\n' + ESC, status: 'blocked' },
+      { kind: 'task', goal: 'g1', task: 'r1/web', detail: 'needs ' + BIDI }
+    ],
+    next_ready: [{ task: 'r1/ui', goal: 'g2', title: 'Do ' + BIDI }]
+  };
+}
+
+function evidence(id, check, verdict, task, extra) {
+  return Object.assign({ id, check, verdict, exit_code: verdict === 'passed' ? 0 : 1, summary: 'summary ' + IMG + ' ' + ESC, output: 'out ' + SCRIPT + '\n' + ESC, commit: COMMIT, tree: TREE, dirty: false, counts: true, task, at_ms: 1700000000000 }, extra || {});
+}
+
+function goalShowDoc(id) {
+  const g = goalsDoc(4).goals.find((x) => x.id === id) || goalsDoc(4).goals[0];
+  const big = evidence('e2', 'tests', 'failed', 'r1/web', { dirty: true, counts: false, output: ESC + IMG + '\n' + 'Z'.repeat(30000) });
+  const history = [
+    evidence('e3', 'lint', 'passed', 'r1/api', { summary: 'lint ok' }),
+    big,
+    evidence('e1', 'tests', 'passed', 'r1/api', { summary: 'tests ok ' + BIDI })
+  ];
+  return Object.assign({}, g, {
+    schema: 'fleet.goals.show/1',
+    intent: 'intent ' + SCRIPT + '\nsecond line ' + ESC,
+    child_ids: ['g2', 'g3', 'bad id<x>'],
+    checks: [
+      { check: 'tests', kind: 'command', mandatory: true, detail: 'cargo test ' + IMG, latest: history[2] },
+      { check: 'lint', kind: 'refcheck-json', mandatory: false, detail: 'lint ' + BIDI, latest: null }
+    ],
+    history
+  });
+}
 
 function statusDoc(env) {
   const now = Date.now();
@@ -724,7 +797,7 @@ function staticChecks() {
   check(!/<style/i.test(HTML), 'no style element');
   check(!/@import/.test(CSS) && !/url\(/i.test(CSS), 'css has no @import or url()');
   check(CSS.includes('prefers-color-scheme: dark'), 'css supports dark mode');
-  ['view', 'statusline', 'hdr-version', 'hdr-sessions', 'hdr-rss', 'hdr-approvals', 'logout', 'nav-runs', 'nav-decisions', 'nav-events', 'nav-health'].forEach(
+  ['view', 'statusline', 'hdr-version', 'hdr-sessions', 'hdr-rss', 'hdr-approvals', 'hdr-goals', 'logout', 'nav-runs', 'nav-goals', 'nav-decisions', 'nav-events', 'nav-health'].forEach(
     (id) => check(HTML.includes('id="' + id + '"'), 'index.html has #' + id)
   );
 }
@@ -1099,6 +1172,156 @@ async function nextRoute() {
   check(failed.replaced.length === 1 && failed.replaced[0][2] === '/' && failed.location.hash === '', 'a failed login drops the fragment and does not follow next');
 }
 
+async function goalsFlow() {
+  const env = await boot({ hash: '#/goals', stored: true });
+  await env.advance(100);
+  check(env.registry.get('nav-goals').hasClass('active'), 'goals nav active');
+  check(env.calls.some((c) => c.url === '/api/goals') && env.calls.some((c) => c.url === '/api/remaining'), 'goals and remaining are requested');
+  check(find(env, (n) => n.hasClass('goalsum'))[0].textContent === '4 goals, 1 verified, 1 abandoned', 'summary line');
+  check(env.text('hdr-goals') === '2 goals left' && !env.registry.get('hdr-goals').hasClass('hidden'), 'header chip counts goals that are not verified or abandoned');
+  check(hasTextNode(env, 'Ship ' + IMG) && hasTextNode(env, 'Child ' + SCRIPT), 'goal titles are text nodes');
+  check(allText(env).includes('[U+001B]') && allText(env).includes('[U+202E]') && !/[\u001b\u202e]/.test(allText(env)), 'ESC and bidi controls are made visible');
+  check(hasTextNode(env, 'because [U+001B][31mred[U+001B][0m'), 'goal reason is text');
+  assertSafe(env, 'goals');
+  // depth indent
+  const rows = find(env, (n) => n.hasClass('goalrow'));
+  check(rows.length === 4 && rows[0].hasClass('indent-0') && rows[1].hasClass('indent-1'), 'tree rows are indented by depth');
+  // verification badges
+  const unv = find(env, (n) => n.hasClass('vf-unverified'));
+  check(unv.length === 1 && unv[0].textContent === 'unverified', 'exactly one unverified badge: the governed task in review');
+  check(find(env, (n) => n.hasClass('vf-verified')).length === 1, 'a verified badge for the verified task');
+  check(find(env, (n) => n.hasClass('vf-failed')).length === 1, 'a failed badge');
+  check(find(env, (n) => n.hasClass('vf-none')).length === 0, 'no badge for verification none');
+  check(find(env, (n) => n.hasClass('ct-unknown')).length === 1, 'an unknown contract value gets the neutral class');
+  // links
+  const links = find(env, (n) => n.tagName === 'a' && n.hasClass('rlink'));
+  const hrefs = links.map((a) => a.getAttribute('href'));
+  check(hrefs.every((h) => HREF_OK.test(h)), 'every link is a validated hash route');
+  check(hrefs.includes('#/goal/g1') && hrefs.includes('#/task/r1/api') && hrefs.includes('#/goal/g3'), 'goal and task links are built');
+  check(!hrefs.some((h) => h.includes('bad') || h.includes('<') || h.includes(' ')), 'invalid ids are never linked');
+  check(!links.some((a) => a.textContent.includes('Weird')), 'a goal with an invalid id is shown as plain text');
+  check(hasTextNode(env, 'Weird ' + IMG), 'the unlinked title is still shown');
+  check(hasTextNode(env, 'not a ref<x>'), 'an invalid task ref is shown as plain text');
+  // remaining work
+  check(allText(env).includes('Open leaf goals (1)') && allText(env).includes('Blockers (2)') && allText(env).includes('Next ready tasks (1)'), 'remaining work sections');
+  check(hasTextNode(env, 'Blocked ' + IMG) && allText(env).includes('Do safe[U+202E]gnp.exe'), 'remaining texts are text');
+  check(hrefs.filter((h) => h === '#/task/r1/ui').length >= 1, 'next ready task links to its task page');
+  // read-only
+  const goalCalls = env.calls.filter((c) => /^\/api\/(goal|goals|remaining|verify)/.test(c.url));
+  check(goalCalls.length > 0 && goalCalls.every((c) => c.method === 'GET' && c.body === null), 'only GET requests are made for goals');
+  check(!buttons(env, 'Resolve').length && !find(env, (n) => n.tagName === 'button' && /verify/i.test(n.textContent)).length, 'no verify or change button on the goals page');
+  const goalsPolls = env.calls.filter((c) => c.url === '/api/goals').length;
+  const statusPolls = env.statusCalls().length;
+  check(goalsPolls === statusPolls, 'goals are fetched exactly once per status poll (' + goalsPolls + ' and ' + statusPolls + ')');
+  await env.setVisible('hidden');
+  const before = env.calls.length;
+  await env.advance(10000);
+  check(env.calls.length === before, 'no goal requests while the tab is hidden');
+  await env.setVisible('visible');
+
+  // the goal page
+  env.location.hash = '#/goal/g1';
+  await env.advance(100);
+  check(env.registry.get('nav-goals').hasClass('active'), 'goals nav stays active on a goal page');
+  check(env.calls.some((c) => c.url === '/api/goal?id=g1'), 'the goal is requested by id');
+  check(hasTextNode(env, 'intent ' + SCRIPT + '\nsecond line [U+001B][31mred[U+001B][0m'), 'intent is multi line text');
+  check(find(env, (n) => n.hasClass('multi') && n.textContent.startsWith('intent '))[0] !== undefined, 'intent keeps line breaks in a pre-wrap block');
+  check(find(env, (n) => n.tagName === 'code' && n.textContent === CONTRACT_ID).length >= 1, 'full contract id shown');
+  check(allText(env).includes('short form ' + CONTRACT_ID.slice(0, 12)), 'short contract id shown');
+  const links2 = find(env, (n) => n.tagName === 'a').map((a) => a.getAttribute('href'));
+  check(links2.includes('#/goals') && links2.includes('#/goal/g2') && links2.includes('#/goal/g3') && !links2.some((h) => h.includes('bad')), 'children link by validated id only');
+  check(hasTextNode(env, 'bad id<x>'), 'an invalid child id is plain text');
+  const checksTable = find(env, (n) => n.tagName === 'table');
+  check(checksTable.length === 3, 'tasks, checks and evidence tables');
+  const checkRows = checksTable[1].all((n) => n.tagName === 'tr').slice(1);
+  check(checkRows.length === 2, 'one row per check');
+  check(checkRows[0].textContent.includes('tests') && checkRows[0].textContent.includes('yes'), 'check row shows mandatory');
+  check(checkRows[0].textContent.includes(COMMIT.slice(0, 12)) && !checkRows[0].textContent.includes(COMMIT), 'short commit in the checks table');
+  check(checkRows[1].textContent.includes('no evidence'), 'a check without evidence says so');
+  check(find(env, (n) => n.hasClass('vd-passed')).length >= 1 && find(env, (n) => n.hasClass('vd-failed')).length >= 1, 'verdict badges');
+  const evRows = find(env, (n) => n.hasClass('evrow'));
+  check(evRows.length === 3, 'three evidence rows');
+  check(evRows[1].hasClass('dim') && !evRows[0].hasClass('dim'), 'evidence that does not count is dimmed');
+  check(allText(env).includes('Evidence that does not count (dirty worktree or not the reviewed commit) is shown dimmed.'), 'dim note shown');
+  check(find(env, (n) => n.hasClass('evdetail') && !n.hasClass('hidden')).length === 0, 'output rows start collapsed');
+  evRows[1].dispatch('click');
+  const evOut = find(env, (n) => n.hasClass('evout'))[0];
+  check(!!evOut && evOut.textContent.length <= 20000 + 20 && evOut.textContent.length >= 20000, 'the output shown is bounded to 20000 characters (got ' + (evOut ? evOut.textContent.length : -1) + ')');
+  check(evOut.textContent.startsWith('[U+001B]' ) && evOut.textContent.includes(IMG), 'the output is text with visible controls');
+  check(allText(env).includes('Output cut: showing the first 20000 of'), 'a notice says the output was cut');
+  check(find(env, (n) => n.tagName === 'code' && n.textContent === COMMIT).length === 1 && find(env, (n) => n.tagName === 'code' && n.textContent === TREE).length === 1, 'full commit and tree shown when a row is opened');
+  check(find(env, (n) => n.hasClass('evdetail') && !n.hasClass('hidden')).length === 1, 'one row is open');
+  await env.advance(2100);
+  check(find(env, (n) => n.hasClass('evdetail') && !n.hasClass('hidden')).length === 1, 'an open row stays open after a poll');
+  evRows[1].dispatch('click');
+  check(find(env, (n) => n.hasClass('evdetail') && !n.hasClass('hidden')).length === 0, 'a second click closes the row');
+  assertSafe(env, 'goal');
+  const goalGets = env.calls.filter((c) => c.url.startsWith('/api/goal?'));
+  check(goalGets.length > 0 && goalGets.every((c) => c.method === 'GET'), 'goal requests are GET');
+
+  // an invalid id never reaches the server
+  const n0 = env.calls.filter((c) => c.url.startsWith('/api/goal?')).length;
+  env.location.hash = '#/goal/bad%20id%3Cx%3E';
+  await env.advance(2100);
+  check(allText(env).includes('Not a valid goal id'), 'an invalid goal id is refused');
+  check(env.calls.filter((c) => c.url.startsWith('/api/goal?')).length === n0, 'an invalid goal id makes no request');
+
+  // task page: goals and evidence
+  env.location.hash = '#/task/r1/api';
+  await env.advance(300);
+  check(allText(env).includes('Goals and evidence'), 'task page has a goals section');
+  const gcards = find(env, (n) => n.hasClass('govbox'))[0];
+  check(gcards.textContent.includes('Ship ' + IMG), 'the governing goal is listed');
+  check(gcards.all((n) => n.hasClass('vf-verified')).length === 1, 'the verification badge for this task');
+  const govRows = gcards.all((n) => n.tagName === 'tr').slice(1);
+  check(govRows.length === 2, 'one row per check');
+  check(govRows[0].textContent.includes('passed') && govRows[0].textContent.includes('tests ok'), 'the newest evidence for this task is shown (e1 for r1/api, not the failed e2 of r1/web)');
+  check(!govRows[0].textContent.includes('failed'), 'evidence of another task is not shown');
+  check(govRows[1].textContent.includes('lint ok'), 'the second check shows its own evidence');
+  assertSafe(env, 'task goals');
+  env.location.hash = '#/task/r1/web';
+  await env.advance(300);
+  const gcards2 = find(env, (n) => n.hasClass('govbox'))[0];
+  check(gcards2.all((n) => n.hasClass('vf-unverified')).length === 1 && gcards2.all((n) => n.hasClass('vf-verified')).length === 0, 'unverified for the task in review, no verified badge');
+  check(gcards2.textContent.includes('failed'), 'the failed evidence of r1/web is shown for r1/web');
+  env.location.hash = '#/task/r1/ui';
+  await env.advance(300);
+  check(find(env, (n) => n.hasClass('govbox'))[0].all((n) => n.hasClass('vf-unverified') || n.hasClass('vf-verified')).length === 0, 'no verification badge for a task whose verification is none');
+
+  // run DAG badges
+  env.location.hash = '#/run/r1';
+  await env.advance(300);
+  const rects = find(env, (n) => n.tagName === 'rect');
+  check(rects.filter((r) => r.hasClass('vf-unverified')).length === 1, 'DAG: the unverified task has an unverified badge');
+  check(rects.filter((r) => r.hasClass('vf-verified')).length === 1, 'DAG: the verified task has a verified badge');
+  check(rects.filter((r) => /vf-(none|pending|failed)/.test(r.className)).length === 0, 'DAG: no badge for ungoverned or none');
+  check(find(env, (n) => n.tagName === 'text' && n.textContent === 'unverified').length === 1, 'DAG: badge text');
+  assertSafe(env, 'dag goals');
+  check(env.unauth.length === 0 && violations.length === 0, 'goal requests carry the session header and use no unsafe API');
+}
+
+async function goalsBounds() {
+  const env = await boot({ hash: '#/task/r1/api', stored: true, server: { goalCount: 11 } });
+  await env.advance(500);
+  const fetched = env.calls.filter((c) => c.url.startsWith('/api/goal?'));
+  check(fetched.length === 5, 'at most five goals are fetched for a task (got ' + fetched.length + ')');
+  check(find(env, (n) => n.hasClass('govbox'))[0].textContent.includes('at most 5 goals are expanded'), 'goals beyond five say they are not expanded');
+  const env2 = await boot({ hash: '#/goals', stored: true, server: { goalCount: 700 } });
+  await env2.advance(300);
+  check(find(env2, (n) => n.hasClass('goalrow')).length === 500, 'the goal tree shows at most 500 goals');
+  check(allText(env2).includes('200 more goals are not shown.'), 'the cut is announced');
+}
+
+async function goalsUnavailable() {
+  const env = await boot({ hash: '#/goals', stored: true, server: { goalsStatus: 404 } });
+  await env.advance(300);
+  check(allText(env).includes('Goals are not available: goals unavailable'), 'a missing goals endpoint is explained');
+  check(env.registry.get('hdr-goals').hasClass('hidden') || env.text('hdr-goals') === '', 'no header chip without goals');
+  const env2 = await boot({ hash: '#/goals', stored: true, server: { goalsStatus: 401 } });
+  await env2.advance(300);
+  check(allText(env2) === NOT_LOGGED_IN && env2.storage.data.size === 0, 'a 401 on the goals request logs out and clears the session');
+}
+
 async function streamRetries() {
   const env = await boot({ hash: '#/task/r1/web', stored: true, server: { streamThrow: 1000 } });
   await env.advance(40000);
@@ -1137,6 +1360,9 @@ await sessionFlow();
 await notLoggedIn();
 await rateLimited();
 await nextRoute();
+await goalsFlow();
+await goalsBounds();
+await goalsUnavailable();
 await streamRetries();
 await streamOverflow();
 await streamAuth();

@@ -24,6 +24,19 @@
   const RETRY_MS = 3000;
   const MAX_STREAM_RETRIES = 5;
   const ID_RE = /^[0-9a-f]{64}$/;
+  // Ids that are safe to put into a hash route. Anything else is shown as plain text.
+  const ID_OK = /^[A-Za-z0-9._-]{1,40}$/;
+  const REF_OK = /^[A-Za-z0-9._-]{1,40}\/[A-Za-z0-9._-]{1,40}$/;
+  const GOAL_STATUS = new Set(['open', 'in_progress', 'blocked', 'verified', 'abandoned']);
+  const CONTRACT = new Set(['none', 'pending', 'passed', 'failed']);
+  const VERIFICATION = new Set(['none', 'pending', 'unverified', 'failed', 'verified']);
+  const VERDICT = new Set(['passed', 'failed', 'error']);
+  const VERIF_RANK = new Map([['failed', 4], ['unverified', 3], ['pending', 2], ['verified', 1]]);
+  const MAX_GOALS_SHOWN = 500;
+  const MAX_LIST_SHOWN = 100;
+  const MAX_EVIDENCE_SHOWN = 200;
+  const MAX_EVIDENCE_OUTPUT = 20000;
+  const MAX_GOAL_DETAILS = 5;
 
   const KNOWN = new Set([
     'pending', 'ready', 'running', 'review', 'completed', 'failed', 'blocked',
@@ -39,6 +52,8 @@
 
   let csrf = null;
   let session = null;
+  let lastGoals = null;
+  let goalsNote = null;
   let loggedOut = false;
   let lastStatus = null;
   let lastParam = null;
@@ -394,6 +409,18 @@
         lastStatus = res.data;
         lastParam = param;
         fetchedAt = Date.now();
+        const gres = await api('GET', '/api/goals');
+        if (gres.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        if (gres.ok && gres.data && Array.isArray(gres.data.goals)) {
+          lastGoals = gres.data;
+          goalsNote = null;
+        } else {
+          lastGoals = null;
+          goalsNote = errText(gres);
+        }
         updateHeader(lastStatus);
         if (param === statusParam() && view && view.update) {
           try {
@@ -429,6 +456,12 @@
     if (b) {
       b.textContent = pending + (pending === 1 ? ' pending approval' : ' pending approvals');
       b.className = 'badge ' + (pending > 0 ? 'st-review' : 'st-unknown');
+    }
+    const gl = document.getElementById('hdr-goals');
+    if (gl) {
+      const left = goalsLeft();
+      gl.classList.toggle('hidden', left === 0);
+      gl.textContent = left + (left === 1 ? ' goal left' : ' goals left');
     }
   }
 
@@ -467,7 +500,10 @@
     if (parts[0] === 'task' && parts[1] && parts[2]) {
       return { name: 'task', run: parts[1], task: parts.slice(2).join('/') };
     }
-    if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health') {
+    if (parts[0] === 'goal' && parts[1]) {
+      return { name: 'goal', id: parts[1] };
+    }
+    if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health' || parts[0] === 'goals') {
       return { name: parts[0] };
     }
     return { name: 'runs' };
@@ -486,8 +522,8 @@
   }
 
   function setNav(name) {
-    const section = name === 'run' || name === 'task' ? 'runs' : name;
-    ['runs', 'decisions', 'events', 'health'].forEach(function (id) {
+    const section = name === 'run' || name === 'task' ? 'runs' : name === 'goal' ? 'goals' : name;
+    ['runs', 'goals', 'decisions', 'events', 'health'].forEach(function (id) {
       const a = document.getElementById('nav-' + id);
       if (a) {
         a.classList.toggle('active', id === section);
@@ -513,6 +549,10 @@
       v = eventsView();
     } else if (r.name === 'health') {
       v = healthView();
+    } else if (r.name === 'goals') {
+      v = goalsView();
+    } else if (r.name === 'goal') {
+      v = goalView(r.id);
     } else {
       v = runsView();
     }
@@ -666,7 +706,7 @@
     };
   }
 
-  function drawDag(runId, tasks) {
+  function drawDag(runId, tasks, vmap) {
     const lay = layout(tasks);
     const root = svg('svg', {
       'class': 'dag',
@@ -715,6 +755,11 @@
       node.appendChild(svg('text', { 'class': 'node-title', x: 10, y: 40 }, short(t.title, 30)));
       node.appendChild(svg('rect', { 'class': 'node-badge ' + cls, x: 10, y: 50, width: 86, height: 18, rx: 9 }));
       node.appendChild(svg('text', { 'class': 'node-badge-text', x: 53, y: 63 }, short(t.status, 12)));
+      const vf = vmap.get(runId + '/' + t.id);
+      if (vf) {
+        node.appendChild(svg('rect', { 'class': 'node-badge vf-' + vf, x: 104, y: 50, width: 86, height: 18, rx: 9 }));
+        node.appendChild(svg('text', { 'class': 'node-badge-text', x: 147, y: 63 }, short(vf, 12)));
+      }
       if (t.live) {
         node.appendChild(svg('circle', { 'class': 'node-live', cx: BOX_W - 16, cy: 59, r: 5 }));
       }
@@ -760,9 +805,10 @@
           return;
         }
         const tasks = Array.isArray(run.tasks) ? run.tasks : [];
+        const vmap = verificationMap();
         const s = JSON.stringify([run, tasks.map(function (t) {
           return [t.id, t.title, t.status, t.deps, t.worker, t.attempt, t.live];
-        })]);
+        }), Array.from(vmap)]);
         if (s === sig) {
           return;
         }
@@ -782,7 +828,7 @@
           dagBox.replaceChildren(el('p', 'muted', 'This run has no tasks yet.'));
         } else {
           const scroller = el('div', 'dagscroll');
-          scroller.appendChild(drawDag(run.id, tasks));
+          scroller.appendChild(drawDag(run.id, tasks, vmap));
           dagBox.replaceChildren(scroller, el('p', 'muted small', 'Arrows run from a dependency (left) to the task that waits for it. Click a task for details.'));
         }
       }
@@ -856,6 +902,10 @@
     root.appendChild(streamNote);
     root.appendChild(lostNote);
     root.appendChild(pre);
+    root.appendChild(el('h3', '', 'Goals and evidence'));
+    const govBox = el('div', 'govbox');
+    govBox.appendChild(el('p', 'muted', 'Loading goals.'));
+    root.appendChild(govBox);
 
     let stopped = false;
     let gen = 0;
@@ -866,6 +916,106 @@
     let halted = false;
     let flushTimer = null;
     let fieldsSig = null;
+    let govSig = null;
+    let govGen = 0;
+    const govDocs = new Map();
+
+    function renderGov(gov) {
+      if (lastGoals === null) {
+        govBox.replaceChildren(el('p', 'muted', 'Goal information is not available' + (goalsNote ? ': ' + clean(goalsNote, { max: 300 }) : '.')));
+        return;
+      }
+      if (!gov.length) {
+        govBox.replaceChildren(el('p', 'muted', 'No goal names this task.'));
+        return;
+      }
+      const cards = [];
+      gov.forEach(function (g, i) {
+        const card = el('article', 'card');
+        const head = el('div', 'cardhead');
+        head.appendChild(goalLink(g.id, g.title));
+        head.appendChild(el('span', 'muted mono-text', g.id));
+        head.appendChild(tagged('gs', GOAL_STATUS, g.status));
+        head.appendChild(tagged('ct', CONTRACT, g.contract, 'contract ' + clean(g.contract, { max: 20 })));
+        const mine = (Array.isArray(g.tasks) ? g.tasks : []).find(function (t) {
+          return t && t.task === ref;
+        });
+        if (mine && mine.verification) {
+          head.appendChild(tagged('vf', VERIFICATION, mine.verification, 'verification ' + clean(mine.verification, { max: 20 })));
+        }
+        card.appendChild(head);
+        const entry = govDocs.get(g.id);
+        if (i >= MAX_GOAL_DETAILS) {
+          card.appendChild(el('p', 'muted small', 'Evidence is not loaded for this goal (at most ' + MAX_GOAL_DETAILS + ' goals are expanded).'));
+        } else if (!entry) {
+          card.appendChild(el('p', 'muted small', 'Loading evidence.'));
+        } else if (entry.error) {
+          card.appendChild(el('p', 'notice small', 'Could not load evidence: ' + entry.error));
+        } else {
+          const checks = Array.isArray(entry.doc.checks) ? entry.doc.checks : [];
+          const history = Array.isArray(entry.doc.history) ? entry.doc.history : [];
+          if (!checks.length) {
+            card.appendChild(el('p', 'muted small', 'This goal has no checks.'));
+          } else {
+            const table = makeTable(['Check', 'Kind', 'Mandatory', 'Newest evidence for this task', 'Summary', 'Commit', 'Counts'], 'auto');
+            checks.forEach(function (c) {
+              const e = history.find(function (x) {
+                return x && x.check === c.check && (x.task === ref || x.task === taskId);
+              });
+              const tr = el('tr', e && e.counts !== true ? 'dim' : '');
+              tr.appendChild(cell(c.check));
+              tr.appendChild(cell(c.kind));
+              tr.appendChild(cell(c.mandatory ? 'yes' : 'no'));
+              tr.appendChild(cell(e ? tagged('vd', VERDICT, e.verdict) : 'no evidence for this task'));
+              tr.appendChild(cell(e ? e.summary : '', 'wrap multi', true));
+              tr.appendChild(cell(e ? el('code', 'mono-text', shortHash(e.commit)) : ''));
+              tr.appendChild(cell(e ? (e.counts === true ? 'yes' : 'no') : ''));
+              table.appendChild(tr);
+            });
+            card.appendChild(scrollBox(table));
+          }
+        }
+        cards.push(card);
+      });
+      cards.push(el('p', 'muted small', 'Evidence that does not count (dirty worktree or not the reviewed commit) is shown dimmed.'));
+      govBox.replaceChildren.apply(govBox, cards);
+    }
+
+    async function loadGov(gov, myGen) {
+      const wanted = gov.slice(0, MAX_GOAL_DETAILS);
+      for (let i = 0; i < wanted.length; i++) {
+        const res = await api('GET', '/api/goal?id=' + enc(wanted[i].id));
+        if (stopped || myGen !== govGen) {
+          return;
+        }
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        if (res.ok && res.data && typeof res.data === 'object') {
+          govDocs.set(wanted[i].id, { doc: res.data, error: null });
+        } else {
+          govDocs.set(wanted[i].id, { doc: null, error: errText(res) });
+        }
+        renderGov(gov);
+      }
+    }
+
+    function syncGov() {
+      const gov = governing(ref).filter(function (g) {
+        return typeof g.id === 'string' && ID_OK.test(g.id);
+      });
+      const sig = JSON.stringify([lastGoals === null, goalsNote, gov]);
+      if (sig === govSig) {
+        return;
+      }
+      govSig = sig;
+      govGen += 1;
+      renderGov(gov);
+      if (lastGoals !== null) {
+        loadGov(gov, govGen);
+      }
+    }
 
     function note(text) {
       streamNote.textContent = clean(text);
@@ -1252,6 +1402,7 @@
           fieldsSig = s;
           renderFields(run, t);
         }
+        syncGov();
         mergeBtn.disabled = !(t.status === 'completed' && t.merged === null);
         sendBox.classList.toggle('hidden', !t.live);
         if (t.live) {
@@ -1641,6 +1792,492 @@
       node: root,
       start: load,
       resume: load,
+      stop: function () {
+        active = false;
+      }
+    };
+  }
+
+  // ------------------------------------------------------------ goals views
+
+  function tagged(prefix, set, value, label) {
+    const known = typeof value === 'string' && set.has(value);
+    return el('span', 'badge ' + prefix + '-' + (known ? value : 'unknown'), label === undefined ? value : label);
+  }
+
+  function routeLink(route, label) {
+    const a = el('a', 'rlink', label);
+    a.setAttribute('href', route);
+    return a;
+  }
+
+  // A link only for ids that are plain, otherwise the text itself.
+  function goalLink(id, label) {
+    const text = label === undefined || label === null || label === '' ? id : label;
+    if (typeof id === 'string' && ID_OK.test(id)) {
+      return routeLink('#/goal/' + id, text);
+    }
+    return el('span', 'mono-text', text);
+  }
+
+  function taskLink(ref, label) {
+    const text = label === undefined || label === null || label === '' ? ref : label;
+    if (typeof ref === 'string' && REF_OK.test(ref)) {
+      return routeLink('#/task/' + ref, text);
+    }
+    return el('span', 'mono-text', text);
+  }
+
+  function shortHash(v) {
+    return clean(v, { max: 80 }).slice(0, 12);
+  }
+
+  function goalList() {
+    return lastGoals && Array.isArray(lastGoals.goals) ? lastGoals.goals.filter(Boolean) : [];
+  }
+
+  function goalsLeft() {
+    return goalList().filter(function (g) {
+      return g.status !== 'verified' && g.status !== 'abandoned';
+    }).length;
+  }
+
+  function governing(ref) {
+    return goalList().filter(function (g) {
+      return Array.isArray(g.tasks) && g.tasks.some(function (t) {
+        return t && t.task === ref;
+      });
+    });
+  }
+
+  // The worst verification of every task that a goal names (failed, unverified, pending, verified).
+  function verificationMap() {
+    const m = new Map();
+    goalList().forEach(function (g) {
+      (Array.isArray(g.tasks) ? g.tasks : []).forEach(function (t) {
+        if (!t || typeof t.task !== 'string') {
+          return;
+        }
+        const rank = VERIF_RANK.get(t.verification) || 0;
+        if (rank > (VERIF_RANK.get(m.get(t.task)) || 0)) {
+          m.set(t.task, t.verification);
+        }
+      });
+    });
+    return m;
+  }
+
+  function makeTable(headers, cls) {
+    const t = el('table', 'grid ' + (cls || ''));
+    const head = el('tr');
+    headers.forEach(function (h) {
+      head.appendChild(el('th', '', h));
+    });
+    t.appendChild(head);
+    return t;
+  }
+
+  function cell(content, cls, multi) {
+    const td = el('td', cls || 'wrap');
+    if (content && content.nodeType) {
+      td.appendChild(content);
+    } else if (content !== undefined && content !== null && content !== '') {
+      td.textContent = clean(content, { multi: !!multi, max: multi ? 20000 : 4000 });
+    }
+    return td;
+  }
+
+  function scrollBox(node) {
+    const box = el('div', 'tablescroll');
+    box.appendChild(node);
+    return box;
+  }
+
+  function taskChips(tasks) {
+    const line = el('div', 'taskchips');
+    const list = Array.isArray(tasks) ? tasks : [];
+    list.slice(0, 20).forEach(function (t) {
+      if (!t) {
+        return;
+      }
+      const chip = el('span', 'taskchip');
+      chip.appendChild(taskLink(t.task));
+      chip.appendChild(badge(t.status));
+      if (t.verification && t.verification !== 'none') {
+        chip.appendChild(tagged('vf', VERIFICATION, t.verification));
+      }
+      line.appendChild(chip);
+    });
+    if (list.length > 20) {
+      line.appendChild(el('span', 'muted small', (list.length - 20) + ' more tasks not shown'));
+    }
+    return line;
+  }
+
+  function goalsView() {
+    const root = el('section', 'page');
+    root.appendChild(el('h2', '', 'Goals'));
+    const summary = el('p', 'goalsum', '');
+    const remBox = el('div', 'remaining');
+    const treeBox = el('div', 'goaltree');
+    root.appendChild(summary);
+    root.appendChild(el('h3', '', 'Remaining work'));
+    root.appendChild(remBox);
+    root.appendChild(el('h3', '', 'Goal tree'));
+    root.appendChild(treeBox);
+    let treeSig = null;
+    let remSig = null;
+    let busy = false;
+    let active = true;
+
+    function goalRow(g) {
+      const depth = typeof g.depth === 'number' && g.depth > 0 ? Math.min(Math.floor(g.depth), 12) : 0;
+      const row = el('div', 'goalrow indent-' + depth);
+      const head = el('div', 'goalhead');
+      head.appendChild(goalLink(g.id, g.title));
+      head.appendChild(el('span', 'muted mono-text', g.id));
+      head.appendChild(tagged('gs', GOAL_STATUS, g.status));
+      head.appendChild(tagged('ct', CONTRACT, g.contract, 'contract ' + clean(g.contract, { max: 20 })));
+      head.appendChild(el('span', 'muted small', num(g.evidence) + ' evidence'));
+      if (typeof g.children === 'number' && g.children > 0) {
+        head.appendChild(el('span', 'muted small', g.children + (g.children === 1 ? ' child' : ' children')));
+      }
+      row.appendChild(head);
+      if (g.reason) {
+        row.appendChild(el('div', 'muted small reason', g.reason));
+      }
+      if (Array.isArray(g.tasks) && g.tasks.length) {
+        row.appendChild(taskChips(g.tasks));
+      }
+      return row;
+    }
+
+    function paintTree() {
+      const sig = JSON.stringify([lastGoals, goalsNote]);
+      if (sig === treeSig) {
+        return;
+      }
+      treeSig = sig;
+      if (lastGoals === null) {
+        summary.textContent = clean(goalsNote ? 'Goals are not available: ' + goalsNote : 'Loading goals.', { max: 400 });
+        treeBox.replaceChildren();
+        return;
+      }
+      summary.textContent = num(lastGoals.total) + ' goals, ' + num(lastGoals.verified) + ' verified, ' +
+        num(lastGoals.abandoned) + ' abandoned';
+      const goals = goalList();
+      if (!goals.length) {
+        treeBox.replaceChildren(el('p', 'muted', 'There are no goals.'));
+        return;
+      }
+      const rows = goals.slice(0, MAX_GOALS_SHOWN).map(goalRow);
+      if (goals.length > MAX_GOALS_SHOWN) {
+        rows.push(el('p', 'muted', (goals.length - MAX_GOALS_SHOWN) + ' more goals are not shown.'));
+      }
+      treeBox.replaceChildren.apply(treeBox, rows);
+    }
+
+    function section(title, list, headers, build) {
+      const box = el('div', 'remsection');
+      box.appendChild(el('h4', '', title + ' (' + list.length + ')'));
+      if (!list.length) {
+        box.appendChild(el('p', 'muted', 'none'));
+        return box;
+      }
+      const table = makeTable(headers, 'auto');
+      list.slice(0, MAX_LIST_SHOWN).forEach(function (x) {
+        const tr = el('tr');
+        build(x).forEach(function (c) {
+          tr.appendChild(c);
+        });
+        table.appendChild(tr);
+      });
+      box.appendChild(scrollBox(table));
+      if (list.length > MAX_LIST_SHOWN) {
+        box.appendChild(el('p', 'muted small', (list.length - MAX_LIST_SHOWN) + ' more are not shown.'));
+      }
+      return box;
+    }
+
+    function paintRemaining(d) {
+      const leaves = Array.isArray(d.open_leaves) ? d.open_leaves.filter(Boolean) : [];
+      const blockers = Array.isArray(d.blockers) ? d.blockers.filter(Boolean) : [];
+      const ready = Array.isArray(d.next_ready) ? d.next_ready.filter(Boolean) : [];
+      remBox.replaceChildren(
+        section('Open leaf goals', leaves, ['Goal', 'Status', 'Contract', 'Evidence'], function (g) {
+          return [cell(goalLink(g.id, g.title)), cell(tagged('gs', GOAL_STATUS, g.status)),
+            cell(tagged('ct', CONTRACT, g.contract, 'contract ' + clean(g.contract, { max: 20 }))), cell(num(g.evidence))];
+        }),
+        section('Blockers', blockers, ['Kind', 'Subject', 'Detail', 'Status'], function (b) {
+          const subject = el('span');
+          if (b.kind === 'task') {
+            subject.appendChild(taskLink(b.task));
+            subject.appendChild(document.createTextNode(' in goal '));
+            subject.appendChild(goalLink(b.goal));
+          } else {
+            subject.appendChild(goalLink(b.goal, b.title));
+          }
+          return [cell(b.kind), cell(subject), cell(b.detail, 'wrap multi', true),
+            cell(b.status ? tagged('gs', GOAL_STATUS, b.status, b.status) : '')];
+        }),
+        section('Next ready tasks', ready, ['Task', 'Goal', 'Title'], function (r) {
+          return [cell(taskLink(r.task)), cell(goalLink(r.goal)), cell(r.title)];
+        })
+      );
+    }
+
+    async function loadRemaining() {
+      if (busy || !active) {
+        return;
+      }
+      busy = true;
+      try {
+        const res = await api('GET', '/api/remaining');
+        if (!active) {
+          return;
+        }
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        if (!res.ok || !res.data) {
+          remSig = null;
+          remBox.replaceChildren(el('p', 'muted', 'Remaining work is not available: ' + errText(res)));
+          return;
+        }
+        const sig = JSON.stringify(res.data);
+        if (sig !== remSig) {
+          remSig = sig;
+          paintRemaining(res.data);
+        }
+      } finally {
+        busy = false;
+      }
+    }
+
+    return {
+      node: root,
+      start: function () {
+        paintTree();
+        loadRemaining();
+      },
+      update: function () {
+        paintTree();
+        loadRemaining();
+      },
+      stop: function () {
+        active = false;
+      }
+    };
+  }
+
+  function goalView(id) {
+    const root = el('section', 'page');
+    root.appendChild(routeLink('#/goals', 'All goals'));
+    const holder = el('div', 'goalpage');
+    root.appendChild(holder);
+    const openRows = new Set();
+    let sig = null;
+    let busy = false;
+    let active = ID_OK.test(id);
+    if (!active) {
+      holder.appendChild(el('p', 'notice', 'Not a valid goal id: ' + id));
+    } else {
+      holder.appendChild(el('p', 'muted', 'Loading the goal.'));
+    }
+
+    function evidenceDetail(e) {
+      const box = el('div', 'evidetail');
+      box.appendChild(el('div', 'label', 'Commit'));
+      box.appendChild(el('code', 'mono block', e.commit));
+      box.appendChild(el('div', 'label', 'Tree'));
+      box.appendChild(el('code', 'mono block', e.tree));
+      box.appendChild(el('div', 'label', 'Output'));
+      const text = typeof e.output === 'string' ? e.output : '';
+      if (!text) {
+        box.appendChild(el('p', 'muted', 'no output'));
+      } else {
+        if (text.length > MAX_EVIDENCE_OUTPUT) {
+          box.appendChild(el('p', 'notice small', 'Output cut: showing the first ' + MAX_EVIDENCE_OUTPUT + ' of ' + text.length + ' characters.'));
+        }
+        box.appendChild(el('pre', 'mono block evout', text.slice(0, MAX_EVIDENCE_OUTPUT), true));
+      }
+      return box;
+    }
+
+    function historyTable(history) {
+      const table = makeTable(['Id', 'Check', 'Verdict', 'Exit', 'Commit', 'Tree', 'Dirty', 'Counts', 'Task', 'Time', 'Summary'], 'auto evidence');
+      history.slice(0, MAX_EVIDENCE_SHOWN).forEach(function (e, i) {
+        const key = typeof e.id === 'string' ? e.id : String(i);
+        const tr = el('tr', 'evrow' + (e.counts === true ? '' : ' dim'));
+        tr.setAttribute('tabindex', '0');
+        tr.setAttribute('aria-expanded', 'false');
+        tr.appendChild(cell(e.id));
+        tr.appendChild(cell(e.check));
+        tr.appendChild(cell(tagged('vd', VERDICT, e.verdict)));
+        tr.appendChild(cell(typeof e.exit_code === 'number' ? String(e.exit_code) : 'none'));
+        tr.appendChild(cell(el('code', 'mono-text', shortHash(e.commit))));
+        tr.appendChild(cell(el('code', 'mono-text', shortHash(e.tree))));
+        tr.appendChild(cell(e.dirty ? 'yes' : 'no'));
+        tr.appendChild(cell(e.counts === true ? 'yes' : 'no'));
+        tr.appendChild(cell(e.task));
+        tr.appendChild(cell(fmtTime(e.at_ms)));
+        tr.appendChild(cell(e.summary, 'wrap multi', true));
+        const more = el('tr', 'evdetail hidden');
+        const td = el('td', 'wrap');
+        td.setAttribute('colspan', '11');
+        more.appendChild(td);
+        let built = false;
+        const toggle = function () {
+          const opening = more.classList.contains('hidden');
+          if (opening && !built) {
+            td.appendChild(evidenceDetail(e));
+            built = true;
+          }
+          more.classList.toggle('hidden', !opening);
+          tr.setAttribute('aria-expanded', opening ? 'true' : 'false');
+          if (opening) {
+            openRows.add(key);
+          } else {
+            openRows.delete(key);
+          }
+        };
+        tr.addEventListener('click', toggle);
+        tr.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') {
+            toggle();
+          }
+        });
+        table.appendChild(tr);
+        table.appendChild(more);
+        if (openRows.has(key)) {
+          toggle();
+        }
+      });
+      return table;
+    }
+
+    function paint(g) {
+      const top = el('div', 'titlebar');
+      top.appendChild(el('h2', '', g.title));
+      top.appendChild(tagged('gs', GOAL_STATUS, g.status));
+      top.appendChild(tagged('ct', CONTRACT, g.contract, 'contract ' + clean(g.contract, { max: 20 })));
+      const dl = el('dl', 'fields');
+      field(dl, 'Goal id', g.id);
+      field(dl, 'Intent', g.intent, true);
+      const st = el('span');
+      st.appendChild(tagged('gs', GOAL_STATUS, g.status));
+      st.appendChild(el('span', 'multi', g.reason ? ' ' + clean(g.reason, { multi: true, max: 2000 }) : ''));
+      field(dl, 'Status and reason', st);
+      const ct = el('span');
+      ct.appendChild(tagged('ct', CONTRACT, g.contract, 'contract ' + clean(g.contract, { max: 20 })));
+      if (typeof g.contract_id === 'string' && g.contract_id) {
+        ct.appendChild(el('code', 'mono block', g.contract_id));
+        ct.appendChild(el('span', 'muted small', 'short form ' + shortHash(g.contract_id)));
+      }
+      field(dl, 'Contract', ct);
+      field(dl, 'Parent', typeof g.parent === 'string' && g.parent ? goalLink(g.parent) : null);
+      const kids = Array.isArray(g.child_ids) ? g.child_ids : [];
+      if (kids.length) {
+        const span = el('span', 'links');
+        kids.slice(0, MAX_LIST_SHOWN).forEach(function (c) {
+          span.appendChild(goalLink(c));
+          span.appendChild(document.createTextNode(' '));
+        });
+        field(dl, 'Children', span);
+      } else {
+        field(dl, 'Children', null);
+      }
+      field(dl, 'Depth', num(g.depth));
+      field(dl, 'Evidence recorded', num(g.evidence));
+
+      const parts = [top, dl];
+      parts.push(el('h3', '', 'Tasks'));
+      const tasks = Array.isArray(g.tasks) ? g.tasks.filter(Boolean) : [];
+      if (!tasks.length) {
+        parts.push(el('p', 'muted', 'No task is named by this goal.'));
+      } else {
+        const table = makeTable(['Task', 'Status', 'Verification'], 'auto');
+        tasks.slice(0, MAX_LIST_SHOWN).forEach(function (t) {
+          const tr = el('tr');
+          tr.appendChild(cell(taskLink(t.task)));
+          tr.appendChild(cell(badge(t.status)));
+          tr.appendChild(cell(tagged('vf', VERIFICATION, t.verification)));
+          table.appendChild(tr);
+        });
+        parts.push(scrollBox(table));
+      }
+
+      parts.push(el('h3', '', 'Checks'));
+      const checks = Array.isArray(g.checks) ? g.checks.filter(Boolean) : [];
+      if (!checks.length) {
+        parts.push(el('p', 'muted', 'This goal has no checks.'));
+      } else {
+        const table = makeTable(['Check', 'Kind', 'Mandatory', 'Detail', 'Newest verdict', 'Summary', 'Commit', 'Tree', 'Counts'], 'auto');
+        checks.slice(0, MAX_LIST_SHOWN).forEach(function (c) {
+          const l = c.latest && typeof c.latest === 'object' ? c.latest : null;
+          const tr = el('tr', l && l.counts !== true ? 'dim' : '');
+          tr.appendChild(cell(c.check));
+          tr.appendChild(cell(c.kind));
+          tr.appendChild(cell(c.mandatory ? 'yes' : 'no'));
+          tr.appendChild(cell(c.detail, 'wrap multi', true));
+          tr.appendChild(cell(l ? tagged('vd', VERDICT, l.verdict) : 'no evidence'));
+          tr.appendChild(cell(l ? l.summary : '', 'wrap multi', true));
+          tr.appendChild(cell(l ? el('code', 'mono-text', shortHash(l.commit)) : ''));
+          tr.appendChild(cell(l ? el('code', 'mono-text', shortHash(l.tree)) : ''));
+          tr.appendChild(cell(l ? (l.counts === true ? 'yes' : 'no') : ''));
+          table.appendChild(tr);
+        });
+        parts.push(scrollBox(table));
+      }
+
+      parts.push(el('h3', '', 'Evidence history'));
+      parts.push(el('p', 'muted small', 'Evidence that does not count (dirty worktree or not the reviewed commit) is shown dimmed. Click a row for the full output, commit and tree.'));
+      const history = Array.isArray(g.history) ? g.history.filter(Boolean) : [];
+      if (!history.length) {
+        parts.push(el('p', 'muted', 'No evidence has been recorded.'));
+      } else {
+        parts.push(scrollBox(historyTable(history)));
+        if (history.length > MAX_EVIDENCE_SHOWN) {
+          parts.push(el('p', 'muted small', (history.length - MAX_EVIDENCE_SHOWN) + ' older entries are not shown.'));
+        }
+      }
+      holder.replaceChildren.apply(holder, parts);
+    }
+
+    async function load() {
+      if (busy || !active) {
+        return;
+      }
+      busy = true;
+      try {
+        const res = await api('GET', '/api/goal?id=' + enc(id));
+        if (!active) {
+          return;
+        }
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        if (!res.ok || !res.data) {
+          sig = null;
+          holder.replaceChildren(el('p', 'notice', 'Could not load the goal: ' + errText(res)));
+          return;
+        }
+        const s = JSON.stringify(res.data);
+        if (s !== sig) {
+          sig = s;
+          paint(res.data);
+        }
+      } finally {
+        busy = false;
+      }
+    }
+
+    return {
+      node: root,
+      start: load,
+      update: load,
       stop: function () {
         active = false;
       }

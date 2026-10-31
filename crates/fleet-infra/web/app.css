@@ -599,6 +599,141 @@ textarea.textin {
   fill: #2e7d32;
 }
 
+/* ------------------------------------------------------- goals and evidence */
+
+.view a {
+  overflow-wrap: anywhere;
+  unicode-bidi: isolate;
+  max-width: 100%;
+}
+
+a.rlink {
+  color: var(--accent);
+}
+
+.gs-open,
+.ct-none,
+.vf-none,
+.gs-abandoned,
+.gs-unknown,
+.ct-unknown,
+.vf-unknown,
+.vd-unknown {
+  --st: #5b6573;
+}
+
+.gs-in_progress {
+  --st: #1565c0;
+}
+
+.gs-blocked,
+.vd-error {
+  --st: #a04000;
+}
+
+.gs-verified,
+.ct-passed,
+.vf-verified,
+.vd-passed {
+  --st: #2e7d32;
+}
+
+.ct-pending,
+.vf-pending {
+  --st: #8a5a00;
+}
+
+.vf-unverified {
+  --st: #a04000;
+}
+
+.ct-failed,
+.vf-failed,
+.vd-failed {
+  --st: #b3261e;
+}
+
+.goalsum {
+  font-weight: 600;
+}
+
+.goalrow {
+  padding: 8px 10px;
+  margin: 4px 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.goalhead,
+.taskchips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+.taskchips {
+  margin-top: 4px;
+}
+
+.taskchip {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.indent-0 { margin-left: 0; }
+.indent-1 { margin-left: 18px; }
+.indent-2 { margin-left: 36px; }
+.indent-3 { margin-left: 54px; }
+.indent-4 { margin-left: 72px; }
+.indent-5 { margin-left: 90px; }
+.indent-6 { margin-left: 108px; }
+.indent-7 { margin-left: 126px; }
+.indent-8 { margin-left: 144px; }
+.indent-9 { margin-left: 162px; }
+.indent-10 { margin-left: 180px; }
+.indent-11 { margin-left: 198px; }
+.indent-12 { margin-left: 216px; }
+
+.tablescroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.grid.auto {
+  table-layout: auto;
+}
+
+.dim {
+  opacity: 0.55;
+}
+
+.evrow {
+  cursor: pointer;
+}
+
+.evrow:hover {
+  background: var(--code-bg);
+}
+
+.evdetail td {
+  background: var(--bg);
+}
+
+.evout {
+  max-height: 24em;
+}
+
+.govbox .card {
+  margin: 8px 0;
+}
+
 @media (max-width: 640px) {
   .fields {
     grid-template-columns: 1fr;
