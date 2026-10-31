@@ -32,6 +32,7 @@ const EVENT_POLL: Duration = Duration::from_millis(250);
 const STATUS_EVERY: Duration = Duration::from_secs(1);
 const TAIL_EVERY: Duration = Duration::from_millis(500);
 const TAIL_MAX: i128 = 16 * 1024;
+const MSG_LIMIT: i128 = 50;
 const BACKOFF_BASE_MS: u64 = 250;
 const BACKOFF_MAX_MS: u64 = 4000;
 
@@ -223,12 +224,25 @@ impl App {
                 if was_offline {
                     self.model.set_message("reconnected to the daemon");
                 }
+                self.poll_messages();
             }
             Err(e) => {
                 self.model.connected = false;
+                self.model.clear_messages();
                 self.model
                     .set_message(&format!("daemon unreachable: {} (retrying)", e.message));
             }
+        }
+    }
+
+    /// Polls `msg.list` on the status cadence. It is read-only and optional: any failure (an older
+    /// daemon, a refused request) just empties the Messages pane and never touches the
+    /// connection status shown for the dashboard itself.
+    fn poll_messages(&mut self) {
+        let args = Value::object([("limit", Value::Int(MSG_LIMIT))]);
+        match self.link.call("msg.list", args) {
+            Ok(v) => self.model.update_messages(&v),
+            Err(_) => self.model.clear_messages(),
         }
     }
 

@@ -27,6 +27,7 @@ pub enum Focus {
     Tasks,
     Gates,
     Approvals,
+    Messages,
     Output,
 }
 
@@ -35,7 +36,7 @@ impl Focus {
         match self {
             Focus::Tasks => Focus::Gates,
             Focus::Gates => Focus::Approvals,
-            Focus::Approvals => Focus::Output,
+            Focus::Approvals | Focus::Messages => Focus::Output,
             Focus::Output => Focus::Tasks,
         }
     }
@@ -45,6 +46,7 @@ impl Focus {
             Focus::Tasks => "tasks",
             Focus::Gates => "gates",
             Focus::Approvals => "approvals",
+            Focus::Messages => "messages",
             Focus::Output => "output",
         }
     }
@@ -133,6 +135,40 @@ pub struct EventLine {
     pub line: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MsgChannel {
+    pub run: String,
+    pub name: String,
+    pub mode: String,
+    pub muted: bool,
+    pub mute_reason: String,
+    pub queued: u64,
+    pub awaiting_approval: u64,
+    pub delivered: u64,
+    pub expired: u64,
+    pub blocked: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MutedTask {
+    pub run: String,
+    pub task: String,
+    pub reason: String,
+}
+
+/// One message header from `msg.list`. Every field is untrusted peer content.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MsgRow {
+    pub id: String,
+    pub run: String,
+    pub channel: String,
+    pub label: String,
+    pub kind: String,
+    pub status: String,
+    pub reason: String,
+    pub subject: String,
+}
+
 #[derive(Debug)]
 pub struct Model {
     pub daemon: DaemonInfo,
@@ -148,6 +184,13 @@ pub struct Model {
     pub gate_selected: usize,
     pub approval_selected: usize,
     pub focus: Focus,
+    /// Messaging channels (`msg.list`); the Messages pane exists only while this is non-empty.
+    pub msg_channels: Vec<MsgChannel>,
+    pub msg_muted_tasks: Vec<MutedTask>,
+    /// Newest first, no bodies. Untrusted peer content.
+    pub msg_rows: Vec<MsgRow>,
+    pub msg_total: u64,
+    pub msg_selected: usize,
     pub tail_key: Option<String>,
     pub tail: String,
     pub message: String,
@@ -173,6 +216,11 @@ impl Default for Model {
             gate_selected: 0,
             approval_selected: 0,
             focus: Focus::Tasks,
+            msg_channels: Vec::new(),
+            msg_muted_tasks: Vec::new(),
+            msg_rows: Vec::new(),
+            msg_total: 0,
+            msg_selected: 0,
             tail_key: None,
             tail: String::new(),
             message: String::new(),
@@ -253,6 +301,40 @@ fn parse_task(run: &str, t: &Value) -> TaskRow {
             })
             .collect(),
         live: t.get("live").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+fn parse_channel(c: &Value) -> MsgChannel {
+    let counts = c.get("messages").cloned().unwrap_or(Value::Null);
+    MsgChannel {
+        run: text_of(c, "run"),
+        name: text_of(c, "name"),
+        mode: text_of(c, "mode"),
+        muted: c.get("muted").and_then(Value::as_bool).unwrap_or(false),
+        mute_reason: text_of(c, "mute_reason"),
+        queued: num_of(&counts, "queued"),
+        awaiting_approval: num_of(&counts, "awaiting_approval"),
+        delivered: num_of(&counts, "delivered"),
+        expired: num_of(&counts, "expired"),
+        blocked: num_of(&counts, "blocked"),
+    }
+}
+
+fn parse_message(m: &Value) -> MsgRow {
+    let reason = text_of(m, "reason");
+    MsgRow {
+        id: text_of(m, "id"),
+        run: text_of(m, "run"),
+        channel: text_of(m, "channel"),
+        label: text_of(m, "label"),
+        kind: text_of(m, "kind"),
+        status: text_of(m, "status"),
+        reason: if reason.is_empty() {
+            text_of(m, "detail")
+        } else {
+            reason
+        },
+        subject: text_of(m, "subject"),
     }
 }
 
@@ -380,10 +462,12 @@ impl Model {
 
     /// Moves the selection of the focused list by `delta`, clamped to the list.
     pub fn move_selection(&mut self, delta: i32) {
+        let msg_len = self.msg_item_count();
         let (index, len) = match self.focus {
             Focus::Tasks | Focus::Output => (&mut self.selected, self.tasks.len()),
             Focus::Gates => (&mut self.gate_selected, self.gates.len()),
             Focus::Approvals => (&mut self.approval_selected, self.approvals.len()),
+            Focus::Messages => (&mut self.msg_selected, msg_len),
         };
         let step = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
         let moved = if delta < 0 {
@@ -407,6 +491,60 @@ impl Model {
 
     pub fn set_message(&mut self, text: &str) {
         self.message = clean_line(text);
+    }
+
+    /// Replaces the messaging state with a `fleet.msg.list/1` document. Everything in it is
+    /// untrusted peer content: strings are sanitized and capped like every other field.
+    pub fn update_messages(&mut self, doc: &Value) {
+        let previous = self.msg_selected;
+        self.msg_channels = list_of(doc, "channels")
+            .iter()
+            .take(MAX_LIST)
+            .map(parse_channel)
+            .collect();
+        self.msg_muted_tasks = list_of(doc, "muted_tasks")
+            .iter()
+            .take(MAX_LIST)
+            .map(|t| MutedTask {
+                run: text_of(t, "run"),
+                task: text_of(t, "task"),
+                reason: text_of(t, "reason"),
+            })
+            .collect();
+        self.msg_rows = list_of(doc, "messages")
+            .iter()
+            .take(MAX_LIST)
+            .map(parse_message)
+            .collect();
+        self.msg_total = num_of(doc, "total");
+        self.msg_selected = clamp_index(previous, self.msg_item_count());
+    }
+
+    /// Forgets the messaging state (the `msg.list` poll failed or the daemon has no messaging).
+    pub fn clear_messages(&mut self) {
+        self.msg_channels.clear();
+        self.msg_muted_tasks.clear();
+        self.msg_rows.clear();
+        self.msg_total = 0;
+        self.msg_selected = 0;
+    }
+
+    /// The Messages pane exists (is drawn and focusable) only while a channel exists.
+    pub fn has_messages_pane(&self) -> bool {
+        !self.msg_channels.is_empty()
+    }
+
+    /// Selectable rows of the Messages pane: channels, muted tasks, then messages.
+    pub fn msg_item_count(&self) -> usize {
+        self.msg_channels.len() + self.msg_muted_tasks.len() + self.msg_rows.len()
+    }
+
+    /// The panel `Tab` moves to: the Messages pane sits after Approvals when it exists.
+    pub fn next_focus(&self) -> Focus {
+        match self.focus {
+            Focus::Approvals if self.has_messages_pane() => Focus::Messages,
+            other => other.next(),
+        }
     }
 
     /// Task counts by status, in [`STATUS_NAMES`] order.
@@ -505,6 +643,55 @@ pub(crate) mod fixtures {
         };
         m.insert(key.to_string(), Value::Array(items));
         Value::Object(m)
+    }
+
+    pub fn msg_channel(name: &str, muted: bool, reason: &str) -> Value {
+        Value::object([
+            ("run", Value::str("r1")),
+            ("name", Value::str(name)),
+            ("mode", Value::str("lead")),
+            ("muted", Value::Bool(muted)),
+            ("mute_reason", Value::str(reason)),
+            (
+                "messages",
+                Value::object([
+                    ("queued", Value::int(1)),
+                    ("awaiting_approval", Value::int(2)),
+                    ("delivered", Value::int(3)),
+                    ("expired", Value::int(4)),
+                    ("blocked", Value::int(5)),
+                ]),
+            ),
+        ])
+    }
+
+    pub fn msg_message(id: &str, subject: &str, status: &str, reason: &str) -> Value {
+        Value::object([
+            ("id", Value::str(id)),
+            ("run", Value::str("r1")),
+            ("channel", Value::str("review")),
+            ("from", Value::str("t2")),
+            (
+                "label",
+                Value::str("from task t2 (unverified peer message)"),
+            ),
+            ("kind", Value::str("note")),
+            ("subject", Value::str(subject)),
+            ("status", Value::str(status)),
+            ("reason", Value::str(reason)),
+        ])
+    }
+
+    pub fn msg_list(channels: Vec<Value>, messages: Vec<Value>) -> Value {
+        let total = i64::try_from(messages.len()).unwrap_or(0);
+        Value::object([
+            ("schema", Value::str("fleet.msg.list/1")),
+            ("channels", Value::array(channels)),
+            ("muted_tasks", Value::array([])),
+            ("messages", Value::array(messages)),
+            ("total", Value::int(total)),
+            ("truncated", Value::Bool(false)),
+        ])
     }
 }
 
@@ -704,5 +891,148 @@ mod tests {
             seen,
             vec![Focus::Gates, Focus::Approvals, Focus::Output, Focus::Tasks]
         );
+    }
+
+    #[test]
+    fn message_ingest_tolerates_missing_and_mistyped_fields() {
+        let mut m = Model::new();
+        m.update_messages(&Value::Null);
+        assert!(m.msg_channels.is_empty() && m.msg_rows.is_empty() && !m.has_messages_pane());
+        let doc = Value::object([
+            (
+                "channels",
+                Value::array([
+                    Value::int(7),
+                    Value::object([
+                        ("name", Value::int(3)),
+                        ("muted", Value::str("yes")),
+                        ("messages", Value::str("nope")),
+                    ]),
+                ]),
+            ),
+            (
+                "messages",
+                Value::array([Value::Null, Value::object([("id", Value::int(1))])]),
+            ),
+            ("muted_tasks", Value::str("x")),
+            ("total", Value::str("many")),
+        ]);
+        m.update_messages(&doc);
+        assert_eq!(m.msg_channels.len(), 2);
+        assert_eq!(m.msg_channels[1], MsgChannel::default());
+        assert_eq!(m.msg_rows.len(), 2);
+        assert_eq!(m.msg_rows[1], MsgRow::default());
+        assert!(m.msg_muted_tasks.is_empty());
+        assert_eq!(m.msg_total, 0);
+        assert!(m.has_messages_pane());
+    }
+
+    #[test]
+    fn message_ingest_reads_channels_counts_and_messages() {
+        let mut m = Model::new();
+        m.update_messages(&msg_list(
+            vec![msg_channel("review", true, "operator froze it")],
+            vec![msg_message("m1", "hello", "blocked", "secret")],
+        ));
+        let c = &m.msg_channels[0];
+        assert_eq!(
+            (c.run.as_str(), c.name.as_str(), c.mode.as_str()),
+            ("r1", "review", "lead")
+        );
+        assert!(c.muted);
+        assert_eq!(c.mute_reason, "operator froze it");
+        assert_eq!(
+            (
+                c.queued,
+                c.awaiting_approval,
+                c.delivered,
+                c.expired,
+                c.blocked
+            ),
+            (1, 2, 3, 4, 5)
+        );
+        let r = &m.msg_rows[0];
+        assert_eq!(
+            (r.id.as_str(), r.status.as_str(), r.reason.as_str()),
+            ("m1", "blocked", "secret")
+        );
+        assert_eq!(r.label, "from task t2 (unverified peer message)");
+        assert_eq!(m.msg_total, 1);
+        m.clear_messages();
+        assert!(!m.has_messages_pane());
+    }
+
+    #[test]
+    fn message_text_is_sanitized_and_capped_on_ingest() {
+        let evil = "x\x1b]52;c;AAAA\x07\x1b[2J\u{202e}y\nz\x00";
+        let mut m = Model::new();
+        m.update_messages(&msg_list(
+            vec![msg_channel(evil, true, evil)],
+            vec![msg_message(evil, &"s".repeat(5000), "blocked", evil)],
+        ));
+        let all = [
+            m.msg_channels[0].name.clone(),
+            m.msg_channels[0].mute_reason.clone(),
+            m.msg_rows[0].id.clone(),
+            m.msg_rows[0].reason.clone(),
+            m.msg_rows[0].subject.clone(),
+            m.msg_rows[0].label.clone(),
+        ];
+        for s in &all {
+            assert!(
+                !s.chars()
+                    .any(|c| c.is_control() || fleet_domain::ids::is_invisible(c)),
+                "{s:?}"
+            );
+        }
+        assert!(m.msg_rows[0].subject.chars().count() <= MAX_FIELD);
+    }
+
+    #[test]
+    fn focus_cycle_includes_messages_only_with_channels() {
+        let mut m = Model::new();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            m.focus = m.next_focus();
+            seen.push(m.focus);
+        }
+        assert_eq!(
+            seen,
+            vec![Focus::Gates, Focus::Approvals, Focus::Output, Focus::Tasks]
+        );
+        m.update_messages(&msg_list(vec![msg_channel("review", false, "")], vec![]));
+        m.focus = Focus::Tasks;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            m.focus = m.next_focus();
+            seen.push(m.focus);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Focus::Gates,
+                Focus::Approvals,
+                Focus::Messages,
+                Focus::Output,
+                Focus::Tasks
+            ]
+        );
+    }
+
+    #[test]
+    fn messages_selection_moves_over_channels_and_messages() {
+        let mut m = Model::new();
+        m.update_messages(&msg_list(
+            vec![msg_channel("review", false, "")],
+            vec![
+                msg_message("m1", "a", "queued", ""),
+                msg_message("m2", "b", "queued", ""),
+            ],
+        ));
+        m.focus = Focus::Messages;
+        m.move_selection(10);
+        assert_eq!(m.msg_selected, 2);
+        m.move_selection(-10);
+        assert_eq!(m.msg_selected, 0);
     }
 }

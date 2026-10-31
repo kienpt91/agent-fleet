@@ -64,7 +64,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Tab => {
-            model.focus = model.focus.next();
+            model.focus = model.next_focus();
             Action::None
         }
         KeyCode::Char('o') => {
@@ -124,7 +124,7 @@ fn enter(model: &mut Model) -> Action {
             }
             Action::OpenAttach(task.key())
         }
-        Focus::Approvals => Action::None,
+        Focus::Approvals | Focus::Messages => Action::None,
     }
 }
 
@@ -246,6 +246,30 @@ mod tests {
         assert_eq!(m.focus, Focus::Output);
         handle_key(&mut m, ch('o'));
         assert_eq!(m.focus, Focus::Tasks);
+    }
+
+    #[test]
+    fn messages_pane_is_focusable_only_with_channels_and_is_read_only() {
+        let mut m = model();
+        for _ in 0..3 {
+            handle_key(&mut m, press(KeyCode::Tab));
+            assert_ne!(m.focus, Focus::Messages);
+        }
+        m.update_messages(&msg_list(
+            vec![msg_channel("review", true, "frozen")],
+            vec![msg_message("m1", "hi", "blocked", "why")],
+        ));
+        m.focus = Focus::Approvals;
+        handle_key(&mut m, press(KeyCode::Tab));
+        assert_eq!(m.focus, Focus::Messages);
+        handle_key(&mut m, ch('j'));
+        assert_eq!(m.msg_selected, 1);
+        for code in [KeyCode::Enter, KeyCode::Char('a'), KeyCode::Char('d')] {
+            assert_eq!(handle_key(&mut m, press(code)), Action::None);
+        }
+        assert!(m.input.is_none());
+        handle_key(&mut m, press(KeyCode::Tab));
+        assert_eq!(m.focus, Focus::Output);
     }
 
     #[test]
