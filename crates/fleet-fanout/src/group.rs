@@ -279,6 +279,8 @@ pub struct NewGroup {
 pub trait TaskView {
     /// The task still has a worktree (it was created and not removed).
     fn has_worktree(&self, run: &RunId, task: &TaskId) -> bool;
+    /// How the task ended; `None` while it has not.
+    fn outcome(&self, run: &RunId, task: &TaskId) -> Option<MemberOutcome>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -464,24 +466,55 @@ impl Groups {
             }
         }
         for id in touched {
-            let Some(g) = self.groups.get(&id) else {
-                continue;
-            };
-            if g.closed.is_some() {
-                continue;
+            if let Some(g) = self.groups.get(&id) {
+                if let Some(reason) = self.closing(g, view) {
+                    out.push(DomainEvent::GroupClosed { group: id, reason });
+                }
             }
-            let reason = if g.winner.is_some() {
-                g.members
-                    .iter()
-                    .all(|m| !view.has_worktree(&g.run, &m.task))
-                    .then_some(CloseReason::Resolved)
-            } else {
-                (g.status() == GroupStatus::Finished
-                    && g.members.iter().all(|m| m.state == MemberState::Failed))
-                .then_some(CloseReason::NoCompletion)
-            };
-            if let Some(reason) = reason {
-                out.push(DomainEvent::GroupClosed { group: id, reason });
+        }
+        out
+    }
+
+    /// Why `g` is done with, when it is: a decided group none of whose members has a worktree
+    /// left, or a finished one in which no member completed.
+    fn closing(&self, g: &Group, view: &dyn TaskView) -> Option<CloseReason> {
+        if g.closed.is_some() {
+            return None;
+        }
+        if g.winner.is_some() {
+            g.members
+                .iter()
+                .all(|m| !view.has_worktree(&g.run, &m.task))
+                .then_some(CloseReason::Resolved)
+        } else {
+            (g.status() == GroupStatus::Finished
+                && g.members.iter().all(|m| m.state == MemberState::Failed))
+            .then_some(CloseReason::NoCompletion)
+        }
+    }
+
+    /// What a restart may find unrecorded: members whose task ended while the daemon was not
+    /// recording (or whose group event was lost), and groups that are done with. Like
+    /// [`Groups::follow_up`], recording these may call for more.
+    pub fn reconcile(&self, view: &dyn TaskView) -> Vec<DomainEvent> {
+        let mut out = Vec::new();
+        for g in self.iter() {
+            if g.winner.is_none() && g.closed != Some(CloseReason::Resolved) {
+                for m in g.members.iter().filter(|m| m.state == MemberState::Running) {
+                    if let Some(outcome) = view.outcome(&g.run, &m.task) {
+                        out.push(DomainEvent::MemberFinished {
+                            group: g.id.clone(),
+                            task: m.task.clone(),
+                            outcome,
+                        });
+                    }
+                }
+            }
+            if let Some(reason) = self.closing(g, view) {
+                out.push(DomainEvent::GroupClosed {
+                    group: g.id.clone(),
+                    reason,
+                });
             }
         }
         out
@@ -623,6 +656,10 @@ mod tests {
     impl TaskView for Worktrees {
         fn has_worktree(&self, _run: &RunId, task: &TaskId) -> bool {
             self.0.contains(task.as_str())
+        }
+
+        fn outcome(&self, _run: &RunId, _task: &TaskId) -> Option<MemberOutcome> {
+            None
         }
     }
 
@@ -943,6 +980,60 @@ mod tests {
         let b = replayed.get(&gid("fan1")).unwrap();
         assert_eq!(a, b);
         assert_eq!(b.winner, Some(tid("a")));
+    }
+
+    struct Ended(BTreeMap<String, MemberOutcome>, BTreeSet<String>);
+
+    impl TaskView for Ended {
+        fn has_worktree(&self, _run: &RunId, task: &TaskId) -> bool {
+            self.1.contains(task.as_str())
+        }
+
+        fn outcome(&self, _run: &RunId, task: &TaskId) -> Option<MemberOutcome> {
+            self.0.get(task.as_str()).copied()
+        }
+    }
+
+    #[test]
+    fn a_restart_records_what_it_finds_unrecorded() {
+        // the daemon died after `task_completed` and `task_failed` were recorded but before the group
+        // events were: reconciling derives them, and then the group closes or waits as it should
+        let mut g = registry("fan1", &["a", "b"]);
+        let fleet = Ended(
+            [
+                ("a".to_string(), MemberOutcome::Failed),
+                ("b".to_string(), MemberOutcome::Failed),
+            ]
+            .into(),
+            BTreeSet::new(),
+        );
+        let first = g.reconcile(&fleet);
+        assert_eq!(first.len(), 2);
+        for e in &first {
+            g.apply(7, e);
+        }
+        let second = g.reconcile(&fleet);
+        assert_eq!(
+            second,
+            vec![DomainEvent::GroupClosed {
+                group: gid("fan1"),
+                reason: CloseReason::NoCompletion
+            }]
+        );
+        g.apply(8, &second[0]);
+        assert!(g.reconcile(&fleet).is_empty());
+
+        // a decided group whose worktrees are gone closes, one that still has one does not
+        let mut d = registry("fan2", &["c", "d"]);
+        settle(&mut d, 2, &[completed("c"), completed("d")], &none());
+        let pick = d
+            .pick_event(&gid("fan2"), &tid("c"), sha('d'), "verified")
+            .unwrap();
+        d.apply(3, &pick);
+        let still = Ended(BTreeMap::new(), ["d".to_string()].into());
+        assert!(d.reconcile(&still).is_empty());
+        let gone = Ended(BTreeMap::new(), BTreeSet::new());
+        assert_eq!(d.reconcile(&gone).len(), 1);
     }
 
     #[test]

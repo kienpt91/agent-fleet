@@ -87,6 +87,9 @@ pub struct MemberFacts {
     pub has_contract: bool,
     pub checks: Vec<CheckFact>,
     pub scopes: Vec<ScopeReport>,
+    /// The contract has a mandatory `diff` check and the diff could not be read: whether the
+    /// member stayed in scope is not known (and is not assumed).
+    pub scope_unknown: bool,
     /// What the worker reported (untrusted) and why the task failed (fleet's own text).
     pub summary: Option<String>,
     pub failure: Option<String>,
@@ -108,12 +111,14 @@ impl MemberFacts {
         }
     }
 
-    /// No path outside the allow globs of a mandatory `diff` check was touched.
+    /// No path outside the allow globs of a mandatory `diff` check was touched, and that is known.
     pub fn in_scope(&self) -> bool {
-        self.scopes
-            .iter()
-            .filter(|s| s.mandatory)
-            .all(|s| s.clean())
+        !self.scope_unknown
+            && self
+                .scopes
+                .iter()
+                .filter(|s| s.mandatory)
+                .all(|s| s.clean())
     }
 
     /// Where verification stands for the member's recorded commit and tree, and why.
@@ -354,6 +359,7 @@ mod tests {
             has_contract: true,
             checks: vec![check("tests", true, EvidenceStatus::Verified)],
             scopes: Vec::new(),
+            scope_unknown: false,
             summary: Some("did it".to_string()),
             failure: None,
         }
@@ -433,6 +439,10 @@ mod tests {
             outside_count: 1,
         });
         assert!(!m.in_scope());
+        // an unreadable diff is not an in-scope diff
+        let mut unknown = facts("b");
+        unknown.scope_unknown = true;
+        assert!(!unknown.in_scope());
     }
 
     #[test]

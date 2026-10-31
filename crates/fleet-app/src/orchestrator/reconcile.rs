@@ -29,6 +29,11 @@ impl Orchestrator {
         if let Err(e) = self.commit(settle) {
             self.warn(e.message);
         }
+        // Group events a stopped daemon did not get to record (a member whose task had ended).
+        let groups = self.group_reconcile();
+        if let Err(e) = self.commit(groups) {
+            self.warn(e.message);
+        }
         Ok(())
     }
 

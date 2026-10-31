@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod config;
+mod fanout;
 pub mod neo;
 pub mod orchestrator;
 pub mod ports;

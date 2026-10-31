@@ -13,6 +13,7 @@ mod reconcile;
 mod supervise;
 
 use crate::config::AppConfig;
+use crate::fanout::FanoutState;
 use crate::neo::{VerifyOutcome, Verifying};
 use crate::ports::{Ports, SessionId, StoredEvent};
 use crate::views::Recent;
@@ -52,6 +53,8 @@ pub struct Orchestrator {
     pub(crate) state: FleetState,
     /// The goal ledger, a projection of the same event log as `state`.
     pub(crate) ledger: Ledger,
+    /// Fan-out groups, a projection of the same event log.
+    pub(crate) fanout: FanoutState,
     pub(crate) policy: Policy,
     pub(crate) live: BTreeMap<Key, Live>,
     /// Quality-gate jobs in flight: (run, task, attempt).
@@ -85,11 +88,13 @@ impl Orchestrator {
         cfg.validate()?;
         let mut state = FleetState::new();
         let mut ledger = Ledger::new();
+        let mut fanout = FanoutState::default();
         let mut recent: VecDeque<Recent> = VecDeque::new();
         ports.store.replay(&mut |s: StoredEvent| {
             push_recent(&mut recent, s.seq, s.ts_ms, &s.event);
             state.apply(&s.event);
             ledger.apply_checked(&s.event, ports.digest.as_ref());
+            fanout.groups.apply(s.ts_ms, &s.event);
             Ok(())
         })?;
         let policy = Policy {
@@ -106,6 +111,7 @@ impl Orchestrator {
             ports,
             state,
             ledger,
+            fanout,
             policy,
             live: BTreeMap::new(),
             gate_jobs: BTreeSet::new(),
@@ -174,12 +180,17 @@ impl Orchestrator {
         let first = last.saturating_add(1).saturating_sub(count);
         let mut stored = Vec::with_capacity(events.len());
         let mut committed_task = false;
+        let mut group_relevant: Vec<DomainEvent> = Vec::new();
         for (i, event) in events.into_iter().enumerate() {
             let seq = first.saturating_add(i as u64);
             self.state.apply(&event);
             self.ledger
                 .apply_checked(&event, self.ports.digest.as_ref());
+            self.fanout.groups.apply(ts, &event);
             committed_task |= matches!(event, DomainEvent::TaskCommitted { .. });
+            if is_group_relevant(&event) {
+                group_relevant.push(event.clone());
+            }
             push_recent(&mut self.recent, seq, ts, &event);
             stored.push(StoredEvent {
                 seq,
@@ -193,6 +204,11 @@ impl Orchestrator {
             // commit is not verified any more.
             let settle = self.ledger.resettle();
             self.commit(settle)?;
+        }
+        if !group_relevant.is_empty() {
+            // A member's task ended, a decided group lost its last worktree: record what follows.
+            let follow = self.group_follow_up(&group_relevant);
+            self.commit(follow)?;
         }
         Ok(())
     }
@@ -251,6 +267,17 @@ impl Orchestrator {
     }
 }
 
+/// Task events a fan-out group reacts to (see `Groups::follow_up`).
+fn is_group_relevant(event: &DomainEvent) -> bool {
+    matches!(
+        event,
+        DomainEvent::TaskCompleted { .. }
+            | DomainEvent::TaskFailed { .. }
+            | DomainEvent::MemberFinished { .. }
+            | DomainEvent::WinnerPicked { .. }
+            | DomainEvent::WorktreeRemoved { .. }
+    )
+}
 fn push_recent(recent: &mut VecDeque<Recent>, seq: u64, ts_ms: u64, event: &DomainEvent) {
     if matches!(event, DomainEvent::Warning { .. }) {
         return;

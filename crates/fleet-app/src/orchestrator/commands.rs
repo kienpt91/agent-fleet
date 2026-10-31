@@ -2,6 +2,7 @@
 
 use super::{Key, Orchestrator};
 use crate::api::{Command, NewRunArgs, Reply};
+use crate::fanout::{MergeVariant, MergedTask};
 use crate::ports::{IntegrationMerge, MergeOutcome};
 use crate::views::{self, StatusContext};
 use fleet_domain::error::{ErrorCode, FleetError, Result};
@@ -118,6 +119,16 @@ impl Orchestrator {
                 task,
                 ticket,
             } => self.verify_status(&target, task.as_deref(), ticket),
+            Command::Fanout(args) => self.fanout(args),
+            Command::GroupList => Ok(self.group_list()),
+            Command::GroupShow { group } => self.group_show(&group),
+            Command::GroupCompare { group, rank } => self.group_compare(&group, rank.as_deref()),
+            Command::GroupPick {
+                group,
+                task,
+                allow_unverified,
+                remove_others,
+            } => self.group_pick(&group, &task, allow_unverified, remove_others),
             Command::Shutdown => {
                 self.shutdown_requested = true;
                 self.begin_shutdown();
@@ -449,6 +460,35 @@ impl Orchestrator {
 
     fn merge(&mut self, reference: &str) -> Result<Reply> {
         let key = self.resolve(reference)?;
+        if let Some(g) = self.fanout.groups.group_of(&key.0, &key.1) {
+            return Err(FleetError::conflict(format!(
+                "{} is a member of fan-out group {}; its result reaches the integration branch only through `fleet pick {} {}`",
+                qualified(&key.0, &key.1),
+                g.id,
+                g.id,
+                key.1
+            )));
+        }
+        let merged = self.merge_task(&key, None)?;
+        Ok(data(
+            "fleet.merge/1",
+            vec![
+                ("task", Value::str(qualified(&key.0, &key.1))),
+                ("branch", Value::str(merged.branch)),
+                ("integration_branch", Value::str(merged.integration)),
+                ("merge_sha", Value::str(merged.sha.as_str())),
+            ],
+        ))
+    }
+
+    /// Merges a completed task into its run's integration branch, behind the approval the policy
+    /// asks for. `variant` is a fan-out pick: it names the commit that was reviewed (the branch
+    /// must still be there) and the action the approval is bound to.
+    pub(crate) fn merge_task(
+        &mut self,
+        key: &Key,
+        variant: Option<&MergeVariant<'_>>,
+    ) -> Result<MergedTask> {
         let (repo, branch, integration, base, title) = {
             let run = self.state.run(&key.0)?;
             let task = run.check_mergeable(&key.1)?;
@@ -461,6 +501,19 @@ impl Orchestrator {
             )
         };
         let head = self.ports.vcs.branch_head(&repo, &branch)?;
+        if let Some(v) = variant {
+            if &head != v.expected_head {
+                return Err(FleetError::conflict(format!(
+                    "{} points at {} now, not at {} where it was reviewed; it is not picked",
+                    qualified(&key.0, &key.1),
+                    head.as_str().get(..12).unwrap_or(head.as_str()),
+                    v.expected_head
+                        .as_str()
+                        .get(..12)
+                        .unwrap_or(v.expected_head.as_str())
+                )));
+            }
+        }
         // A task a verification contract guards is merged only as the commit that was proven:
         // the branch may have moved since (a worker process, a commit made while the gates ran).
         // The tree is asked of the repository again, so evidence that was taken on another tree
@@ -478,14 +531,24 @@ impl Orchestrator {
             }
         }
         let now = self.now();
-        let gate = self.state.request_merge(
-            &key.0,
-            &key.1,
-            &head,
-            &self.policy,
-            now,
-            self.ports.digest.as_ref(),
-        )?;
+        let gate = match variant {
+            None => self.state.request_merge(
+                &key.0,
+                &key.1,
+                &head,
+                &self.policy,
+                now,
+                self.ports.digest.as_ref(),
+            )?,
+            Some(v) => self.state.request_merge_action(
+                &key.0,
+                &key.1,
+                &(v.action)(&integration, &branch, &head),
+                &self.policy,
+                now,
+                self.ports.digest.as_ref(),
+            )?,
+        };
         match gate {
             MergeGate::Pending { approval, events } => {
                 self.commit(events)?;
@@ -522,15 +585,11 @@ impl Orchestrator {
                             result.created,
                         )?;
                         self.commit(events)?;
-                        Ok(data(
-                            "fleet.merge/1",
-                            vec![
-                                ("task", Value::str(qualified(&key.0, &key.1))),
-                                ("branch", Value::str(branch)),
-                                ("integration_branch", Value::str(integration)),
-                                ("merge_sha", Value::str(sha.as_str())),
-                            ],
-                        ))
+                        Ok(MergedTask {
+                            branch,
+                            integration,
+                            sha,
+                        })
                     }
                     MergeOutcome::Conflict { files } => {
                         let events = self.state.merge_conflicted(
@@ -560,6 +619,20 @@ impl Orchestrator {
     }
 
     fn cleanup(&mut self, only: Option<&RunId>, branches: bool) -> Result<Reply> {
+        self.cleanup_filtered(only, branches, None)
+    }
+
+    /// Removes the worktrees of finished tasks: completed ones that were merged, failed ones and
+    /// the members a fan-out pick superseded. With `branches`, the branches of merged tasks (once
+    /// they are contained in the integration branch) and of superseded members go too: a
+    /// superseded branch is the discarded alternative, its work is not merged anywhere. `tasks`
+    /// limits the work to those tasks.
+    pub(crate) fn cleanup_filtered(
+        &mut self,
+        only: Option<&RunId>,
+        branches: bool,
+        tasks: Option<&BTreeSet<Key>>,
+    ) -> Result<Reply> {
         struct Item {
             key: Key,
             repo: String,
@@ -567,7 +640,15 @@ impl Orchestrator {
             branch: String,
             integration: String,
             merged_into_integration: bool,
+            superseded: bool,
         }
+        let groups = &self.fanout.groups;
+        let superseded = |run: &RunId, task: &TaskId| {
+            groups
+                .group_of(run, task)
+                .and_then(|g| g.member(task))
+                .is_some_and(|m| m.state == fleet_fanout::group::MemberState::Superseded)
+        };
         let items: Vec<Item> = self
             .state
             .runs()
@@ -578,6 +659,10 @@ impl Orchestrator {
                     .filter(|t| {
                         (t.status == TaskStatus::Completed && t.merged.is_some())
                             || t.status == TaskStatus::Failed
+                            || superseded(&r.id, &t.id)
+                    })
+                    .filter(|t| {
+                        tasks.is_none_or(|keys| keys.contains(&(r.id.clone(), t.id.clone())))
                     })
                     .map(|t| Item {
                         key: (r.id.clone(), t.id.clone()),
@@ -586,6 +671,7 @@ impl Orchestrator {
                         branch: t.branch.clone(),
                         integration: r.integration_branch(),
                         merged_into_integration: t.merged.is_some(),
+                        superseded: superseded(&r.id, &t.id),
                     })
                     .collect::<Vec<_>>()
             })
@@ -615,8 +701,21 @@ impl Orchestrator {
                     Err(e) => self.warn(format!("{name}: cleanup failed: {}", e.message)),
                 }
             }
-            // Only branches whose work is already in the integration branch may be deleted.
-            if branches && item.merged_into_integration {
+            // Only branches whose work is already in the integration branch may be deleted, and
+            // the branches of superseded members, whose work is deliberately left out of it.
+            if branches && item.superseded {
+                match self
+                    .ports
+                    .vcs
+                    .remove_worktree(&item.repo, "", &item.branch, true)
+                {
+                    Ok(()) => deleted.push(Value::str(&item.branch)),
+                    Err(e) => self.warn(format!(
+                        "{name}: could not delete the branch: {}",
+                        e.message
+                    )),
+                }
+            } else if branches && item.merged_into_integration {
                 let merged = self
                     .ports
                     .vcs
