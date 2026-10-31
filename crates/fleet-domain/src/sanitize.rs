@@ -228,14 +228,18 @@ impl Sanitizer {
     fn ground(&mut self, b: u8, out: &mut String) {
         if self.utf8_need > 0 {
             if b & 0xc0 == 0x80 {
-                self.utf8[self.utf8_have] = b;
+                if let Some(slot) = self.utf8.get_mut(self.utf8_have) {
+                    *slot = b;
+                }
                 self.utf8_have += 1;
                 self.utf8_need -= 1;
                 if self.utf8_need == 0 {
                     let have = self.utf8_have;
                     self.utf8_have = 0;
-                    match std::str::from_utf8(&self.utf8[..have])
-                        .ok()
+                    match self
+                        .utf8
+                        .get(..have)
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
                         .and_then(|s| s.chars().next())
                     {
                         Some(c) => self.emit_char(c, out),
@@ -294,8 +298,9 @@ impl Sanitizer {
             },
             Mode::Passthrough => match c {
                 '\n' | '\r' | '\t' | '\u{8}' => out.push(c),
-                c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) || is_invisible(c) => {
-                }
+                c if (c as u32) < 0x20
+                    || (0x7f..=0x9f).contains(&(c as u32))
+                    || is_invisible(c) => {}
                 c => out.push(c),
             },
         }
@@ -304,14 +309,15 @@ impl Sanitizer {
 
 /// Allowlist for CSI sequences in passthrough mode.
 fn csi_allowed(body: &[u8], fin: u8) -> bool {
-    let (private, rest) = match body.first() {
-        Some(&p) if matches!(p, b'<' | b'=' | b'>' | b'?') => (Some(p), &body[1..]),
+    let (private, rest) = match body.split_first() {
+        Some((&p, tail)) if matches!(p, b'<' | b'=' | b'>' | b'?') => (Some(p), tail),
         _ => (None, body),
     };
-    let (params, inter) = match rest.iter().position(|b| (0x20..=0x2f).contains(b)) {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, &rest[rest.len()..]),
-    };
+    let split = rest
+        .iter()
+        .position(|b| (0x20..=0x2f).contains(b))
+        .unwrap_or(rest.len());
+    let (params, inter) = rest.split_at(split);
     if !params
         .iter()
         .all(|b| b.is_ascii_digit() || *b == b';' || *b == b':')
@@ -320,7 +326,23 @@ fn csi_allowed(body: &[u8], fin: u8) -> bool {
     }
     match (private, inter, fin) {
         (None, [], b'm') => true,
-        (None, [], b'A'..=b'H' | b'f' | b'J' | b'K' | b'L' | b'M' | b'P' | b'S' | b'T' | b'X' | b'@' | b'd' | b'r') => true,
+        (
+            None,
+            [],
+            b'A'..=b'H'
+            | b'f'
+            | b'J'
+            | b'K'
+            | b'L'
+            | b'M'
+            | b'P'
+            | b'S'
+            | b'T'
+            | b'X'
+            | b'@'
+            | b'd'
+            | b'r',
+        ) => true,
         (None, [], b's' | b'u') => params.is_empty(),
         // cursor style (DECSCUSR)
         (None, [b' '], b'q') => true,
@@ -333,8 +355,20 @@ fn csi_allowed(body: &[u8], fin: u8) -> bool {
                         .is_some_and(|n| {
                             matches!(
                                 n,
-                                1 | 7 | 12 | 25 | 47 | 1000 | 1002 | 1003 | 1004 | 1006 | 1047
-                                    | 1048 | 1049 | 2004 | 2026
+                                1 | 7
+                                    | 12
+                                    | 25
+                                    | 47
+                                    | 1000
+                                    | 1002
+                                    | 1003
+                                    | 1004
+                                    | 1006
+                                    | 1047
+                                    | 1048
+                                    | 1049
+                                    | 2004
+                                    | 2026
                             )
                         })
                 })
@@ -447,7 +481,10 @@ mod tests {
     #[test]
     fn bidi_and_invisible_characters_are_escaped() {
         assert_eq!(text("a\u{202e}b".as_bytes()), "a\\u{202e}b");
-        assert_eq!(text("a\u{2066}b\u{2069}".as_bytes()), "a\\u{2066}b\\u{2069}");
+        assert_eq!(
+            text("a\u{2066}b\u{2069}".as_bytes()),
+            "a\\u{2066}b\\u{2069}"
+        );
         assert_eq!(text("a\u{200b}b".as_bytes()), "a\\u{200b}b");
         assert_eq!(text("a\u{feff}b".as_bytes()), "a\\u{feff}b");
         assert_eq!(text("a\u{e0041}b".as_bytes()), "a\\u{e0041}b");
@@ -494,12 +531,17 @@ mod tests {
         let out = text(&input);
         assert!(!out.contains('\u{1b}'));
         assert!(!out.chars().any(|c| (0x80..=0x9f).contains(&(c as u32))));
-        assert!(!out.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+        assert!(!out
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t'));
     }
 
     #[test]
     fn passthrough_keeps_colors_and_cursor_motion() {
-        assert_eq!(pass(b"\x1b[1;31mhi\x1b[0m\x1b[2;3H\x1b[K"), "\x1b[1;31mhi\x1b[0m\x1b[2;3H\x1b[K");
+        assert_eq!(
+            pass(b"\x1b[1;31mhi\x1b[0m\x1b[2;3H\x1b[K"),
+            "\x1b[1;31mhi\x1b[0m\x1b[2;3H\x1b[K"
+        );
         assert_eq!(pass(b"\x1b[?25l\x1b[?1049h"), "\x1b[?25l\x1b[?1049h");
     }
 

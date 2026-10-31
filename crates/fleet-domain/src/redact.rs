@@ -34,8 +34,12 @@ impl Charset {
         match self {
             Charset::Alnum => c.is_ascii_alphanumeric(),
             Charset::Hex => c.is_ascii_hexdigit(),
-            Charset::Base64 => c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'),
-            Charset::Token => c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/' | '='),
+            Charset::Base64 => {
+                c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_')
+            }
+            Charset::Token => {
+                c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/' | '=')
+            }
         }
     }
 }
@@ -115,12 +119,18 @@ impl Redactor {
                 ));
             }
             if l.contains('\n') {
-                return Err(FleetError::invalid("redaction literals must be single-line"));
+                return Err(FleetError::invalid(
+                    "redaction literals must be single-line",
+                ));
             }
             self.literals.push(l.clone());
         }
         for rule in rules {
-            if rule.prefix.is_empty() || rule.prefix.len() > 64 || rule.min_len == 0 || rule.min_len > 4096 {
+            if rule.prefix.is_empty()
+                || rule.prefix.len() > 64
+                || rule.min_len == 0
+                || rule.min_len > 4096
+            {
                 return Err(FleetError::invalid(format!(
                     "redaction rule {:?} needs a prefix (1-64 bytes) and min_len 1-4096",
                     rule.name
@@ -142,7 +152,11 @@ impl Redactor {
             let secret_name = SECRET_NAME_PARTS.iter().any(|p| lower.contains(p))
                 || lower.ends_with("_key")
                 || lower.ends_with("_pass");
-            if secret_name && value.len() >= 8 && !value.contains('\n') && !self.literals.contains(&value) {
+            if secret_name
+                && value.len() >= 8
+                && !value.contains('\n')
+                && !self.literals.contains(&value)
+            {
                 self.literals.push(value);
             }
         }
@@ -257,7 +271,11 @@ mod tests {
     #[test]
     fn aws_and_bearer_shapes() {
         let r = Redactor::builtin();
-        let line = format!("key AKIA{} auth: Bearer {}", "A1B2C3D4E5F6G7H8", "x".repeat(20));
+        let line = format!(
+            "key AKIA{} auth: Bearer {}",
+            "A1B2C3D4E5F6G7H8",
+            "x".repeat(20)
+        );
         let out = r.redact(&line);
         assert!(out.contains("[REDACTED:aws-access-key]"));
         assert!(out.contains("[REDACTED:bearer-token]"));
@@ -269,7 +287,10 @@ mod tests {
         let mut r = Redactor::builtin();
         r.add_env_values([
             ("MY_API_TOKEN".to_string(), "hunter2hunter2".to_string()),
-            ("PATH".to_string(), "/usr/bin:/bin:/usr/local/bin".to_string()),
+            (
+                "PATH".to_string(),
+                "/usr/bin:/bin:/usr/local/bin".to_string(),
+            ),
             ("SHORT_SECRET".to_string(), "abc".to_string()),
         ]);
         assert_eq!(r.literal_count(), 1);
@@ -301,7 +322,10 @@ mod tests {
             "-----END OPENSSH PRIVATE KEY-----",
             "after",
         ];
-        let out: Vec<_> = lines.iter().map(|l| s.line(l).map(|c| c.into_owned())).collect();
+        let out: Vec<_> = lines
+            .iter()
+            .map(|l| s.line(l).map(|c| c.into_owned()))
+            .collect();
         assert_eq!(out[0].as_deref(), Some("before"));
         assert_eq!(out[1].as_deref(), Some("[REDACTED:private-key]"));
         assert_eq!(out[2], None);

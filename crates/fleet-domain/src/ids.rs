@@ -26,9 +26,7 @@ pub fn validate_id(kind: &str, id: &str) -> Result<()> {
         )));
     }
     if RESERVED.contains(&id) {
-        return Err(FleetError::invalid(format!(
-            "{kind} id {id:?} is reserved"
-        )));
+        return Err(FleetError::invalid(format!("{kind} id {id:?} is reserved")));
     }
     Ok(())
 }

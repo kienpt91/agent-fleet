@@ -5,8 +5,13 @@
 //! traits declared here.
 
 #![forbid(unsafe_code)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
 
 pub mod error;
-pub mod limits;
 pub mod ids;
+pub mod limits;
+pub mod redact;
+pub mod sanitize;
