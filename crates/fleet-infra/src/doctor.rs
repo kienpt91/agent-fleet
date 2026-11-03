@@ -433,15 +433,24 @@ mod tests {
         let t = TempDir::new("doc-tracker");
         let bin = t.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        t.script("bin/git", "#!/bin/sh\nsleep 1\necho 'git version 2.50.0'\n");
+        // the fake git stays alive until the test lets it go, so that no amount of load can make it end before it is looked for
+        let release = t.join("release");
+        t.script(
+            "bin/git",
+            &format!(
+                "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\necho 'git version 2.50.0'\n",
+                release.display()
+            ),
+        );
         let env = vec![("PATH".to_string(), bin.to_str().unwrap().to_string())];
         let tracker = JobTracker::new();
         let seen = tracker.clone();
         let probe = std::thread::spawn(move || check_git(&env, &tracker));
         assert!(
-            crate::testutil::wait_until(3_000, || !seen.live().is_empty()),
+            crate::testutil::wait_until(30_000, || !seen.live().is_empty()),
             "the git child was never listed in the tracker"
         );
+        std::fs::write(&release, b"go").unwrap();
         let check = probe.join().unwrap();
         assert_eq!(check.status, Status::Ok, "{}", check.detail);
         assert!(seen.live().is_empty(), "the entry goes with the child");
