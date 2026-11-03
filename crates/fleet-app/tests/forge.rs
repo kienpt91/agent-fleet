@@ -1325,3 +1325,115 @@ fn read_only_forge_commands_are_marked_read_only_and_the_others_are_not() {
         );
     }
 }
+
+// ---- fan-out groups: a group's work leaves only through its pick ---------------------------------------
+
+fn fanout_config() -> AppConfig {
+    let mut cfg = forge_cfg();
+    cfg.merge_needs_approval = false;
+    cfg
+}
+
+/// A run of one fan-out group `fan1` (members `fan1-1` and `fan1-2`) whose members are both completed.
+fn finished_group(h: &mut Harness) {
+    new_run(h);
+    h.call(
+        "group.fanout",
+        obj(vec![
+            ("run", s("r1")),
+            ("title", s("two tries")),
+            ("spec", s("do the work")),
+            ("workers", Value::array([s("agent")])),
+            ("count", Value::int(2)),
+        ]),
+    )
+    .unwrap();
+    h.call("run.start", obj(vec![("run", s("r1"))])).unwrap();
+    h.orch.tick();
+    for (task, c) in [("fan1-1", '1'), ("fan1-2", '2')] {
+        let head = Sha::parse(&c.to_string().repeat(40)).unwrap();
+        h.world.set_branch_head(&format!("fleet/r1/{task}"), head);
+    }
+    // a member whose branch already holds the work: nothing is left uncommitted for fleet to commit
+    for task in ["fan1-1", "fan1-2"] {
+        let session = h.world.session_for(task).expect("the member has a session");
+        let spec = h.world.session_spec(session).unwrap();
+        h.world.write_result(
+            &spec.cwd,
+            ContractRead::Valid(WorkerResult {
+                status: ResultStatus::Done,
+                summary: format!("{task} done"),
+            }),
+        );
+        h.world.exit(session, 0);
+        h.orch.tick();
+    }
+    for _ in 0..4 {
+        h.orch.tick();
+    }
+    assert_eq!(task_status(h, "fan1-1"), "completed");
+    assert_eq!(task_status(h, "fan1-2"), "completed");
+}
+
+fn pick(h: &mut Harness, task: &str) {
+    h.call(
+        "group.pick",
+        obj(vec![
+            ("group", s("fan1")),
+            ("task", s(task)),
+            ("allow_unverified", Value::Bool(true)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn to_task(h: &mut Harness, number: u64, id: &str, after: &str) -> Result<Value, FleetError> {
+    call_data(
+        h,
+        "issue.to-task",
+        obj(vec![
+            ("number", Value::int(number)),
+            ("id", s(id)),
+            ("after", Value::array([s(after)])),
+        ]),
+    )
+}
+
+#[test]
+fn an_issue_cannot_become_a_task_that_builds_on_a_member_that_was_not_picked() {
+    let mut h = Harness::with_config(fanout_config());
+    h.forge.set_remote("/repo", "https://github.com/o/r.git");
+    finished_group(&mut h);
+    h.forge.add_issue(7, "Crash", "", &[]);
+    h.forge.add_issue(8, "Hang", "", &[]);
+    let before = kinds(&h);
+    // before the pick no member may be built on, as for `task add --after`
+    for member in ["fan1-1", "fan1-2"] {
+        let err = to_task(&mut h, 7, "next", member).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict, "{member}: {}", err.message);
+        assert!(err.message.contains("fan-out group"), "{}", err.message);
+    }
+    assert_eq!(kinds(&h), before, "nothing was created or linked");
+    pick(&mut h, "fan1-1");
+    // after it only the winner may
+    let err = to_task(&mut h, 7, "next", "fan1-2").unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{}", err.message);
+    assert!(err.message.contains("not its winner"), "{}", err.message);
+    assert_eq!(count(&h, "issue_linked"), 0);
+    let ok = to_task(&mut h, 8, "next", "fan1-1").unwrap();
+    assert_eq!(text(&ok, "task"), "r1/next");
+    assert_eq!(count(&h, "issue_linked"), 1);
+    // the same guard holds for the other two ways of adding a task
+    let plain = h
+        .call(
+            "task.add",
+            obj(vec![
+                ("run", s("r1")),
+                ("id", s("plain")),
+                ("title", s("plain")),
+                ("after", Value::array([s("fan1-2")])),
+            ]),
+        )
+        .unwrap_err();
+    assert_eq!(plain.code, ErrorCode::Conflict);
+}

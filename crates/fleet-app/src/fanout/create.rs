@@ -80,7 +80,7 @@ impl Orchestrator {
                 host: None,
             })
             .collect();
-        let (_, mut events) = self.state.add_tasks(&args.run, tasks)?;
+        let (_, mut events) = self.add_validated_tasks(&args.run, tasks)?;
         let (goal, contract_id) = match &args.contract {
             None => (None, None),
             Some(doc) => {

@@ -296,10 +296,22 @@ impl Orchestrator {
         Ok(())
     }
 
-    fn add_tasks(&mut self, run: &RunId, tasks: Vec<NewTask>, schema: &str) -> Result<Reply> {
+    /// The one way tasks are checked and made, for `task add`, a plan, a task made of an issue and a
+    /// fan-out group: the named hosts exist and no task builds on a fan-out member that was not
+    /// picked, then the state validates the tasks themselves and returns the events. Nothing is
+    /// recorded here; the caller commits the events.
+    pub(crate) fn add_validated_tasks(
+        &mut self,
+        run: &RunId,
+        tasks: Vec<NewTask>,
+    ) -> Result<(Vec<TaskId>, Vec<DomainEvent>)> {
         self.check_hosts(&tasks)?;
         self.refuse_group_dependencies(run, &tasks)?;
-        let (ids, events) = self.state.add_tasks(run, tasks.clone())?;
+        self.state.add_tasks(run, tasks)
+    }
+
+    fn add_tasks(&mut self, run: &RunId, tasks: Vec<NewTask>, schema: &str) -> Result<Reply> {
+        let (ids, events) = self.add_validated_tasks(run, tasks.clone())?;
         let remote = self.remote_tasks(run, &tasks, &ids);
         self.refuse_remote_joining(run, &remote)?;
         self.commit(events)?;
@@ -341,7 +353,6 @@ impl Orchestrator {
         tasks: Vec<NewTask>,
         channels: Vec<ChannelDef>,
     ) -> Result<Reply> {
-        self.check_hosts(&tasks)?;
         let (run_id, new_event) = match (run, new_run) {
             (Some(_), Some(_)) => {
                 return Err(FleetError::invalid(
@@ -354,9 +365,8 @@ impl Orchestrator {
                 ))
             }
             (Some(r), None) => {
-                self.refuse_group_dependencies(&r, &tasks)?;
                 // Validate the tasks and channels against the run before changing anything.
-                let (ids, _) = self.state.add_tasks(&r, tasks.clone())?;
+                let (ids, _) = self.add_validated_tasks(&r, tasks.clone())?;
                 let mut known: BTreeSet<TaskId> = self
                     .state
                     .run(&r)?
@@ -374,6 +384,7 @@ impl Orchestrator {
                 let (id, event) = self.create_run_event(args)?;
                 // The tasks must be valid for the run that is about to exist; check with a
                 // scratch copy of the state so an invalid plan creates nothing.
+                self.check_hosts(&tasks)?;
                 let mut scratch = fleet_domain::fleet::FleetState::new();
                 scratch.apply(&event);
                 let (ids, _) = scratch.add_tasks(&id, tasks.clone())?;

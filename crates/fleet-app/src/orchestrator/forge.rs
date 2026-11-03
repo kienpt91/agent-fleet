@@ -620,7 +620,7 @@ impl Orchestrator {
             )));
         }
         let draft = issue_task_draft(repo, issue);
-        let (ids, mut events) = self.state.add_tasks(
+        let (ids, mut events) = self.add_validated_tasks(
             run,
             vec![NewTask {
                 id: args.id.clone(),
