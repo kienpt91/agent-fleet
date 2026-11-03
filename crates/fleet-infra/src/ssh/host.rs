@@ -93,6 +93,21 @@ impl SshRemoteHost {
     }
 }
 
+/// What remains of `budget` since `started`; an error when nothing does.
+fn budget_left(started: std::time::Instant, budget: Timing) -> Result<Timing> {
+    let left = budget.total.saturating_sub(started.elapsed());
+    if left < Duration::from_secs(1) {
+        return Err(FleetError::new(
+            fleet_domain::error::ErrorCode::Timeout,
+            "sending the code to the host took longer than its time budget",
+        ));
+    }
+    Ok(Timing {
+        total: left,
+        stall: budget.stall.min(left),
+    })
+}
+
 fn markers_dir(state: &Path) -> PathBuf {
     state.join("remote").join("live")
 }
@@ -269,6 +284,10 @@ impl Shared {
         worktree: &str,
     ) -> Result<()> {
         self.mark_live(t)?;
+        // One budget for the whole of sending (code, replacing a stale worktree, brief): this runs
+        // on the engine thread, so it is bounded as a whole and not call by call.
+        let started = std::time::Instant::now();
+        let budget = self.timing(|t| t.prepare);
         let prepare = RemoteCall::Prepare {
             layout,
             run: &t.run,
@@ -281,7 +300,7 @@ impl Shared {
                 &prepare,
                 Input::File(bundle.to_path_buf()),
                 Output::Capture { max: 16 * 1024 },
-                self.timing(|t| t.prepare),
+                budget_left(started, budget)?,
             )?;
             if done.success() {
                 break;
@@ -314,7 +333,7 @@ impl Shared {
             &put,
             Input::Bytes(brief),
             Output::Capture { max: 4096 },
-            self.timing(|t| t.prepare),
+            budget_left(started, budget)?,
         )?;
         if !done.success() {
             return Err(self.client.explain(host, "sending the brief", &done));
@@ -538,6 +557,24 @@ impl RemoteHost for SshRemoteHost {
         let client = &self.shared.client;
         let host = client.host(&t.host)?;
         let layout = host.layout()?;
+        // The variables go to the host in a file (stdin of a small call), never on a command line,
+        // where every local user could read them in the process table.
+        let put = RemoteCall::PutEnv {
+            layout: &layout,
+            run: &t.run,
+            task: &t.task,
+        };
+        let text = fleet_domain::remote::env_file_text(&req.env)?;
+        let done = client.run(
+            host,
+            &put,
+            Input::Bytes(text.into_bytes()),
+            Output::Capture { max: 4096 },
+            self.shared.timing(|t| t.quick),
+        )?;
+        if !done.success() {
+            return Err(client.explain(host, "sending the environment", &done));
+        }
         let call = RemoteCall::Launch {
             layout: &layout,
             run: &t.run,
@@ -545,7 +582,6 @@ impl RemoteHost for SshRemoteHost {
             program: &req.program,
             allowed: &host.allowed_workers,
             args: &req.args,
-            env: &req.env,
         };
         let invocation = client.command_for(host, &call, true)?;
         let program = client
@@ -685,5 +721,26 @@ impl RemoteHost for SshRemoteHost {
             ));
         }
         lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_budget_of_sending_is_shared_by_its_calls() {
+        let budget = Timing {
+            total: Duration::from_secs(120),
+            stall: Duration::from_secs(60),
+        };
+        let now = std::time::Instant::now();
+        let first = budget_left(now, budget).unwrap();
+        assert!(first.total <= Duration::from_secs(120) && first.stall == Duration::from_secs(60));
+        let spent = now.checked_sub(Duration::from_secs(100)).unwrap();
+        let later = budget_left(spent, budget).unwrap();
+        assert!(later.total <= Duration::from_secs(20) && later.stall <= Duration::from_secs(20));
+        let over = now.checked_sub(Duration::from_secs(120)).unwrap();
+        assert!(budget_left(over, budget).is_err());
     }
 }

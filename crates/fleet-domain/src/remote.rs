@@ -181,9 +181,9 @@ pub fn validate_remote_env(name: &str, value: &str) -> Result<()> {
             "is not valid",
         ));
     }
-    if value.contains('\0') || value.len() > MAX_REMOTE_ENV_VALUE {
+    if value.contains(['\0', '\n']) || value.len() > MAX_REMOTE_ENV_VALUE {
         return Err(FleetError::invalid(format!(
-            "the value of remote variable {name} is too long or contains NUL"
+            "the value of remote variable {name} is too long or contains NUL or a line break"
         )));
     }
     Ok(())
@@ -213,6 +213,11 @@ impl RemoteLayout {
     /// the result cannot leave the base directory.
     pub fn worktree(&self, run: &RunId, task: &TaskId) -> String {
         format!("{}/{}/{}", self.base, run.as_str(), task.as_str())
+    }
+
+    /// The file the variables of the worker wait in until the launcher reads and deletes it.
+    pub fn envfile(&self, run: &RunId, task: &TaskId) -> String {
+        format!("{}/{}/{}.env", self.base, run.as_str(), task.as_str())
     }
 
     /// The file the launcher writes its process ids to, next to (not inside) the worktree.
@@ -275,8 +280,12 @@ case $dir in \"$base\"/?*/?*) ;; *) echo 'fleet: directory outside the base dire
 case $dir in */../*|*/./*|*/..|*/.) echo 'fleet: directory with . or ..' >&2; exit 71;; esac; \
 mkdir -p -- \"$base\"; \
 [ -d \"$base\" ] && [ ! -L \"$base\" ] || { echo 'fleet: the base directory is not a plain directory' >&2; exit 70; }; \
+[ -O \"$base\" ] || { echo 'fleet: the base directory is not owned by this user' >&2; exit 70; }; \
+p=$(ls -ld -- \"$base\" | cut -c1-10); case $p in ?????w????|????????w?) echo 'fleet: the base directory is writable by others' >&2; exit 70;; esac; \
 run=${dir%/*}; mkdir -p -- \"$run\"; \
 [ ! -L \"$run\" ] || { echo 'fleet: the run directory is a link' >&2; exit 70; }; \
+[ -O \"$run\" ] || { echo 'fleet: the run directory is not owned by this user' >&2; exit 70; }; \
+p=$(ls -ld -- \"$run\" | cut -c1-10); case $p in ?????w????|????????w?) echo 'fleet: the run directory is writable by others' >&2; exit 70;; esac; \
 [ ! -e \"$dir\" ] || { echo 'fleet: the remote worktree exists already' >&2; exit 72; }; \
 mkdir -- \"$dir\"; cd -- \"$dir\"; \
 g init -q .; \
@@ -295,10 +304,11 @@ const PUT_BRIEF: &str = "set -eu; umask 077; cd -- \"$1\"; mkdir -p .fleet; cat 
 /// Script of [`RemoteCall::Launch`]: `$1` worktree, `$2` process id file, then the program and
 /// its arguments. Records the process id and the process group (what a later signal needs) and
 /// replaces itself with the worker.
-const LAUNCH: &str = "cd -- \"$1\" || exit 126; pidfile=$2; shift 2; \
+const LAUNCH: &str = "cd -- \"$1\" || exit 126; pidfile=$2; envfile=$3; shift 3; \
 pg=$(ps -o pgid= -p \"$$\" 2>/dev/null | tr -d ' '); \
 printf '%s %s\\n' \"$$\" \"$pg\" > \"$pidfile\" 2>/dev/null || :; \
-exec \"$@\"";
+if [ -f \"$envfile\" ]; then while IFS= read -r l; do [ -n \"$l\" ] && set -- \"$l\" \"$@\"; done < \"$envfile\"; rm -f -- \"$envfile\"; fi; \
+exec /usr/bin/env -i \"$@\"";
 
 /// Script of [`RemoteCall::ReadContract`]: `$1` worktree, `$2` file name below `.fleet`.
 const READ_CONTRACT: &str = "cd -- \"$1\" 2>/dev/null || exit 3; f=.fleet/$2; \
@@ -326,25 +336,31 @@ kill -s \"$2\" -- \"-$pg\" 2>/dev/null || kill -s \"$2\" \"$pid\" 2>/dev/null ||
 
 /// Script of [`RemoteCall::Remove`]: `$1` base, `$2` worktree, `$3` process id file. Refuses
 /// anything that is not strictly below `<base>/<run>/`.
-const REMOVE: &str = "base=$1; dir=$2; pidfile=$3; \
+const REMOVE: &str = "base=$1; dir=$2; pidfile=$3; envfile=$4; \
 case $dir in \"$base\"/?*/?*) ;; *) echo 'fleet: directory outside the base directory' >&2; exit 71;; esac; \
 case $dir in */../*|*/./*|*/..|*/.) exit 71;; esac; \
 case $pidfile in \"$base\"/?*/?*) ;; *) exit 71;; esac; \
-rm -rf -- \"$dir\" \"$pidfile\"";
+case $envfile in \"$base\"/?*/?*) ;; *) exit 71;; esac; \
+rm -rf -- \"$dir\" \"$pidfile\" \"$envfile\"";
 
 /// Script of [`RemoteCall::CheckBase`]: `$1` base. Creates it when needed and says `ok` when it is
 /// a plain, writable directory.
-const CHECK_BASE: &str =
-    "umask 077; mkdir -p -- \"$1\" && [ -d \"$1\" ] && [ ! -L \"$1\" ] && [ -w \"$1\" ] && echo ok";
+/// Script of [`RemoteCall::PutEnv`]: `$1` base, `$2` the environment file; the variables on stdin,
+/// one `NAME=value` per line. The launcher reads the file and deletes it: values never appear on
+/// a command line.
+const PUT_ENV: &str = "set -eu; umask 077; base=$1; f=$2; case $f in \"$base\"/?*/?*) ;; *) echo 'fleet: file outside the base directory' >&2; exit 71;; esac; cat > \"$f\"";
+
+const CHECK_BASE: &str = "umask 077; mkdir -p -- \"$1\" && [ -d \"$1\" ] && [ ! -L \"$1\" ] && [ -w \"$1\" ] && [ -O \"$1\" ] && case $(ls -ld -- \"$1\" | cut -c1-10) in ?????w????|????????w?) false;; *) true;; esac && echo ok";
 
 /// Script of [`RemoteCall::RoundTrip`]: prints every argument followed by a NUL, then `uname -s`
 /// and the user id the command runs as, one per line.
 const ROUND_TRIP: &str = "printf '%s\\0' \"$@\"; uname -s; id -u";
 
 /// Every constant script, for tests and for the documentation of what runs on a remote host.
-pub const SCRIPTS: [(&str, &str); 9] = [
+pub const SCRIPTS: [(&str, &str); 10] = [
     ("prepare", PREPARE),
     ("put-brief", PUT_BRIEF),
+    ("put-env", PUT_ENV),
     ("launch", LAUNCH),
     ("read-contract", READ_CONTRACT),
     ("finalize", FINALIZE),
@@ -412,8 +428,14 @@ pub enum RemoteCall<'a> {
         run: &'a RunId,
         task: &'a TaskId,
     },
-    /// Starts the worker in the worktree with exactly `env` as its environment. `program` must be
-    /// one of `allowed`.
+    /// Writes stdin (the text of [`env_file_text`]) to the environment file of the task.
+    PutEnv {
+        layout: &'a RemoteLayout,
+        run: &'a RunId,
+        task: &'a TaskId,
+    },
+    /// Starts the worker in the worktree with the environment of the file written by `PutEnv`
+    /// (and nothing else). `program` must be one of `allowed`.
     Launch {
         layout: &'a RemoteLayout,
         run: &'a RunId,
@@ -421,7 +443,6 @@ pub enum RemoteCall<'a> {
         program: &'a str,
         allowed: &'a [String],
         args: &'a [String],
-        env: &'a [(String, String)],
     },
     /// Reads one contract file (at most [`REMOTE_CONTRACT_READ`] bytes).
     ReadContract {
@@ -543,6 +564,12 @@ impl RemoteCall<'_> {
                 let dir = layout.worktree(run, task);
                 script_call(&fixed_env(path, layout.base()), PUT_BRIEF, false, &[&dir])
             }
+            RemoteCall::PutEnv { layout, run, task } => script_call(
+                &fixed_env(path, layout.base()),
+                PUT_ENV,
+                false,
+                &[layout.base(), &layout.envfile(run, task)],
+            ),
             RemoteCall::Launch {
                 layout,
                 run,
@@ -550,7 +577,6 @@ impl RemoteCall<'_> {
                 program,
                 allowed,
                 args,
-                env,
             } => {
                 validate_remote_program(program)?;
                 if !allowed.iter().any(|a| a == program) {
@@ -566,13 +592,14 @@ impl RemoteCall<'_> {
                 }
                 let dir = layout.worktree(run, task);
                 let pidfile = layout.pidfile(run, task);
-                let mut words = env_words(env)?;
+                let mut words = env_words(&[("PATH".to_string(), path.to_string())])?;
                 words.push(quote(SH)?);
                 words.push("-c".to_string());
                 words.push(quote(LAUNCH)?);
                 words.push(quote(SCRIPT_NAME)?);
                 words.push(quote(&dir)?);
                 words.push(quote(&pidfile)?);
+                words.push(quote(&layout.envfile(run, task))?);
                 words.push(quote(program)?);
                 for a in *args {
                     words.push(quote(a)?);
@@ -628,11 +655,30 @@ impl RemoteCall<'_> {
                     &fixed_env(path, layout.base()),
                     REMOVE,
                     false,
-                    &[layout.base(), &dir, &pidfile],
+                    &[layout.base(), &dir, &pidfile, &layout.envfile(run, task)],
                 )
             }
         }
     }
+}
+
+/// The text of the environment file: one `NAME=value` per line, every entry validated (no NUL, no
+/// line break in a value, bounded).
+pub fn env_file_text(env: &[(String, String)]) -> Result<String> {
+    if env.len() > MAX_REMOTE_ENV {
+        return Err(FleetError::limit(format!(
+            "more than {MAX_REMOTE_ENV} remote environment variables"
+        )));
+    }
+    let mut out = String::new();
+    for (k, v) in env {
+        validate_remote_env(k, v)?;
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// The environment of a remote worker: only what the operator wrote for the host plus the
@@ -826,16 +872,13 @@ mod tests {
     }
 
     #[test]
-    fn property_hostile_arguments_stay_single_words_in_every_call() {
+    fn property_hostile_arguments_stay_single_words_and_values_never_reach_a_command_line() {
         let mut rng = Lcg(99);
         let l = layout();
         let (run, task) = (id_run(), id_task());
         let allowed = vec!["agent".to_string()];
         for _ in 0..2000 {
             let args: Vec<String> = (0..rng.below(6)).map(|_| random_word(&mut rng)).collect();
-            let env: Vec<(String, String)> = (0..rng.below(4))
-                .map(|i| (format!("V{i}"), random_word(&mut rng)))
-                .collect();
             let line = RemoteCall::Launch {
                 layout: &l,
                 run: &run,
@@ -843,33 +886,89 @@ mod tests {
                 program: "agent",
                 allowed: &allowed,
                 args: &args,
-                env: &env,
             }
             .assemble(DEFAULT_REMOTE_PATH)
             .unwrap();
             let words = lex(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"));
-            // /usr/bin/env -i <env...> /bin/sh -c SCRIPT fleet-remote DIR PIDFILE PROGRAM ARGS...
+            // /usr/bin/env -i PATH=.. /bin/sh -c SCRIPT fleet-remote DIR PIDFILE ENVFILE PROGRAM ARGS...
             assert_eq!(words[0], ENV);
             assert_eq!(words[1], "-i");
-            for (i, (k, v)) in env.iter().enumerate() {
-                assert_eq!(words[2 + i], format!("{k}={v}"));
-            }
-            let at = 2 + env.len();
-            assert_eq!(words[at], SH);
-            assert_eq!(words[at + 1], "-c");
-            assert_eq!(words[at + 2], LAUNCH);
-            assert_eq!(words[at + 3], SCRIPT_NAME);
-            assert_eq!(words[at + 4], "/srv/fleet/r1/t1");
-            assert_eq!(words[at + 5], "/srv/fleet/r1/t1.pid");
-            assert_eq!(words[at + 6], "agent");
-            assert_eq!(&words[at + 7..], &args[..]);
+            assert_eq!(words[2], format!("PATH={DEFAULT_REMOTE_PATH}"));
+            assert_eq!(words[3], SH);
+            assert_eq!(words[4], "-c");
+            assert_eq!(words[5], LAUNCH);
+            assert_eq!(words[6], SCRIPT_NAME);
+            assert_eq!(words[7], "/srv/fleet/r1/t1");
+            assert_eq!(words[8], "/srv/fleet/r1/t1.pid");
+            assert_eq!(words[9], "/srv/fleet/r1/t1.env");
+            assert_eq!(words[10], "agent");
+            assert_eq!(&words[11..], &args[..]);
 
             let line = RemoteCall::RoundTrip { args: &args }
                 .assemble(DEFAULT_REMOTE_PATH)
                 .unwrap();
             let words = lex(&line).unwrap();
             assert_eq!(&words[words.len() - args.len()..], &args[..]);
+
+            // Variables travel in a file, never in a command: every entry survives in its own line
+            // or is refused.
+            let env: Vec<(String, String)> = (0..rng.below(4))
+                .map(|i| (format!("V{i}"), random_word(&mut rng)))
+                .collect();
+            match env_file_text(&env) {
+                Ok(text) => {
+                    let lines: Vec<&str> = text.split_terminator('\n').collect();
+                    assert_eq!(lines.len(), env.len());
+                    for (line, (k, v)) in lines.iter().zip(&env) {
+                        assert_eq!(*line, format!("{k}={v}"));
+                    }
+                }
+                Err(_) => assert!(env.iter().any(|(_, v)| v.contains('\n'))),
+            }
         }
+    }
+
+    #[test]
+    fn a_secret_value_is_in_no_command_line_only_in_the_environment_file() {
+        let l = layout();
+        let (run, task) = (id_run(), id_task());
+        let allowed = vec!["agent".to_string()];
+        let env = vec![("API_KEY".to_string(), "top-secret-value-1234".to_string())];
+        let calls = [
+            RemoteCall::Launch {
+                layout: &l,
+                run: &run,
+                task: &task,
+                program: "agent",
+                allowed: &allowed,
+                args: &[],
+            },
+            RemoteCall::PutEnv {
+                layout: &l,
+                run: &run,
+                task: &task,
+            },
+            RemoteCall::Remove {
+                layout: &l,
+                run: &run,
+                task: &task,
+            },
+        ];
+        for call in calls {
+            let line = call.assemble(DEFAULT_REMOTE_PATH).unwrap();
+            assert!(!line.contains("top-secret"), "{line}");
+        }
+        assert_eq!(
+            env_file_text(&env).unwrap(),
+            "API_KEY=top-secret-value-1234\n"
+        );
+        assert!(env_file_text(&[("A".into(), "x\ny".into())]).is_err());
+        assert!(env_file_text(&[("A B".into(), "x".into())]).is_err());
+        assert!(env_file_text(&[("A".into(), "x\0".into())]).is_err());
+        let many: Vec<(String, String)> = (0..=MAX_REMOTE_ENV)
+            .map(|i| (format!("V{i}"), "1".into()))
+            .collect();
+        assert!(env_file_text(&many).is_err());
     }
 
     #[test]
@@ -950,7 +1049,6 @@ mod tests {
                 program,
                 allowed: &allowed,
                 args: &[],
-                env: &[],
             }
             .assemble(DEFAULT_REMOTE_PATH)
         };
@@ -971,12 +1069,11 @@ mod tests {
     }
 
     #[test]
-    fn long_lines_bad_names_and_too_many_variables_are_refused() {
+    fn long_lines_and_too_many_arguments_are_refused() {
         let l = layout();
         let (run, task) = (id_run(), id_task());
         let allowed = vec!["agent".to_string()];
-        let big = vec!["x".repeat(MAX_REMOTE_COMMAND)];
-        let launch = |args: &[String], env: &[(String, String)]| {
+        let launch = |args: &[String]| {
             RemoteCall::Launch {
                 layout: &l,
                 run: &run,
@@ -984,23 +1081,17 @@ mod tests {
                 program: "agent",
                 allowed: &allowed,
                 args,
-                env,
             }
             .assemble(DEFAULT_REMOTE_PATH)
         };
+        let big = vec!["x".repeat(MAX_REMOTE_COMMAND)];
         assert_eq!(
-            launch(&big, &[]).unwrap_err().code,
+            launch(&big).unwrap_err().code,
             crate::error::ErrorCode::Limit
         );
-        assert!(launch(&["a\0b".to_string()], &[]).is_err());
-        assert!(launch(&[], &[("A B".to_string(), "x".to_string())]).is_err());
-        assert!(launch(&[], &[("A".to_string(), "x\0".to_string())]).is_err());
-        let many: Vec<(String, String)> = (0..=MAX_REMOTE_ENV)
-            .map(|i| (format!("V{i}"), "1".into()))
-            .collect();
-        assert!(launch(&[], &many).is_err());
+        assert!(launch(&["a\0b".to_string()]).is_err());
         let args: Vec<String> = (0..=MAX_REMOTE_ARGS).map(|_| "a".to_string()).collect();
-        assert!(launch(&args, &[]).is_err());
+        assert!(launch(&args).is_err());
     }
 
     #[test]

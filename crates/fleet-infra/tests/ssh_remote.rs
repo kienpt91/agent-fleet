@@ -663,24 +663,17 @@ fn forwarding_agent_display_and_environment_do_not_reach_the_remote() {
         "the test agent did not start"
     );
     let task = rt("build", "r1", "t1");
-    let invocation = {
-        let layout = host.layout().unwrap();
-        let allowed = host.allowed_workers.clone();
-        let call = RemoteCall::Launch {
-            layout: &layout,
-            run: &task.run,
-            task: &task.task,
-            program: "env",
-            allowed: &allowed,
-            args: &[],
-            env: &[("ONLY".to_string(), "explicit".to_string())],
-        };
-        remote.client().command_for(&host, &call, true).unwrap()
-    };
-    let (mut args, mut env) = (invocation.args, invocation.env);
-    // The work directory does not exist here; the launcher then fails before exec, so run in a prepared one.
     let wt = fx.worktree("r1", "t1");
     prepare(&remote, &task, &wt).unwrap();
+    let cmd = remote
+        .launch_command(&LaunchRequest {
+            task: task.clone(),
+            program: "env".to_string(),
+            args: vec![],
+            env: vec![("ONLY".to_string(), "explicit".to_string())],
+        })
+        .unwrap();
+    let (mut args, mut env) = (cmd.args, cmd.env);
     // Hostile local environment (what a user's shell would have): agent, display, locale, secrets.
     env.extend([
         (
@@ -944,7 +937,6 @@ fn a_jump_host_hop_uses_the_same_strict_options_and_its_processes_are_refused_as
         program: "sh",
         allowed: &allowed,
         args: &args,
-        env: &[("PATH".to_string(), "/usr/bin:/bin".to_string())],
     };
     let done = remote
         .client()
@@ -1397,4 +1389,114 @@ fn the_ssh_adapter_satisfies_the_remote_host_contract() {
         wt,
     };
     fleet_app::testing::remote::remote_host_contract(&mut harness);
+}
+
+#[test]
+fn a_secret_variable_is_in_no_command_line_and_the_file_it_travels_in_is_deleted() {
+    let Some(fx) = Fx::new() else { return };
+    let (remote, host, task, _wt, _prepared) = prepared_task(&fx, &["sh"]);
+    let secret = "top-secret-argv-check-77"; // secret-scan: allow
+    let dir = remote.remote_dir(&task).unwrap();
+    let mut env = worker_env(&host.env, &task.run, &task.task, &dir);
+    env.push(("API_KEY".to_string(), secret.to_string()));
+    let cmd = remote
+        .launch_command(&LaunchRequest {
+            task: task.clone(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "printenv API_KEY; ls ..".to_string()],
+            env,
+        })
+        .unwrap();
+    assert!(
+        !cmd.args.join(" ").contains(secret),
+        "the secret is on the ssh command line: {:?}",
+        cmd.args
+    );
+    let envfile = fx.remote_dir(&host, "r1", "t1").with_extension("env");
+    assert!(
+        envfile.exists(),
+        "the variables wait in a file until the launcher reads them"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&envfile).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let done = exec::run(
+        &Spec {
+            program: PathBuf::from(&cmd.program),
+            args: cmd.args,
+            env: cmd.env,
+            input: Input::None,
+            output: Output::Capture { max: 1 << 20 },
+            limits: Limits {
+                total: Duration::from_secs(60),
+                stall: Duration::from_secs(60),
+            },
+        },
+        &JobTracker::new(),
+    );
+    let text = output_text(&done);
+    assert!(done.success(), "{text}");
+    assert!(text.contains(secret), "the worker got the value: {text}");
+    assert!(
+        !text.contains("t1.env"),
+        "the file is gone before the worker runs: {text}"
+    );
+    assert!(!envfile.exists());
+}
+
+#[test]
+fn a_base_directory_that_others_can_write_is_refused_by_prepare_and_the_doctor_call() {
+    let Some(fx) = Fx::new() else { return };
+    let host = fx.host(&["sh"]);
+    let remote = fx.remote(vec![host.clone()]);
+    fx.trust(&remote, &host);
+    let wt = fx.worktree("r1", "t1");
+    std::fs::create_dir_all(&host.base_dir).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&host.base_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let err = prepare(&remote, &rt("build", "r1", "t1"), &wt).unwrap_err();
+    assert!(
+        err.message.contains("writable by others"),
+        "{}",
+        err.message
+    );
+    assert!(!fx.remote_dir(&host, "r1", "t1").exists());
+    let done = remote
+        .client()
+        .run(
+            &host,
+            &RemoteCall::CheckBase {
+                base: &host.base_dir,
+            },
+            Input::None,
+            Output::Capture { max: 4096 },
+            short(30, 20),
+        )
+        .unwrap();
+    assert!(
+        !done.success() && !done.stdout.starts_with(b"ok"),
+        "{:?}",
+        done
+    );
+    // The same directory made private works.
+    std::fs::set_permissions(&host.base_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(prepare(&remote, &rt("build", "r1", "t1"), &wt).is_ok());
+    // A run directory that others can write is refused too.
+    remote.abandon(&rt("build", "r1", "t1"));
+    assert!(wait_until(20_000, || !fx
+        .remote_dir(&host, "r1", "t1")
+        .exists()));
+    std::fs::set_permissions(
+        fx.remote_dir(&host, "r1", "t1").parent().unwrap(),
+        std::fs::Permissions::from_mode(0o770),
+    )
+    .unwrap();
+    let err = prepare(&remote, &rt("build", "r1", "t1"), &wt).unwrap_err();
+    assert!(
+        err.message.contains("writable by others"),
+        "{}",
+        err.message
+    );
 }
