@@ -327,3 +327,45 @@ fn the_startup_reports_what_the_remote_reconciliation_found() {
 fn config_with_remote(_remote: &FakeRemote) -> fleet_app::config::AppConfig {
     config()
 }
+
+// ---- compiled context and messages ----------------------------------------------------------
+
+#[test]
+fn a_remote_task_of_a_compiled_run_gets_the_pack_and_the_pointer_brief_before_the_host_is_prepared()
+{
+    let remote = FakeRemote::new();
+    let mut h = remote_harness(config(), &remote);
+    h.call(
+        "run.create",
+        obj(vec![
+            ("objective", s("go remote")),
+            ("repo", s("/repo")),
+            ("context", s("compiled")),
+        ]),
+    )
+    .unwrap();
+    add_remote(&mut h, "a", Some("build"));
+    start(&mut h);
+
+    // What the adapter sends to the host is read from the local worktree, so the pack and the
+    // brief must be in it when the host is prepared (and they are written by the same code as for
+    // a local task).
+    let prepared = remote.prepared();
+    assert_eq!(prepared.len(), 1);
+    let wt = prepared[0].worktree.clone();
+    let (_, brief) = h
+        .world
+        .briefs()
+        .into_iter()
+        .find(|(w, _)| *w == wt)
+        .expect("the brief was written to the worktree that is sent");
+    assert!(brief.contains(".fleet/context.md"), "{brief}");
+    let (text, manifest) = h
+        .world
+        .context_files(&wt)
+        .expect("the pack was written to the worktree that is sent");
+    assert!(!text.is_empty() && manifest.contains("layers"));
+    assert_eq!(h.world.saved_packs("r1", "a").len(), 1);
+    // and the worker's own paths are the host's
+    assert_eq!(remote.launched()[0].args[3], "/remote/build/r1/a");
+}

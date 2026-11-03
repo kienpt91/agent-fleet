@@ -680,3 +680,64 @@ fn quality_gates_run_locally_on_the_verified_commit_never_on_the_host() {
     );
     r.f.shutdown();
 }
+
+// ---- compiled context and messages on a remote task ------------------------------------------------
+
+/// A plan with `context = "compiled"` in its `[run]` table.
+fn compiled_plan(f: &Fleet, tasks: &[T]) -> PathBuf {
+    let toml = plan_toml(&f.repo, "r1", 1, tasks).replacen(
+        "[run]\n",
+        "[run]\ncontext = \"compiled\"\n",
+        1,
+    );
+    f.tmp.write("plan-compiled.toml", &toml)
+}
+
+#[test]
+fn a_remote_task_of_a_compiled_run_gets_the_same_pack_and_brief_and_its_handoff_comes_back() {
+    let out = std::env::temp_dir().join(unique_token("remote-ctx"));
+    fs::create_dir_all(&out).unwrap();
+    let o = out.display().to_string();
+    let script = format!(
+        "if [ ! -e {o}/first ]; then : > {o}/first; \
+printf '{{\"version\":1,\"summary\":\"left off at step 3\"}}' > .fleet/handoff.json; exit 1; fi; \
+cp .fleet/context.md {o}/second.md; cp .fleet/context.json {o}/second.json; cp .fleet/brief.md {o}/brief.md; \
+printf '{{\"version\":1,\"status\":\"done\",\"summary\":\"done remotely\"}}' > .fleet/result.json"
+    );
+    let Some(mut r) = rig(&script, "timeout_secs = 90", |c| c.set("max_retries", "2")) else {
+        return;
+    };
+    start_with_host(&mut r);
+    r.f.start();
+    let plan = compiled_plan(&r.f, &[t("a").worker("remote-sh").host("build")]);
+    r.f.ok(&["plan", plan.to_str().unwrap()]);
+    r.f.ok(&["start", "--run", "r1"]);
+    let task =
+        r.f.wait_task("r1", "a", &["completed", "failed", "blocked"]);
+    assert_eq!(
+        jstr(&task, "status"),
+        "completed",
+        "{task:?}\n{}",
+        r.f.diag()
+    );
+    // The second attempt found the pack fleet compiled for it, on the host, and the pointer brief.
+    let second = fs::read_to_string(out.join("second.md")).unwrap();
+    let show = r.f.json(&["context", "show", "r1/a", "--json"]);
+    assert_eq!(
+        jstr(&show, "text"),
+        second,
+        "the host got exactly the stored pack"
+    );
+    let manifest = fs::read_to_string(out.join("second.json")).unwrap();
+    assert!(manifest.contains("neo-context/1"), "{manifest}");
+    let brief = fs::read_to_string(out.join("brief.md")).unwrap();
+    assert!(brief.contains(".fleet/context.md"), "{brief}");
+    // The summary the first attempt left on the host came back (as the local one would have) and
+    // is carried into the retry pack, quoted and labelled.
+    assert!(second.contains("> left off at step 3"), "{second}");
+    assert!(second.contains("UNVERIFIED ("), "{second}");
+    // Nothing is left on the host.
+    assert_eq!(r.remote_entries(), Vec::<String>::new());
+    let _ = fs::remove_dir_all(&out);
+    r.f.shutdown();
+}

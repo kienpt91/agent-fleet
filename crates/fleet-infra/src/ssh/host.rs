@@ -18,8 +18,10 @@ use fleet_app::remote::{
 };
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::ids::{show, HostName, RunId, TaskId};
-use fleet_domain::limits::MAX_BRIEF_FILE_BYTES;
-use fleet_domain::remote::{ContractFile, RemoteCall, RemoteSignal, REMOTE_CONTRACT_READ};
+use fleet_domain::limits::{MAX_BRIEF_FILE_BYTES, MAX_CONTEXT_FILE_BYTES};
+use fleet_domain::remote::{
+    ContractFile, InputFile, RemoteCall, RemoteSignal, REMOTE_CONTRACT_READ,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -319,24 +321,39 @@ impl Shared {
             }
             return Err(self.client.explain(host, "sending the code", &done));
         }
-        // The brief, from the local worktree (a plain file below `.fleet`).
-        let brief_path = Path::new(worktree).join(".fleet").join("brief.md");
-        let brief = fsx::read_regular(&brief_path, MAX_BRIEF_FILE_BYTES as u64)
-            .map_err(|e| FleetError::invalid(format!("cannot read the brief: {e}")))?;
-        let put = RemoteCall::PutBrief {
-            layout,
-            run: &t.run,
-            task: &t.task,
-        };
-        let done = self.client.run(
-            host,
-            &put,
-            Input::Bytes(brief),
-            Output::Capture { max: 4096 },
-            budget_left(started, budget)?,
-        )?;
-        if !done.success() {
-            return Err(self.client.explain(host, "sending the brief", &done));
+        // What a local worker finds in `.fleet`, from the local worktree (plain files there): the
+        // brief, and the compiled context with its manifest when the run uses compiled context.
+        let dir = Path::new(worktree).join(".fleet");
+        let files = [
+            (InputFile::Brief, MAX_BRIEF_FILE_BYTES, true),
+            (InputFile::Context, MAX_CONTEXT_FILE_BYTES, false),
+            (InputFile::Manifest, MAX_CONTEXT_FILE_BYTES, false),
+        ];
+        for (file, max, required) in files {
+            let name = file.file_name();
+            let bytes = match fsx::read_regular_in(&dir, name, max as u64) {
+                Ok(b) => b,
+                Err(fsx::ReadError::Missing) if !required => continue,
+                Err(e) => {
+                    return Err(FleetError::invalid(format!("cannot read {name}: {e}")));
+                }
+            };
+            let put = RemoteCall::PutFile {
+                layout,
+                run: &t.run,
+                task: &t.task,
+                file,
+            };
+            let done = self.client.run(
+                host,
+                &put,
+                Input::Bytes(bytes),
+                Output::Capture { max: 4096 },
+                budget_left(started, budget)?,
+            )?;
+            if !done.success() {
+                return Err(self.client.explain(host, &format!("sending {name}"), &done));
+            }
         }
         Ok(())
     }
@@ -395,7 +412,11 @@ impl Shared {
 
         // 2. The worker's contract files.
         if reachable {
-            for file in [ContractFile::Result, ContractFile::Question] {
+            for file in [
+                ContractFile::Result,
+                ContractFile::Question,
+                ContractFile::Handoff,
+            ] {
                 match self.read_contract(host, t, &layout, file) {
                     Ok(Some(bytes)) => {
                         if let Err(e) = self.store_contract(&req.worktree, file, &bytes) {

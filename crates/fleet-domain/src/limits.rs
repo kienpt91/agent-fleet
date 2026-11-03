@@ -33,6 +33,8 @@ pub const MAX_ACTION_ARGS: usize = 64;
 pub const MAX_ACTION_ARG_LEN: usize = 4 * 1024;
 pub const MAX_BRIEF_ARG_BYTES: usize = 16 * 1024;
 pub const MAX_BRIEF_FILE_BYTES: usize = 128 * 1024;
+/// The largest compiled context (`.fleet/context.md`) handed to a worker.
+pub const MAX_CONTEXT_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Files a worker can write (`.fleet/result.json`, `.fleet/question.json`).
 pub const MAX_CONTRACT_FILE: u64 = 64 * 1024;

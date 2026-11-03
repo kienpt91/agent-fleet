@@ -10,7 +10,7 @@ use crate::json;
 use fleet_app::ports::ContractFiles;
 use fleet_domain::contract::{ContractRead, WorkerHandoff, WorkerQuestion, WorkerResult};
 use fleet_domain::error::{FleetError, Result};
-use fleet_domain::limits::{MAX_BRIEF_FILE_BYTES, MAX_CONTRACT_FILE};
+use fleet_domain::limits::{MAX_BRIEF_FILE_BYTES, MAX_CONTEXT_FILE_BYTES, MAX_CONTRACT_FILE};
 use fleet_domain::redact::Redactor;
 use fleet_domain::sanitize::head_str;
 use fleet_domain::value::Value;
@@ -24,8 +24,6 @@ const BRIEF_FILE: &str = "brief.md";
 const HANDOFF_FILE: &str = "handoff.json";
 const CONTEXT_FILE: &str = "context.md";
 const MANIFEST_FILE: &str = "context.json";
-/// The largest compiled context handed to a worker.
-const MAX_CONTEXT_FILE: usize = 2 * 1024 * 1024;
 
 /// Reads and prepares the contract files. Free text a worker writes (result summary, question
 /// text and choices) is redacted on the way in, so no secret reaches the log or other briefs.
@@ -111,9 +109,9 @@ impl ContractFiles for FsContractFiles {
     }
 
     fn prepare_context(&self, worktree: &str, text: &str, manifest_json: &str) -> Result<()> {
-        if text.len() > MAX_CONTEXT_FILE {
+        if text.len() > MAX_CONTEXT_FILE_BYTES {
             return Err(FleetError::invalid(format!(
-                "the context is larger than {MAX_CONTEXT_FILE} bytes"
+                "the context is larger than {MAX_CONTEXT_FILE_BYTES} bytes"
             )));
         }
         let dir = Self::fleet_dir(worktree)?;

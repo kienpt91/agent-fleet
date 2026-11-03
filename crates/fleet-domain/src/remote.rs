@@ -298,8 +298,9 @@ rm -f .git/fleet-in.bundle; \
 printf '.fleet/\\n' >> .git/info/exclude; \
 g checkout -q -b work fleet-sent";
 
-/// Script of [`RemoteCall::PutBrief`]: `$1` worktree; the brief on stdin.
-const PUT_BRIEF: &str = "set -eu; umask 077; cd -- \"$1\"; mkdir -p .fleet; cat > .fleet/brief.md";
+/// Script of [`RemoteCall::PutFile`]: `$1` worktree, `$2` the file name below `.fleet` (one of the
+/// constants of [`InputFile::file_name`]); the file on stdin.
+const PUT_FILE: &str = "set -eu; umask 077; cd -- \"$1\"; mkdir -p .fleet; cat > \".fleet/$2\"";
 
 /// Script of [`RemoteCall::Launch`]: `$1` worktree, `$2` process id file, then the program and
 /// its arguments. Records the process id and the process group (what a later signal needs) and
@@ -359,7 +360,7 @@ const ROUND_TRIP: &str = "printf '%s\\0' \"$@\"; uname -s; id -u";
 /// Every constant script, for tests and for the documentation of what runs on a remote host.
 pub const SCRIPTS: [(&str, &str); 10] = [
     ("prepare", PREPARE),
-    ("put-brief", PUT_BRIEF),
+    ("put-file", PUT_FILE),
     ("put-env", PUT_ENV),
     ("launch", LAUNCH),
     ("read-contract", READ_CONTRACT),
@@ -372,11 +373,33 @@ pub const SCRIPTS: [(&str, &str); 10] = [
 
 // ---- calls ---------------------------------------------------------------------------------------------
 
+/// A file fleet writes into the `.fleet` directory of a remote worktree before the worker starts:
+/// what a local worker finds there as well (the brief, and the compiled context with its manifest
+/// when the run uses compiled context).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputFile {
+    Brief,
+    Context,
+    Manifest,
+}
+
+impl InputFile {
+    pub fn file_name(self) -> &'static str {
+        match self {
+            InputFile::Brief => "brief.md",
+            InputFile::Context => "context.md",
+            InputFile::Manifest => "context.json",
+        }
+    }
+}
+
 /// A worker contract file that is read back from a remote worktree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContractFile {
     Result,
     Question,
+    /// The summary a worker leaves for the next attempt (compiled context).
+    Handoff,
 }
 
 impl ContractFile {
@@ -384,6 +407,7 @@ impl ContractFile {
         match self {
             ContractFile::Result => "result.json",
             ContractFile::Question => "question.json",
+            ContractFile::Handoff => "handoff.json",
         }
     }
 }
@@ -422,11 +446,12 @@ pub enum RemoteCall<'a> {
         run: &'a RunId,
         task: &'a TaskId,
     },
-    /// Writes stdin to `.fleet/brief.md` of the worktree.
-    PutBrief {
+    /// Writes stdin to a file of the `.fleet` directory of the worktree.
+    PutFile {
         layout: &'a RemoteLayout,
         run: &'a RunId,
         task: &'a TaskId,
+        file: InputFile,
     },
     /// Writes stdin (the text of [`env_file_text`]) to the environment file of the task.
     PutEnv {
@@ -560,9 +585,19 @@ impl RemoteCall<'_> {
                     &[layout.base(), &dir],
                 )
             }
-            RemoteCall::PutBrief { layout, run, task } => {
+            RemoteCall::PutFile {
+                layout,
+                run,
+                task,
+                file,
+            } => {
                 let dir = layout.worktree(run, task);
-                script_call(&fixed_env(path, layout.base()), PUT_BRIEF, false, &[&dir])
+                script_call(
+                    &fixed_env(path, layout.base()),
+                    PUT_FILE,
+                    false,
+                    &[&dir, file.file_name()],
+                )
             }
             RemoteCall::PutEnv { layout, run, task } => script_call(
                 &fixed_env(path, layout.base()),
@@ -984,10 +1019,11 @@ mod tests {
                 run: &run,
                 task: &task,
             },
-            RemoteCall::PutBrief {
+            RemoteCall::PutFile {
                 layout: &l,
                 run: &run,
                 task: &task,
+                file: InputFile::Context,
             },
             RemoteCall::ReadContract {
                 layout: &l,
