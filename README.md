@@ -429,7 +429,7 @@ never sees, stores or passes a token** (ADR 20). Commands: `fleet github status`
 ```toml
 [github]
 enabled = true
-repo = "owner/name"            # or leave it out: read from the remote of a run's repository
+repo = "owner/name"            # pin it whenever workers run (see below); else read from the remote of a run's repository
 remote = "origin"              # the git remote branches are pushed to
 base = "main"                  # base of a new pull request unless --base is given
 # allowed_hosts = ["github.com"]; host = "ghe.example.org" for GitHub Enterprise Server
@@ -453,9 +453,18 @@ base = "main"                  # base of a new pull request unless --base is giv
   redacted, quoted line by line and introduced by `from GitHub issue #n (untrusted)`; it never becomes a contract, a goal or an approval.
 - **A pull request needs an approval of exactly that pull request** (ADR 21): repository, base, head branch, head commit, title, body and
   draft flag are in the digest; change any of them (or move the branch) and the old approval does not apply; an approval is used once and is
-  spent only after a preflight read succeeded. The push is `<sha>:refs/heads/<branch>` through the hardened git runner: no force, tags or extra
-  refs; the remote URL is re-read, compared with the approved repository and rebuilt; ssh remotes and configuration that rewrites URLs or steers
-  HTTP are refused.
+  spent only after a preflight read succeeded and the adapter confirmed it can take the publication (trusted `gh`, open rate gate, free slot).
+  `fleet approval list` shows each field on its own line, the draft flag before the long ones and the whole body (up to 4 KiB, quoted). The push
+  is `<sha>:refs/heads/<branch>` through the hardened git runner: no force, tags or extra refs; the remote URL is re-read, compared with the
+  approved repository and rebuilt; ssh remotes and configuration that rewrites URLs or steers HTTP are refused, a configuration git cannot read is
+  refused, and git runs in a private throwaway git directory, so it never reads the repository's configuration at all (a worker can write it).
+- **Which repository.** `[github] repo` pins it, and you should whenever workers run: without it the repository is read from the remote of the run's
+  repository, a line a worker can rewrite. It is then recorded when the run is created, a later different answer is refused until you pin `repo`, and
+  `issue to-task`, `pr create` and the approval request say which repository it is and where that came from. Errors never repeat the user name,
+  password or query of a URL, and what `gh` and `git` print is redacted before it is shown or recorded.
+- **What the approval is not.** It is a gate inside fleet. `gh`'s credential store belongs to your user, as do the workers: a worker can run `gh` or
+  `git push` itself. Run workers as another user or in a container without your `gh` configuration, and give `gh` a fine-grained token for the one
+  repository (see [SECURITY.md](SECURITY.md)).
 - **Push credentials, honestly.** The hardened runner reads none of your git configuration, so your own credential helper is *not* used. For
   an https remote choose `push_credentials = "gh"` (git runs `gh auth git-credential` for that one push) or `"helper"` with the absolute path of
   one helper (for example the macOS keychain helper). `"none"` works for remotes that need no credential, and for local repositories (tests,

@@ -23,10 +23,18 @@ the daemon runs next to workers that execute untrusted code as the same user.
   dashboard. Hard timeout, output capped at 2 MiB, answer parsed as JSON under a size cap and read through strict schemas
   (required typed fields, caps, terminal control and secret shapes removed), a rate gate that backs off with jitter and
   never starts a process while blocked.
+- What `gh` prints to stderr, and what `git push` prints, is cleaned and passed through the daemon's redactor before it is
+  part of an error, a reply or a `pull_request_failed` event.
 - The values of secret-looking variables of the daemon's environment are already redaction literals (`[redact] env_values`),
   so a token that did leak into an answer is redacted before it is stored.
 
 ## Consequences
+"fleet never holds a token" is a statement about fleet, not a credential boundary. `gh`'s credentials are readable by every
+process of the operator's user, workers included (workers run as the same user, see ADR 4): a worker can call `gh` or
+`git push` itself without fleet's approval. The approval gate controls what *fleet* publishes. To make it mean more, run
+workers as another user or in a container without access to the `gh` configuration, and give `gh` a fine-grained token for the
+one repository.
+
 fleet cannot sign in for you and cannot work where `gh` cannot. On Linux desktops where `gh` keeps its token in a session
 keyring, the minimal environment can hide the keyring (name `DBUS_SESSION_BUS_ADDRESS` in `env_pass`). `gh` is trusted code
 of the operator, not a sandbox boundary: a replaced `gh` binary outside the repositories is outside this defence.
