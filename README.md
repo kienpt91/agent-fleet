@@ -419,6 +419,27 @@ fails the diff constraint; secrets in check output are redacted before they reac
 file of its worktree to point at a repository of its own (alternates, a replace ref) gets a failed review, no evidence and no merge**
 (the commit and tree come from the real repository, ADR 16); nothing above a check's working directory is the state directory.
 
+## Self-development
+
+NEO can be pointed at its own repository: agents write the code of the remaining milestones, one named file per task, and
+fleet's own verification contracts decide whether a task may complete. The scaffold is in [`dogfood/`](dogfood/RUNBOOK.md).
+The principle (ADR 20): **a system must not be able to loosen its own guardrails.** The approval and admission code, the
+verification and evidence code, the secret scanner and hooks, CI, SECURITY.md, the examples that define commands, the dependency
+manifests and lock file, the architecture tests and the `dogfood/` directory itself are [protected
+paths](dogfood/PROTECTED_PATHS.md): no task may change them, and a change needs a commit authored by a person or a human approval of
+the exact diff plus an independent security review. Every task's contract (the `diff` check now takes a `deny` list) forbids them and
+also runs formatting, clippy with `-D warnings`, the architecture tests, the layered tests, the secret scanner, an unchanged
+`Cargo.lock` and a check that no measured number of the documentation changed; a roadmap plan for N3 to N5 lists the tasks, and the
+ones that touch protected paths are marked human-only with a contract that can never pass.
+
+What is and is not safe today, exactly: the machinery is tested (shell tests of the checkers, consistency tests of the data, a dry run with the
+scripted agent in a container) and **the scaffold itself has not been run with a real agent**; earlier trial runs with hand-written contracts
+completed two real tasks, and showed that the agent, headless in `--approval-mode write`, cannot run commands, so it edits blind and fleet's own
+verification is the whole proof. The worker is the same user as you and is
+not sandboxed, so the runs belong on a throwaway clone, in a container, a VM or under another OS user; there is no token governor, so spend
+is limited only by a hard limit you set in the provider's console; `merge` stays a human approval. See
+[docs/neo.md](docs/neo.md#self-development-what-is-and-is-not-safe-today) and the [runbook](dogfood/RUNBOOK.md).
+
 ## Concepts
 
 | Term | Meaning |
@@ -995,7 +1016,7 @@ DOCKER_NET=none run 'scripts/neo-demo.sh /target/release/fleet'   # the NEO N1 d
 ```
 
 Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/fleet-app`, `crates/fleet-infra`,
-`crates/fleet-cli`, `docs/`, `examples/`, `scripts/`, `docker/`.
+`crates/fleet-cli`, `docs/`, `examples/`, `scripts/`, `docker/`, `dogfood/` (the self-development scaffold).
 
 ## License
 

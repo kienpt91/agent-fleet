@@ -199,6 +199,44 @@ isolation, as for workers. A weak check passes a weak result.
 - The `PATH` cut-down keeps world-writable and in-repository directories out, but does not prove that the directories it
   keeps hold only honest programs.
 
+## Self-development: what is and is not safe today
+
+NEO can be pointed at its own repository: agents write the code of the remaining milestones one named file at a time, and
+fleet's own contracts decide whether each task may complete. The scaffold is in [dogfood/](../dogfood/RUNBOOK.md); the
+decision is [ADR 20](adr/0020-neo-may-not-modify-its-own-guardrails.md). Exactly what that means today:
+
+**Exists and is tested (without any real agent):**
+
+- A list of protected paths NEO may never change by itself (the approval and admission code, the verification and evidence
+  code, the secret scanner and hooks, CI, SECURITY.md, the examples that define commands, the dependency manifests and the
+  lock file, the architecture tests, the `dogfood/` directory), with the reason of each entry
+  ([PROTECTED_PATHS.md](../dogfood/PROTECTED_PATHS.md)). A change to one needs a commit authored by a person, or a human
+  approval of the exact diff plus an independent security review.
+- The `diff` check takes a `deny` list: every self-development contract forbids the whole list, next to a scope that allows
+  one named file, and also runs formatting, lints with `-D warnings`, the architecture tests, the layered tests, the secret
+  scanner, an unchanged `Cargo.lock` and a check that no measured number of README.md or docs/ changed
+  ([contracts](../dogfood/contracts/README.md)). The checker scripts run from a copy outside the repository.
+- A roadmap plan for N3, N4 and N5 and maintenance with a goal and a contract per task; tasks that touch protected paths are
+  **human-only**: they use a worker that fails at once and a contract that no change can satisfy
+  ([human-only.md](../dogfood/human-only.md)). One narrow reviewed exception exists, a test-only change in one protected Rust
+  file, with a stress check for flaky tests ([contracts](../dogfood/contracts/README.md)).
+- A daemon configuration template (one worker, one retry, merge and external commands as approvals, no secret variable), a
+  container wrapper (offline, tree read-only), a runbook, and a dry run with the scripted agent that was run in the development
+  container.
+
+**Not safe, not done, not claimed:**
+
+- **This scaffold has not been run with a real agent.** Earlier trial runs of NEO with `omp` on the owner's macOS, with hand-written
+  contracts, completed two real tasks with every check passing, and showed that in `--approval-mode write` the agent cannot run shell
+  commands headless: it edits blind, and fleet's own run of the contract is the whole proof. That is the safe default of the template. The
+  isolated agent profile and the scaffold's own contracts were not exercised with the real agent.
+- The worker is the same user as the operator and is not sandboxed: contracts judge what was committed, not what a process
+  did to other files. Use a throwaway clone and a container, a VM or another OS user.
+- No token governor (N4) and no context compiler (N2, in progress elsewhere): nothing limits spend but the provider's own
+  console, and the agent sees a task's spec as its brief, not its contract.
+- A weak check passes a weak result, and a person still reads every diff. `merge` stays a human approval.
+
 See the decisions in [docs/adr/0011](adr/0011-neo-domain-crates-and-application-module.md),
-[0012](adr/0012-goals-and-evidence-are-event-sourced.md), [0013](adr/0013-verification-by-fleet-gates-completion.md) and [0014](adr/0014-checks-run-on-an-export-and-their-processes-are-untrusted.md),
-and the vocabulary in [domain.md](domain.md).
+[0012](adr/0012-goals-and-evidence-are-event-sourced.md), [0013](adr/0013-verification-by-fleet-gates-completion.md),
+[0014](adr/0014-checks-run-on-an-export-and-their-processes-are-untrusted.md) and
+[0020](adr/0020-neo-may-not-modify-its-own-guardrails.md), and the vocabulary in [domain.md](domain.md).
