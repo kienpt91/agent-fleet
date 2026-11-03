@@ -50,6 +50,8 @@ the summary instead of changing it):
 
 Rules: standard library only, no new dependency, no unsafe. Do not touch any other file. Do not edit
 numbers in README.md or docs/. Do not run commands that need the network.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -71,6 +73,8 @@ contains a newline or a space outside string contents.
 
 Change ONLY crates/fleet-domain/src/value.rs and only inside the existing test module. Do not change
 any non-test line. Standard library only, no unsafe. Do not edit numbers in README.md or docs/.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -92,6 +96,8 @@ Add three rows to the glossary table of docs/domain.md, in the same style as the
 
 Change ONLY docs/domain.md and add nothing else to it. Do not edit any number, test count or
 coverage figure anywhere. No new links except to the three dogfood files named above.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 # ---- maintenance --------------------------------------------------------------------------------------
@@ -111,6 +117,8 @@ targets and anchor spellings; do not rewrite prose and NEVER edit a number: test
 figures, check counts, crate counts and the soak figures are measured by a person and a check fails the
 task if any such line changes. If a link cannot be fixed without changing a claim, leave it and say
 so in the summary.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -178,6 +186,8 @@ through its canonical text; random strings never panic the constructor.
 
 Change ONLY crates/neo-knowledge/src/source.rs. Standard library and fleet-domain only, no unsafe, no
 unwrap/expect/indexing outside tests, no I/O, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -200,6 +210,8 @@ assertion alone can never produce verified (test it for every source kind).
 Tests: every legal and every illegal transition; claims over the bound are refused; hostile text
 (control characters, bidi overrides) is refused. Change ONLY crates/neo-knowledge/src/fact.rs.
 Standard library and fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -224,6 +236,8 @@ verification rule; a superseded fact never becomes verified again; bounds hold.
 Change ONLY files below crates/neo-knowledge/src/ and crates/neo-knowledge/tests/. Do not edit
 Cargo.toml (no dependency may be added). Standard library and fleet-domain only, no unsafe, no
 unwrap/expect/indexing outside tests.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -242,6 +256,8 @@ Tests: unchanged hashes give nothing, a changed hash gives exactly the facts bou
 the result is sorted and deterministic, a map with 100000 entries is handled in linear time.
 Change ONLY crates/neo-knowledge/src/stale.rs. Standard library and fleet-domain only, no unsafe, no
 unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -261,6 +277,8 @@ superseded by the other, scopes, and a property test with a deterministic genera
 does not depend on the order the facts were verified in. Change ONLY
 crates/neo-knowledge/src/contradiction.rs. Standard library and fleet-domain only, no unsafe, no
 unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -280,6 +298,8 @@ Tests: valid documents, each kind of error, and a fuzz-style test with a determi
 builds 20000 random `Value` trees and checks that parsing never panics and that whatever parses
 satisfies the bounds of fact.rs. Change ONLY crates/neo-knowledge/src/parse.rs. Standard library and
 fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -308,6 +328,8 @@ worker file, storage and its bounds, the `fleet facts` commands, and an honest l
 there. Describe only what the code does: read crates/neo-knowledge and the commands before writing,
 and quote limits from limits.rs. Do not state test counts or coverage figures. Change ONLY
 docs/knowledge.md.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -351,6 +373,8 @@ infallible and deterministic, so replay gives the same state.
 Tests including a property test with a deterministic generator: remaining is never negative, the sum of
 charges equals spent, replay equals live. Change ONLY crates/neo-governor/src/budget.rs. Standard
 library and fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -368,6 +392,8 @@ Tests: reported replaces estimated, estimated after reported is ignored, duplica
 idempotent, out-of-order arrival ends in the same totals (property test, deterministic generator).
 Change ONLY crates/neo-governor/src/meter.rs. Standard library and fleet-domain only, no unsafe, no
 unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -386,6 +412,8 @@ Tests: empty text, ASCII, CJK, emoji, a 10 MiB string finishes, monotonicity (pr
 deterministic generator), the estimate of a concatenation is at most the sum of the estimates plus a
 small constant. Change ONLY crates/neo-governor/src/estimator.rs. Standard library only, no unsafe,
 no unwrap/expect/indexing outside tests.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -405,6 +433,8 @@ over.
 Tests for each rule and a property test of monotonicity with a deterministic generator. Change ONLY
 crates/neo-governor/src/policy.rs. Standard library and fleet-domain only, no unsafe, no
 unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -420,6 +450,8 @@ decision is never followed by Allow in the same window, and estimates never exce
 later replaces by more than the documented bound. Use only the public API of the crate.
 
 Change ONLY crates/neo-governor/tests/accounting.rs. Standard library and the crate itself only.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -444,6 +476,8 @@ Write docs/governor.md (a new file): budgets and their levels, metering (reporte
 policies, the hard stop and what it kills, `fleet budget`, the bounds, and an honest list of what is not
 there (token counts of providers are approximations; spend is checked by the provider's own dashboard).
 Read the code before writing; state no test counts or coverage figures. Change ONLY docs/governor.md.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -488,6 +522,8 @@ Tests: each kind, each refusal, strings assembled at run time that have the shap
 providers are refused (build them in the test from pieces; never write a key-shaped literal), a
 property test that random strings never panic. Change ONLY crates/neo-broker/src/refs.rs.
 Standard library and fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -506,6 +542,8 @@ State clearly in the module comment that the pool assigns the owner's own accoun
 has no notion of rotating identities to get around a provider's limits and none may be added.
 Tests for each policy, expiry, exclusivity and determinism. Change ONLY crates/neo-broker/src/account.rs.
 Standard library and fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -525,6 +563,8 @@ account (test: two leases of different accounts for the same task give the same 
 Tests for each denial, revocation order, and a property test with a deterministic generator. Change ONLY
 crates/neo-broker/src/capability.rs. Standard library and fleet-domain only, no unsafe, no
 unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]
@@ -540,6 +580,8 @@ is responsible for complying with each provider's terms; NEO will not implement 
 (rotating identities to defeat per-account limits, hiding usage, spoofing); subscription logins of
 consumer products are out of scope unless the provider documents programmatic use. Short, plain,
 no legal claims, no provider-specific claims you cannot source. Change ONLY docs/broker-terms.md.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
 '''
 
 [[tasks]]

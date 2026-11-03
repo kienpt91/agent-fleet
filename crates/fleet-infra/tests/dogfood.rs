@@ -783,6 +783,13 @@ fn the_plan_is_a_valid_dag_whose_every_task_names_its_worker_and_says_when_it_is
                     "{}",
                     t.id
                 );
+                // the agent runs in write mode: it cannot run commands, fleet commits and checks
+                assert!(
+                    t.spec.contains("You cannot run commands")
+                        && t.spec.contains("Commit nothing yourself"),
+                    "{}: the spec must say that the agent edits blind",
+                    t.id
+                );
             }
             other => panic!("{}: worker {other}", t.id),
         }
