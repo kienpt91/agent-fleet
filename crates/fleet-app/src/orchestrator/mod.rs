@@ -74,6 +74,9 @@ pub struct Orchestrator {
     /// Session ends that could not be recorded yet (the store failed); retried every tick so a
     /// task never stays `running` without a session.
     pub(crate) pending_ends: BTreeMap<Key, WorkerEnd>,
+    /// Invalid outbox files rejected without an event since the last one that was recorded, per
+    /// task (not persisted: it only enriches the next record).
+    pub(crate) skipped_files: BTreeMap<Key, u32>,
     pub(crate) recent: VecDeque<Recent>,
     pub(crate) started_ms: u64,
     pub(crate) pid: u64,
@@ -123,6 +126,7 @@ impl Orchestrator {
             verify_outcomes: VecDeque::new(),
             verified: BTreeSet::new(),
             pending_ends: BTreeMap::new(),
+            skipped_files: BTreeMap::new(),
             recent,
             started_ms,
             pid: 0,

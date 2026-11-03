@@ -261,6 +261,15 @@ impl World {
             .find(|(_, s)| s.spec.task.as_str() == task && !s.released)
             .map(|(k, _)| SessionId(*k))
     }
+    /// The live sessions of one run, by task id.
+    pub fn sessions_of_run(&self, run: &str) -> Vec<(String, SessionId)> {
+        self.lock()
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.spec.run.as_str() == run && !s.released)
+            .map(|(k, s)| (s.spec.task.to_string(), SessionId(*k)))
+            .collect()
+    }
     pub fn exit(&self, id: SessionId, code: i64) {
         if let Some(s) = self.lock().sessions.get_mut(&id.0) {
             s.state = SessionState::Exited {

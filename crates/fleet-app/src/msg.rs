@@ -7,7 +7,7 @@ use fleet_domain::approval::Approval;
 use fleet_domain::fleet::FleetState;
 use fleet_domain::ids::{ChannelName, RunId, TaskId};
 use fleet_domain::msg::board::MessageBoard;
-use fleet_domain::msg::channel::{Channel, Member};
+use fleet_domain::msg::channel::{Channel, Member, MuteNote};
 use fleet_domain::msg::message::{DeliveryState, Message, Sender};
 use fleet_domain::status::{ApprovalStatus, MessageStatus};
 use fleet_domain::value::Value;
@@ -212,23 +212,29 @@ pub fn list_value(
         .take(limit)
         .map(|m| message_value(m, status_of(state, m, now_ms), false))
         .collect();
-    let muted_tasks: Vec<Value> = board
+    let mute_row = |run: &str, task: &str, channel: Option<&str>, note: &MuteNote| {
+        Value::object([
+            ("run", Value::str(run)),
+            ("task", Value::str(task)),
+            // set when the task is muted on that channel only
+            ("channel", channel.map_or(Value::Null, Value::str)),
+            ("reason", Value::str(note.reason.as_str())),
+            ("by", Value::str(&note.by)),
+            (
+                "gate",
+                note.gate
+                    .as_ref()
+                    .map_or(Value::Null, |g| Value::str(g.as_str())),
+            ),
+        ])
+    };
+    let mut muted_tasks: Vec<Value> = board
         .muted_tasks()
-        .map(|((run, task), note)| {
-            Value::object([
-                ("run", Value::str(run.as_str())),
-                ("task", Value::str(task.as_str())),
-                ("reason", Value::str(note.reason.as_str())),
-                ("by", Value::str(&note.by)),
-                (
-                    "gate",
-                    note.gate
-                        .as_ref()
-                        .map_or(Value::Null, |g| Value::str(g.as_str())),
-                ),
-            ])
-        })
+        .map(|((run, task), note)| mute_row(run.as_str(), task.as_str(), None, note))
         .collect();
+    muted_tasks.extend(board.muted_members().map(|((run, channel, task), note)| {
+        mute_row(run.as_str(), task.as_str(), Some(channel.as_str()), note)
+    }));
     Value::object([
         ("schema", Value::str("fleet.msg.list/1")),
         ("channels", Value::array(channels)),

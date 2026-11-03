@@ -14,6 +14,7 @@ use crate::ids::{validate_ref_name, validate_text, ApprovalId, DecisionId, RunId
 use crate::limits::{
     MAX_APPROVAL_RECORDS, MAX_OBJECTIVE, MAX_OPEN_DECISIONS, MAX_RUNS, MAX_TOTAL_TASKS,
 };
+use crate::msg::limits::{MAX_OPEN_CHANNEL_GATES, MAX_OPEN_MESSAGE_APPROVALS};
 use crate::run::{validate_parallel, NewTask, RetryPolicy, Run, WorkerEnd};
 use crate::sanitize::{flatten_line, quote_lines, tail_str};
 use crate::status::{ApprovalStatus, BlockKind, DecisionKind, EndKind, Purpose, TaskStatus};
@@ -139,6 +140,23 @@ impl FleetState {
                     .join(", ")
             ))),
         }
+    }
+
+    /// Message approvals that wait for a person: they have a share of their own in the decision
+    /// pool, so a flood of messages cannot take the room questions and merges need.
+    pub fn open_message_approvals(&self) -> usize {
+        self.approvals
+            .values()
+            .filter(|a| a.purpose == Purpose::Message && a.status == ApprovalStatus::Pending)
+            .count()
+    }
+
+    /// Open gates about muted channels and tasks (their own share of the pool as well).
+    pub fn open_channel_gates(&self) -> usize {
+        self.decisions
+            .values()
+            .filter(|d| d.kind == DecisionKind::Channel && d.is_open())
+            .count()
     }
 
     pub fn open_decision_count(&self) -> usize {
@@ -515,6 +533,9 @@ impl FleetState {
         hasher: &dyn Digest,
     ) -> Result<(ApprovalId, DomainEvent)> {
         self.run(run)?;
+        if self.open_message_approvals() >= MAX_OPEN_MESSAGE_APPROVALS {
+            return Err(FleetError::limit("too many messages wait for approval"));
+        }
         if self.open_decision_count() >= MAX_OPEN_DECISIONS {
             return Err(FleetError::limit(
                 "too many unanswered questions and approvals",
@@ -543,6 +564,11 @@ impl FleetState {
         choices: &[&str],
     ) -> Result<(DecisionId, DomainEvent)> {
         self.run(run)?;
+        if self.open_channel_gates() >= MAX_OPEN_CHANNEL_GATES {
+            return Err(FleetError::limit(
+                "too many gates about muted channels are open",
+            ));
+        }
         if self.open_decision_count() >= MAX_OPEN_DECISIONS {
             return Err(FleetError::limit(
                 "too many unanswered questions and approvals",
@@ -2009,6 +2035,72 @@ mod tests {
                 &FakeDigest
             )
             .is_err());
+    }
+
+    #[test]
+    fn message_approvals_and_channel_gates_have_shares_of_their_own_in_the_decision_pool() {
+        let (mut s, run) = fleet_with_running(&["a", "b"]);
+        let action = |n: u64| {
+            Action::message(
+                &crate::ids::MessageId::from_seq(n),
+                "review",
+                "task:a",
+                &["b".to_string()],
+                "abc123",
+            )
+        };
+        for n in 0..MAX_OPEN_MESSAGE_APPROVALS {
+            let (_, ev) = s
+                .request_message_approval(
+                    &run,
+                    &tid("a"),
+                    &action(n as u64 + 1),
+                    60_000,
+                    100,
+                    &FakeDigest,
+                )
+                .unwrap();
+            s.apply(&ev);
+        }
+        assert_eq!(s.open_message_approvals(), MAX_OPEN_MESSAGE_APPROVALS);
+        let full = s
+            .request_message_approval(&run, &tid("a"), &action(999), 60_000, 100, &FakeDigest)
+            .unwrap_err();
+        assert!(
+            full.message.contains("wait for approval"),
+            "{}",
+            full.message
+        );
+        // the pool still has room for everything else: a gate, and an answered approval frees one
+        const { assert!(MAX_OPEN_MESSAGE_APPROVALS + MAX_OPEN_CHANNEL_GATES < MAX_OPEN_DECISIONS) };
+        for _ in 0..MAX_OPEN_CHANNEL_GATES {
+            let (_, ev) = s
+                .raise_channel_gate(&run, &tid("a"), "muted", &["unmute"])
+                .unwrap();
+            s.apply(&ev);
+        }
+        assert_eq!(s.open_channel_gates(), MAX_OPEN_CHANNEL_GATES);
+        let full = s
+            .raise_channel_gate(&run, &tid("a"), "muted", &["unmute"])
+            .unwrap_err();
+        assert!(full.message.contains("gates"), "{}", full.message);
+        assert_eq!(
+            s.open_decision_count(),
+            MAX_OPEN_MESSAGE_APPROVALS + MAX_OPEN_CHANNEL_GATES
+        );
+        // a question of a worker is not affected by either being full
+        assert!(
+            s.open_decision_count() < MAX_OPEN_DECISIONS,
+            "room is left for questions and merge approvals"
+        );
+        let events = s
+            .decide_seen(&ApprovalId::from_seq(1), false, 200, &FakeDigest)
+            .unwrap();
+        apply_all(&mut s, &events);
+        assert_eq!(s.open_message_approvals(), MAX_OPEN_MESSAGE_APPROVALS - 1);
+        assert!(s
+            .request_message_approval(&run, &tid("a"), &action(1000), 60_000, 300, &FakeDigest)
+            .is_ok());
     }
 
     #[test]

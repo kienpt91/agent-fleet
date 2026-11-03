@@ -62,8 +62,10 @@ pub struct Refused {
     pub trip: Option<TripInfo>,
 }
 
-/// What a tripped limit asks of the caller: mute `channel` (or, for a flood, `task`), and put a
-/// decision gate in front of a person. The text names ids and numbers only.
+/// What a tripped limit asks of the caller, and how far it reaches: with `channel` only, mute the
+/// channel; with `channel` and `task`, mute that task on that channel; with `task` only, mute the
+/// task everywhere (a flood of refusals). A decision gate goes to a person. The text names ids
+/// and numbers only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TripInfo {
     pub run: RunId,
@@ -123,6 +125,8 @@ pub enum Due {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MuteTarget {
     Channel(RunId, ChannelName),
+    /// One task on one channel only.
+    Member(RunId, ChannelName, TaskId),
     Task(RunId, TaskId),
 }
 
@@ -132,29 +136,64 @@ struct SenderCounters {
     window: SlidingWindow,
 }
 
+/// The outbox files of one task that were dealt with and recorded: only the newest attempt's
+/// numbers are kept, and older attempts are forgotten (their outbox is emptied before the next).
+#[derive(Clone, Debug, Default)]
+struct SourceMarks {
+    attempt: u32,
+    numbers: BTreeSet<u64>,
+}
+
+/// `outbox:<attempt>:<n>.json` as (attempt, n).
+fn parse_source(source: &str) -> Option<(u32, u64)> {
+    let rest = source.strip_prefix("outbox:")?;
+    let (attempt, name) = rest.split_once(':')?;
+    let number = name.strip_suffix(".json")?.parse().ok()?;
+    Some((attempt.parse().ok()?, number))
+}
+
 #[derive(Debug, Default)]
 pub struct MessageBoard {
     channels: BTreeMap<(RunId, ChannelName), Channel>,
     messages: BTreeMap<MessageId, Message>,
     seq: u64,
     muted_tasks: BTreeMap<(RunId, TaskId), MuteNote>,
+    /// A task muted on one channel only.
+    muted_members: BTreeMap<(RunId, ChannelName, TaskId), MuteNote>,
     channel_totals: BTreeMap<(RunId, ChannelName), u32>,
     senders: BTreeMap<(RunId, ChannelName, Sender), SenderCounters>,
     task_windows: BTreeMap<(RunId, TaskId), SlidingWindow>,
     refused_windows: BTreeMap<(RunId, TaskId), SlidingWindow>,
-    exchanges: BTreeMap<(RunId, ChannelName), Exchanges>,
+    /// Refusals recorded for a task, in all, until a person unmutes it.
+    refused_total: BTreeMap<(RunId, TaskId), u32>,
+    /// When a file-level refusal of a task was last recorded.
+    last_file_refusal: BTreeMap<(RunId, TaskId), u64>,
+    /// What passed between the tasks of a run, over all its channels.
+    exchanges: BTreeMap<RunId, Exchanges>,
     digests: BTreeMap<(RunId, ChannelName, String), u64>,
-    sources: BTreeSet<(RunId, String, String)>,
+    sources: BTreeMap<(RunId, TaskId), SourceMarks>,
     accepted: usize,
+    accepted_by_run: BTreeMap<RunId, usize>,
     inbox_seq: BTreeMap<(RunId, TaskId), u64>,
     gates: BTreeMap<DecisionId, MuteTarget>,
+}
+
+/// How far a tripped limit reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TripScope {
+    /// The whole channel (nobody else is left to keep talking).
+    Channel,
+    /// The sender on that channel only.
+    Member,
+    /// The sender on every channel (a flood of refusals).
+    Task,
 }
 
 /// A refusal in the making: the reason, the detail, and whether it tripped a limit.
 struct Failure {
     reason: BlockReason,
     detail: String,
-    trip: Option<(MuteReason, Trip)>,
+    trip: Option<(MuteReason, Trip, TripScope)>,
 }
 
 fn fail<T>(reason: BlockReason, detail: impl Into<String>) -> std::result::Result<T, Failure> {
@@ -219,6 +258,33 @@ impl MessageBoard {
 
     pub fn muted_tasks(&self) -> impl Iterator<Item = (&(RunId, TaskId), &MuteNote)> {
         self.muted_tasks.iter()
+    }
+
+    /// Whether `task` is muted on `channel` only (not on every channel).
+    pub fn member_muted(
+        &self,
+        run: &RunId,
+        channel: &ChannelName,
+        task: &TaskId,
+    ) -> Option<&MuteNote> {
+        self.muted_members
+            .get(&(run.clone(), channel.clone(), task.clone()))
+    }
+
+    /// The tasks muted on one channel only, with why.
+    pub fn member_mutes(&self, run: &RunId, channel: &ChannelName) -> Vec<(TaskId, MuteNote)> {
+        self.muted_members
+            .iter()
+            .filter(|((r, c, _), _)| r == run && c == channel)
+            .map(|((_, _, t), n)| (t.clone(), n.clone()))
+            .collect()
+    }
+
+    /// Every task muted on one channel only: run, channel, task.
+    pub fn muted_members(
+        &self,
+    ) -> impl Iterator<Item = (&(RunId, ChannelName, TaskId), &MuteNote)> {
+        self.muted_members.iter()
     }
 
     /// Messages sent on `channel` by `task`, over its whole life.
@@ -328,7 +394,12 @@ impl MessageBoard {
                 direction: c.def.direction.as_str(),
                 max_message_bytes: c.def.max_message_bytes,
                 requires_approval: c.def.requires_approval,
-                muted: c.muted.is_some(),
+                muted: c.muted.is_some()
+                    || self.muted_members.contains_key(&(
+                        run.clone(),
+                        c.def.name.clone(),
+                        task.clone(),
+                    )),
             })
             .collect();
         MessageNotes {
@@ -408,7 +479,17 @@ impl MessageBoard {
                     gate: gate.clone(),
                 };
                 match (channel, task) {
-                    (Some(c), _) => {
+                    (Some(c), Some(t)) => {
+                        self.muted_members
+                            .insert((run.clone(), c.clone(), t.clone()), note);
+                        if let Some(g) = gate {
+                            self.gates.insert(
+                                g.clone(),
+                                MuteTarget::Member(run.clone(), c.clone(), t.clone()),
+                            );
+                        }
+                    }
+                    (Some(c), None) => {
                         if let Some(ch) = self.channels.get_mut(&(run.clone(), c.clone())) {
                             ch.muted = Some(note);
                             if let Some(g) = gate {
@@ -430,23 +511,35 @@ impl MessageBoard {
             DomainEvent::ChannelUnmuted {
                 run, channel, task, ..
             } => match (channel, task) {
-                (Some(c), _) => {
-                    let key = (run.clone(), c.clone());
-                    if let Some(ch) = self.channels.get_mut(&key) {
+                (Some(c), Some(t)) => {
+                    self.muted_members
+                        .remove(&(run.clone(), c.clone(), t.clone()));
+                    self.reset_exchanges(run);
+                }
+                (Some(c), None) => {
+                    if let Some(ch) = self.channels.get_mut(&(run.clone(), c.clone())) {
                         ch.muted = None;
                     }
-                    if let Some(ex) = self.exchanges.get_mut(&key) {
-                        ex.reset();
-                    }
+                    self.muted_members
+                        .retain(|(r, name, _), _| !(r == run && name == c));
+                    self.reset_exchanges(run);
                 }
                 (None, Some(t)) => {
                     let key = (run.clone(), t.clone());
                     self.muted_tasks.remove(&key);
                     self.refused_windows.remove(&key);
+                    self.refused_total.remove(&key);
+                    self.last_file_refusal.remove(&key);
                 }
                 (None, None) => {}
             },
             _ => {}
+        }
+    }
+
+    fn reset_exchanges(&mut self, run: &RunId) {
+        if let Some(ex) = self.exchanges.get_mut(run) {
+            ex.reset();
         }
     }
 
@@ -460,6 +553,8 @@ impl MessageBoard {
         let key = (m.run.clone(), name);
         self.seq = self.seq.max(m.id.seq());
         self.accepted = self.accepted.saturating_add(1);
+        let in_run = self.accepted_by_run.entry(m.run.clone()).or_insert(0);
+        *in_run = in_run.saturating_add(1);
         let counters = self
             .senders
             .entry((key.0.clone(), key.1.clone(), m.from.clone()))
@@ -477,14 +572,10 @@ impl MessageBoard {
                 .record(m.submitted_ms, MINUTE_MS, HARD_PER_MINUTE as usize + 1);
             let to: Vec<TaskId> = m.recipients.iter().map(|r| r.task.clone()).collect();
             self.exchanges
-                .entry(key.clone())
+                .entry(m.run.clone())
                 .or_default()
                 .record(t, &to, m.depth);
-            self.sources.insert((
-                m.run.clone(),
-                m.from.text(),
-                m.source.clone().unwrap_or_default(),
-            ));
+            self.note_source(&m.run, t, &m.source);
         }
         if m.from != Sender::Operator {
             self.digests.insert(
@@ -530,15 +621,19 @@ impl MessageBoard {
         };
         self.seq = self.seq.max(m.id.seq());
         if let Sender::Task(t) = &m.from {
-            self.refused_windows
-                .entry((m.run.clone(), t.clone()))
-                .or_default()
-                .record(*at_ms, MINUTE_MS, MAX_BLOCKED_PER_MINUTE + 1);
-            self.sources.insert((
-                m.run.clone(),
-                m.from.text(),
-                m.source.clone().unwrap_or_default(),
-            ));
+            let key = (m.run.clone(), t.clone());
+            self.refused_windows.entry(key.clone()).or_default().record(
+                *at_ms,
+                MINUTE_MS,
+                MAX_BLOCKED_PER_MINUTE + 1,
+            );
+            let total = self.refused_total.entry(key.clone()).or_insert(0);
+            *total = total.saturating_add(1);
+            if m.channel.is_empty() {
+                // a file that was not a message: the next such file within a minute is folded in
+                self.last_file_refusal.insert(key, *at_ms);
+            }
+            self.note_source(&m.run, t, &m.source);
         }
         self.messages.insert(m.id.clone(), m);
         self.prune();
@@ -674,12 +769,13 @@ impl MessageBoard {
             at_ms: now_ms,
             source: sub.source.clone(),
         }];
-        let trip = f.trip.and_then(|(mute, trip)| {
+        let trip = f.trip.and_then(|(mute, trip, scope)| {
             let sender = sub.from.task()?.clone();
             let name = ChannelName::parse(sub.channel).ok();
-            let (channel, task) = match mute {
-                MuteReason::Flood => (None, Some(sender.clone())),
-                _ => (name, None),
+            let (channel, task) = match scope {
+                TripScope::Channel => (name, None),
+                TripScope::Member => (name, Some(sender.clone())),
+                TripScope::Task => (None, Some(sender.clone())),
             };
             Some(TripInfo {
                 run: sub.run.clone(),
@@ -700,7 +796,11 @@ impl MessageBoard {
     }
 
     /// A file that is not a message at all (it did not parse, it is too large): refused like any
-    /// other, and counted towards a flood.
+    /// other and counted towards a flood and towards the task's budget of refusals. Such files
+    /// are recorded at most once per [`INVALID_COALESCE_MS`] per task; the others are rejected
+    /// without an event of their own (`events` is empty), so a stream of junk cannot fill the log.
+    /// `unrecorded` is how many such files were rejected since the last record; they count
+    /// towards the per-minute flood limit.
     #[allow(clippy::too_many_arguments)]
     pub fn refuse_file(
         &self,
@@ -710,6 +810,8 @@ impl MessageBoard {
         detail: &str,
         source: Option<String>,
         hasher: &dyn Digest,
+        limits: &MessagingLimits,
+        unrecorded: usize,
         now_ms: u64,
     ) -> Refused {
         let sub = Submission {
@@ -723,34 +825,112 @@ impl MessageBoard {
             in_reply_to: None,
             source,
         };
-        let failure = self.flood(run, from, now_ms).unwrap_or(Failure {
-            reason,
-            detail: flatten_line(detail, 160),
-            trip: None,
-        });
+        let failure = match self.flood(run, from, limits, now_ms, unrecorded) {
+            Some(f) => f,
+            None => {
+                if self.would_coalesce(run, from, now_ms) {
+                    return Refused {
+                        id: MessageId::from_seq(self.seq.saturating_add(1)),
+                        events: Vec::new(),
+                        reason,
+                        detail: flatten_line(detail, 160),
+                        trip: None,
+                    };
+                }
+                Failure {
+                    reason,
+                    detail: flatten_line(detail, 160),
+                    trip: None,
+                }
+            }
+        };
         self.refusal(&sub, failure, 0, hasher, now_ms)
     }
 
-    /// Whether this exact file of this sender was dealt with already (accepted or refused), so a
-    /// file that is read twice, after a restart or a failed rename, is one message.
-    pub fn seen_source(&self, run: &RunId, from: &Sender, source: &str) -> bool {
-        self.sources
-            .contains(&(run.clone(), from.text(), source.to_string()))
+    /// Whether the next file-level refusal of this sender would be folded into the one recorded
+    /// less than a minute ago.
+    pub fn would_coalesce(&self, run: &RunId, from: &Sender, now_ms: u64) -> bool {
+        let Sender::Task(t) = from else {
+            return false;
+        };
+        self.last_file_refusal
+            .get(&(run.clone(), t.clone()))
+            .is_some_and(|last| now_ms.saturating_sub(*last) < INVALID_COALESCE_MS)
     }
 
-    /// A task that keeps sending messages that are refused is a flood.
-    fn flood(&self, run: &RunId, from: &Sender, now_ms: u64) -> Option<Failure> {
+    /// Whether this exact file of this sender was dealt with already (accepted or refused and
+    /// recorded), so a file that is read twice, after a restart or a failed rename, is one
+    /// message. Only a high-water mark of attempts and the numbers of the newest attempt are kept.
+    pub fn seen_source(&self, run: &RunId, from: &Sender, source: &str) -> bool {
+        let Sender::Task(t) = from else {
+            return false;
+        };
+        let Some((attempt, number)) = parse_source(source) else {
+            return false;
+        };
+        self.sources
+            .get(&(run.clone(), t.clone()))
+            .is_some_and(|m| m.attempt == attempt && m.numbers.contains(&number))
+    }
+
+    fn note_source(&mut self, run: &RunId, task: &TaskId, source: &Option<String>) {
+        let Some((attempt, number)) = source.as_deref().and_then(parse_source) else {
+            return;
+        };
+        let marks = self.sources.entry((run.clone(), task.clone())).or_default();
+        if attempt > marks.attempt {
+            marks.attempt = attempt;
+            marks.numbers.clear();
+        }
+        if attempt == marks.attempt {
+            marks.numbers.insert(number);
+        }
+    }
+
+    /// A task that keeps sending messages that are refused is a flood, and one that has caused
+    /// too many refusals in all is out of budget, until a person unmutes it.
+    fn flood(
+        &self,
+        run: &RunId,
+        from: &Sender,
+        limits: &MessagingLimits,
+        now_ms: u64,
+        unrecorded: usize,
+    ) -> Option<Failure> {
         let Sender::Task(t) = from else {
             return None;
         };
+        let key = (run.clone(), t.clone());
+        let total = self.refused_total.get(&key).copied().unwrap_or(0);
+        if total >= limits.max_refused_per_task {
+            return Some(Failure {
+                reason: BlockReason::Rate,
+                detail: "too many messages of this task were refused".to_string(),
+                trip: Some((
+                    MuteReason::RefusalBudget,
+                    Trip::RefusalBudget {
+                        task: t.clone(),
+                        refused: total,
+                        limit: limits.max_refused_per_task,
+                    },
+                    TripScope::Task,
+                )),
+            });
+        }
         let flooding = self
             .refused_windows
-            .get(&(run.clone(), t.clone()))
-            .is_some_and(|w| w.count(now_ms, MINUTE_MS) >= MAX_BLOCKED_PER_MINUTE);
+            .get(&key)
+            .map_or(0, |w| w.count(now_ms, MINUTE_MS))
+            .saturating_add(unrecorded)
+            >= MAX_BLOCKED_PER_MINUTE;
         flooding.then(|| Failure {
             reason: BlockReason::Rate,
             detail: "too many refused messages in a minute".to_string(),
-            trip: Some((MuteReason::Flood, flood_trip(t, MAX_BLOCKED_PER_MINUTE))),
+            trip: Some((
+                MuteReason::Flood,
+                flood_trip(t, MAX_BLOCKED_PER_MINUTE),
+                TripScope::Task,
+            )),
         })
     }
 
@@ -758,7 +938,7 @@ impl MessageBoard {
     fn plan(&self, sub: &Submission<'_>, cx: &Context<'_>) -> std::result::Result<Plan, Failure> {
         let now = cx.now_ms;
         let run = sub.run;
-        if let Some(f) = self.flood(run, &sub.from, now) {
+        if let Some(f) = self.flood(run, &sub.from, cx.limits, now, 0) {
             return Err(f);
         }
         let Some(name) = ChannelName::parse(sub.channel).ok() else {
@@ -778,6 +958,12 @@ impl MessageBoard {
             }
             if self.muted_tasks.contains_key(&(run.clone(), t.clone())) {
                 return fail(BlockReason::TaskMuted, format!("task {t} is muted"));
+            }
+            if self.member_muted(run, &name, t).is_some() {
+                return fail(
+                    BlockReason::TaskMuted,
+                    format!("task {t} is muted on this channel"),
+                );
             }
         }
         if channel.muted.is_some() {
@@ -819,16 +1005,23 @@ impl MessageBoard {
                 ),
             );
         }
+        // A reply names a message its sender received. A message the sender wrote itself or never
+        // got is refused with the same words as one that does not exist, so ids are no oracle.
         let explicit_depth = match sub.in_reply_to {
             None => 0,
             Some(parent) => match self.messages.get(parent) {
-                Some(p) if !p.is_refused() && p.run == *run && p.channel == name.as_str() => {
+                Some(p)
+                    if !p.is_refused()
+                        && p.run == *run
+                        && p.channel == name.as_str()
+                        && sub.from.task().is_none_or(|s| p.recipient(s).is_some()) =>
+                {
                     p.depth.saturating_add(1)
                 }
                 _ => {
                     return fail(
                         BlockReason::UnknownReply,
-                        format!("no message {parent} here"),
+                        format!("no message {parent} was sent to you on this channel"),
                     )
                 }
             },
@@ -858,36 +1051,30 @@ impl MessageBoard {
                     );
                 }
             }
-            if let Some(ex) = self.exchanges.get(&(run.clone(), name.clone())) {
-                for t in &recipients {
-                    depth = depth.max(ex.implicit_depth(from, t));
-                }
-                if let Some(trip) = ex.check(from, &recipients, depth, cx.limits) {
-                    let mute = match trip {
-                        Trip::ReplyDepth { .. } => MuteReason::ReplyDepth,
-                        Trip::PairBudget { .. } => MuteReason::PairBudget,
-                        Trip::Flood { .. } => MuteReason::Flood,
-                    };
-                    let reason = match mute {
-                        MuteReason::ReplyDepth => BlockReason::ReplyDepth,
-                        _ => BlockReason::PairBudget,
-                    };
-                    return Err(Failure {
-                        reason,
-                        detail: trip.describe(),
-                        trip: Some((mute, trip)),
-                    });
-                }
-            } else if depth > cx.limits.max_reply_depth {
-                let trip = Trip::ReplyDepth {
-                    depth,
-                    limit: cx.limits.max_reply_depth,
-                    pair: crate::msg::loops::pair_key(from, recipients.first().unwrap_or(from)),
+            // the exchange of two tasks is counted over every channel of the run, so changing
+            // channels does not start a new chain or a new budget
+            let empty = Exchanges::default();
+            let ex = self.exchanges.get(run).unwrap_or(&empty);
+            for t in &recipients {
+                depth = depth.max(ex.implicit_depth(from, t));
+            }
+            if let Some(trip) = ex.check(from, &recipients, depth, cx.limits) {
+                let (mute, reason) = match trip {
+                    Trip::ReplyDepth { .. } => (MuteReason::ReplyDepth, BlockReason::ReplyDepth),
+                    _ => (MuteReason::PairBudget, BlockReason::PairBudget),
+                };
+                // a loop is two members' doing: with somebody else still healthy on the channel
+                // only the sender that crossed the limit is muted, and the others go on talking
+                let scope = if self.has_other_healthy_member(channel, from, &recipients, cx.roster)
+                {
+                    TripScope::Member
+                } else {
+                    TripScope::Channel
                 };
                 return Err(Failure {
-                    reason: BlockReason::ReplyDepth,
+                    reason,
                     detail: trip.describe(),
-                    trip: Some((MuteReason::ReplyDepth, trip)),
+                    trip: Some((mute, trip, scope)),
                 });
             }
             let counters = self
@@ -930,11 +1117,33 @@ impl MessageBoard {
                     format!("{all_channels} messages in the last minute over all channels"),
                 );
             }
+            // messages that wait for a person take a share of the decision pool: a channel may
+            // have only a few at a time, the rest is refused instead of queued
+            if def.requires_approval {
+                let waiting = self
+                    .messages
+                    .values()
+                    .filter(|m| {
+                        m.run == *run
+                            && m.channel == name.as_str()
+                            && m.approval.is_some()
+                            && m.has_pending()
+                    })
+                    .count();
+                if waiting >= MAX_PENDING_APPROVALS_PER_CHANNEL {
+                    return fail(
+                        BlockReason::Quota,
+                        format!("{waiting} messages already wait for approval on this channel"),
+                    );
+                }
+            }
         }
-        if self.accepted >= cx.limits.max_total_messages {
+        // the cap is per run, so one run cannot use up another's; one ceiling covers them all
+        let in_run = self.accepted_by_run.get(run).copied().unwrap_or(0);
+        if in_run >= cx.limits.max_total_messages || self.accepted >= HARD_TOTAL_MESSAGES {
             return fail(
                 BlockReason::GlobalCap,
-                format!("{} messages were accepted in all", self.accepted),
+                format!("{in_run} messages were accepted in this run"),
             );
         }
         let approval = def.requires_approval && matches!(sub.from, Sender::Task(_));
@@ -946,6 +1155,28 @@ impl MessageBoard {
             body,
             digest,
             approval,
+        })
+    }
+
+    /// Whether some member other than `from` and the recipients can still take part on the
+    /// channel (not ended, not muted).
+    fn has_other_healthy_member(
+        &self,
+        channel: &Channel,
+        from: &TaskId,
+        recipients: &[TaskId],
+        roster: &[RosterEntry],
+    ) -> bool {
+        channel.member_tasks(roster).iter().any(|e| {
+            !e.ended()
+                && &e.task != from
+                && !recipients.contains(&e.task)
+                && !self
+                    .muted_tasks
+                    .contains_key(&(channel.run.clone(), e.task.clone()))
+                && self
+                    .member_muted(&channel.run, &channel.def.name, &e.task)
+                    .is_none()
         })
     }
 
@@ -977,6 +1208,13 @@ impl MessageBoard {
             .filter(|e| def.is_member(&e.task, e.worker.as_ref()))
             .filter(|e| Some(&e.task) != sender)
             .filter(|e| !lead_only || def.is_lead(&e.task, e.worker.as_ref()))
+            .filter(|e| {
+                !self.muted_members.contains_key(&(
+                    sub.run.clone(),
+                    def.name.clone(),
+                    e.task.clone(),
+                ))
+            })
             .collect();
         let chosen: Vec<&RosterEntry> = match sub.to {
             Some(to) => match candidates.iter().find(|e| &e.task == to) {
@@ -1039,14 +1277,19 @@ impl MessageBoard {
                 .and_then(|n| self.channels.get(&(m.run.clone(), n)));
             // a channel muted because nobody is left still delivers what it already accepted (a
             // worker's last message before it exits); every other mute holds everything
+            let member_muted = |t: &TaskId| {
+                channel.is_some_and(|c| {
+                    self.muted_members
+                        .contains_key(&(m.run.clone(), c.def.name.clone(), t.clone()))
+                })
+            };
             let silenced = channel.is_some_and(|c| {
                 c.muted
                     .as_ref()
                     .is_some_and(|n| n.reason != MuteReason::EndpointEnded)
-            }) || m
-                .from
-                .task()
-                .is_some_and(|t| self.muted_tasks.contains_key(&(m.run.clone(), t.clone())));
+            }) || m.from.task().is_some_and(|t| {
+                self.muted_tasks.contains_key(&(m.run.clone(), t.clone())) || member_muted(t)
+            });
             for r in m
                 .recipients
                 .iter()
@@ -1072,9 +1315,14 @@ impl MessageBoard {
                     && !self
                         .muted_tasks
                         .contains_key(&(m.run.clone(), r.task.clone()))
+                    && !member_muted(&r.task)
                     && entry.is_some_and(|e| e.live)
                 {
-                    if self.delivered_to(&m.run, &r.task).len() >= MAX_INBOX_ENTRIES {
+                    let delivered = self.delivered_to(&m.run, &r.task);
+                    let from_sender = delivered.iter().filter(|(_, d)| d.from == m.from).count();
+                    let sender_full =
+                        m.from != Sender::Operator && from_sender >= MAX_INBOX_PER_SENDER;
+                    if delivered.len() >= MAX_INBOX_ENTRIES || sender_full {
                         out.push(expire(ExpireReason::InboxFull));
                     } else {
                         out.push(Due::Deliver {
@@ -1146,7 +1394,7 @@ impl MessageBoard {
         let c = self
             .channel(run, name)
             .ok_or_else(|| FleetError::not_found(format!("channel {run}/{name} does not exist")))?;
-        if c.muted.is_none() {
+        if c.muted.is_none() && self.member_mutes(run, name).is_empty() {
             return Err(FleetError::conflict(format!(
                 "channel {run}/{name} is not muted"
             )));
@@ -1206,6 +1454,62 @@ impl MessageBoard {
         })
     }
 
+    /// Mutes one task on one channel only: it can neither send nor receive there, and every
+    /// other member goes on talking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mute_member(
+        &self,
+        run: &RunId,
+        name: &ChannelName,
+        task: &TaskId,
+        reason: MuteReason,
+        by: &str,
+        gate: Option<DecisionId>,
+        now_ms: u64,
+    ) -> Result<DomainEvent> {
+        if self.channel(run, name).is_none() {
+            return Err(FleetError::not_found(format!(
+                "channel {run}/{name} does not exist"
+            )));
+        }
+        if self.member_muted(run, name, task).is_some() {
+            return Err(FleetError::conflict(format!(
+                "task {run}/{task} is already muted on channel {name}"
+            )));
+        }
+        Ok(DomainEvent::ChannelMuted {
+            run: run.clone(),
+            channel: Some(name.clone()),
+            task: Some(task.clone()),
+            reason,
+            by: by.to_string(),
+            gate,
+            at_ms: now_ms,
+        })
+    }
+
+    pub fn unmute_member(
+        &self,
+        run: &RunId,
+        name: &ChannelName,
+        task: &TaskId,
+        by: &str,
+        now_ms: u64,
+    ) -> Result<DomainEvent> {
+        if self.member_muted(run, name, task).is_none() {
+            return Err(FleetError::conflict(format!(
+                "task {run}/{task} is not muted on channel {name}"
+            )));
+        }
+        Ok(DomainEvent::ChannelUnmuted {
+            run: run.clone(),
+            channel: Some(name.clone()),
+            task: Some(task.clone()),
+            by: by.to_string(),
+            at_ms: now_ms,
+        })
+    }
+
     /// The unmuting a person's answer to a mute gate asks for (`unmute`); none for `keep muted`
     /// or when the target is no longer muted.
     pub fn answer_gate(&self, gate: &DecisionId, answer: &str, now_ms: u64) -> Vec<DomainEvent> {
@@ -1215,6 +1519,9 @@ impl MessageBoard {
         let by = format!("gate {gate}");
         let event = match self.gates.get(gate) {
             Some(MuteTarget::Channel(run, name)) => self.unmute_channel(run, name, &by, now_ms),
+            Some(MuteTarget::Member(run, name, task)) => {
+                self.unmute_member(run, name, task, &by, now_ms)
+            }
             Some(MuteTarget::Task(run, task)) => self.unmute_task(run, task, &by, now_ms),
             None => return Vec::new(),
         };
@@ -1757,34 +2064,605 @@ mod tests {
         assert!(trip.text.contains("depth 4") && trip.text.contains("limit is 3"));
     }
 
-    #[test]
-    fn the_pair_budget_stops_exchanges_that_avoid_replying() {
-        let mut b = board_with(channel_def(vec![
+    fn permissive(extra: Vec<(&str, Value)>) -> (MessageBoard, Env) {
+        let mut pairs = vec![
             ("max_messages_per_minute", Value::int(100)),
             ("max_messages_per_task", Value::int(100)),
-        ]));
+        ];
+        pairs.extend(extra);
         let mut env = Env::new();
-        env.limits.max_pair_exchanges = 5;
         env.limits.max_per_task_per_minute = 100;
+        (board_with(channel_def(pairs)), env)
+    }
+
+    #[test]
+    fn one_way_messages_never_trip_the_pair_budget_and_cannot_mute_the_channel() {
+        let (mut b, mut env) = permissive(vec![]);
+        env.limits.max_pair_exchanges = 3;
+        env.limits.max_reply_depth = 3;
+        for i in 0..60 {
+            env.now += 10;
+            ok(&mut b, &env, "a", Some("b"), "x", &format!("one way {i}"));
+        }
+        assert!(b.channel(&run(), &name("ch")).unwrap().muted.is_none());
+        assert_eq!(b.accepted_count(), 60);
+    }
+
+    #[test]
+    fn the_pair_budget_counts_changes_of_direction_and_mutes_only_the_sender_that_crossed_it() {
+        let (mut b, mut env) = permissive(vec![]);
+        env.limits.max_pair_exchanges = 5;
         env.limits.max_reply_depth = 100;
         let mut count = 0;
-        loop {
+        let r = loop {
             env.now += 10;
-            // a talks to b in one direction only: no reply depth builds up
-            match send(&b, &env, "a", Some("b"), "x", &format!("m{count}")) {
+            let (from, to) = if count % 2 == 0 {
+                ("a", "b")
+            } else {
+                ("b", "a")
+            };
+            match send(&b, &env, from, Some(to), "x", &format!("m{count}")) {
                 Verdict::Accepted(a) => {
                     b.apply(&a.event);
                     count += 1;
                 }
+                Verdict::Refused(r) => break r,
+            }
+            assert!(count <= 8);
+        };
+        assert_eq!(count, 6, "a first message and five changes of direction");
+        assert_eq!(r.reason, BlockReason::PairBudget);
+        let trip = r.trip.unwrap();
+        assert_eq!(trip.reason, MuteReason::PairBudget);
+        // c is a healthy third member: only the sender is muted, on this channel
+        assert_eq!(trip.channel, Some(name("ch")));
+        assert_eq!(trip.task, Some(t("a")), "the sender of the sixth change");
+    }
+
+    #[test]
+    fn with_nobody_else_on_the_channel_a_loop_mutes_the_channel() {
+        let two = ChannelDef::from_value(&Value::object([
+            ("name", Value::str("ch")),
+            (
+                "members",
+                Value::array(["task:a", "task:b"].map(Value::str)),
+            ),
+            ("max_messages_per_minute", Value::int(100)),
+        ]))
+        .unwrap();
+        let mut b = board_with(two);
+        let mut env = Env::new();
+        env.limits.max_reply_depth = 2;
+        env.limits.max_per_task_per_minute = 100;
+        let mut tripped = None;
+        for i in 0..6 {
+            env.now += 10;
+            let (from, to) = if i % 2 == 0 { ("a", "b") } else { ("b", "a") };
+            match send(&b, &env, from, Some(to), "x", &format!("m{i}")) {
+                Verdict::Accepted(a) => b.apply(&a.event),
                 Verdict::Refused(r) => {
-                    assert_eq!(r.reason, BlockReason::PairBudget);
-                    assert_eq!(r.trip.unwrap().reason, MuteReason::PairBudget);
+                    tripped = r.trip;
                     break;
                 }
             }
-            assert!(count <= 5);
         }
-        assert_eq!(count, 5);
+        let trip = tripped.expect("the loop is stopped");
+        assert_eq!((trip.channel, trip.task), (Some(name("ch")), None));
+    }
+
+    #[test]
+    fn a_member_mute_holds_that_member_only_and_unmuting_the_channel_lifts_it() {
+        let (mut b, env) = permissive(vec![]);
+        let ev = b
+            .mute_member(
+                &run(),
+                &name("ch"),
+                &t("a"),
+                MuteReason::ReplyDepth,
+                "auto",
+                None,
+                env.now,
+            )
+            .unwrap();
+        b.apply(&ev);
+        assert!(b.member_muted(&run(), &name("ch"), &t("a")).is_some());
+        assert!(b
+            .mute_member(
+                &run(),
+                &name("ch"),
+                &t("a"),
+                MuteReason::Operator,
+                "o",
+                None,
+                0
+            )
+            .is_err());
+        let r = no(&mut b, &env, "a", Some("b"), "x", "from the muted one");
+        assert_eq!(r.reason, BlockReason::TaskMuted);
+        // others talk, and nobody can write to the muted one
+        ok(&mut b, &env, "b", Some("c"), "x", "b to c");
+        let r = no(&mut b, &env, "c", Some("a"), "x", "to the muted one");
+        assert_eq!(r.reason, BlockReason::BadRecipient);
+        // the brief says so
+        let notes = b.notes_for(&run(), &t("a"), None);
+        assert!(notes.channels[0].muted);
+        // unmuting the channel lifts member mutes too
+        let ev = b
+            .unmute_channel(&run(), &name("ch"), "operator", env.now)
+            .unwrap();
+        b.apply(&ev);
+        assert!(b.member_muted(&run(), &name("ch"), &t("a")).is_none());
+        ok(&mut b, &env, "a", Some("b"), "x", "back again");
+        assert!(b
+            .unmute_channel(&run(), &name("ch"), "operator", env.now)
+            .is_err());
+    }
+
+    #[test]
+    fn a_member_mute_gate_answer_unmutes_only_that_member() {
+        let (mut b, _env) = permissive(vec![]);
+        let gate = DecisionId::from_seq(2);
+        let ev = b
+            .mute_member(
+                &run(),
+                &name("ch"),
+                &t("a"),
+                MuteReason::PairBudget,
+                "auto",
+                Some(gate.clone()),
+                5,
+            )
+            .unwrap();
+        b.apply(&ev);
+        let ev = b
+            .mute_task(&run(), &t("b"), MuteReason::Flood, "auto", None, 5)
+            .unwrap();
+        b.apply(&ev);
+        assert_eq!(
+            b.gate_target(&gate),
+            Some(&MuteTarget::Member(run(), name("ch"), t("a")))
+        );
+        assert_eq!(b.member_mutes(&run(), &name("ch")).len(), 1);
+        assert_eq!(b.muted_members().count(), 1);
+        for e in b.answer_gate(&gate, GATE_UNMUTE, 6) {
+            b.apply(&e);
+        }
+        assert!(b.member_muted(&run(), &name("ch"), &t("a")).is_none());
+        assert!(b.task_muted(&run(), &t("b")).is_some(), "other mutes stay");
+    }
+
+    #[test]
+    fn a_member_muted_sender_or_recipient_holds_delivery() {
+        let (mut b, env) = permissive(vec![]);
+        ok(&mut b, &env, "a", Some("b"), "x", "waiting");
+        let ev = b
+            .mute_member(
+                &run(),
+                &name("ch"),
+                &t("b"),
+                MuteReason::PairBudget,
+                "auto",
+                None,
+                env.now,
+            )
+            .unwrap();
+        b.apply(&ev);
+        assert!(
+            due_with(&b, env.now, roster(), |_| None).is_empty(),
+            "recipient muted"
+        );
+        let ev = b
+            .unmute_member(&run(), &name("ch"), &t("b"), "o", env.now)
+            .unwrap();
+        b.apply(&ev);
+        assert_eq!(due_with(&b, env.now, roster(), |_| None).len(), 1);
+        let ev = b
+            .mute_member(
+                &run(),
+                &name("ch"),
+                &t("a"),
+                MuteReason::PairBudget,
+                "auto",
+                None,
+                env.now,
+            )
+            .unwrap();
+        b.apply(&ev);
+        assert!(
+            due_with(&b, env.now, roster(), |_| None).is_empty(),
+            "sender muted"
+        );
+        assert!(b
+            .unmute_member(&run(), &name("ch"), &t("b"), "o", 0)
+            .is_err());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_with(
+        b: &MessageBoard,
+        env: &Env,
+        run: &RunId,
+        from: Sender,
+        channel: &str,
+        to: &str,
+        body: &str,
+        parent: Option<&MessageId>,
+        source: Option<String>,
+    ) -> Verdict {
+        let to = t(to);
+        let sub = Submission {
+            run,
+            from,
+            channel,
+            to: Some(&to),
+            kind: MessageKind::Info,
+            subject: "re",
+            body,
+            in_reply_to: parent,
+            source,
+        };
+        b.submit(
+            &sub,
+            &Context {
+                roster: &env.roster,
+                limits: &env.limits,
+                now_ms: env.now,
+                hasher: &Toy,
+                redact: &redact_none,
+            },
+        )
+    }
+
+    #[test]
+    fn a_reply_names_a_message_the_sender_received_and_ids_are_no_oracle() {
+        let (mut b, env) = permissive(vec![]);
+        let first = ok(&mut b, &env, "a", Some("b"), "x", "for b");
+        let run = run();
+        let reply = |b: &MessageBoard, from: &str, to: &str, parent: &MessageId| {
+            submit_with(
+                b,
+                &env,
+                &run,
+                Sender::Task(t(from)),
+                "ch",
+                to,
+                "answer",
+                Some(parent),
+                None,
+            )
+        };
+        let detail = |v: Verdict| match v {
+            Verdict::Refused(r) => (r.reason, r.detail),
+            Verdict::Accepted(_) => panic!("accepted"),
+        };
+        // c was not a party, a wrote it itself: both refused, with the words of a missing id
+        let (r1, d1) = detail(reply(&b, "c", "a", &first));
+        let (r2, d2) = detail(reply(&b, "a", "b", &first));
+        let (r3, d3) = detail(reply(&b, "c", "a", &MessageId::from_seq(77)));
+        assert_eq!(
+            (r1, r2, r3),
+            (
+                BlockReason::UnknownReply,
+                BlockReason::UnknownReply,
+                BlockReason::UnknownReply
+            )
+        );
+        assert_eq!(
+            d1.replace("m1", "mX"),
+            d3.replace("m77", "mX"),
+            "{d1} / {d3}"
+        );
+        assert!(d2.contains("m1"));
+        assert!(matches!(reply(&b, "b", "a", &first), Verdict::Accepted(_)));
+        // the operator may refer to any message of the channel
+        assert!(matches!(
+            submit_with(
+                &b,
+                &env,
+                &run,
+                Sender::Operator,
+                "ch",
+                "b",
+                "from a person",
+                Some(&first),
+                None
+            ),
+            Verdict::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn an_exchange_is_counted_over_every_channel_of_the_run() {
+        let two = |name: &str| {
+            ChannelDef::from_value(&Value::object([
+                ("name", Value::str(name)),
+                (
+                    "members",
+                    Value::array(["task:a", "task:b", "task:c"].map(Value::str)),
+                ),
+                ("max_messages_per_minute", Value::int(100)),
+                ("max_messages_per_task", Value::int(100)),
+            ]))
+            .unwrap()
+        };
+        let mut b = MessageBoard::new();
+        for ev in b.open_channels(&run(), &[two("one"), two("two")]).unwrap() {
+            b.apply(&ev);
+        }
+        let mut env = Env::new();
+        env.limits.max_reply_depth = 3;
+        env.limits.max_per_task_per_minute = 100;
+        let run_id = run();
+        let mut refused = None;
+        for i in 0..8 {
+            env.now += 10;
+            let (from, to) = if i % 2 == 0 { ("a", "b") } else { ("b", "a") };
+            let channel = if i % 2 == 0 { "one" } else { "two" };
+            match submit_with(
+                &b,
+                &env,
+                &run_id,
+                Sender::Task(t(from)),
+                channel,
+                to,
+                &format!("hop {i}"),
+                None,
+                None,
+            ) {
+                Verdict::Accepted(a) => b.apply(&a.event),
+                Verdict::Refused(r) => {
+                    refused = Some((i, r.reason));
+                    break;
+                }
+            }
+        }
+        assert_eq!(refused, Some((4, BlockReason::ReplyDepth)));
+    }
+
+    #[test]
+    fn junk_files_are_recorded_once_a_minute_and_count_towards_a_flood() {
+        let (mut b, mut env) = permissive(vec![]);
+        env.now = 10_000_000;
+        let from = Sender::Task(t("a"));
+        let limits = MessagingLimits::default();
+        let junk = |b: &MessageBoard, n: u64, unrecorded: usize, now: u64| {
+            b.refuse_file(
+                &run(),
+                &from,
+                BlockReason::Invalid,
+                "not json",
+                Some(format!("outbox:1:{n}.json")),
+                &Toy,
+                &limits,
+                unrecorded,
+                now,
+            )
+        };
+        let first = junk(&b, 1, 0, env.now);
+        assert_eq!(first.events.len(), 1);
+        for e in &first.events {
+            b.apply(e);
+        }
+        // within the minute the next ones are rejected without an event
+        let second = junk(&b, 2, 0, env.now + 1_000);
+        assert!(second.events.is_empty() && second.trip.is_none());
+        assert!(b.would_coalesce(&run(), &from, env.now + 59_000));
+        assert!(!b.would_coalesce(&run(), &from, env.now + 60_000));
+        assert!(!b.would_coalesce(&run(), &Sender::Operator, env.now));
+        // a minute later one is recorded again
+        let later = junk(&b, 3, 5, env.now + 61_000);
+        assert_eq!(later.events.len(), 1);
+        // but twenty of them in a minute are a flood, recorded and muted
+        let flood = junk(&b, 4, MAX_BLOCKED_PER_MINUTE, env.now + 1_500);
+        assert_eq!(flood.events.len(), 1);
+        assert_eq!(flood.trip.unwrap().reason, MuteReason::Flood);
+    }
+
+    #[test]
+    fn a_task_that_causes_too_many_refusals_in_all_runs_out_of_budget_until_unmuted() {
+        let (mut b, mut env) = permissive(vec![]);
+        env.limits.max_refused_per_task = 7;
+        let mut tripped = None;
+        for i in 0..20 {
+            // a minute apart: far below the per-minute flood limit
+            env.now += 61_000;
+            let r = no(
+                &mut b,
+                &env,
+                "a",
+                Some("ghost"),
+                "x",
+                &format!("refused {i}"),
+            );
+            if let Some(trip) = r.trip {
+                tripped = Some((i, trip));
+                break;
+            }
+        }
+        let (i, trip) = tripped.expect("the budget ends");
+        assert_eq!(i, 7, "seven refusals are tolerated, the eighth trips");
+        assert_eq!(trip.reason, MuteReason::RefusalBudget);
+        assert_eq!(
+            (trip.channel.clone(), trip.task.clone()),
+            (None, Some(t("a")))
+        );
+        assert!(trip.text.contains("refused in all"), "{}", trip.text);
+        // unmuting the task gives a fresh budget
+        let ev = b
+            .mute_task(
+                &run(),
+                &t("a"),
+                MuteReason::RefusalBudget,
+                "auto",
+                None,
+                env.now,
+            )
+            .unwrap();
+        b.apply(&ev);
+        let ev = b.unmute_task(&run(), &t("a"), "operator", env.now).unwrap();
+        b.apply(&ev);
+        env.now += 61_000;
+        let r = no(&mut b, &env, "a", Some("ghost"), "x", "after the unmute");
+        assert!(r.trip.is_none());
+    }
+
+    #[test]
+    fn outbox_files_are_remembered_by_attempt_and_number_only() {
+        let (mut b, env) = permissive(vec![]);
+        let from = Sender::Task(t("a"));
+        let rid = run();
+        let at = |n: u32, f: u64| format!("outbox:{n}:{f}.json");
+        assert!(!b.seen_source(&rid, &from, &at(1, 1)));
+        fn send_file(b: &mut MessageBoard, env: &Env, from: &Sender, source: String, body: &str) {
+            if let Verdict::Accepted(a) = submit_with(
+                b,
+                env,
+                &run(),
+                from.clone(),
+                "ch",
+                "b",
+                body,
+                None,
+                Some(source),
+            ) {
+                b.apply(&a.event);
+            }
+        }
+        send_file(&mut b, &env, &from, at(1, 1), "one");
+        send_file(&mut b, &env, &from, at(1, 9), "two");
+        assert!(b.seen_source(&rid, &from, &at(1, 1)) && b.seen_source(&rid, &from, &at(1, 9)));
+        assert!(
+            !b.seen_source(&rid, &from, &at(1, 2)),
+            "a lower number may still come"
+        );
+        assert!(!b.seen_source(&rid, &from, &at(2, 1)));
+        // a newer attempt forgets the older one: memory follows the live attempt only
+        send_file(&mut b, &env, &from, at(2, 1), "three");
+        assert!(b.seen_source(&rid, &from, &at(2, 1)));
+        assert!(!b.seen_source(&rid, &from, &at(1, 1)));
+        for bad in [
+            "",
+            "outbox",
+            "outbox:x:1.json",
+            "outbox:1:x.json",
+            "file:1:1.json",
+        ] {
+            assert!(!b.seen_source(&rid, &from, bad), "{bad}");
+        }
+        assert!(!b.seen_source(&rid, &Sender::Operator, &at(2, 1)));
+    }
+
+    #[test]
+    fn at_most_a_few_messages_per_channel_wait_for_approval() {
+        let (mut b, mut env) = permissive(vec![("requires_approval", Value::Bool(true))]);
+        let mut accepted = 0;
+        for i in 0..40 {
+            env.now += 10;
+            match send(&b, &env, "a", Some("b"), "x", &format!("m{i}")) {
+                Verdict::Accepted(a) => {
+                    let a = a.with_approval(ApprovalId::from_seq(i + 1));
+                    b.apply(&a.event);
+                    accepted += 1;
+                }
+                Verdict::Refused(r) => {
+                    assert_eq!(r.reason, BlockReason::Quota, "{}", r.detail);
+                    assert!(r.detail.contains("wait for approval"));
+                    break;
+                }
+            }
+        }
+        assert_eq!(accepted, MAX_PENDING_APPROVALS_PER_CHANNEL);
+        // a message that was delivered (or expired) no longer counts
+        b.apply(&DomainEvent::MessageDelivered {
+            id: MessageId::from_seq(1),
+            to: t("b"),
+            at_ms: env.now,
+        });
+        env.now += 10;
+        assert!(matches!(
+            send(&b, &env, "a", Some("b"), "x", "one more"),
+            Verdict::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn the_message_cap_is_per_run_with_one_ceiling_over_all() {
+        let mut b = board_with(channel_def(vec![
+            ("max_messages_per_minute", Value::int(100)),
+            ("max_messages_per_task", Value::int(100)),
+        ]));
+        let r2 = RunId::parse("r2").unwrap();
+        for ev in b.open_channels(&r2, &[channel_def(vec![])]).unwrap() {
+            b.apply(&ev);
+        }
+        let mut env = Env::new();
+        env.limits.max_total_messages = 2;
+        env.limits.max_per_task_per_minute = 100;
+        ok(&mut b, &env, "a", Some("b"), "x", "one");
+        ok(&mut b, &env, "a", Some("b"), "x", "two");
+        let r = no(&mut b, &env, "a", Some("b"), "x", "three");
+        assert_eq!(r.reason, BlockReason::GlobalCap);
+        // another run has its own allowance
+        assert!(matches!(
+            submit_with(
+                &b,
+                &env,
+                &r2,
+                Sender::Task(t("a")),
+                "ch",
+                "b",
+                "in run two",
+                None,
+                None
+            ),
+            Verdict::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn one_sender_cannot_take_more_than_its_share_of_an_inbox() {
+        let (mut b, mut env) = permissive(vec![("max_messages_per_task", Value::int(200))]);
+        env.limits.max_total_messages = 500;
+        for i in 0..(MAX_INBOX_PER_SENDER + 3) {
+            env.now += 10;
+            ok(&mut b, &env, "a", Some("b"), "x", &format!("flood {i}"));
+        }
+        loop {
+            let due = due_with(&b, env.now, roster(), |_| None);
+            if due.is_empty() {
+                break;
+            }
+            for step in due {
+                match step {
+                    Due::Deliver { id, to } => b.apply(&DomainEvent::MessageDelivered {
+                        id,
+                        to,
+                        at_ms: env.now,
+                    }),
+                    Due::Expire { id, to, reason } => {
+                        assert_eq!(reason, ExpireReason::InboxFull);
+                        b.apply(&DomainEvent::MessageExpired {
+                            id,
+                            to,
+                            reason,
+                            at_ms: env.now,
+                        })
+                    }
+                    Due::Deny { .. } => unreachable!(),
+                }
+            }
+        }
+        assert_eq!(
+            b.delivered_to(&run(), &t("b")).len(),
+            MAX_INBOX_PER_SENDER,
+            "the rest expired as inbox-full"
+        );
+        // another sender still has room
+        env.now += 10;
+        let c = ok(&mut b, &env, "c", Some("b"), "x", "from c");
+        assert!(due_with(&b, env.now, roster(), |_| None)
+            .iter()
+            .any(|d| matches!(d, Due::Deliver { id, .. } if *id == c)));
     }
 
     #[test]

@@ -61,6 +61,7 @@ struct MessagesSection {
     max_reply_depth: Option<u64>,
     max_pair_exchanges: Option<u64>,
     max_messages_per_task_per_minute: Option<u64>,
+    max_refused_per_task: Option<u64>,
     /// Type a one-line notice into a worker's terminal when a message arrives. Off by default.
     notify_input: Option<bool>,
 }
@@ -351,6 +352,9 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
     }
     if let Some(n) = m.max_messages_per_task_per_minute {
         limits.max_per_task_per_minute = small("max_messages_per_task_per_minute", n)?;
+    }
+    if let Some(n) = m.max_refused_per_task {
+        limits.max_refused_per_task = small("max_refused_per_task", n)?;
     }
     if let Some(b) = m.notify_input {
         limits.notify_input = b;
@@ -805,6 +809,40 @@ format = "refcheck-json"
         assert!(dflt.app.workers.is_empty());
         let key = format!("ghp_{}", "a1B2".repeat(10));
         assert!(!dflt.redactor.redact(&format!("token {key}")).contains(&key));
+    }
+
+    #[test]
+    fn the_messages_section_sets_every_limit_and_is_validated() {
+        let loaded = parse(
+            "[messages]\nmax_total_messages = 40\nmax_fan_out = 3\nmax_reply_depth = 4\nmax_pair_exchanges = 9\nmax_messages_per_task_per_minute = 12\nmax_refused_per_task = 55\nnotify_input = true\n",
+        )
+        .unwrap();
+        let m = loaded.app.messaging;
+        assert_eq!(
+            (
+                m.max_total_messages,
+                m.max_fan_out,
+                m.max_reply_depth,
+                m.max_pair_exchanges,
+                m.max_per_task_per_minute,
+                m.max_refused_per_task,
+                m.notify_input
+            ),
+            (40, 3, 4, 9, 12, 55, true)
+        );
+        let defaults = parse("").unwrap().app.messaging;
+        assert_eq!(defaults.max_refused_per_task, 100);
+        assert!(!defaults.notify_input, "off unless the operator says so");
+        for bad in [
+            "max_refused_per_task = 0",
+            "max_refused_per_task = 100000",
+            "max_refused_per_task = 99999999999999",
+            "max_refused_per_task = -1",
+            "max_refused_per_task = \"many\"",
+            "max_reply_depth = 0",
+        ] {
+            assert!(parse(&format!("[messages]\n{bad}\n")).is_err(), "{bad}");
+        }
     }
 
     #[test]

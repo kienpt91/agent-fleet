@@ -145,6 +145,14 @@ impl Orchestrator {
         let (events, accepted) = match item.read {
             OutboxRead::NotReady => return,
             OutboxRead::Invalid(reason, detail) => {
+                // Files that are not messages are recorded at most once a minute per task; the
+                // others are rejected and only counted here, so junk cannot fill the log.
+                let skipped = self.skipped_files.get(key).copied().unwrap_or(0);
+                let detail = if skipped > 0 {
+                    format!("{detail} (and {skipped} more files since the last record)")
+                } else {
+                    detail
+                };
                 let r = self.board.refuse_file(
                     &key.0,
                     &sender,
@@ -152,8 +160,16 @@ impl Orchestrator {
                     &detail,
                     Some(source),
                     self.ports.digest.as_ref(),
+                    &self.cfg.messaging,
+                    usize::try_from(skipped).unwrap_or(usize::MAX),
                     now,
                 );
+                if r.events.is_empty() && r.trip.is_none() {
+                    let n = self.skipped_files.entry(key.clone()).or_insert(0);
+                    *n = n.saturating_add(1);
+                } else {
+                    self.skipped_files.remove(key);
+                }
                 (self.refusal_events(r, now), false)
             }
             OutboxRead::Valid(m) => self.judge(&key.0, &sender, m, source, now),
@@ -271,6 +287,8 @@ impl Orchestrator {
                 &e.message,
                 None,
                 self.ports.digest.as_ref(),
+                &self.cfg.messaging,
+                0,
                 now,
             ))),
         }
@@ -290,7 +308,8 @@ impl Orchestrator {
     /// in the gate: ids and numbers only.
     fn trip_events(&mut self, trip: &TripInfo, now: u64) -> Vec<DomainEvent> {
         let what = match (&trip.channel, &trip.task) {
-            (Some(c), _) => format!("Channel {c} of run {}", trip.run),
+            (Some(c), Some(t)) => format!("Task {}/{t} on channel {c}", trip.run),
+            (Some(c), None) => format!("Channel {c} of run {}", trip.run),
             (None, Some(t)) => format!("Task {}/{t}", trip.run),
             (None, None) => return Vec::new(),
         };
@@ -322,7 +341,11 @@ impl Orchestrator {
             }
         };
         let mute = match (&trip.channel, &trip.task) {
-            (Some(c), _) => self
+            (Some(c), Some(t)) => {
+                self.board
+                    .mute_member(&trip.run, c, t, trip.reason, AUTO, gate, now)
+            }
+            (Some(c), None) => self
                 .board
                 .mute_channel(&trip.run, c, trip.reason, AUTO, gate, now),
             (None, Some(t)) => self
@@ -542,12 +565,20 @@ impl Orchestrator {
                     )?);
                 } else {
                     events.push(self.board.unmute_channel(run, name, OPERATOR, now)?);
-                    let gate = self
+                    let mut gates = vec![self
                         .board
                         .channel(run, name)
                         .and_then(|c| c.muted.as_ref())
-                        .and_then(|n| n.gate.clone());
-                    events.extend(self.close_gate(gate));
+                        .and_then(|n| n.gate.clone())];
+                    gates.extend(
+                        self.board
+                            .member_mutes(run, name)
+                            .into_iter()
+                            .map(|(_, n)| n.gate),
+                    );
+                    for gate in gates {
+                        events.extend(self.close_gate(gate));
+                    }
                 }
                 ("channel", format!("{run}/{name}"))
             }

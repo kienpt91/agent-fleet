@@ -222,6 +222,8 @@ string_enum!(
         PairBudget => "pair-budget",
         /// A task kept sending messages that were refused.
         Flood => "flood",
+        /// A task used up the total number of refusals it may cause (until a person looks).
+        RefusalBudget => "refusal-budget",
         /// Fewer than two members can still take part, or the lead is gone.
         EndpointEnded => "endpoint-ended",
     }

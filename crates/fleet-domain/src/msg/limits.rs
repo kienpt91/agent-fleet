@@ -34,6 +34,17 @@ pub const MAX_OUTBOX_LISTED: usize = 64;
 pub const MAX_INBOX_ENTRIES: usize = 256;
 /// Refused messages a sender may produce per minute before it is muted as a flood.
 pub const MAX_BLOCKED_PER_MINUTE: usize = 20;
+/// Invalid files (not a message at all) of one task are recorded at most once per this long; the
+/// others are rejected without an event of their own.
+pub const INVALID_COALESCE_MS: u64 = 60_000;
+/// Messages of one channel that may wait for a person's approval at the same time.
+pub const MAX_PENDING_APPROVALS_PER_CHANNEL: usize = 16;
+/// Message approvals waiting in the whole fleet, and open gates about muted channels: their own
+/// shares of the decision pool, so they cannot starve questions and merge approvals.
+pub const MAX_OPEN_MESSAGE_APPROVALS: usize = 128;
+pub const MAX_OPEN_CHANNEL_GATES: usize = 32;
+/// Messages of one sender that may sit in one recipient's inbox (of [`MAX_INBOX_ENTRIES`]).
+pub const MAX_INBOX_PER_SENDER: usize = 64;
 /// Messages (and refusals) kept in memory; refusals are dropped first.
 pub const MESSAGES_KEPT: usize = 4096;
 /// Digests remembered for duplicate suppression.
@@ -56,7 +67,10 @@ pub struct MessagingLimits {
     pub max_pair_exchanges: u32,
     /// Messages one task may send per minute over all its channels.
     pub max_per_task_per_minute: u32,
-    /// Type a one-line notice into a worker's terminal when a message arrives. Off by default.
+    /// Refusals one task may cause in all (until a person unmutes it) before it is muted.
+    pub max_refused_per_task: u32,
+    /// Type a one-line notice (without Enter) into a worker's terminal when a message arrives.
+    /// Off by default.
     pub notify_input: bool,
 }
 
@@ -64,6 +78,7 @@ pub const HARD_TOTAL_MESSAGES: usize = 2000;
 pub const HARD_FAN_OUT: usize = 32;
 pub const HARD_REPLY_DEPTH: u32 = 32;
 pub const HARD_PAIR_EXCHANGES: u32 = 200;
+pub const HARD_REFUSED_PER_TASK: u32 = 1000;
 
 impl Default for MessagingLimits {
     fn default() -> Self {
@@ -73,6 +88,7 @@ impl Default for MessagingLimits {
             max_reply_depth: 6,
             max_pair_exchanges: 12,
             max_per_task_per_minute: 30,
+            max_refused_per_task: 100,
             notify_input: false,
         }
     }
@@ -102,6 +118,9 @@ impl MessagingLimits {
                 "max_messages_per_task_per_minute",
                 u64::from(HARD_PER_MINUTE),
             );
+        }
+        if self.max_refused_per_task == 0 || self.max_refused_per_task > HARD_REFUSED_PER_TASK {
+            return bad("max_refused_per_task", u64::from(HARD_REFUSED_PER_TASK));
         }
         Ok(())
     }
@@ -163,6 +182,14 @@ mod tests {
             },
             MessagingLimits {
                 max_per_task_per_minute: HARD_PER_MINUTE + 1,
+                ..d
+            },
+            MessagingLimits {
+                max_refused_per_task: 0,
+                ..d
+            },
+            MessagingLimits {
+                max_refused_per_task: HARD_REFUSED_PER_TASK + 1,
                 ..d
             },
         ];

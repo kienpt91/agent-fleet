@@ -521,3 +521,186 @@ esac
     let list = messages(&f);
     assert_eq!(list.len(), 1);
 }
+
+// ---- the review's adversarial scenarios, with the real binary --------------------------------------
+
+const THREE: &str = "[[channels]]\nname = \"talk\"\nmembers = [\"task:alpha\", \"task:beta\", \"task:gamma\"]\nmax_messages_per_minute = 60\nmax_messages_per_task = 50\n";
+
+/// The `channel_muted` events of the log, one line each.
+fn mute_events(f: &Fleet) -> Vec<String> {
+    f.events_raw()
+        .lines()
+        .filter(|l| l.contains("\"type\":\"channel_muted\""))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_ping_pong_between_two_members_mutes_only_the_one_that_crossed_the_limit_while_a_third_keeps_talking(
+) {
+    let out = fleet_infra::testutil::TempDir::new("msg-grief");
+    let script = r#"
+case "$FLEET_TASK" in
+  alpha)
+    send 1 '{"version":1,"channel":"talk","to":"beta","kind":"question","subject":"ping","body":"round one"}'
+    wait_for .fleet/inbox/m2.json
+    send 2 '{"version":1,"channel":"talk","to":"beta","kind":"question","subject":"ping","body":"round three"}'
+    wait_for .fleet/inbox/m6.json && cp .fleet/inbox/m6.json @OUT@/alpha-got-gamma.json
+    done_ok ;;
+  beta)
+    wait_for .fleet/inbox/m1.json
+    send 1 '{"version":1,"channel":"talk","to":"alpha","kind":"result","subject":"pong","body":"round two"}'
+    wait_for .fleet/inbox/m3.json
+    send 2 '{"version":1,"channel":"talk","to":"alpha","kind":"result","subject":"pong","body":"round four"}'
+    sleep 3
+    touch @OUT@/beta-sent
+    done_ok ;;
+  gamma)
+    wait_for @OUT@/beta-sent
+    # a reply to a message gamma never received: refused like a message that does not exist
+    send 1 '{"version":1,"channel":"talk","to":"alpha","kind":"info","subject":"eavesdrop","body":"attaching to a chain","in_reply_to":"m1"}'
+    send 2 '{"version":1,"channel":"talk","to":"alpha","kind":"info","subject":"still here","body":"gamma is not part of the loop"}'
+    done_ok ;;
+esac
+"#;
+    let f = fleet_with(&out, script, "[messages]\nmax_reply_depth = 2\n");
+    plan_with(&f, 3, THREE, &[t("alpha"), t("beta"), t("gamma")]);
+    for task in ["alpha", "beta", "gamma"] {
+        f.wait_task("r1", task, &["completed", "review"]);
+    }
+    // gamma's message reached alpha although the loop was stopped
+    assert!(
+        out.read("alpha-got-gamma.json")
+            .contains("gamma is not part of the loop"),
+        "alpha never heard from gamma"
+    );
+    let list = messages(&f);
+    let by = |status: &str, reason: &str| {
+        list.iter()
+            .filter(|m| jstr(m, "status") == status && jstr(m, "reason") == reason)
+            .count()
+    };
+    assert_eq!(by("blocked", "reply-depth"), 1, "{list:?}");
+    assert_eq!(by("blocked", "unknown-reply"), 1, "{list:?}");
+    // the reply-depth mute is on beta, on this channel; it did not mute the whole channel
+    let mutes = mute_events(&f);
+    let loop_mutes: Vec<&String> = mutes
+        .iter()
+        .filter(|l| l.contains("\"reason\":\"reply-depth\""))
+        .collect();
+    assert_eq!(loop_mutes.len(), 1, "{mutes:?}");
+    assert!(
+        loop_mutes[0].contains("\"task\":\"beta\"")
+            && loop_mutes[0].contains("\"channel\":\"talk\""),
+        "{}",
+        loop_mutes[0]
+    );
+    assert!(
+        mutes
+            .iter()
+            .all(|l| !l.contains("\"task\":null") || l.contains("endpoint-ended")),
+        "no other automatic channel-wide mute: {mutes:?}"
+    );
+    let gates = f.gates();
+    assert_eq!(gates.len(), 1, "{gates:?}");
+    assert!(jstr(&gates[0], "text").contains("beta"), "{gates:?}");
+    // answering the gate lifts the mute of that one task and nothing else
+    f.ok(&["gate", "resolve", "g1", "--answer", "unmute"]);
+    assert!(f.events_raw().contains("\"type\":\"channel_unmuted\""));
+}
+
+#[test]
+fn junk_files_are_recorded_once_and_then_only_counted_until_the_task_is_muted() {
+    let out = fleet_infra::testutil::TempDir::new("msg-junk");
+    let script = r#"
+case "$FLEET_TASK" in
+  alpha)
+    n=0
+    while [ $n -lt 80 ]; do
+      n=$((n+1))
+      printf '{' > .fleet/outbox/$n.json
+    done
+    sleep 4
+    done_ok ;;
+  beta) sleep 5; done_ok ;;
+esac
+"#;
+    let f = fleet_with(&out, script, "");
+    plan_with(&f, 2, CHANNELS, &[t("alpha"), t("beta")]);
+    f.wait_task("r1", "alpha", &["completed", "review"]);
+    f.wait_task("r1", "beta", &["completed", "review"]);
+    let events = f.events_raw();
+    let blocked = count(&events, "\"type\":\"message_blocked\"");
+    assert!(
+        (1..=4).contains(&blocked),
+        "80 junk files are {blocked} log entries, not 80"
+    );
+    let mutes = mute_events(&f);
+    assert!(
+        mutes.iter().any(|l| l.contains("\"task\":\"alpha\"")
+            && l.contains("\"channel\":null")
+            && l.contains("\"reason\":\"flood\"")),
+        "{mutes:?}"
+    );
+    assert_eq!(f.gates().len(), 1);
+    assert!(f.ok(&["verify-log"]).code == 0);
+}
+
+#[test]
+fn the_notice_is_typed_without_enter_and_only_when_switched_on() {
+    let out = fleet_infra::testutil::TempDir::new("msg-notice");
+    let script = r#"
+case "$FLEET_TASK" in
+  alpha)
+    wait_for @OUT@/beta-ready
+    send 1 '{"version":1,"channel":"talk","to":"beta","kind":"info","subject":"hi","body":"a notice follows"}'
+    wait_for @OUT@/beta-typed
+    done_ok ;;
+  beta)
+    # raw mode: what is typed arrives as it is, and nothing is held back for an Enter
+    stty raw -echo min 0 time 10
+    touch @OUT@/beta-ready
+    wait_for .fleet/inbox/m1.json
+    sleep 1
+    dd bs=1 count=200 of=@OUT@/typed.txt 2>/dev/null
+    touch @OUT@/beta-typed
+    done_ok ;;
+esac
+"#;
+    let f = fleet_with(&out, script, "[messages]\nnotify_input = true\n");
+    plan_with(&f, 2, CHANNELS, &[t("alpha"), t("beta")]);
+    f.wait_task("r1", "beta", &["completed", "review"]);
+    f.wait_task("r1", "alpha", &["completed", "review"]);
+    assert_eq!(
+        out.read("typed.txt"),
+        "[fleet] new message m1 in .fleet/inbox",
+        "exactly the fixed line: no Enter, no peer text"
+    );
+}
+
+#[test]
+fn nothing_is_typed_unless_notify_input_is_on() {
+    let out = fleet_infra::testutil::TempDir::new("msg-nonotice");
+    let script = r#"
+case "$FLEET_TASK" in
+  alpha)
+    wait_for @OUT@/beta-ready
+    send 1 '{"version":1,"channel":"talk","to":"beta","kind":"info","subject":"hi","body":"nothing is typed"}'
+    wait_for @OUT@/beta-typed
+    done_ok ;;
+  beta)
+    stty raw -echo min 0 time 10
+    touch @OUT@/beta-ready
+    wait_for .fleet/inbox/m1.json
+    sleep 1
+    dd bs=1 count=200 of=@OUT@/typed.txt 2>/dev/null
+    touch @OUT@/beta-typed
+    done_ok ;;
+esac
+"#;
+    let f = fleet_with(&out, script, "");
+    plan_with(&f, 2, CHANNELS, &[t("alpha"), t("beta")]);
+    f.wait_task("r1", "beta", &["completed", "review"]);
+    f.wait_task("r1", "alpha", &["completed", "review"]);
+    assert_eq!(out.read("typed.txt"), "", "the terminal received nothing");
+}
