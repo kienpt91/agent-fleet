@@ -364,6 +364,10 @@ fn sample_events() -> Vec<DomainEvent> {
             repo: "github.com/o/r".into(),
             number: 7,
         },
+        DomainEvent::ForgeRepoRecorded {
+            run: RunId::parse("r1").unwrap(),
+            repo: "github.com/o/r".into(),
+        },
         DomainEvent::PullRequestStarted {
             id: ApprovalId::from_seq(2),
             run: RunId::parse("r1").unwrap(),
