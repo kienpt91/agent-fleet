@@ -11,7 +11,7 @@ mkrepo() {
 # a wrapper that "updates" the lock and records the network setting it was started with
 cat > "$work/crun-ok" <<STUB
 #!/bin/sh
-echo "net=\${DOGFOOD_NET:-unset} cmd=\$1 cwd=\$(pwd)" >> "$work/crun.log"
+echo "mode=\${DOGFOOD_MODE:-unset} cmd=\$1 cwd=\$(pwd)" >> "$work/crun.log"
 echo '# lock v2' >> Cargo.lock
 STUB
 cat > "$work/crun-same" <<STUB
@@ -58,7 +58,7 @@ expect_out "the cutoff is passed on" "cutoff 2026-10-24T00:00:00Z"
 expect_out "it tells you to commit yourself" "commit Cargo.lock yourself"
 grep -q 'lock v2' "$r/Cargo.lock" && ok || bad "the new lock was not left in place"
 [ -n "$(git -C "$r" status --porcelain)" ] && ok || bad "the refresh must leave the change uncommitted"
-grep -q "net=bridge cmd=cargo update cwd=$r" "$work/crun.log" && ok || bad "cargo update did not get the network (or ran elsewhere): $(cat "$work/crun.log")"
+grep -q "mode=online cmd=cargo update cwd=$r" "$work/crun.log" && ok || bad "cargo update did not get the online mode (or ran elsewhere): $(cat "$work/crun.log")"
 [ "$(git -C "$r" rev-list --count HEAD)" -eq 2 ] && ok || bad "the script committed"
 
 r=$(mkrepo toonew)

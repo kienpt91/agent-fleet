@@ -6,7 +6,7 @@
 #                   [--cutoff 2026-10-24T00:00:00Z]
 #
 # 1. refuses a repository with uncommitted changes (so Cargo.lock can be put back with git);
-# 2. runs `cargo update` in the container, with network (DOGFOOD_NET=bridge for this call only);
+# 2. runs `cargo update` in the container, with network (DOGFOOD_MODE=online for this call only);
 # 3. runs the age check on the result with the cutoff (default: now minus 7 days, UTC);
 # 4. when any locked version is newer than the cutoff it puts Cargo.lock back and exits 1: the
 #    versions that are too new must be pinned back by hand (`cargo update -p <crate> --precise <ver>`);
@@ -45,7 +45,7 @@ git_() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSY
 [ -z "$(git_ status --porcelain 2>/dev/null)" ] || fail "the repository has uncommitted changes: commit or stash them first"
 
 printf 'deps-refresh: cargo update (network on for this step only)\n'
-( cd "$repo" && DOGFOOD_NET=bridge "$crun" 'cargo update' ) || { git_ checkout -- Cargo.lock; fail "cargo update failed; Cargo.lock was put back"; }
+( cd "$repo" && DOGFOOD_MODE=online "$crun" 'cargo update' ) || { git_ checkout -- Cargo.lock; fail "cargo update failed; Cargo.lock was put back"; }
 if [ -z "$(git_ status --porcelain Cargo.lock)" ]; then
   printf 'deps-refresh: Cargo.lock did not change: nothing to refresh\n'
   exit 0
