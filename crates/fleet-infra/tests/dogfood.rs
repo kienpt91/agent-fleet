@@ -1086,7 +1086,12 @@ fn the_daemon_template_is_accepted_by_the_real_reader_and_is_strict() {
         .find(|(n, _)| n.as_str() == "agent")
         .unwrap()
         .1;
-    assert_eq!(agent.command, "/Users/kienpt/.local/bin/omp");
+    // the template names the agent CLI by an absolute path for the operator to edit: its shape is checked, not
+    // whose machine it came from
+    let cmd = Path::new(&agent.command);
+    assert!(cmd.is_absolute(), "{}", agent.command);
+    assert_eq!(cmd.file_name().and_then(|n| n.to_str()), Some("omp"));
+    assert!(!agent.command.contains(".."), "{}", agent.command);
     assert!(
         agent.env_pass.is_empty(),
         "no secret variable is passed through"

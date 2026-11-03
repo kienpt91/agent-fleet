@@ -194,5 +194,5 @@ git -C "$clone" cherry-pick -n "$base..fleet/neo-roadmap/starter-docs-glossary"
 run sh "$tools/check-conflict-markers.sh" --git "$clone"
 say "git commit as the owner (the commit message is the owner's own)"
 git -C "$clone" -c user.name="Owner Name" -c user.email=owner@example.invalid commit -q -m "Add the self-development terms to the glossary"
-git -C "$clone" log --format='%h %an <%ae> %s' -2
+git -C "$clone" log --format='%h %an <%ae> %s' -1
 git -C "$clone" switch -q "$orig_branch"

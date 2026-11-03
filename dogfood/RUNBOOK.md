@@ -59,7 +59,7 @@ Five rules: (1) one task, one file; (2) protected paths are human-only; (3) the 
 ## 1. Prerequisites
 
 - git 2.39 or newer, Docker, the `fleet` binary (`cargo build --release --locked` in a container, or a host build from a
-  clean export of the commit you reviewed) and the agent CLI (`/Users/kienpt/.local/bin/omp`; version 18.6.1 was inspected and
+  clean export of the commit you reviewed) and the agent CLI (`omp`, found with `command -v omp`; version 18.6.1 was inspected and
   is the one of the trials).
 - **A provider key with a hard spending limit.** Before the first run, in the provider's console, create a key for this work
   only and set a hard monthly limit you can afford to lose. NEO's token governor (N4) does not exist yet: nothing in fleet
@@ -120,9 +120,11 @@ sh scripts/secret-scan.sh --tree && sh scripts/secret-scan.sh --history
 # 6. the daemon configuration (outside the repository, read once at daemon start)
 cp dogfood/fleet.dogfood.example.toml ~/.fleet-dogfood/fleet.toml
 chmod 600 ~/.fleet-dogfood/fleet.toml
+#    the template names /usr/local/bin/omp and /opt/fleet-dogfood/bin/container-run: put the absolute paths of YOUR omp and wrapper in
+sed -i.bak -e "s#/usr/local/bin/omp#$(command -v omp)#" -e "s#/opt/fleet-dogfood/bin/container-run#$HOME/.fleet-dogfood/bin/container-run#" ~/.fleet-dogfood/fleet.toml && rm ~/.fleet-dogfood/fleet.toml.bak
 #    read it. It names omp's absolute path and the verified arguments, one worker at a time, max_retries 1, merge and
 #    external-command as approvals, an env allowlist without any secret variable, the worker `human-only`, and one gate.
-#    Replace the paths under /Users/kienpt/.fleet-dogfood if yours differ.
+#    The two absolute paths are the ones the line above set; fleet reads a path literally (no $HOME, no ~).
 export XDG_STATE_HOME=$HOME/.fleet-dogfood/state    # in every terminal you use for this: the daemon and the commands agree,
                                                     # and this daemon never mixes with one of yours
 fleet doctor --config ~/.fleet-dogfood/fleet.toml
@@ -490,7 +492,7 @@ install-tools: installed into /tmp/dogfood-dryrun.pykQzI/tools
 $ container-run = a copy of dogfood/container-run.inside.sh outside the clone (/tmp/dogfood-dryrun.pykQzI/container-run)
 
 $ dryrun config: dogfood/fleet.dogfood.example.toml with the worker command replaced (diff)
-< command = "/Users/kienpt/.local/bin/omp"
+< command = "/usr/local/bin/omp"
 < args = [
 <   "-p",
 <   "--no-session",
@@ -505,7 +507,7 @@ $ dryrun config: dogfood/fleet.dogfood.example.toml with the worker command repl
 > args = []
 < [[gates]]
 < name = "tests"
-< command = "/Users/kienpt/.fleet-dogfood/bin/container-run"
+< command = "/opt/fleet-dogfood/bin/container-run"
 < args = ["sh scripts/test-layers.sh"]
 < timeout_secs = 1800
 
@@ -1112,7 +1114,6 @@ check-conflict-markers: clean (--git)
 
 $ git commit as the owner (the commit message is the owner's own)
 aa73831 Owner Name <owner@example.invalid> Add the self-development terms to the glossary
-4111beb kienpt <kienphan.dev@gmail.com> Check the one wrapper without a single-element loop
 exit=0
 ```
 

@@ -82,7 +82,7 @@ min_len = 24
 #     "--profile", "fleet-dogfood",
 # `env_pass` stays empty either way: the login lives in omp's own storage, not in a variable.
 [workers.agent]
-command = "/Users/kienpt/.local/bin/omp"
+command = "/usr/local/bin/omp"            # EDIT: the absolute path of YOUR omp (`command -v omp`)
 args = [
   "-p",
   "--no-session",
@@ -115,7 +115,7 @@ idle_timeout_secs = 30
 # The wrapper mounts the worktree read-only and has no network. Refcheck is not used: this is a Rust repository.
 [[gates]]
 name = "tests"
-command = "/Users/kienpt/.fleet-dogfood/bin/container-run"
+command = "/opt/fleet-dogfood/bin/container-run"   # EDIT: the absolute path of YOUR wrapper, outside the repository
 args = ["sh scripts/test-layers.sh"]
 timeout_secs = 1800
 

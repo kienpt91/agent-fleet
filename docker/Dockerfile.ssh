@@ -1,3 +1,6 @@
+# WARNING: CI AND TEST ONLY. This image has a world-writable /etc/passwd (see below): any process in a container
+# built from it can become root. Never run it as a service, never expose a port of it, never push it.
+#
 # Development image plus an OpenSSH client and server, for the SSH remote worktree tests and demo.
 # The tests start their own sshd as an ordinary user on a high port with keys generated at run time
 # (nothing is committed); the image only provides the binaries. /etc/passwd is made writable for the
@@ -7,6 +10,8 @@
 #   docker build -f docker/Dockerfile.dev -t fleet-dev docker/
 #   docker build -f docker/Dockerfile.ssh -t fleet-ssh docker/
 FROM fleet-dev
+LABEL org.opencontainers.image.description="CI AND TEST ONLY: world-writable /etc/passwd, never run as a service, never push" \
+      org.fleet.test-only="true"
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client openssh-server \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /run/sshd && chmod 666 /etc/passwd
