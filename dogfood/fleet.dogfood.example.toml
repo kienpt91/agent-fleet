@@ -1,0 +1,137 @@
+# Daemon configuration for self-development: fleet working on its own repository, with NEO's goal
+# ledger and verification contracts, under a person's control. Copy it OUTSIDE the repository
+# (for example ~/.fleet-dogfood/fleet.toml), read dogfood/RUNBOOK.md, and start the daemon from a
+# THROWAWAY CLONE with `fleet daemon --config ~/.fleet-dogfood/fleet.toml`. fleet reads this file
+# once at start, from the daemon's side, never from a repository.
+#
+# What to check before you use it, and nothing else:
+#   - [workers.agent] command: the absolute path of the agent CLI on this machine (`omp` below);
+#   - [[gates]] command: the absolute path of your container wrapper (dogfood/container-run.example.sh,
+#     installed outside the repository). Paths below assume the directory ~/.fleet-dogfood that RUNBOOK.md
+#     creates (written out, because a TOML file does not expand `~`); change them together.
+# The commits fleet makes are authored `fleet <fleet@localhost>` (the default; no author_name or
+# author_email below). RUNBOOK.md, section 5, says how you re-author them when you take them in.
+#
+# Nothing in this file is a secret and none may become one: no key, no token, no password.
+
+[daemon]
+max_sessions = 1              # one worker at a time. The hard cap of fleet is 64; do not raise this before RUNBOOK.md's checklist is true
+default_worker = "agent"
+max_retries = 1               # one automatic retry per task (a failed attempt or a failed gate); every retry spends again
+kill_grace_secs = 5
+approval_ttl_secs = 600       # an approval nobody used expires after 10 minutes
+sensitive = ["merge", "external-command"]   # BOTH stay: see "Why merge stays a human approval" below
+external_timeout_secs = 120   # an approved command the worker asked for may run this long
+question_grace_secs = 2
+ring_bytes = 262144
+
+[env]
+# Variables the worker, the gates and git receive from the daemon's environment. Nothing else is
+# inherited. NO secret variable is in this list. HOME is passed because the agent CLI keeps its
+# configuration, login and sessions under it: this is the same user and the same home as yours, so it
+# is NOT a security boundary (RUNBOOK.md, known gaps). DOGFOOD_* variables of the container wrapper are
+# deliberately not passed: a check can never switch the wrapper to its online mode.
+allow = ["PATH", "HOME", "USER", "LANG", "TERM"]
+
+[redact]
+# Stored output is redacted by key shapes built into fleet, by these extra rules and by the values of
+# secret-looking variables of the daemon's own environment. The rules cover typical prefixes of
+# provider keys; add the prefix of yours if it is not among them.
+literals = []
+env_values = true
+
+[[redact.rules]]
+name = "sk-prefixed-key"
+prefix = "sk-"
+charset = "token"
+min_len = 24
+
+[[redact.rules]]
+name = "key-prefixed-key"
+prefix = "key-"
+charset = "token"
+min_len = 24
+
+# ---- the worker ---------------------------------------------------------------------------------------
+# The agent CLI of this machine, `omp` 18.6.1, run non-interactively, with the arguments that were run for
+# real on the owner's macOS in trial runs of NEO (two tasks completed with every contract check passing):
+#   -p                    print mode: process the prompt and exit
+#   --no-session          keep no session file
+#   --no-extensions       do not discover extensions
+#   --no-skills           do not discover skills
+#   --no-rules            do not discover rules or context files of the project or of other tools
+#   --max-time 25m        omp stops the session after 25 minutes (fleet's own timeout below is the backstop)
+#   --cwd {worktree}      start in the task's worktree
+#   --approval-mode write approve reads and workspace writes, refuse anything that executes (see below)
+#   @{brief_file}         the brief of the task, as the prompt
+#
+# WHAT `--approval-mode write` DOES HEADLESS, as observed in those runs: the agent could NOT run shell
+# commands (the approval it needs cannot be given with nobody there), so it edited files BLIND, without ever
+# running a build or a test; fleet's own verification of the committed result (the contract) did all the
+# proving, in a container. That is the safe default for an unattended worker: the agent can change files of
+# its worktree and nothing else, and what it claims is checked by something that is not the agent. Do not
+# "fix" it with `--auto-approve`, `--yolo` or `--approval-mode yolo`: that lets the agent run anything as you.
+#
+# WHAT THIS DOES NOT ISOLATE: the default profile reads YOUR omp configuration through HOME, among it
+# global MCP servers (their tools count as `write` and are approved automatically) and your login. The
+# trial runs used it. To keep your configuration out of the worker's way, give omp its own profile (isolated
+# auth, sessions, settings and caches under ~/.omp/profiles/fleet-dogfood) and log in once, in a terminal,
+# with a provider key that has a HARD spending limit set in the provider's console:
+#     omp --profile fleet-dogfood login <provider>
+# then add these two lines to `args` below, before "--cwd" (NOT exercised yet: see RUNBOOK.md, section 2):
+#     "--profile", "fleet-dogfood",
+# `env_pass` stays empty either way: the login lives in omp's own storage, not in a variable.
+[workers.agent]
+command = "/Users/kienpt/.local/bin/omp"
+args = [
+  "-p",
+  "--no-session",
+  "--no-extensions",
+  "--no-skills",
+  "--no-rules",
+  "--max-time", "25m",
+  "--cwd", "{worktree}",
+  "--approval-mode", "write",
+  "@{brief_file}",
+]
+env_pass = []                 # no secret variable (RUNBOOK.md, "If the key must be a variable")
+timeout_secs = 1800           # 30 minutes in all; omp's own --max-time is 25
+idle_timeout_secs = 600       # print mode may print nothing until the end, so this is long; --max-time is the real bound
+
+# A worker for tasks that only a person may do (dogfood/human-only.md). It prints why and fails at
+# once, so such a task costs nothing and its dependents wait behind it; its contract can never pass either.
+[workers.human-only]
+command = "/bin/sh"
+args = ["-c", "echo 'task {task} is human-only: a person does this one, see dogfood/human-only.md' >&2; exit 1"]
+timeout_secs = 30
+idle_timeout_secs = 30
+
+# ---- quality gates ------------------------------------------------------------------------------------
+# Gates run in the task's WORKTREE after the worker finished and after the verification contract
+# passed. The contract already runs the same suites on a clean export of the commit (which is what is
+# proven and merged); this gate is a second, slower look at the worktree itself. It is optional:
+# delete it to halve the time of a task. The command is the wrapper OUTSIDE the repository, never a
+# script of the repository (a worker can edit those, see SECURITY.md "Quality gates").
+# The wrapper mounts the worktree read-only and has no network. Refcheck is not used: this is a Rust repository.
+[[gates]]
+name = "tests"
+command = "/Users/kienpt/.fleet-dogfood/bin/container-run"
+args = ["sh scripts/test-layers.sh"]
+timeout_secs = 1800
+
+# ---- why merge stays a human approval ----------------------------------------------------------------
+# `sensitive` lists "merge": `fleet merge <task>` answers "approval required" and names an approval bound
+# to the exact commit; only you can approve it (`fleet approve`), and the merge then brings in exactly that
+# commit, nothing the branch gained since. That is the last place where a person looks at the diff
+# before anything reaches the integration branch, and the place where check-protected.sh is run by hand
+# on the exact commit. Removing "merge" would make the agent's work land on its own. Never do that here.
+# "external-command" stays too: a worker may ask fleet to run a command; a person approves each one.
+#
+# ---- where the worktrees are --------------------------------------------------------------------------
+# fleet makes one git worktree per task under <repo>/.fleet-worktrees/<run>/<task> on the branch
+# fleet/<run>/<task>. They are separate checkouts: a worker writing there does not change the files of
+# your main checkout, the index or the branch you have checked out, and the protected files that the
+# contracts look at are read from git objects (the commit of the task branch), not from any working
+# tree. A worker is the same user, though: it CAN reach your main checkout, the shared .git directory
+# and everything else you can. That is why RUNBOOK.md has you run on a throwaway clone and keep
+# the check scripts in a directory outside the repository.

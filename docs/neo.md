@@ -57,7 +57,7 @@ types, duplicate ids and out-of-range numbers are errors.
   {"id": "refs",   "kind": "refcheck-json", "program": "/usr/local/bin/refcheck", "args": ["--json", "."],
    "mandatory": false},
   {"id": "readme", "kind": "file", "path": "README.md", "assert": "contains", "value": "## Usage"},
-  {"id": "scope",  "kind": "diff", "allow": ["src/**", "tests/**"]}
+  {"id": "scope",  "kind": "diff", "allow": ["src/**", "tests/**"], "deny": ["src/vendor/**"]}
 ]}
 ```
 
@@ -66,7 +66,7 @@ types, duplicate ids and out-of-range numbers are errors.
 | `command` | the program exits with `expect_exit` (default 0) | `program` (absolute), `args`, `expect_exit` 0-255, `timeout_ms` 100 to 1800000 (default 120000) |
 | `refcheck-json` | stdout is a `refcheck` JSON document without errors (the judgement of the quality gate of the same name) | `program`, `args`, `timeout_ms` |
 | `file` | `exists`: a regular file is there; `sha256`: its SHA-256 equals `value`; `contains`: it is UTF-8 text containing `value` | `path` (relative, no `..`), `assert`, `value` |
-| `diff` | every path the commits of the task changed since the run's base commit (`.fleet/` paths included) matches a glob | `allow`: 1 to 32 globs: `*`, `?`, `**` as a whole segment; no classes, braces or escapes |
+| `diff` | every path the commits of the task changed since the run's base commit (`.fleet/` paths included) matches no `deny` glob and, when `allow` is given, at least one `allow` glob (a denied path fails whatever `allow` says; a diff cut at 10000 paths is an `error`, never a pass) | `allow`: 0 to 32 globs, `deny`: 0 to 128 globs, at least one of the two in total: `*`, `?`, `**` as a whole segment (`dir/**` also matches a path that is just `dir`); no classes, braces or escapes; case-sensitive |
 
 Every check has `id` (`[a-z0-9][a-z0-9_-]*`) and `mandatory` (default true; at least one check must be mandatory).
 Defaults are written out in the canonical form, so the contract id (the SHA-256 of the canonical text, shown shortened
@@ -199,9 +199,48 @@ isolation, as for workers. A weak check passes a weak result.
 - The `PATH` cut-down keeps world-writable and in-repository directories out, but does not prove that the directories it
   keeps hold only honest programs.
 
+## Self-development: what is and is not safe today
+
+NEO can be pointed at its own repository: agents write the code of the remaining milestones one named file at a time, and
+fleet's own contracts decide whether each task may complete. The scaffold is in [dogfood/](../dogfood/RUNBOOK.md); the
+decision is [ADR 28](adr/0028-neo-may-not-modify-its-own-guardrails.md). Exactly what that means today:
+
+**Exists and is tested (without any real agent):**
+
+- A list of protected paths NEO may never change by itself (the approval and admission code, the verification and evidence
+  code, the secret scanner and hooks, CI, SECURITY.md, the examples that define commands, the dependency manifests and the
+  lock file, the architecture tests, the `dogfood/` directory), with the reason of each entry
+  ([PROTECTED_PATHS.md](../dogfood/PROTECTED_PATHS.md)). A change to one needs a commit authored by a person, or a human
+  approval of the exact diff plus an independent security review.
+- The `diff` check takes a `deny` list: every self-development contract forbids the whole list, next to a scope that allows
+  one named file, and also runs formatting, lints with `-D warnings`, the architecture tests, the layered tests, the secret
+  scanner, an unchanged `Cargo.lock` and a check that no measured number of README.md or docs/ changed
+  ([contracts](../dogfood/contracts/README.md)). The checker scripts run from a copy outside the repository.
+- A roadmap plan for N3, N4 and N5 and maintenance with a goal and a contract per task; tasks that touch protected paths are
+  **human-only**: they use a worker that fails at once and a contract that no change can satisfy
+  ([human-only.md](../dogfood/human-only.md)). One narrow reviewed exception exists, a test-only change in one protected Rust
+  file, with a stress check for flaky tests ([contracts](../dogfood/contracts/README.md)).
+- A daemon configuration template (one worker, one retry, merge and external commands as approvals, no secret variable), a
+  container wrapper (offline, tree read-only), a runbook, and a dry run with the scripted agent that was run in the development
+  container.
+
+**Not safe, not done, not claimed:**
+
+- **This scaffold has not been run with a real agent.** Earlier trial runs of NEO with `omp` on the owner's macOS, with hand-written
+  contracts, completed two real tasks with every check passing, and showed that in `--approval-mode write` the agent cannot run shell
+  commands headless: it edits blind, and fleet's own run of the contract is the whole proof. That is the safe default of the template. The
+  isolated agent profile and the scaffold's own contracts were not exercised with the real agent.
+- The worker is the same user as the operator and is not sandboxed: contracts judge what was committed, not what a process
+  did to other files. Use a throwaway clone and a container, a VM or another OS user.
+- No token governor (N4): nothing limits spend but the provider's own console. The context compiler (N2, above) exists but is an
+  opt-in of a run (`context = "compiled"`) that the roadmap plan does not switch on and that has not been tried with the scaffold,
+  so the agent sees a task's spec as its brief, not its contract.
+- A weak check passes a weak result, and a person still reads every diff. `merge` stays a human approval.
+
 See the decisions in [docs/adr/0011](adr/0011-neo-domain-crates-and-application-module.md),
-[0012](adr/0012-goals-and-evidence-are-event-sourced.md), [0013](adr/0013-verification-by-fleet-gates-completion.md) and [0014](adr/0014-checks-run-on-an-export-and-their-processes-are-untrusted.md),
-and the vocabulary in [domain.md](domain.md).
+[0012](adr/0012-goals-and-evidence-are-event-sourced.md), [0013](adr/0013-verification-by-fleet-gates-completion.md),
+[0014](adr/0014-checks-run-on-an-export-and-their-processes-are-untrusted.md) and
+[0028](adr/0028-neo-may-not-modify-its-own-guardrails.md), and the vocabulary in [domain.md](domain.md).
 
 # Milestone N2: the context compiler and handoff packets
 

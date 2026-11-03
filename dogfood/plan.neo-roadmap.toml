@@ -1,0 +1,609 @@
+# The remaining NEO milestones (N3 knowledge store, N4 token governor, N5 credential broker) and
+# maintenance, as a task DAG for `fleet plan dogfood/plan.neo-roadmap.toml`.
+#
+# How it fits together (read dogfood/RUNBOOK.md first):
+#   - Every task has a goal in dogfood/goals.neo-roadmap.tsv with a verification contract from
+#     dogfood/contracts/ (dogfood/apply-goals.sh adds them). The contract decides whether the task
+#     can complete; the plan only says what to do and in which order.
+#   - A plan cannot mark a task "human-only", so such a task says so in its title and spec, uses the
+#     worker `human-only` (a command that prints why and fails at once, so it costs nothing) and has
+#     the contract `human-only.json`, which no change can satisfy: it can never auto-complete. Its
+#     dependents wait behind it. dogfood/human-only.md lists them and what the person does.
+#   - fleet cannot mark a task completed by hand either. When a person has done the work of a
+#     human-only task (or an earlier run merged a task), start the next stage from
+#     `dogfood/plan-without.sh --repo <the clone> --run-id <new id> <this file> <done ids>`.
+#   - ALWAYS load the plan through plan-without.sh with --repo (`none` as the list of ids keeps every task):
+#     fleet does not make the `repo` of a plan file absolute, so a relative one would be resolved
+#     by the daemon against its own working directory. The `repo` below names no repository on purpose.
+#   - All other tasks use the worker `agent` and may change ONE named file (the contract's diff
+#     check allows only that), never a protected path (dogfood/PROTECTED_PATHS.md).
+#   - N3 to N5 assume milestone N2 (context compiler) is merged to main before the plan is loaded.
+
+[run]
+id = "neo-roadmap"
+objective = "Build NEO milestones N3, N4 and N5 under human control: agents write pure domain code and docs in named files, people do everything that touches the guardrails"
+repo = "/ABSOLUTE/PATH/OF/THE/THROWAWAY/CLONE"   # a placeholder that names no repository: give the real one with plan-without.sh --repo
+max_parallel = 1
+
+# ---- starters: validate the loop end to end with small, safe tasks -----------------------------------
+# Run these first, one at a time. Nothing else starts before all three are merged and reviewed.
+
+[[tasks]]
+id = "starter-error-tests"
+title = "Starter: unit tests for fleet-domain error.rs"
+worker = "agent"
+spec = '''
+Add unit tests to crates/fleet-domain/src/error.rs. It has none today; the exit codes and names are
+only pinned by the end-to-end tests.
+
+Change ONLY crates/fleet-domain/src/error.rs, and only by adding a `#[cfg(test)] mod tests` at the end
+of the file. Do not change any line outside that module.
+
+Tests to write (read the code first and assert what it does; if something looks wrong, say so in
+the summary instead of changing it):
+- every ErrorCode: as_str then parse gives the same code; an unknown name parses to None;
+- exit_code gives distinct values and matches the table in README.md (0 ok, 1 internal, 2 usage,
+  3 daemon_down, 4 not_found, 5 approval_required, 6 conflict, 7 invalid, 8 limit, 9 unavailable,
+  10 forbidden, 11 tampered, 12 timeout, 13 unhealthy) for the codes this file defines;
+- each constructor (usage, invalid, not_found, conflict, limit, forbidden, unavailable, internal)
+  sets the matching code and keeps the message; with_subject sets the subject; io keeps the context.
+
+Rules: standard library only, no new dependency, no unsafe. Do not touch any other file. Do not edit
+numbers in README.md or docs/. Do not run commands that need the network.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "starter-value-property"
+title = "Starter: a property test for the canonical form of fleet-domain Value"
+worker = "agent"
+spec = '''
+Add one property-style test to crates/fleet-domain/src/value.rs, in its existing `#[cfg(test)]` module.
+
+Property: `Value::canonical()` does not depend on the order in which the keys of an object were
+inserted, and equal values have equal canonical text.
+
+Use a small deterministic pseudo-random generator written inside the test (a linear congruential
+generator, as other tests of this workspace do; look at neo-verify/src/contract.rs for the style).
+No crate. Generate at least 200 random values (nested objects and arrays of strings, integers,
+booleans and null, depth at most 4), build each object twice with the keys in different orders, and
+assert that the canonical texts are equal. Also assert that the canonical text of a value never
+contains a newline or a space outside string contents.
+
+Change ONLY crates/fleet-domain/src/value.rs and only inside the existing test module. Do not change
+any non-test line. Standard library only, no unsafe. Do not edit numbers in README.md or docs/.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "starter-docs-glossary"
+title = "Starter: glossary entries for self-development in docs/domain.md"
+worker = "agent"
+spec = '''
+Add three rows to the glossary table of docs/domain.md, in the same style as the existing rows
+(`| **Term** | Meaning |`), after the NEO rows:
+
+- **Protected path**: a file or directory NEO may never change by itself (the approval and admission
+  code, the verification and evidence code, the secret scanner and hooks, CI, dependency manifests,
+  the architecture tests and the dogfood directory). The list is dogfood/protected-paths.json; the
+  reasons are in dogfood/PROTECTED_PATHS.md. A task whose commits touch one fails its contract.
+- **Human-only task**: a task of the roadmap plan that touches a protected path. It uses the worker
+  `human-only`, a contract that no change can satisfy, and is done by a person (dogfood/human-only.md).
+- **Self-development**: running fleet on this repository with NEO's own goal ledger and verification
+  contracts under a person's control, as described in dogfood/RUNBOOK.md.
+
+Change ONLY docs/domain.md and add nothing else to it. Do not edit any number, test count or
+coverage figure anywhere. No new links except to the three dogfood files named above.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+# ---- maintenance --------------------------------------------------------------------------------------
+
+[[tasks]]
+id = "maint-docs-links"
+title = "Maintenance: make the relative links and anchors in README.md and docs/ resolve"
+worker = "agent"
+after = ["starter-error-tests", "starter-value-property", "starter-docs-glossary"]
+spec = '''
+Check every relative link and every `#anchor` in README.md and docs/*.md (not docs/adr, which is
+protected) and fix the ones that do not resolve: a moved file, a heading that was renamed. Use the
+headings as the ground truth for anchors (GitHub's lowercase and dash rules).
+
+Change only README.md and files directly in docs/ (not docs/adr/ and not docs/img/). Change only link
+targets and anchor spellings; do not rewrite prose and NEVER edit a number: test counts, coverage
+figures, check counts, crate counts and the soak figures are measured by a person and a check fails the
+task if any such line changes. If a link cannot be fixed without changing a claim, leave it and say
+so in the summary.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "maint-deps-refresh"
+title = "HUMAN-ONLY maintenance: dependency refresh under the 7 day policy"
+worker = "human-only"
+after = ["starter-error-tests", "starter-value-property", "starter-docs-glossary"]
+spec = '''
+HUMAN-ONLY. Cargo.toml and Cargo.lock are protected; a worker never changes dependencies.
+A person runs dogfood/deps-refresh.sh (it updates Cargo.lock in the container, runs the age check
+against a cutoff of now minus 7 days and puts Cargo.lock back when any crate is too new), reviews
+the Cargo.lock diff and the new build scripts and procedural-macro crates against SECURITY.md, runs
+the layered tests and commits the result on a branch. See dogfood/human-only.md.
+'''
+
+[[tasks]]
+id = "maint-numbers"
+title = "HUMAN-ONLY maintenance: refresh the measured numbers of README.md"
+worker = "human-only"
+after = ["maint-deps-refresh"]
+spec = '''
+HUMAN-ONLY. Test counts, coverage figures and the other measured numbers of README.md, SECURITY.md
+and docs/ are refreshed by a person from the output of scripts/test-layers.sh, scripts/coverage.sh,
+the soak test and check-crates-age (fresh docker volumes), never by a task. See dogfood/human-only.md.
+'''
+
+# ---- N3: the knowledge store ---------------------------------------------------------------------------
+# Pure domain code in a new crate, `neo-knowledge` (std and fleet-domain only). A person scaffolds the
+# crate and, later, wires it into events, use cases, adapters and the CLI. Agents fill in the
+# modules one file at a time.
+
+[[tasks]]
+id = "n3-scaffold"
+title = "HUMAN-ONLY N3: scaffold the neo-knowledge crate"
+worker = "human-only"
+after = ["starter-error-tests", "starter-value-property", "starter-docs-glossary"]
+spec = '''
+HUMAN-ONLY (workspace Cargo.toml, Cargo.lock and the architecture tests are protected).
+Create crates/neo-knowledge: Cargo.toml (std and fleet-domain only, `[lints] workspace = true`), a
+src/lib.rs with `#![forbid(unsafe_code)]`, the test-only lint relaxations used by the other domain
+crates and `pub mod limits; pub mod source; pub mod fact; pub mod base; pub mod stale;
+pub mod contradiction; pub mod parse;`, and one file per module with only a module comment and the
+module's limits in limits.rs. Add the crate to the workspace members, refresh Cargo.lock offline,
+add it to the CRATES, DOMAIN, INNER and PURE lists and the dependency table of
+crates/fleet-cli/tests/architecture.rs, and to scripts/test-layers.sh and scripts/coverage.sh (domain
+layer). Run the layered tests, the architecture tests and the secret scanner, then commit.
+'''
+
+[[tasks]]
+id = "n3-source"
+title = "N3: fact sources and the confidence they give (source.rs)"
+worker = "agent"
+after = ["n3-scaffold"]
+spec = '''
+Implement crates/neo-knowledge/src/source.rs.
+
+A fact's source is one of: a file citation (path, commit, line range, SHA-256 of the cited lines), the
+id of the evidence of an executed check, a URL with its retrieval date and content hash, or a human.
+Write: the `Source` enum with validation (bounded lengths, relative paths without `..`, lowercase hex
+hashes of 64 digits, no control or invisible characters; reuse fleet_domain::ids helpers), a total order or
+`Display` that is stable, and `Confidence` (executed check, then file citation, then URL, then human
+assertion, then agent assertion) with `Source::confidence()`; an agent assertion is a source kind too
+(`Agent { task }`). Property-style tests with a deterministic generator: every valid source round-trips
+through its canonical text; random strings never panic the constructor.
+
+Change ONLY crates/neo-knowledge/src/source.rs. Standard library and fleet-domain only, no unsafe, no
+unwrap/expect/indexing outside tests, no I/O, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n3-fact"
+title = "N3: the Fact value object and its status machine (fact.rs)"
+worker = "agent"
+after = ["n3-source"]
+spec = '''
+Implement crates/neo-knowledge/src/fact.rs on top of source.rs.
+
+A `Fact` has an id, a bounded claim text, a subject key and value (the pair used to find
+contradictions), a scope (global, project, run, task), tags, a `Source`, a status (proposed, verified,
+rejected, superseded, stale), a `supersedes` link and the file hash a file-bound fact depends on.
+Write the constructor with validation, and the status machine as a pure function table:
+proposed to verified or rejected; verified to superseded or stale; stale to verified or rejected;
+nothing leaves rejected or superseded. A fact becomes verified only when the caller names a verification
+rule: an executed check, a citation that was mechanically confirmed, or a human approval; an agent
+assertion alone can never produce verified (test it for every source kind).
+
+Tests: every legal and every illegal transition; claims over the bound are refused; hostile text
+(control characters, bidi overrides) is refused. Change ONLY crates/neo-knowledge/src/fact.rs.
+Standard library and fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n3-base"
+title = "N3: the KnowledgeBase aggregate with replay (base.rs and a replay property test)"
+worker = "agent"
+after = ["n3-fact"]
+spec = '''
+Implement crates/neo-knowledge/src/base.rs: the `KnowledgeBase` aggregate, a projection of events like the
+goal ledger of neo-goals (read crates/neo-goals/src/ledger.rs for the pattern: commands validate and
+return events, `apply` is infallible and deterministic).
+
+Events local to this crate: FactProposed, FactVerified (with the rule used), FactRejected,
+FactSuperseded, FactMarkedStale. Commands: propose, verify, reject, supersede. Bounds: at most 4096
+facts, with the oldest rejected or superseded ones evicted from memory deterministically (the same on
+replay).
+
+Tests in the file and in crates/neo-knowledge/tests/replay.rs: replaying the events of a random
+command sequence (deterministic generator) gives a base equal to the live one; verified requires a
+verification rule; a superseded fact never becomes verified again; bounds hold.
+
+Change ONLY files below crates/neo-knowledge/src/ and crates/neo-knowledge/tests/. Do not edit
+Cargo.toml (no dependency may be added). Standard library and fleet-domain only, no unsafe, no
+unwrap/expect/indexing outside tests.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n3-stale"
+title = "N3: staleness by file hash (stale.rs)"
+worker = "agent"
+after = ["n3-base"]
+spec = '''
+Implement crates/neo-knowledge/src/stale.rs: a pure function that, given the base and a map of current
+file hashes (path to hash, supplied by the caller: no file access here), returns the ids of verified
+facts whose recorded file hash differs from the current one and the commands to mark them stale
+through the aggregate of base.rs. A fact that is not bound to a file never goes stale; a path that is
+missing from the map is reported as `unknown`, not stale.
+
+Tests: unchanged hashes give nothing, a changed hash gives exactly the facts bound to that file,
+the result is sorted and deterministic, a map with 100000 entries is handled in linear time.
+Change ONLY crates/neo-knowledge/src/stale.rs. Standard library and fleet-domain only, no unsafe, no
+unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n3-contradiction"
+title = "N3: contradictions between verified facts (contradiction.rs)"
+worker = "agent"
+after = ["n3-base"]
+spec = '''
+Implement crates/neo-knowledge/src/contradiction.rs: find the sets of verified facts that share a subject
+key and scope but differ in value, and the set of fact ids that must not be compiled into a context
+pack while the contradiction stands (both sides). Return a deterministic, sorted description that a
+decision gate can show a person. Facts in other statuses never take part. Scope matters: the same key in
+different scopes is not a contradiction.
+
+Tests: no facts, one fact, two equal values, two different values, three facts where two agree, a fact
+superseded by the other, scopes, and a property test with a deterministic generator that the result
+does not depend on the order the facts were verified in. Change ONLY
+crates/neo-knowledge/src/contradiction.rs. Standard library and fleet-domain only, no unsafe, no
+unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n3-parse"
+title = "N3: parsing the facts a worker proposes (parse.rs)"
+worker = "agent"
+after = ["n3-fact"]
+spec = '''
+Implement crates/neo-knowledge/src/parse.rs: turn the neutral `Value` of a `.fleet/facts.json` document
+(`{"version":1,"facts":[{"claim","subject","value","scope","tags","source"}]}`) into proposals. Reading
+the file is somebody else's job; this parses a value. Strict schema: unknown keys, wrong types, more
+than 32 facts, oversized text and every kind of source other than `agent` (a worker may only assert,
+never claim to have executed a check) are errors; the error names the offending field and never echoes
+more than 64 characters of the input.
+
+Tests: valid documents, each kind of error, and a fuzz-style test with a deterministic generator that
+builds 20000 random `Value` trees and checks that parsing never panics and that whatever parses
+satisfies the bounds of fact.rs. Change ONLY crates/neo-knowledge/src/parse.rs. Standard library and
+fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n3-integrate"
+title = "HUMAN-ONLY N3: wire the knowledge store into events, use cases, adapters and the CLI"
+worker = "human-only"
+after = ["n3-stale", "n3-contradiction", "n3-parse"]
+spec = '''
+HUMAN-ONLY (events, ports, use cases, adapters, the daemon and the CLI are protected).
+Add the fact events to fleet-domain/src/events.rs, the `neo/knowledge.rs` use cases and the
+KnowledgeBase port to fleet-app, an append-only JSONL store under the state directory (0600, bounded,
+redacted before it is written) and the reading of `.fleet/facts.json` with the same safe-read rules as
+result.json to fleet-infra, the contradiction decision gate, and `fleet facts` commands to the CLI.
+Port contract suites and end-to-end tests included. See dogfood/human-only.md.
+'''
+
+[[tasks]]
+id = "n3-docs"
+title = "N3: document the knowledge store (docs/knowledge.md)"
+worker = "agent"
+after = ["n3-integrate"]
+spec = '''
+Write docs/knowledge.md (a new file) describing what exists after N3: the Fact and its sources and
+confidence, the status machine, staleness by hash, contradictions and the gate, the `.fleet/facts.json`
+worker file, storage and its bounds, the `fleet facts` commands, and an honest list of what is not
+there. Describe only what the code does: read crates/neo-knowledge and the commands before writing,
+and quote limits from limits.rs. Do not state test counts or coverage figures. Change ONLY
+docs/knowledge.md.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n3-review"
+title = "HUMAN-ONLY N3: independent security review and acceptance"
+worker = "human-only"
+after = ["n3-docs"]
+spec = '''
+HUMAN-ONLY. An independent security review of the whole N3 diff, the milestone criteria of the NEO design
+(proposal and verification flow, staleness by hash, contradiction gate, redaction, bounded sizes, fuzzed
+parsing), the numbers of the README, SECURITY.md and docs/neo.md updated by a person. See dogfood/human-only.md.
+'''
+
+# ---- N4: the token governor ----------------------------------------------------------------------------
+# A new pure crate, `neo-governor`. There is no usage source yet for any real agent: how an adapter
+# learns token counts from the agent is part of the human-only integration and may turn out to be estimates only.
+
+[[tasks]]
+id = "n4-scaffold"
+title = "HUMAN-ONLY N4: scaffold the neo-governor crate"
+worker = "human-only"
+after = ["n3-review"]
+spec = '''
+HUMAN-ONLY. Same as n3-scaffold for the crate crates/neo-governor with the modules
+`limits, budget, meter, estimator, policy`.
+'''
+
+[[tasks]]
+id = "n4-budget"
+title = "N4: the Budget aggregate (budget.rs)"
+worker = "agent"
+after = ["n4-scaffold"]
+spec = '''
+Implement crates/neo-governor/src/budget.rs: budgets at four levels (run, task, agent, account) in
+tokens and optionally in currency units (integer micro-units, never floats). Commands: set a limit,
+charge a usage, release. A charge that would pass the limit is reported as exceeded and is still
+recorded (the spend happened); a budget never shows a negative remainder (saturating arithmetic, no
+overflow: test u64::MAX). Events local to the crate: BudgetSet, Charged, BudgetExceeded; `apply` is
+infallible and deterministic, so replay gives the same state.
+
+Tests including a property test with a deterministic generator: remaining is never negative, the sum of
+charges equals spent, replay equals live. Change ONLY crates/neo-governor/src/budget.rs. Standard
+library and fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n4-meter"
+title = "N4: metering from adapter reports and estimates (meter.rs)"
+worker = "agent"
+after = ["n4-budget"]
+spec = '''
+Implement crates/neo-governor/src/meter.rs: a `Usage` record (task, agent, account, input tokens, output
+tokens, kind: Reported by the adapter or Estimated) and a `Meter` that turns usage into charges against
+the budgets of budget.rs. A reported figure replaces the estimate it follows for the same call id (never
+double counted); an estimate never replaces a reported figure. Deterministic under replay.
+
+Tests: reported replaces estimated, estimated after reported is ignored, duplicates by call id are
+idempotent, out-of-order arrival ends in the same totals (property test, deterministic generator).
+Change ONLY crates/neo-governor/src/meter.rs. Standard library and fleet-domain only, no unsafe, no
+unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n4-estimator"
+title = "N4: a deterministic token estimator (estimator.rs)"
+worker = "agent"
+after = ["n4-scaffold"]
+spec = '''
+Implement crates/neo-governor/src/estimator.rs: `estimate(text: &str) -> u64`, a documented, deterministic
+approximation of the token count of a text (for example by UTF-8 bytes and word boundaries, with a
+safety factor that errs on the high side), monotonic in the length of the text, no panics on any input,
+linear time. Document in the module comment the error you expect and that it is an estimate and nothing
+more. No tokenizer data, no crate.
+
+Tests: empty text, ASCII, CJK, emoji, a 10 MiB string finishes, monotonicity (property test with a
+deterministic generator), the estimate of a concatenation is at most the sum of the estimates plus a
+small constant. Change ONLY crates/neo-governor/src/estimator.rs. Standard library only, no unsafe,
+no unwrap/expect/indexing outside tests.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n4-policy"
+title = "N4: limits, priorities, bursts and daily windows (policy.rs)"
+worker = "agent"
+after = ["n4-budget"]
+spec = '''
+Implement crates/neo-governor/src/policy.rs: a pure `decide(budget view, policy, priority, now) ->
+Decision` with `Allow`, `Warn` (soft limit passed), `Stop` (hard limit passed) and `Pause`. A policy has a
+soft and a hard fraction, an allowance per priority (a low-priority task is stopped earlier), a burst
+allowance that may exceed the hard limit once by a bounded amount, and a daily window (`now` is an
+argument in whole days since an epoch: this file never reads a clock). `Stop` is monotonic: once a budget
+is over its hard limit and the burst is used, every later decision for it is Stop until the window rolls
+over.
+
+Tests for each rule and a property test of monotonicity with a deterministic generator. Change ONLY
+crates/neo-governor/src/policy.rs. Standard library and fleet-domain only, no unsafe, no
+unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n4-props"
+title = "N4: accounting property tests across modules (tests/accounting.rs)"
+worker = "agent"
+after = ["n4-meter", "n4-policy", "n4-estimator"]
+spec = '''
+Write crates/neo-governor/tests/accounting.rs: integration-level property tests with a deterministic
+generator that drive the meter, the budgets and the policy together: no budget ever has a negative
+remainder, accounting is identical when the same usage events are replayed in the same order, a Stop
+decision is never followed by Allow in the same window, and estimates never exceed what reported usage
+later replaces by more than the documented bound. Use only the public API of the crate.
+
+Change ONLY crates/neo-governor/tests/accounting.rs. Standard library and the crate itself only.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n4-integrate"
+title = "HUMAN-ONLY N4: events, hard stop, usage source and `fleet budget`"
+worker = "human-only"
+after = ["n4-props"]
+spec = '''
+HUMAN-ONLY. Events (fleet-domain), use cases and the hard-stop enforcement in the supervision of the
+orchestrator (kill or pause the worker), an adapter for the usage the agent reports (check what the
+real agent CLI can report; if it reports nothing, estimates only, and say so), `fleet budget` in the
+CLI, the soak test of the hard stop. See dogfood/human-only.md.
+'''
+
+[[tasks]]
+id = "n4-docs"
+title = "N4: document the token governor (docs/governor.md)"
+worker = "agent"
+after = ["n4-integrate"]
+spec = '''
+Write docs/governor.md (a new file): budgets and their levels, metering (reported against estimated),
+policies, the hard stop and what it kills, `fleet budget`, the bounds, and an honest list of what is not
+there (token counts of providers are approximations; spend is checked by the provider's own dashboard).
+Read the code before writing; state no test counts or coverage figures. Change ONLY docs/governor.md.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n4-review"
+title = "HUMAN-ONLY N4: independent security review and acceptance"
+worker = "human-only"
+after = ["n4-docs"]
+spec = '''
+HUMAN-ONLY. Independent review of the N4 diff, the milestone criteria (metering from adapter usage and
+estimates, hard-stop enforcement in a soak test, no negative budgets, deterministic accounting under
+replay), numbers of the README and SECURITY.md refreshed by a person. See dogfood/human-only.md.
+'''
+
+# ---- N5: the credential broker -------------------------------------------------------------------------
+# Almost everything that touches a secret is human-only. Agents write only the pure model: references
+# (never values), accounts, leases, capabilities.
+
+[[tasks]]
+id = "n5-scaffold"
+title = "HUMAN-ONLY N5: scaffold the neo-broker crate"
+worker = "human-only"
+after = ["n4-review"]
+spec = '''
+HUMAN-ONLY. Same as n3-scaffold for the crate crates/neo-broker with the modules
+`limits, refs, account, capability`.
+'''
+
+[[tasks]]
+id = "n5-refs"
+title = "N5: credential references, never values (refs.rs)"
+worker = "agent"
+after = ["n5-scaffold"]
+spec = '''
+Implement crates/neo-broker/src/refs.rs: `CredentialRef` is `keychain:<name>`, `env:<NAME>` or
+`file:<absolute path>`; nothing else. Parsing refuses a value that looks like a secret (use
+fleet_domain::redact::Redactor::builtin() on the input and refuse if it would change it), refuses
+control and invisible characters, paths with `..`, relative paths and anything longer than 256 bytes.
+A `CredentialRef` has no accessor that could hold a secret: only the kind and the name. Its `Debug` and
+`Display` print the reference, which is not secret by construction.
+
+Tests: each kind, each refusal, strings assembled at run time that have the shape of keys of several
+providers are refused (build them in the test from pieces; never write a key-shaped literal), a
+property test that random strings never panic. Change ONLY crates/neo-broker/src/refs.rs.
+Standard library and fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no I/O.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n5-account"
+title = "N5: accounts, leases and assignment policies (account.rs)"
+worker = "agent"
+after = ["n5-refs"]
+spec = '''
+Implement crates/neo-broker/src/account.rs: `Account` (id, label, a `CredentialRef`, an optional owner
+note), `Lease` (account, task, expiry as a number the caller supplies) and a `Pool` with the assignment
+policies round robin, least used and pinned per task. Deterministic: the same sequence of requests
+gives the same assignments. A released or expired lease frees its account for the next request. A
+lease is never granted to two tasks at once for an account marked exclusive.
+
+State clearly in the module comment that the pool assigns the owner's own accounts and keys only; it
+has no notion of rotating identities to get around a provider's limits and none may be added.
+Tests for each policy, expiry, exclusivity and determinism. Change ONLY crates/neo-broker/src/account.rs.
+Standard library and fleet-domain only, no unsafe, no unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n5-capability"
+title = "N5: scoped, revocable lease capabilities (capability.rs)"
+worker = "agent"
+after = ["n5-account"]
+spec = '''
+Implement crates/neo-broker/src/capability.rs: a `Capability` bound to one lease with a set of
+allowed model names, a token budget and an expiry, and `check(request) -> Allow | Deny(reason)`. Revocation
+is a set of lease ids; a revoked, expired, over-budget or out-of-scope request is denied with a reason
+that never contains a credential reference or anything else from the account. The capability value
+itself is an opaque handle (a bounded random-looking string supplied by the caller): it never derives
+from, embeds or reveals a `CredentialRef`, and the context pack digest of a task does not depend on the
+account (test: two leases of different accounts for the same task give the same task-visible data).
+
+Tests for each denial, revocation order, and a property test with a deterministic generator. Change ONLY
+crates/neo-broker/src/capability.rs. Standard library and fleet-domain only, no unsafe, no
+unwrap/expect/indexing outside tests, no clock.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n5-terms-doc"
+title = "N5: document the provider-terms boundary (docs/broker-terms.md)"
+worker = "agent"
+after = ["n5-scaffold"]
+spec = '''
+Write docs/broker-terms.md (a new file) stating the policy boundary of the credential broker as the NEO
+design puts it: multiple credentials are supported for legitimate cases (an organisation's own keys for
+separate projects or teams, failover across the owner's own keys, per-project cost attribution); the owner
+is responsible for complying with each provider's terms; NEO will not implement evasion features
+(rotating identities to defeat per-account limits, hiding usage, spoofing); subscription logins of
+consumer products are out of scope unless the provider documents programmatic use. Short, plain,
+no legal claims, no provider-specific claims you cannot source. Change ONLY docs/broker-terms.md.
+
+You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
+'''
+
+[[tasks]]
+id = "n5-adapter"
+title = "HUMAN-ONLY N5: the secret-touching adapter, the proxy and the leak tests"
+worker = "human-only"
+after = ["n5-capability", "n5-terms-doc"]
+spec = '''
+HUMAN-ONLY (everything that touches a credential is protected). The adapter that reads references
+(keychain, daemon environment at start, a 0600 file outside any repository), the local endpoint with
+per-lease capabilities, the injection into upstream requests, events, use cases and CLI, and the tests
+that no credential appears in any worker environment, argv, file in its view, log, trace or event.
+See dogfood/human-only.md.
+'''
+
+[[tasks]]
+id = "n5-review"
+title = "HUMAN-ONLY N5: independent security review and acceptance"
+worker = "human-only"
+after = ["n5-adapter"]
+spec = '''
+HUMAN-ONLY. Independent review of every line that touches a credential, the secret scanner on tree and
+history, capability scoping and revocation tests, the documented provider-terms boundary, numbers of the
+README and SECURITY.md refreshed by a person. See dogfood/human-only.md.
+'''

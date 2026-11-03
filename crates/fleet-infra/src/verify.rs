@@ -1158,6 +1158,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_deny_list_forbids_paths_in_the_commits_of_the_job_whatever_else_they_touch() {
+        need_git!();
+        let fx = Fx::new();
+        fx.commit(&[
+            ("src/a.rs", "a\n"),
+            ("Cargo.lock", "# changed\n"),
+            ("crates/x/Cargo.toml", "[package]\n"),
+        ]);
+        let deny = |globs: &[&str]| {
+            doc(vec![Value::object([
+                ("id", Value::str("protected")),
+                ("kind", Value::str("diff")),
+                ("deny", Value::array(globs.iter().map(|g| Value::str(*g)))),
+            ])])
+        };
+        assert_eq!(fx.run(deny(&["docs/**"]))[0].verdict, Verdict::Passed);
+        let r = &fx.run(deny(&["Cargo.lock", "crates/*/Cargo.toml"]))[0];
+        assert_eq!(r.verdict, Verdict::Failed);
+        assert!(r.output.contains("Cargo.lock"), "{}", r.output);
+        assert!(r.output.contains("crates/x/Cargo.toml"), "{}", r.output);
+        assert!(!r.output.contains("src/a.rs"), "{}", r.output);
+        let mut cut = fx.job(deny(&["docs/**"]));
+        cut.state.truncated = true;
+        assert_eq!(
+            run_verify(&cut, &fx.ctx).results[0].reports[0].verdict,
+            Verdict::Error,
+            "a diff that was cut cannot prove that nothing denied was touched"
+        );
+    }
+
     // ---- when it cannot run -------------------------------------------------------------------------------
 
     #[test]

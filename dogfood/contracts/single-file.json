@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "id": "protected-diff",
+      "kind": "diff",
+      "deny": [
+        ".github/**",
+        "SECURITY.md",
+        "scripts/**",
+        "docker/**",
+        "docs/adr/**",
+        "examples/fleet.example.toml",
+        "examples/agents/**",
+        "examples/neo/**",
+        "dogfood/**",
+        "lefthook.yml",
+        ".secret-scan-allow",
+        ".gitignore",
+        ".gitattributes",
+        ".gitmodules",
+        ".cargo/**",
+        ".omp/**",
+        ".mcp.json",
+        "AGENTS.md",
+        "rust-toolchain.toml",
+        "rustfmt.toml",
+        ".rustfmt.toml",
+        "clippy.toml",
+        ".clippy.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/*/Cargo.toml",
+        "crates/*/build.rs",
+        "crates/fleet-domain/src/approval.rs",
+        "crates/fleet-domain/src/decision.rs",
+        "crates/fleet-domain/src/fleet.rs",
+        "crates/fleet-domain/src/run.rs",
+        "crates/fleet-domain/src/supervision.rs",
+        "crates/fleet-domain/src/env.rs",
+        "crates/fleet-domain/src/ids.rs",
+        "crates/fleet-domain/src/limits.rs",
+        "crates/fleet-domain/src/brief.rs",
+        "crates/fleet-domain/src/contract.rs",
+        "crates/fleet-domain/src/events.rs",
+        "crates/fleet-domain/src/chain.rs",
+        "crates/fleet-domain/src/quality.rs",
+        "crates/fleet-domain/src/redact.rs",
+        "crates/fleet-domain/src/sanitize.rs",
+        "crates/fleet-domain/src/output.rs",
+        "crates/fleet-domain/src/lib.rs",
+        "crates/neo-verify/**",
+        "crates/neo-goals/**",
+        "crates/fleet-app/**",
+        "crates/fleet-infra/**",
+        "crates/fleet-cli/**",
+        "crates/fleet-cli/tests/architecture.rs"
+      ]
+    },
+    {
+      "id": "protected-script",
+      "kind": "command",
+      "program": "@TOOLS@/check-protected.sh",
+      "args": ["--repo", "@REPO@", "@BASE@..fleet/@RUN@/@TASK@"],
+      "timeout_ms": 60000
+    },
+    {
+      "id": "lock-unchanged",
+      "kind": "file",
+      "path": "Cargo.lock",
+      "assert": "sha256",
+      "value": "@LOCK_SHA256@"
+    },
+    {
+      "id": "docs-claims",
+      "kind": "command",
+      "program": "@TOOLS@/check-docs-claims.sh",
+      "args": ["--repo", "@REPO@", "@BASE@..fleet/@RUN@/@TASK@"],
+      "timeout_ms": 60000
+    },
+    {
+      "id": "conflict-markers",
+      "kind": "command",
+      "program": "@TOOLS@/check-conflict-markers.sh",
+      "args": ["--tree"],
+      "timeout_ms": 60000
+    },
+    {
+      "id": "secret-scan",
+      "kind": "command",
+      "program": "@TOOLS@/check-secret-tree.sh",
+      "timeout_ms": 120000
+    },
+    {
+      "id": "fmt",
+      "kind": "command",
+      "program": "@CONTAINER_RUN@",
+      "args": ["cargo fmt --all -- --check"],
+      "timeout_ms": 300000
+    },
+    {
+      "id": "clippy",
+      "kind": "command",
+      "program": "@CONTAINER_RUN@",
+      "args": ["cargo clippy --workspace --all-targets --locked --offline -- -D warnings"],
+      "timeout_ms": 1200000
+    },
+    {
+      "id": "architecture",
+      "kind": "command",
+      "program": "@CONTAINER_RUN@",
+      "args": ["cargo test --locked --offline -p fleet-cli --test architecture"],
+      "timeout_ms": 1200000
+    },
+    {
+      "id": "layers",
+      "kind": "command",
+      "program": "@CONTAINER_RUN@",
+      "args": ["sh scripts/test-layers.sh"],
+      "timeout_ms": 1800000
+    }
+,
+    {
+      "id": "scope",
+      "kind": "diff",
+      "allow": ["@FILE_PATH@"@ALSO@]
+    }
+  ]
+}

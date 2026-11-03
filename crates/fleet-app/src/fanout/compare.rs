@@ -143,7 +143,7 @@ impl Orchestrator {
                     },
                     summary: newest.map(|e| e.summary().to_string()).unwrap_or_default(),
                 });
-                if let CheckKind::DiffOnly { allow } = &check.kind {
+                if let CheckKind::DiffOnly { allow, deny } = &check.kind {
                     has_scope_check |= check.mandatory;
                     match &touched {
                         Some(paths) => {
@@ -151,6 +151,7 @@ impl Orchestrator {
                                 check.id.as_str(),
                                 check.mandatory,
                                 allow,
+                                deny,
                                 paths,
                             ));
                             // the paths of a diff that was listed only in part were not all judged

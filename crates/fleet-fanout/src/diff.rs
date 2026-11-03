@@ -146,9 +146,11 @@ impl DiffStat {
 pub struct ScopeReport {
     pub check: String,
     pub mandatory: bool,
-    /// Touched paths some allow glob matches (at most [`MAX_SCOPE_PATHS`]).
+    /// Touched paths the check lets through: no deny glob matches and, when the check has allow
+    /// globs, one of them matches (at most [`MAX_SCOPE_PATHS`]).
     pub allowed_touched: Vec<String>,
-    /// Touched paths no allow glob matches: out of scope (at most [`MAX_SCOPE_PATHS`]).
+    /// Touched paths a deny glob matches or, when the check has allow globs, no allow glob matches:
+    /// out of scope (at most [`MAX_SCOPE_PATHS`]).
     pub outside: Vec<String>,
     /// Number of out-of-scope paths, listed or not.
     pub outside_count: u64,
@@ -160,11 +162,14 @@ impl ScopeReport {
     }
 }
 
-/// Judges `touched` against the allow globs of one `diff` check.
+/// Judges `touched` against one `diff` check, as the check itself does (`neo_verify::judge`): a path
+/// a `deny` glob matches is out of scope whatever `allow` says; without `allow` globs every other
+/// path is in scope.
 pub fn scope_report(
     check: &str,
     mandatory: bool,
     allow: &[Glob],
+    deny: &[Glob],
     touched: &BTreeSet<&str>,
 ) -> ScopeReport {
     let mut report = ScopeReport {
@@ -175,7 +180,9 @@ pub fn scope_report(
         outside_count: 0,
     };
     for path in touched {
-        if allow.iter().any(|g| g.matches(path)) {
+        let denied = deny.iter().any(|g| g.matches(path));
+        let allowed = allow.is_empty() || allow.iter().any(|g| g.matches(path));
+        if allowed && !denied {
             if report.allowed_touched.len() < MAX_SCOPE_PATHS {
                 report.allowed_touched.push((*path).to_string());
             }
@@ -305,14 +312,40 @@ mod tests {
             change("docs/x.md", ChangeKind::Added, 3, 0),
             change("Cargo.toml", ChangeKind::Modified, 1, 0),
         ]);
-        let report = scope_report("scope", true, &[glob("src/**")], &stat.touched_paths());
+        let report = scope_report("scope", true, &[glob("src/**")], &[], &stat.touched_paths());
         assert_eq!(report.allowed_touched, ["src/a.rs"]);
         assert_eq!(report.outside, ["Cargo.toml", "docs/x.md"]);
         assert_eq!(report.outside_count, 2);
         assert!(!report.clean());
-        let all = scope_report("s", false, &[glob("**")], &stat.touched_paths());
+        let all = scope_report("s", false, &[glob("**")], &[], &stat.touched_paths());
         assert!(all.clean());
         assert!(!all.mandatory);
+    }
+
+    #[test]
+    fn a_denied_path_is_out_of_scope_whatever_allow_says_and_a_deny_list_alone_lets_the_rest_through(
+    ) {
+        let stat = DiffStat::from_changes(vec![
+            change("src/a.rs", ChangeKind::Modified, 1, 1),
+            change("src/vendor/x.rs", ChangeKind::Added, 3, 0),
+            change("docs/x.md", ChangeKind::Added, 3, 0),
+        ]);
+        let touched = stat.touched_paths();
+        let both = scope_report(
+            "scope",
+            true,
+            &[glob("src/**")],
+            &[glob("src/vendor/**")],
+            &touched,
+        );
+        assert_eq!(both.allowed_touched, ["src/a.rs"]);
+        assert_eq!(both.outside, ["docs/x.md", "src/vendor/x.rs"]);
+        let deny_only = scope_report("scope", true, &[], &[glob("src/vendor/**")], &touched);
+        assert_eq!(deny_only.allowed_touched, ["docs/x.md", "src/a.rs"]);
+        assert_eq!(deny_only.outside, ["src/vendor/x.rs"]);
+        assert_eq!(deny_only.outside_count, 1);
+        let none = scope_report("scope", true, &[], &[], &touched);
+        assert!(none.clean(), "a check without globs judges nothing out");
     }
 
     #[test]
@@ -321,7 +354,7 @@ mod tests {
             old_path: Some("secrets/key.pem".to_string()),
             ..change("src/key.rs", ChangeKind::Renamed, 0, 0)
         }]);
-        let report = scope_report("scope", true, &[glob("src/**")], &stat.touched_paths());
+        let report = scope_report("scope", true, &[glob("src/**")], &[], &stat.touched_paths());
         assert_eq!(report.outside, ["secrets/key.pem"]);
     }
 
@@ -331,7 +364,7 @@ mod tests {
             .map(|i| change(&format!("x/{i:04}"), ChangeKind::Added, 1, 0))
             .collect();
         let stat = DiffStat::from_changes(many);
-        let report = scope_report("scope", true, &[glob("src/**")], &stat.touched_paths());
+        let report = scope_report("scope", true, &[glob("src/**")], &[], &stat.touched_paths());
         assert_eq!(report.outside.len(), MAX_SCOPE_PATHS);
         assert_eq!(report.outside_count, (MAX_SCOPE_PATHS * 3) as u64);
     }

@@ -5,7 +5,7 @@
 //!   {"id": "tests",  "kind": "command", "program": "/usr/bin/make", "args": ["test"], "expect_exit": 0},
 //!   {"id": "refs",   "kind": "refcheck-json", "program": "/usr/local/bin/refcheck", "args": ["--json", "."]},
 //!   {"id": "readme", "kind": "file", "path": "README.md", "assert": "contains", "value": "## Usage"},
-//!   {"id": "scope",  "kind": "diff", "allow": ["src/**", "tests/**"]}
+//!   {"id": "scope",  "kind": "diff", "allow": ["src/**", "tests/**"], "deny": ["src/vendor/**"]}
 //! ]}
 //! ```
 //!
@@ -18,7 +18,8 @@ use crate::evidence::{ContractState, Evidence};
 use crate::glob::Glob;
 use crate::limits::{
     DEFAULT_TIMEOUT_MS, MAX_ARGS, MAX_ARG_LEN, MAX_CHECKS, MAX_CHECK_ID, MAX_CONTRACT_BYTES,
-    MAX_GLOBS, MAX_NEEDLE, MAX_PATH_LEN, MAX_PROGRAM_LEN, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS,
+    MAX_DENY_GLOBS, MAX_GLOBS, MAX_NEEDLE, MAX_PATH_LEN, MAX_PROGRAM_LEN, MAX_TIMEOUT_MS,
+    MIN_TIMEOUT_MS,
 };
 use fleet_domain::approval::Digest;
 use fleet_domain::ids::{is_invisible, show};
@@ -122,8 +123,10 @@ pub enum CheckKind {
         path: String,
         assertion: FileAssertion,
     },
-    /// Everything the work changed matches at least one of the globs.
-    DiffOnly { allow: Vec<Glob> },
+    /// Every path the work changed matches no `deny` glob and, when `allow` is not empty, at
+    /// least one `allow` glob. A denied path fails the check whatever `allow` says. At least one
+    /// of the two lists is not empty.
+    DiffOnly { allow: Vec<Glob>, deny: Vec<Glob> },
 }
 
 impl CheckKind {
@@ -329,7 +332,7 @@ impl Check {
             .concat(),
             "refcheck-json" => [&common[..], &["program", "args", "timeout_ms"]].concat(),
             "file" => [&common[..], &["path", "assert", "value"]].concat(),
-            "diff" => [&common[..], &["allow"]].concat(),
+            "diff" => [&common[..], &["allow", "deny"]].concat(),
             other => {
                 return Err(format!(
                     "{label}: unknown kind {} (expected command, refcheck-json, file or diff)",
@@ -398,17 +401,21 @@ impl Check {
                 }
             }
             _ => {
-                let patterns = str_list(map, "allow", &label, MAX_GLOBS)?;
-                if patterns.is_empty() {
-                    return Err(format!("{label}: `allow` needs at least one glob"));
-                }
-                CheckKind::DiffOnly {
-                    allow: patterns
+                let globs = |key: &str, max: usize| -> Result<Vec<Glob>, String> {
+                    str_list(map, key, &label, max)?
                         .into_iter()
                         .map(Glob::new)
                         .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| format!("{label}: {e}"))?,
+                        .map_err(|e| format!("{label}: {e}"))
+                };
+                let allow = globs("allow", MAX_GLOBS)?;
+                let deny = globs("deny", MAX_DENY_GLOBS)?;
+                if allow.is_empty() && deny.is_empty() {
+                    return Err(format!(
+                        "{label}: a diff check needs at least one `allow` or `deny` glob"
+                    ));
                 }
+                CheckKind::DiffOnly { allow, deny }
             }
         };
         Ok(Check {
@@ -460,11 +467,17 @@ impl Check {
                     }
                 }
             }
-            CheckKind::DiffOnly { allow } => {
-                pairs.push((
-                    "allow",
-                    Value::array(allow.iter().map(|g| Value::str(g.as_str()))),
-                ));
+            CheckKind::DiffOnly { allow, deny } => {
+                // `allow` and `deny` are written only when they are not empty, so a contract that
+                // has only `allow` keeps the canonical text (and the id) it always had.
+                for (key, globs) in [("allow", allow), ("deny", deny)] {
+                    if !globs.is_empty() {
+                        pairs.push((
+                            key,
+                            Value::array(globs.iter().map(|g| Value::str(g.as_str()))),
+                        ));
+                    }
+                }
             }
         }
         Value::object(pairs)
@@ -889,6 +902,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn diff_checks_take_deny_globs_with_or_without_allow() {
+        let diff = |pairs: Vec<(&str, Value)>| {
+            let mut all = vec![("id", Value::str("d")), ("kind", Value::str("diff"))];
+            all.extend(pairs);
+            with_check(Value::object(all))
+        };
+        let list = |items: &[&str]| Value::array(items.iter().map(|i| Value::str(*i)));
+        let parse = |doc: Value| VerificationContract::from_value(&doc);
+        // deny alone, deny with allow, allow alone
+        assert!(parse(diff(vec![("deny", list(&["Cargo.lock"]))])).is_ok());
+        assert!(parse(diff(vec![
+            ("allow", list(&["src/**"])),
+            ("deny", list(&["src/vendor/**"]))
+        ]))
+        .is_ok());
+        // neither, or both empty, is not a constraint
+        assert!(parse(diff(vec![])).is_err());
+        assert!(parse(diff(vec![("allow", list(&[])), ("deny", list(&[]))])).is_err());
+        // deny is validated like allow
+        assert!(parse(diff(vec![("deny", list(&["[a]"]))])).is_err());
+        assert!(parse(diff(vec![("deny", list(&["/abs"]))])).is_err());
+        assert!(parse(diff(vec![("deny", Value::Null)])).is_err());
+        assert!(parse(diff(vec![("deny", Value::str("Cargo.lock"))])).is_err());
+        // the deny list may be longer than the allow list, but it is bounded too
+        let deny = |n: usize| Value::array((0..n).map(|i| Value::str(format!("d{i}/**"))));
+        assert!(parse(diff(vec![("deny", deny(MAX_DENY_GLOBS))])).is_ok());
+        assert!(parse(diff(vec![("deny", deny(MAX_DENY_GLOBS + 1))])).is_err());
+        assert!(parse(diff(vec![
+            ("allow", deny(MAX_GLOBS + 1)),
+            ("deny", list(&["x"]))
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn deny_globs_are_part_of_the_canonical_text_and_the_id_only_when_present() {
+        let spell = |pairs: Vec<(&str, Value)>| {
+            let mut all = vec![("id", Value::str("d")), ("kind", Value::str("diff"))];
+            all.extend(pairs);
+            VerificationContract::from_value(&with_check(Value::object(all))).unwrap()
+        };
+        let list = |items: &[&str]| Value::array(items.iter().map(|i| Value::str(*i)));
+        let allow_only = spell(vec![("allow", list(&["a/**"]))]);
+        // an explicit empty deny list is the same contract as no deny list
+        let with_empty = spell(vec![("allow", list(&["a/**"])), ("deny", list(&[]))]);
+        assert_eq!(allow_only.canonical(), with_empty.canonical());
+        assert!(!allow_only.canonical().contains("deny"));
+        let with_deny = spell(vec![("allow", list(&["a/**"])), ("deny", list(&["a/b"]))]);
+        assert_ne!(allow_only.canonical(), with_deny.canonical());
+        assert!(with_deny.canonical().contains("\"deny\":[\"a/b\"]"));
+        let only_deny = spell(vec![("deny", list(&["a/b"]))]);
+        assert!(!only_deny.canonical().contains("allow"));
+        let again = VerificationContract::from_value(&only_deny.to_value()).unwrap();
+        assert_eq!(again, only_deny);
+    }
+
+    #[test]
     fn counts_are_bounded() {
         let checks = Value::array((0..=MAX_CHECKS).map(|i| {
             Value::object([
@@ -1051,12 +1121,24 @@ pub(crate) mod tests {
                 }
                 _ => {
                     pairs.push(("kind", Value::str("diff")));
-                    pairs.push((
-                        "allow",
-                        Value::array(
-                            (0..1 + rng.next(3)).map(|n| Value::str(format!("src{n}/**"))),
-                        ),
-                    ));
+                    // allow only, deny only, or both
+                    let mode = rng.next(3);
+                    if mode != 1 {
+                        pairs.push((
+                            "allow",
+                            Value::array(
+                                (0..1 + rng.next(3)).map(|n| Value::str(format!("src{n}/**"))),
+                            ),
+                        ));
+                    }
+                    if mode != 0 {
+                        pairs.push((
+                            "deny",
+                            Value::array(
+                                (0..1 + rng.next(3)).map(|n| Value::str(format!("deny{n}/*.rs"))),
+                            ),
+                        ));
+                    }
                 }
             }
             Value::object(pairs)

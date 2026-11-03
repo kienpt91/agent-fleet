@@ -197,6 +197,15 @@ What the design tries to guarantee, and where it is tested:
   rule recognizes are refused, but a secret that does not look like one is not. Output of checks is redacted by pattern
   like all other output. A daemon killed during a verification loses that run (the next start removes its directory and
   runs the contracts of tasks still in review again).
+- **Self-development (`dogfood/`, ADR 28) judges committed work, not what a process does.** Every contract of a self-development
+  task forbids the protected paths (a `deny` list in the `diff` check, plus a stricter script run from a copy outside the
+  repository), but the worker is the same user as the operator: it can edit the main checkout, the shared `.git` directory,
+  the agent's own profile and anything else the operator can, none of which a contract looks at. Run it on a throwaway clone and
+  in a container, a VM or under another OS user. The protected list is only as complete as its author made it. A weak
+  check passes a weak result, and no token governor exists: spend is limited only by the limit set in the provider's console. The
+  scaffold has not been run with a real agent (earlier trials with hand-written contracts were: two tasks completed, the agent could not run
+  commands headless in write mode, and the contract did the proving). A test-only change in one protected Rust file is the one explicit,
+  per-task exception (a human approves the exact diff; ADR 28).
 - **Repositories with alternates or grafts are refused.** Because a forged object source is how a worker's own git
   directory could make fleet see another tree, a repository that has `objects/info/alternates`, `http-alternates` or
   `info/grafts` is not used (a clone made with `--reference` is one); the error names the file. Replace refs are ignored

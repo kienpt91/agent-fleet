@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 /// Files listed per commit when selecting the working set.
 const MAX_TREE_FILES: usize = 20_000;
+/// Globs of a `deny` list written out in a check's line of layer 4 (the rest is counted).
+const DENY_SHOWN: usize = 6;
 /// Files larger than this are never read for an excerpt.
 const MAX_FILE_READ: u64 = 1024 * 1024;
 const MAX_CHANGED: usize = 10_000;
@@ -83,14 +85,40 @@ pub(crate) fn describe_check(check: &Check) -> (String, String) {
             FileAssertion::Sha256(hash) => format!("{path} has the sha256 {hash}"),
             FileAssertion::Contains(text) => format!("{path} contains {text:?}"),
         },
-        CheckKind::DiffOnly { allow } => format!(
-            "every path your commits change matches one of: {}",
-            allow
-                .iter()
-                .map(Glob::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        CheckKind::DiffOnly { allow, deny } => {
+            let list = |globs: &[Glob]| {
+                globs
+                    .iter()
+                    .map(Glob::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            // a deny list can be long (the protected paths of a repository): a few globs and the
+            // count keep the line within what a pack gives a check, and say that there are more
+            let denied = |globs: &[Glob]| {
+                let shown = globs.iter().take(DENY_SHOWN).map(Glob::as_str);
+                let mut text = shown.collect::<Vec<_>>().join(", ");
+                if globs.len() > DENY_SHOWN {
+                    text.push_str(&format!(" and {} more", globs.len() - DENY_SHOWN));
+                }
+                text
+            };
+            match (allow.is_empty(), deny.is_empty()) {
+                (_, true) => format!(
+                    "every path your commits change matches one of: {}",
+                    list(allow)
+                ),
+                (true, false) => format!(
+                    "no path your commits change matches any of: {}",
+                    denied(deny)
+                ),
+                (false, false) => format!(
+                    "every path your commits change matches one of: {}; and none matches any of: {}",
+                    list(allow),
+                    denied(deny)
+                ),
+            }
+        }
     };
     (check.kind.name().to_string(), what)
 }
@@ -266,7 +294,8 @@ impl Orchestrator {
         for g in &governing {
             if let Some(c) = &g.contract {
                 for check in c.contract.checks() {
-                    if let CheckKind::DiffOnly { allow } = &check.kind {
+                    // only `allow` scopes what is shown; a `deny` list says what may not be changed, not what may not be read
+                    if let CheckKind::DiffOnly { allow, .. } = &check.kind {
                         allowed.extend(allow.iter());
                     }
                 }
@@ -806,5 +835,52 @@ impl Orchestrator {
         for (key, trigger) in wanted {
             self.auto_handoff(&key, trigger);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neo_verify::contract::CheckId;
+
+    fn diff(allow: &[&str], deny: &[&str]) -> Check {
+        let globs = |items: &[&str]| items.iter().map(|g| Glob::new(g).unwrap()).collect();
+        Check {
+            id: CheckId::parse("scope").unwrap(),
+            mandatory: true,
+            kind: CheckKind::DiffOnly {
+                allow: globs(allow),
+                deny: globs(deny),
+            },
+        }
+    }
+
+    #[test]
+    fn an_allow_only_diff_check_reads_as_it_always_did() {
+        let (kind, what) = describe_check(&diff(&["src/**", "*.md"], &[]));
+        assert_eq!(kind, "diff");
+        assert_eq!(
+            what,
+            "every path your commits change matches one of: src/**, *.md"
+        );
+    }
+
+    #[test]
+    fn a_deny_list_is_named_and_a_long_one_is_counted() {
+        let (_, what) = describe_check(&diff(&[], &["Cargo.lock", "dogfood/**"]));
+        assert_eq!(
+            what,
+            "no path your commits change matches any of: Cargo.lock, dogfood/**"
+        );
+        let (_, both) = describe_check(&diff(&["a/**"], &["b/**"]));
+        assert_eq!(
+            both,
+            "every path your commits change matches one of: a/**; and none matches any of: b/**"
+        );
+        let many: Vec<String> = (0..80).map(|i| format!("d{i}/**")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let (_, long) = describe_check(&diff(&["x/**"], &refs));
+        assert!(long.contains("d0/**, d1/**, d2/**, d3/**, d4/**, d5/** and 74 more"));
+        assert!(!long.contains("d6/**"));
     }
 }

@@ -10,8 +10,9 @@
 #                and the port contract suites against those fakes
 #   adapters     unit tests of every real adapter, the same contract suites against the real
 #                file adapters in temp dirs, the web adapter over real loopback sockets and the origin rule
-#                with real child processes, the `gh` adapter against a fake `gh` and the git push against a
-#                local bare repository
+#                with real child processes, the `gh` adapter against a fake `gh`, the git push against a
+#                local bare repository and the consistency of the dogfood/ data (the protected list, the
+#                contracts, the plan)
 #   soak         bounded memory with chatty workers (FLEET_SOAK_SECS, default 20)
 #   end-to-end   the real `fleet` binary and daemon (also with --web), CLI, TUI rendering and architecture rules
 #   remote       remote worktrees against a real OpenSSH server (host key pinning, quoting through a real login
@@ -35,7 +36,7 @@ if [ -x /usr/sbin/sshd ]; then RUN="sh scripts/ssh-env.sh"; fi
 
 layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals -p neo-context -p fleet-forge -p fleet-fanout
 layer application  cargo test $OPTS -p fleet-app --features testing
-layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test git_diff --test web_http --test origin --test golden_pack --test forge_gh --test forge_push
+layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test git_diff --test web_http --test origin --test golden_pack --test forge_gh --test forge_push --test dogfood
 layer soak         cargo test $OPTS -p fleet-infra --test soak
 if [ -n "$RUN" ]; then
   layer remote     $RUN cargo test $OPTS -p fleet-infra --test ssh_remote

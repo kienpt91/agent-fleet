@@ -1,0 +1,15 @@
+[run]
+objective = "Remove a flaky failure from one job test"
+repo = "/ABSOLUTE/PATH/OF/THE/THROWAWAY/CLONE"   # give the real one with plan-without.sh --repo
+id = "r1"
+
+[[tasks]]
+id = "flaky-jobs"
+title = "Make the_children_of_running_jobs_are_listed_until_their_group_is_gone reliable"
+spec = """
+In crates/fleet-infra/src/jobs.rs the test the_children_of_running_jobs_are_listed_until_their_group_is_gone failed in two real verification runs (whole fleet-infra lib suite: 513 passed, 1 failed) although it passes when run alone on an idle machine. Find out which assertion fails and why, by reading the test, ThreadJobRunner, the job tracker, the sweeper and procid::group_exists, then make the test deterministic.
+
+Hypotheses to check, none of them certain: (1) the final assertion !group_exists(pid) runs right after live() became empty; the group may still exist for a moment (a killed process stays a zombie until its parent reaps it; in a container without an init process the reaper may be slow or absent), so the check races with reaping; (2) the wait helper's time limits are too tight when the machine is loaded (the suite ran for 32 s in the failing runs); (3) the grandchild sleep 5 and the pid file are timing assumptions. The product rule under test is: a running job's child group is listed until the job ends, and the group is killed before it is forgotten. If a zombie still counts as an existing group in group_exists, the fix belongs in the test (wait until the group is gone or only zombies remain, with a clear failure message and a generous limit), unless reading the code shows that the runner really forgets a group before killing it: in that case fix the runner minimally and say so in your summary.
+
+Rules: do not weaken the rule being tested, do not delete or ignore the test, do not just add a longer sleep without a condition. Only crates/fleet-infra/src/jobs.rs may change (the file contains other tests: leave them alone). No new dependencies. Commit nothing yourself: fleet commits your work.
+"""
