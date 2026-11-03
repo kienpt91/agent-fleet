@@ -792,6 +792,8 @@ pub(crate) mod test_support {
         /// Connections that reached `admit`, and requests that reached `call`.
         pub admits: AtomicUsize,
         pub calls: AtomicUsize,
+        /// Set when the `slow` handler has started.
+        pub slow_started: AtomicBool,
     }
 
     impl Fake {
@@ -805,6 +807,7 @@ pub(crate) mod test_support {
                 refuse_admit: AtomicBool::new(false),
                 admits: AtomicUsize::new(0),
                 calls: AtomicUsize::new(0),
+                slow_started: AtomicBool::new(false),
             };
             (Arc::new(fake), tx)
         }
@@ -869,6 +872,7 @@ pub(crate) mod test_support {
                 "forbid" => Err(FleetError::forbidden("go away")),
                 // an answer that takes a while, as the engine's does around a shutdown
                 "slow" => {
+                    self.slow_started.store(true, Ordering::SeqCst);
                     thread::sleep(Duration::from_millis(120));
                     Ok(HandlerReply::Data(obj(&[(
                         "schema",
@@ -1029,10 +1033,19 @@ mod tests {
     fn a_reply_that_is_being_produced_when_the_server_stops_is_still_delivered() {
         // `fleet shutdown` is answered by an engine that stops right afterwards; the daemon sets the
         // server's stop flag at that moment, and the reply must not be cut off
-        let mut s = start();
+        let fake = Fake::new().0;
+        let mut s = TestServer::start(Arc::clone(&fake) as Arc<dyn RequestHandler>);
         let mut c = Raw::connect(&s.path);
         c.send_line(&encode_request("slow", &Value::Null, c.token.as_deref()));
-        thread::sleep(Duration::from_millis(30));
+        // Stop only once the server has accepted the request and its handler is running.
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while !fake.slow_started.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < give_up,
+                "the server did not start the slow handler within 10 s"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
         s.stop.store(true, Ordering::Release);
         let reply = c.read_reply().expect("the reply arrives");
         assert_eq!(
