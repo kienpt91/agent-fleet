@@ -13,6 +13,11 @@
 //!   A repository whose configuration rewrites URLs (`url.<base>.insteadOf`), steers the HTTP
 //!   transport (`http.*`, a proxy) or names a git proxy is refused: git would apply them to the
 //!   URL after it was checked.
+//! * **Git does not read the repository's configuration.** The push runs in a private, throwaway
+//!   git directory that holds an empty configuration, with the repository's object store as its
+//!   alternate: a worker that rewrites the shared `.git/config` between the check above and the
+//!   moment git starts (or adds URL-scoped keys the check does not know) changes nothing. The
+//!   check stays as a refusal that tells the operator what is wrong, and it fails closed.
 //! * **The branch must still be the approved commit** when git starts, read from the repository
 //!   itself (the same read the merge and the evidence use).
 //! * **Credentials are explicit.** Nothing of the operator's git configuration is read and no ssh
@@ -22,21 +27,27 @@
 //!   helper and git; fleet never sees it, and none is in the environment.
 
 use super::{GitVcs, Out};
-use crate::jobs::JobTracker;
+use crate::jobs::{redact_block, JobTracker};
 use fleet_app::forge::ports::{BranchPublisher, PushRequest};
 use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::{show, validate_ref_name};
-use fleet_domain::sanitize::flatten_line;
+use fleet_domain::redact::Redactor;
+use fleet_domain::sanitize::{flatten_line, sanitize_text};
 use fleet_forge::config::{plain_absolute_path, ForgeConfig, PushCredentials};
 use fleet_forge::push::push_target;
 use fleet_forge::repo::{parse_remote, RemoteTarget};
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub struct GitPublisher {
     vcs: GitVcs,
     cfg: ForgeConfig,
+    redactor: Arc<Redactor>,
     /// The resolved `gh`, when it is the credential helper.
     gh: Option<PathBuf>,
 }
@@ -57,6 +68,7 @@ impl GitPublisher {
         parent_env: Vec<(String, String)>,
         cfg: ForgeConfig,
         gh: Option<PathBuf>,
+        redactor: Arc<Redactor>,
         tracker: JobTracker,
     ) -> GitPublisher {
         let policy = EnvPolicy::new(vec!["PATH".to_string(), "HOME".to_string()]);
@@ -66,6 +78,7 @@ impl GitPublisher {
                 .with_tracker(tracker)
                 .with_timeout(timeout),
             cfg,
+            redactor,
             gh,
         }
     }
@@ -76,7 +89,10 @@ impl GitPublisher {
             .vcs
             .run_raw(repo, None, &[], &["config", "--list", "-z"])?;
         if !listing.ok() {
-            return Ok(());
+            // a configuration git cannot read is one whose content nobody checked
+            return Err(FleetError::forbidden(
+                "the repository's configuration cannot be read, so it cannot be checked for settings that change where git pushes to; fix it (nothing was pushed)",
+            ));
         }
         for entry in listing.stdout.split(|b| *b == 0) {
             let key = entry.split(|b| *b == b'\n').next().unwrap_or_default();
@@ -96,6 +112,24 @@ impl GitPublisher {
             }
         }
         Ok(())
+    }
+
+    /// The object store of the repository, as a path git can list in an alternates variable.
+    fn object_store(&self, repo: &Path) -> Result<String> {
+        let out = self
+            .vcs
+            .run_ok(repo, None, &["rev-parse", "--git-path", "objects"])?;
+        let found = repo.join(out.text().trim());
+        let canonical = std::fs::canonicalize(&found)
+            .map_err(|e| FleetError::io("cannot find the object store of the repository", &e))?;
+        let text = canonical.display().to_string();
+        if text.contains(':') || !plain_absolute_path(&text) {
+            return Err(FleetError::invalid(format!(
+                "the object store {} has characters that cannot be passed to git",
+                show(&text)
+            )));
+        }
+        Ok(text)
     }
 
     /// The `-c` options that give this one call its credential helper.
@@ -125,6 +159,64 @@ impl GitPublisher {
             }
         }
         Ok(args)
+    }
+}
+
+/// A directory only this process can enter, with the few files git needs to take it for an empty
+/// bare repository. It is removed when it goes out of scope.
+struct PrivateGitDir {
+    path: PathBuf,
+}
+
+impl PrivateGitDir {
+    fn create() -> Result<PrivateGitDir> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        for _ in 0..16 {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("fleet-push-{}-{nanos}-{n}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {
+                    let dir = PrivateGitDir { path };
+                    dir.fill()?;
+                    return Ok(dir);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(FleetError::io("cannot make a private git directory", &e)),
+            }
+        }
+        Err(FleetError::internal(
+            "cannot find a free name for a private git directory",
+        ))
+    }
+
+    fn fill(&self) -> Result<()> {
+        let io = |e: std::io::Error| FleetError::io("cannot set up a private git directory", &e);
+        for d in ["objects", "refs", "refs/heads"] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(self.path.join(d))
+                .map_err(io)?;
+        }
+        std::fs::write(self.path.join("HEAD"), "ref: refs/heads/fleet-push\n").map_err(io)?;
+        std::fs::write(
+            self.path.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+        )
+        .map_err(io)
+    }
+
+    fn objects(&self) -> PathBuf {
+        self.path.join("objects")
+    }
+}
+
+impl Drop for PrivateGitDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -213,13 +305,16 @@ fn classify_push(lines: &[String]) -> PushFailure {
     PushFailure::Other
 }
 
-fn failure(out: &Out, target: &str) -> FleetError {
+fn failure(out: &Out, target: &str, redactor: &Arc<Redactor>) -> FleetError {
     let detail = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
-    let text = flatten_line(&detail, 300);
+    let text = flatten_line(
+        &redact_block(redactor, &sanitize_text(detail.as_bytes())),
+        300,
+    );
     match classify_push(&git_lines(out, target)) {
         PushFailure::Refused => FleetError::conflict(format!(
             "the remote refused the push ({text}); fleet never forces a push, so the branch on the remote was not changed"
@@ -321,11 +416,27 @@ impl BranchPublisher for GitPublisher {
         args.push(target.clone());
         args.push(format!("{}:refs/heads/{}", req.head.as_str(), req.branch));
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.vcs.run(&repo, None, &argv)?;
+        // git runs in a directory of its own: the repository's configuration is not read again
+        let objects = self.object_store(&repo)?;
+        let private = PrivateGitDir::create()?;
+        let out = self.vcs.run_raw_env(
+            &private.path,
+            None,
+            &[],
+            &[
+                ("GIT_DIR", private.path.as_os_str()),
+                ("GIT_OBJECT_DIRECTORY", private.objects().as_os_str()),
+                (
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                    OsStr::new(objects.as_str()),
+                ),
+            ],
+            &argv,
+        )?;
         if out.ok() {
             Ok(())
         } else {
-            Err(failure(&out, &target))
+            Err(failure(&out, &target, &self.redactor))
         }
     }
 }
@@ -333,6 +444,10 @@ impl BranchPublisher for GitPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn redactor() -> Arc<Redactor> {
+        Arc::new(Redactor::builtin())
+    }
 
     /// A commit whose name has `403` in it: one in about a hundred commits does.
     const SHA_WITH_403: &str = "c6254030ca394c36317ee4cf1e750bb78ac19d69";
@@ -511,7 +626,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        let e = failure(&out("fatal: unable to access 'https://h/x.git/': The requested URL returned error: 403\n"), "https://h/x.git");
+        let e = failure(&out("fatal: unable to access 'https://h/x.git/': The requested URL returned error: 403\n"), "https://h/x.git", &redactor());
         assert_eq!(e.code, ErrorCode::Unavailable);
         assert!(
             e.message.contains("could not authenticate"),
@@ -521,19 +636,21 @@ mod tests {
         let e = failure(
             &out("! [rejected] a -> b (fetch first)\n"),
             "https://h/x.git",
+            &redactor(),
         );
         assert_eq!(e.code, ErrorCode::Conflict);
         assert!(e.message.contains("never forces"), "{}", e.message);
         let e = failure(
             &out("fatal: unable to access 'https://h/x.git/': Could not resolve host: h\n"),
             "https://h/x.git",
+            &redactor(),
         );
         assert!(
             e.message.contains("could not reach the remote"),
             "{}",
             e.message
         );
-        let e = failure(&out("something strange\n"), "https://h/x.git");
+        let e = failure(&out("something strange\n"), "https://h/x.git", &redactor());
         assert!(e.message.contains("git push failed"), "{}", e.message);
     }
 }

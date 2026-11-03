@@ -8,12 +8,14 @@
 use fleet_app::forge::ports::{BranchPublisher, PushRequest};
 use fleet_domain::error::ErrorCode;
 use fleet_domain::ids::Sha;
+use fleet_domain::redact::Redactor;
 use fleet_forge::config::{ForgeConfig, PushCredentials};
 use fleet_forge::repo::RepoRef;
 use fleet_infra::git::GitPublisher;
 use fleet_infra::jobs::JobTracker;
 use fleet_infra::testutil::{git, git_available, make_repo, TempDir};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const SENTINEL: &str = "fleet-test-sentinel-7f3a9c1d2e4b5a69";
 const BRANCH: &str = "fleet/r1/a";
@@ -118,7 +120,13 @@ exec '{real}' "$@"
             ("GIT_ASKPASS".to_string(), "/tmp/evil-askpass".to_string()),
             ("FLEET_CONTROL_TOKEN".to_string(), SENTINEL.to_string()),
         ];
-        GitPublisher::new(env, cfg, gh, JobTracker::new())
+        GitPublisher::new(
+            env,
+            cfg,
+            gh,
+            Arc::new(Redactor::builtin()),
+            JobTracker::new(),
+        )
     }
 
     fn request(&self) -> PushRequest {
@@ -682,4 +690,44 @@ fn a_rejected_push_and_an_unknown_failure_are_reported_without_the_terminal_cont
         "{:?}",
         err.message
     );
+}
+
+// ---- the push does not depend on the shared configuration ---------------------------------------------
+
+#[test]
+fn git_runs_the_push_in_a_private_directory_not_in_the_repository() {
+    need_git!();
+    let fx = Fx::new();
+    fx.publisher().push(&fx.request()).unwrap();
+    let env = fx.push_env();
+    let git_dir = env
+        .lines()
+        .find_map(|l| l.strip_prefix("GIT_DIR="))
+        .unwrap_or_else(|| panic!("the push had no GIT_DIR of its own:\n{env}"));
+    let repo = std::fs::canonicalize(&fx.repo).unwrap();
+    assert!(
+        !Path::new(git_dir).starts_with(&repo),
+        "{git_dir} is inside the repository"
+    );
+    assert!(
+        env.lines()
+            .any(|l| l.starts_with("GIT_ALTERNATE_OBJECT_DIRECTORIES=")
+                && l.ends_with(".git/objects")),
+        "{env}"
+    );
+    // nothing is left of it
+    assert!(!Path::new(git_dir).exists(), "{git_dir} was not removed");
+}
+
+#[test]
+fn a_configuration_that_cannot_be_read_is_never_taken_for_a_clean_one() {
+    need_git!();
+    let fx = Fx::new();
+    let config = fx.repo.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[broken\n");
+    std::fs::write(&config, text).unwrap();
+    let err = fx.publisher().push(&fx.request()).unwrap_err();
+    assert!(!fx.pushed(), "git push ran: {err:?}");
+    assert!(fx.remote_refs().is_empty());
 }

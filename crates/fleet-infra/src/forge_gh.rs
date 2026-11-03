@@ -383,7 +383,7 @@ impl GhCli {
         let message = crate::json::parse_value(response.body, MAX_RESPONSE_BYTES)
             .map(|v| reader.error_message(&v))
             .unwrap_or_default();
-        let stderr = sanitize_text(&result.stderr);
+        let stderr = redact_block(&self.s.redactor, &sanitize_text(&result.stderr));
         let failure = classify(code, response.status, rate, &message, &stderr);
         if let Failure::RateLimited(h) = &failure {
             let now = (self.now)();

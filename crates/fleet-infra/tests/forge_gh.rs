@@ -753,6 +753,31 @@ fn not_signed_in_offline_missing_and_refused_are_told_apart_and_say_nothing_chan
 }
 
 #[test]
+fn what_gh_prints_to_stderr_is_redacted_before_it_reaches_an_error() {
+    let sb = Sandbox::new();
+    let cli = sb.cli();
+    let ep = "repos/o/r/issues/7";
+    for (status, stderr) in [
+        (
+            "",
+            format!("error connecting to api.github.com\nrejected {SENTINEL} here\n"),
+        ),
+        ("403", format!("gh: refused {SENTINEL} (HTTP 403)\n")),
+        ("", format!("something else {SENTINEL}\n")),
+    ] {
+        let out = if status.is_empty() {
+            String::new()
+        } else {
+            http(403, &[], "{}")
+        };
+        sb.ep_with(ep, &out, 1, &stderr);
+        let err = cli.get_issue(&repo(), 7).unwrap_err();
+        assert!(!err.message.contains(SENTINEL), "{}", err.message);
+        assert!(!format!("{err:?}").contains(SENTINEL), "{err:?}");
+    }
+}
+
+#[test]
 fn a_validation_error_shows_the_cleaned_message_of_github() {
     let sb = Sandbox::new();
     sb.ep_with(
@@ -1045,6 +1070,7 @@ fn jobs_for(sb: &Sandbox) -> GhForgeJobs {
         Sandbox::parent_env(),
         cfg,
         None,
+        Arc::new(Redactor::builtin()),
         sb.tracker.clone(),
     ));
     let _ = dir;
@@ -1145,6 +1171,7 @@ fn the_runner_refuses_work_while_the_rate_gate_is_closed_and_when_gh_is_untruste
             Sandbox::parent_env(),
             ForgeConfig::disabled(),
             None,
+            Arc::new(Redactor::builtin()),
             JobTracker::new(),
         )),
         String::new(),

@@ -163,6 +163,41 @@ fn split_repo_path(host: &str, path: &str) -> Result<RepoRef> {
     RepoRef::from_slug(host, path)
 }
 
+/// The URL as it may be shown: without a user name or password (the `git@` of the ssh forms
+/// stays), and without a query or fragment. A refused URL often is one somebody pasted a
+/// credential into, so no error repeats it.
+fn shown_url(url: &str) -> String {
+    let cut = url
+        .find(['?', '#'])
+        .map_or(url, |at| url.get(..at).unwrap_or(url));
+    let (scheme, rest) = match cut.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, cut),
+    };
+    let (authority, path) = match scheme {
+        Some(_) => rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p)),
+        // `user@host:path` has no slash before the path
+        None => match rest.find('/') {
+            Some(slash) if rest.find('@').is_none_or(|at| at > slash) => return rest.to_string(),
+            _ => (rest, ""),
+        },
+    };
+    let (userinfo, host) = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => (Some(userinfo), host),
+        None => (None, authority),
+    };
+    let user = match userinfo {
+        Some("git") => "git@",
+        Some(_) => "<redacted>@",
+        None => "",
+    };
+    let slash = if path.is_empty() { "" } else { "/" };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{user}{host}{slash}{path}"),
+        None => format!("{user}{host}{slash}{path}"),
+    }
+}
+
 /// Reads the URL of a git remote. Anything that is not one of the forms above is refused: a
 /// relative path, `http://`, `git://`, `ext::` transports, option-like text, a URL with a user
 /// name or password (except the `git@` of the ssh forms), a query or a fragment.
@@ -170,7 +205,7 @@ pub fn parse_remote(url: &str) -> Result<RemoteTarget> {
     let refuse = |why: &str| {
         Err(FleetError::invalid(format!(
             "the remote URL {} is not usable: {why}",
-            show(url)
+            show(&shown_url(url))
         )))
     };
     if url.is_empty() || url.len() > MAX_LOCAL_PATH {
@@ -348,5 +383,27 @@ mod tests {
         }
         let long = format!("/{}", "a".repeat(2000));
         assert!(parse_remote(&long).is_err());
+    }
+
+    #[test]
+    fn a_secret_in_a_refused_url_is_not_in_the_error() {
+        let secret = "hunter2-secret-value";
+        // written in pieces: a fixture must not look like a credential in a URL to the secret scan
+        let at = "@";
+        for url in [
+            format!("https://user:{secret}{at}github.com/o/r"),
+            format!("https://{secret}{at}github.com/o/r.git"),
+            format!("ssh://git:{secret}{at}github.com/o/r"),
+            format!("ssh://bob:{secret}{at}github.com/o/r"),
+            format!("bob:{secret}{at}github.com:o/r"),
+            format!("https://github.com/o/r?token={secret}"),
+            format!("https://github.com/o/r#{secret}"),
+            format!("http://u:{secret}{at}github.com/o/r"),
+            format!("git://u:{secret}{at}github.com/o/r"),
+        ] {
+            let err = parse_remote(&url).unwrap_err();
+            assert!(!err.message.contains(secret), "{url}: {}", err.message);
+            assert!(err.message.contains("github.com"), "{}", err.message);
+        }
     }
 }

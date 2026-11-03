@@ -68,7 +68,7 @@ impl ForgeJobs for GhForgeJobs {
         }
     }
 
-    fn start(&mut self, ticket: u64, req: ForgeRequest, repos: &[String]) -> Result<()> {
+    fn can_start(&self, repos: &[String]) -> Result<()> {
         self.gh.check_trusted(repos)?;
         self.gh.check_rate()?;
         if self.running.load(Ordering::SeqCst) >= MAX_CONCURRENT_FORGE {
@@ -76,6 +76,11 @@ impl ForgeJobs for GhForgeJobs {
                 "{MAX_CONCURRENT_FORGE} GitHub requests are running; wait for one to finish"
             )));
         }
+        Ok(())
+    }
+
+    fn start(&mut self, ticket: u64, req: ForgeRequest, repos: &[String]) -> Result<()> {
+        self.can_start(repos)?;
         self.running.fetch_add(1, Ordering::SeqCst);
         let guard = Running(Arc::clone(&self.running));
         let gh = Arc::clone(&self.gh);
@@ -141,6 +146,10 @@ impl ForgeJobs for UnavailableForge {
         Err(FleetError::unavailable(self.reason.clone()))
     }
 
+    fn can_start(&self, _repos: &[String]) -> Result<()> {
+        Err(FleetError::unavailable(self.reason.clone()))
+    }
+
     fn poll(&mut self) -> Vec<(u64, Result<ForgeAnswer>)> {
         Vec::new()
     }
@@ -177,7 +186,7 @@ pub fn build(
         host: cfg.host.clone(),
         env,
         timeout_ms: cfg.timeout_ms,
-        redactor,
+        redactor: Arc::clone(&redactor),
         tracker: tracker.clone(),
         rate: cfg.rate,
     }));
@@ -185,6 +194,7 @@ pub fn build(
         parent_env.to_vec(),
         cfg.clone(),
         Some(resolved.program),
+        redactor,
         tracker,
     ));
     let note = if resolved.skipped_relative > 0 {
