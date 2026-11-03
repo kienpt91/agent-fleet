@@ -255,6 +255,7 @@ fn dummies() -> BTreeMap<&'static str, &'static str> {
         ("PACKAGE", "fleet-infra"),
         ("TEST_NAME", "a_reply_is_delivered"),
         ("TEST_FILTER", "server::tests::a_reply_is_delivered"),
+        ("ALSO", ""),
     ])
 }
 
@@ -437,8 +438,11 @@ fn the_templates_share_the_fragment_and_the_fragment_is_a_file_of_its_own() {
         assert_eq!(check["id"], id);
     }
     for name in TEMPLATES {
-        let doc: serde_json::Value =
-            serde_json::from_str(&read(&format!("dogfood/contracts/{name}.json"))).unwrap();
+        // `@ALSO@` is not JSON until it is rendered (empty or `, "a"`)
+        let doc: serde_json::Value = serde_json::from_str(
+            &read(&format!("dogfood/contracts/{name}.json")).replace("@ALSO@", ""),
+        )
+        .unwrap();
         assert_eq!(doc["version"], 1);
         let checks = doc["checks"].as_array().unwrap();
         assert_eq!(
@@ -447,6 +451,33 @@ fn the_templates_share_the_fragment_and_the_fragment_is_a_file_of_its_own() {
             "{name}: run dogfood/gen-contracts.sh"
         );
     }
+}
+
+/// A dependent's branch carries its dependencies' work, so its scope check must allow it too: the
+/// `@ALSO@` slot of the three scope templates takes `, "a", "b"` and nothing else changes.
+#[test]
+fn the_scope_of_a_template_has_a_slot_for_what_its_dependencies_changed() {
+    for name in TEMPLATES {
+        let raw = read(&format!("dogfood/contracts/{name}.json"));
+        assert_eq!(raw.matches("@ALSO@").count(), 1, "{name}");
+        let without = contract_of(&rendered(&raw)).unwrap();
+        let with = contract_of(&rendered(&raw).replace(
+            "\"]\n    }\n  ]",
+            "\", \"crates/x/src/a.rs\", \"docs/y.md\"]\n    }\n  ]",
+        ))
+        .unwrap();
+        let scope = |c: &VerificationContract| match &c.checks().last().unwrap().kind {
+            CheckKind::DiffOnly { allow, .. } => globs_of(allow),
+            other => panic!("{other:?}"),
+        };
+        let (a, b) = (scope(&without), scope(&with));
+        assert_eq!(b[..a.len()], a[..], "{name}: the own scope comes first");
+        assert_eq!(b[a.len()..], ["crates/x/src/a.rs", "docs/y.md"], "{name}");
+        // and the other nine-plus checks are untouched
+        assert_eq!(without.checks().len(), with.checks().len());
+    }
+    // the flaky-test template is for one file and has no slot
+    assert!(!read("dogfood/contracts/flaky-test.json").contains("@ALSO@"));
 }
 
 /// The flaky-test template is a reviewed exception for one file: no glob deny check (it could not

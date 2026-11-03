@@ -201,18 +201,20 @@ container** (no docker client there; it uses `container-run.inside.sh`):
 sh dogfood/dryrun.sh --fleet /target/release/fleet --source "$PWD"
 ```
 
-It loads a stage of the plan (the three starter tasks, a human-only task and the agent task behind it), adds the goals with their
-rendered contracts, starts the run with one worker at a time and shows what happens, then does the reviewer's steps. **What you
-must see** (the appendix is the real output of that script):
+It loads a stage of the plan (the three starter tasks, a documentation task that waits for them, a human-only task and the agent
+task behind it), adds the goals with their rendered contracts, starts the run with one worker at a time and shows what happens,
+then does the reviewer's steps. **What you must see** (the appendix is the real output of that script):
 
 1. `starter-docs-glossary` and `starter-error-tests` complete after their contracts passed (`goals list`: `verified`).
 2. `starter-value-property` touches `SECURITY.md` on its first attempt: its contract **fails** (`protected-diff`,
    `protected-script`), the failing checks are quoted in the brief, the retry leaves `SECURITY.md` alone and then it passes.
-3. `n3-scaffold` (human-only) fails at once and costs nothing; `n3-source` behind it is `blocked`; `fleet verify` of it says there is
-   no worktree to verify, so its contract can never pass.
-4. A goal is `verified` only with evidence; `goals show` lists it with the commit and tree it was taken on.
-5. `fleet merge` answers "approval required" with an approval bound to the exact commit; nothing merges before you approve.
-6. The commits come out authored `fleet <fleet@localhost>`; a `git cherry-pick -n` into another branch followed by
+3. `maint-docs-links` waits for the three starters; fleet merges their work into its branch, and its contract's scope check, rendered
+   by `apply-goals.sh` from the plan, allows the files they changed as well as `README.md` and `docs/**` (section 9, "A dependent task").
+4. `n3-scaffold` (human-only) fails at once and costs nothing (its worker exits 1 twice); `n3-source` behind it is `blocked`;
+   `fleet verify` of its goal fails on both checks and the evidence does not count.
+5. A goal is `verified` only with evidence; `goals show` lists it with the commit and tree it was taken on.
+6. `fleet merge` answers "approval required" with an approval bound to the exact commit; nothing merges before you approve.
+7. The commits come out authored `fleet <fleet@localhost>`; a `git cherry-pick -n` into another branch followed by
    `check-conflict-markers.sh --git` and a commit of your own re-authors them.
 
 If any of these differs on your machine, stop: that is a finding, not noise.
@@ -233,8 +235,8 @@ ids=$(sed -n '/^\[\[tasks\]\]/,$ s/^id = "\(.*\)"$/\1/p' dogfood/plan.neo-roadma
 sh dogfood/plan-without.sh --repo "$HOME/work/fleet-dogfood" dogfood/plan.neo-roadmap.toml "$ids" > ~/.fleet-dogfood/stage1.toml
 fleet plan ~/.fleet-dogfood/stage1.toml
 # (c) its goal and contract, rendered for this run
-sh dogfood/apply-goals.sh --tsv dogfood/goals.neo-roadmap.tsv --run neo-roadmap --repo ~/work/fleet-dogfood --base "$base" \
-   --tools ~/.fleet-dogfood/bin --container-run ~/.fleet-dogfood/bin/container-run --out ~/.fleet-dogfood/contracts \
+sh dogfood/apply-goals.sh --tsv dogfood/goals.neo-roadmap.tsv --plan ~/.fleet-dogfood/stage1.toml --run neo-roadmap \
+   --repo ~/work/fleet-dogfood --base "$base" --tools ~/.fleet-dogfood/bin --container-run ~/.fleet-dogfood/bin/container-run --out ~/.fleet-dogfood/contracts \
    --skip-tasks "$ids"                      # prints the commands: read them and the rendered contract, then add --apply
 fleet goals show g-starter-docs-glossary    # the checks, none with evidence yet
 # (d) go: one worker, no parallelism
@@ -378,8 +380,16 @@ to check, forbidden lazy fixes, "commit nothing yourself") and `fleet goals add 
 proves nothing about the part of the file after the first test module, and the agent in `write` mode cannot run the test it is
 fixing; the stress check is what proves it.
 
+**A dependent task.** fleet merges the finished dependencies of a task into its branch before it starts, and the `diff` check reads
+the whole diff since the run's base. A task that `after`-depends on another agent task therefore *carries that task's changes*: with
+a scope of one file it would fail on the files of its dependencies. `apply-goals.sh --plan <the plan that was loaded>` works out,
+for every task, the scopes of its transitive dependencies (it stops at a human-only task: a person lands what is behind a barrier) and
+renders them into the `@ALSO@` slot of the scope check. Consequences: the scope of a dependent is wider than its own file (by exactly
+what its dependencies were allowed to change); `protected-diff` is unchanged; and a stage cut with `plan-without.sh` (the
+dependencies landed in the base) needs nothing extra. Give `--plan` the stage you loaded, not the full roadmap.
+
 **After a human-only barrier.** See [human-only.md](human-only.md): finish and land the person's work, abandon its goal with a reason,
-then `plan-without.sh --repo <clone> --run-id <new id> plan.neo-roadmap.toml <done ids>` and `apply-goals.sh --skip-tasks <done ids>`.
+then `plan-without.sh --repo <clone> --run-id <new id> plan.neo-roadmap.toml <done ids>` and `apply-goals.sh --plan <that stage> --skip-tasks <done ids>`.
 
 **A dependency refresh.** `deps-refresh.sh` (a person runs it; the age check needs the network; the container wrapper's online
 mode is used for `cargo update` only). It puts `Cargo.lock` back if any locked version is newer than the cutoff.

@@ -85,7 +85,7 @@ daemon=$!
 i=0; until "$fleet" status >/dev/null 2>&1; do i=$((i + 1)); [ "$i" -lt 200 ] || { cat "$work/daemon.log" >&2; fail "the daemon did not start"; }; sleep 0.1; done
 
 # ---- the stage: starters, one human-only barrier and the task behind it ----------------------------
-keep_ids="starter-error-tests starter-value-property starter-docs-glossary n3-scaffold n3-source"
+keep_ids="starter-error-tests starter-value-property starter-docs-glossary maint-docs-links n3-scaffold n3-source"
 all_ids=$(sed -n '/^\[\[tasks\]\]/,$ s/^id = "\(.*\)"$/\1/p' "$clone/dogfood/plan.neo-roadmap.toml")
 drop=
 for id in $all_ids; do
@@ -98,19 +98,21 @@ grep -c '^\[\[tasks\]\]' "$work/stage.toml" | sed 's/^/tasks in the stage: /'
 
 cd "$clone"
 run "$fleet" plan "$work/stage.toml"
-say "sh dogfood/apply-goals.sh --skip-tasks <the others> --apply ...   # renders one contract per goal and adds the goals"
-sh dogfood/apply-goals.sh --tsv dogfood/goals.neo-roadmap.tsv --run neo-roadmap --repo "$clone" --base "$base" \
+say "sh dogfood/apply-goals.sh --plan stage.toml --skip-tasks <the others> --apply ...   # renders one contract per goal (a dependent's scope also allows its dependencies') and adds the goals"
+sh dogfood/apply-goals.sh --tsv dogfood/goals.neo-roadmap.tsv --plan "$work/stage.toml" --run neo-roadmap --repo "$clone" --base "$base" \
   --tools "$tools" --container-run "$crun" --out "$work/contracts" --fleet "$fleet" --skip-tasks "$drop" --apply
+say "the scope check of maint-docs-links: it runs after the three starters, whose work fleet merges into its branch"
+grep -A4 '"id": "scope"' "$work/contracts/g-maint-docs-links.json"
 run "$fleet" goals list
 run "$fleet" goals show g-starter-docs-glossary
 run "$fleet" goals remaining
 
 run "$fleet" start --run neo-roadmap --max-parallel 1
 
-# wait until the three starters completed and nothing is waiting, running or in review (a contract
-# run can take many minutes); give up after 90 minutes
+# wait until the four tasks that can finish have completed and nothing is waiting, running or in review (a
+# contract run can take many minutes); give up after 90 minutes
 i=0
-until "$fleet" status | grep -q 'ready 0, running 0, review 0, completed 3'; do
+until "$fleet" status | grep -q 'ready 0, running 0, review 0, completed 4'; do
   i=$((i + 1)); [ "$i" -lt 5400 ] || { echo "timed out; last status:" >&2; "$fleet" status >&2; exit 1; }
   sleep 1
 done
@@ -119,13 +121,36 @@ run "$fleet" status
 run "$fleet" goals list
 run "$fleet" goals show g-starter-value-property
 run "$fleet" goals show g-starter-docs-glossary
+run "$fleet" goals show g-maint-docs-links
 run "$fleet" goals remaining
+
+# why did the first attempts fail? the output of every failed check, from the evidence in the ledger (the
+# entries of `goals show --json` start with {"at_ms":; long outputs are cut to their last 12 lines)
+failed_output() {
+  "$fleet" goals show "$1" --json | awk '
+    BEGIN { RS = "\\{\"at_ms\":" }
+    /"verdict":"failed"/ {
+      check = ""; if (match($0, /"check":"[^"]*"/)) check = substr($0, RSTART + 9, RLENGTH - 10)
+      commit = ""; if (match($0, /"commit":"[0-9a-f]*"/)) commit = substr($0, RSTART + 10, 12)
+      summary = ""; if (match($0, /"summary":"([^"\\]|\\.)*"/)) summary = substr($0, RSTART + 11, RLENGTH - 12)
+      out = ""; if (match($0, /"output":"([^"\\]|\\.)*"/)) out = substr($0, RSTART + 10, RLENGTH - 11)
+      gsub(/\\n/, "\n", out); gsub(/\\"/, "\"", out)
+      n = split(out, lines, "\n"); first = n > 12 ? n - 11 : 1
+      printf "  [%s @ %s] FAILED: %s\n", check, commit, summary
+      for (i = first; i <= n; i++) if (lines[i] != "") printf "      %s\n", lines[i]
+    }'
+}
+for g in g-starter-error-tests g-starter-value-property; do
+  say "the checks that failed for $g (fleet goals show $g --json)"
+  failed_output "$g"
+done
 say "the worker that costs nothing: fleet tail n3-scaffold"
 "$fleet" tail n3-scaffold || true
 
 say "fleet verify r/task: run the contract again, by hand, on the task's current commit"
 "$fleet" verify neo-roadmap/starter-docs-glossary || echo "exit $?"
-say "fleet verify g-n3-scaffold: a human-only task never gets a worktree, so there is nothing to verify and nothing can pass"
+say "fleet verify g-n3-scaffold: the human-only contract. The task has a worktree (its worker ran and failed), which carries the work"
+say "of the three tasks it waited for: so nothing may change fails, and the evidence does not count because the task was never reviewed"
 "$fleet" verify g-n3-scaffold --task neo-roadmap/n3-scaffold || echo "exit $?"
 
 # ---- the person reviews and merges ---------------------------------------------------------------------
@@ -149,6 +174,7 @@ git -C "$clone" branch --show-current
 # ---- taking the work into the branch you keep (fleet's commits carry the identity fleet <fleet@localhost>) ----
 say "git log --format='%h %an <%ae> %s' $base..fleet/neo-roadmap/starter-docs-glossary   # who fleet says made the commits"
 git -C "$clone" log --format='%h %an <%ae> %s' "$base..fleet/neo-roadmap/starter-docs-glossary"
+orig_branch=$(git -C "$clone" branch --show-current)
 run git -C "$clone" switch -q -c owner-branch "$base"
 say "git cherry-pick -n $base..fleet/neo-roadmap/starter-docs-glossary   # applied to the index and the files, not committed"
 git -C "$clone" cherry-pick -n "$base..fleet/neo-roadmap/starter-docs-glossary"
@@ -156,4 +182,4 @@ run sh "$tools/check-conflict-markers.sh" --git "$clone"
 say "git commit as the owner (the commit message is the owner's own)"
 git -C "$clone" -c user.name="Owner Name" -c user.email=owner@example.invalid commit -q -m "Add the self-development terms to the glossary"
 git -C "$clone" log --format='%h %an <%ae> %s' -2
-git -C "$clone" switch -q main
+git -C "$clone" switch -q "$orig_branch"

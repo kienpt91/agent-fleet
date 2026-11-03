@@ -80,6 +80,21 @@ done
 # shellcheck disable=SC2086
 expect_exit 2 "a template without TEST_NAME takes no PACKAGE" "$rc" "$tpl" "$work/x.json" $good PACKAGE=fleet-infra
 
+# ---- ALSO: the scopes of the dependencies --------------------------------------------------------------------
+# shellcheck disable=SC2086
+expect_exit 0 "ALSO adds paths to the scope" "$rc" "$tpl" "$work/also.json" $good ALSO=crates/a/src/x.rs,docs/**,README.md
+grep -q '"allow": \["docs/domain.md", "crates/a/src/x.rs", "docs/\*\*", "README.md"\]' "$work/also.json" && ok || bad "the scope does not list the own file first and then the extra paths: $(grep allow "$work/also.json" | tail -n 1)"
+grep -q '"allow": \["docs/domain.md"\]' "$work/out.json" && ok || bad "without ALSO the scope is the own file only"
+for bad_alsos in '/etc/passwd' 'a/../b' 'a,,b' 'a b' 'a"b' 'a;b' 'a***b' ',a' 'a,' '..' 'a\\b'; do
+  # shellcheck disable=SC2086
+  expect_exit 2 "ALSO refused: $bad_alsos" "$rc" "$tpl" "$work/x.json" $good "ALSO=$bad_alsos"
+done
+many=$(i=0; while [ $i -lt 41 ]; do printf 'f%s.rs,' $i; i=$((i+1)); done; printf 'last.rs')
+# shellcheck disable=SC2086
+expect_exit 2 "ALSO with more than 40 entries" "$rc" "$tpl" "$work/x.json" $good "ALSO=$many"
+# shellcheck disable=SC2086
+expect_exit 2 "a template without the slot takes no ALSO" "$rc" "$ftpl" "$work/x.json" $fgood ALSO=a.rs
+
 # ---- install-tools -----------------------------------------------------------------------------------
 src=$work/src-repo
 mkdir -p "$src/dogfood"

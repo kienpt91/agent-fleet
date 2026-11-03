@@ -69,11 +69,10 @@ expect_exit 2 "a list that spans lines is refused, not guessed at" "$pw" "$work/
 out=$("$pw" "$plan" no-such-task 2>/dev/null); [ -z "$out" ] && ok || bad "a failed run printed a plan"
 
 # ---- apply-goals, dry run ----------------------------------------------------------------------------
-common="--tsv $tsv --run neo-roadmap --repo $work/fake-repo --base 0123456789abcdef0123456789abcdef01234567 --tools /opt/dogfood/bin --container-run /opt/dogfood/container-run --out $work/contracts"
 mkdir -p "$work/fake-repo"
 git -C "$work/fake-repo" init -q -b main; printf '# lock\n' > "$work/fake-repo/Cargo.lock"; git -C "$work/fake-repo" add -A; git -C "$work/fake-repo" commit -q -m c
 real_base=$(git -C "$work/fake-repo" rev-parse HEAD)
-common="--tsv $tsv --run neo-roadmap --repo $work/fake-repo --base $real_base --tools /opt/dogfood/bin --container-run /opt/dogfood/container-run --out $work/contracts"
+common="--tsv $tsv --plan $plan --run neo-roadmap --repo $work/fake-repo --base $real_base --tools /opt/dogfood/bin --container-run /opt/dogfood/container-run --out $work/contracts"
 # shellcheck disable=SC2086
 expect_exit 0 "a dry run prints the commands" "$ag" $common
 # shellcheck disable=SC2086
@@ -87,7 +86,7 @@ expect_eq "and one rendered file each" "$tasks" "$(ls "$work/contracts" | wc -l 
 if grep -l '@[A-Z_]*@' "$work/contracts"/*.json >/dev/null 2>&1; then bad "a rendered contract has a placeholder left"; else ok; fi
 grep -q "'goals' 'add' '--id' 'g-starter-error-tests' .*'--task' 'neo-roadmap/starter-error-tests'" "$work/cmds.txt" && ok || bad "the task reference of a goal is wrong"
 grep -q "'--parent' 'm-n3'" "$work/cmds.txt" && ok || bad "no goal has the milestone as parent"
-grep -q "allow\": \[\"crates/neo-knowledge/src/\*\*\", \"crates/neo-knowledge/tests/\*\*\"\]" "$work/contracts/g-n3-base.json" && ok || bad "the crate template was not rendered with its crate"
+grep -q 'allow": \["crates/neo-knowledge/src/\*\*", "crates/neo-knowledge/tests/\*\*"' "$work/contracts/g-n3-base.json" && ok || bad "the crate template was not rendered with its crate"
 grep -q '"deny": \["\*\*"\]' "$work/contracts/g-n3-scaffold.json" && ok || bad "a human-only goal does not deny everything"
 # every task of the plan has exactly one goal, and every goal names a task of the plan
 sed -n "s/^g-[^	]*	[^	]*	\([^	]*\)	.*/\1/p" "$tsv" | sort > "$work/goal-tasks.txt"
@@ -105,23 +104,23 @@ done
 
 # ---- apply-goals: errors and options -----------------------------------------------------------------
 # shellcheck disable=SC2086
-expect_exit 2 "no --out" "$ag" --tsv "$tsv" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c
+expect_exit 2 "no --out" "$ag" --tsv "$tsv" --plan "$plan" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c
 # shellcheck disable=SC2086
 expect_exit 0 "skipping the tasks of an earlier stage" "$ag" $common --skip-tasks starter-error-tests,starter-value-property,starter-docs-glossary
 # shellcheck disable=SC2086
 "$ag" $common --skip-tasks starter-error-tests,starter-value-property,starter-docs-glossary 2>/dev/null > "$work/cmds2.txt"
 expect_eq "three goals fewer" "$((goals - 3))" "$(wc -l < "$work/cmds2.txt" | tr -d ' ')"
 # shellcheck disable=SC2086
-expect_exit 2 "a relative tools directory is refused by the renderer" "$ag" --tsv "$tsv" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools tools --container-run /opt/c --out "$work/c2"
+expect_exit 2 "a relative tools directory is refused by the renderer" "$ag" --tsv "$tsv" --plan "$plan" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools tools --container-run /opt/c --out "$work/c2"
 printf 'g-x\t-\tt\tsingle-file\t-\tTitle\tIntent\n' > "$work/bad.tsv"
 # shellcheck disable=SC2086
-expect_exit 2 "a template that needs a parameter the row lacks" "$ag" --tsv "$work/bad.tsv" --run r --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c3"
+expect_exit 2 "a template that needs a parameter the row lacks" "$ag" --tsv "$work/bad.tsv" --plan "$plan" --run r --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c3"
 printf 'g-x\t-\tt\tnosuch\t-\tTitle\tIntent\n' > "$work/bad2.tsv"
-expect_exit 2 "an unknown template" "$ag" --tsv "$work/bad2.tsv" --run r --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c4"
+expect_exit 2 "an unknown template" "$ag" --tsv "$work/bad2.tsv" --plan "$plan" --run r --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c4"
 printf 'g-x\t-\t-\tsingle-file\tFILE_PATH=a.rs\tTitle\tIntent\n' > "$work/bad3.tsv"
-expect_exit 2 "a contract without a task" "$ag" --tsv "$work/bad3.tsv" --run r --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c5"
+expect_exit 2 "a contract without a task" "$ag" --tsv "$work/bad3.tsv" --plan "$plan" --run r --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c5"
 printf "g-x\t-\t-\t-\t-\tIt's a title\tIntent\n" > "$work/quote.tsv"
-out=$("$ag" --tsv "$work/quote.tsv" --run r --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c6" 2>/dev/null)
+out=$("$ag" --tsv "$work/quote.tsv" --plan "$plan" --run r --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c6" 2>/dev/null)
 expect_eq "a quote in a title is escaped for the shell" "fleet 'goals' 'add' '--id' 'g-x' '--title' 'It'\\''s a title' '--intent' 'Intent'" "$out"
 
 # ---- apply-goals --apply, against a stub that records what it is asked ------------------------------------
@@ -143,5 +142,41 @@ expect_eq "the goals were added in file order, parents first" "m-starters" "$(se
 printf '#!/bin/sh\nexit 1\n' > "$work/fleet-fail"; chmod +x "$work/fleet-fail"
 # shellcheck disable=SC2086
 expect_exit 2 "a failing fleet stops the run" "$ag" $common --fleet "$work/fleet-fail" --apply
+
+# ---- a dependent's scope allows what its dependencies changed ---------------------------------------------
+# fleet merges finished dependencies into a dependent's branch and the diff check reads the whole diff since the base
+allow_of() { # contract file -> the allow list of its scope check, one glob per line
+  sed -n '/"id": "scope"/,/\]/p' "$1" | grep -o '"[^"]*"' | sed '1,/^"allow"$/d' | tr -d '"'
+}
+# shellcheck disable=SC2086
+"$ag" $common > /dev/null 2>&1
+expect_eq "n3-fact: itself and source.rs (n3-source is its dependency; the human-only n3-scaffold behind it adds nothing)" \
+  "crates/neo-knowledge/src/fact.rs
+crates/neo-knowledge/src/source.rs" "$(allow_of "$work/contracts/g-n3-fact.json")"
+expect_eq "n3-source depends on a human-only task only: nothing is added" "crates/neo-knowledge/src/source.rs" "$(allow_of "$work/contracts/g-n3-source.json")"
+expect_eq "n4-props: the whole closure (meter, policy, estimator and, behind them, budget), no duplicate" \
+  "crates/neo-governor/tests/accounting.rs
+crates/neo-governor/src/meter.rs
+crates/neo-governor/src/budget.rs
+crates/neo-governor/src/policy.rs
+crates/neo-governor/src/estimator.rs" "$(allow_of "$work/contracts/g-n4-props.json")"
+expect_eq "maint-docs-links: after the three starters" \
+  "README.md
+docs/**
+crates/fleet-domain/src/error.rs
+crates/fleet-domain/src/value.rs
+docs/domain.md" "$(allow_of "$work/contracts/g-maint-docs-links.json")"
+expect_eq "n3-base (a crate template) keeps its own globs first" \
+  "crates/neo-knowledge/src/**
+crates/neo-knowledge/tests/**
+crates/neo-knowledge/src/fact.rs
+crates/neo-knowledge/src/source.rs" "$(allow_of "$work/contracts/g-n3-base.json")"
+expect_eq "a starter has no dependency: its contract allows its own file only" "crates/fleet-domain/src/error.rs" "$(allow_of "$work/contracts/g-starter-error-tests.json")"
+# a stage cut away from its dependencies (plan-without) adds nothing for them
+"$pw" --repo /work/c "$plan" starter-error-tests,starter-value-property,starter-docs-glossary > "$work/stage-cut.toml"
+"$ag" --tsv "$tsv" --plan "$work/stage-cut.toml" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools /opt/dogfood/bin --container-run /opt/dogfood/container-run --out "$work/contracts-cut" --skip-tasks starter-error-tests,starter-value-property,starter-docs-glossary > /dev/null 2>&1
+expect_eq "after the starters were landed, maint-docs-links needs nothing extra" "README.md
+docs/**" "$(allow_of "$work/contracts-cut/g-maint-docs-links.json")"
+expect_exit 2 "no --plan" "$ag" --tsv "$tsv" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c7"
 
 finish

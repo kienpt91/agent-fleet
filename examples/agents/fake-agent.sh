@@ -133,6 +133,13 @@ RUST
     fi
     result "added the unit tests of error.rs"
     ;;
+  maint-docs-links)
+    # runs after the three starters: their work is merged into this branch, so the scope of its contract allows their files too
+    if ! grep -q '^A dry-run note' docs/parity.md; then
+      printf '\nA dry-run note: the links of this document were checked by a scripted agent.\n' >> docs/parity.md
+    fi
+    result "checked the links"
+    ;;
   starter-value-property)
     # a careless first attempt also "tidies" a sentence of the security policy; a retry that is told
     # which check failed takes its own line out again (the line was appended, so the file is as it was)

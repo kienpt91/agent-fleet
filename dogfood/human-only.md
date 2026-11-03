@@ -24,9 +24,10 @@ behind it. The procedure at a barrier:
 4. Mark the goal of the barrier done: `fleet goals status <goal> abandoned --reason "done by a person in <commit>"`
    (a verified goal cannot be set by hand, and a human-only goal can never be verified; an abandoned child no longer
    holds its milestone back).
-5. Start the next stage from a plan without the finished tasks:
-   `dogfood/plan-without.sh dogfood/plan.neo-roadmap.toml <done task ids> > stage.toml`, then `fleet plan stage.toml`
-   (give it a new run id in the `[run]` table) and `apply-goals.sh --skip-tasks <done task ids>` for its goals.
+5. Start the next stage from a plan without the finished tasks, for the repository and under a new run id:
+   `dogfood/plan-without.sh --repo <the clone> --run-id <new id> dogfood/plan.neo-roadmap.toml <done task ids> > stage.toml`, then
+   `fleet plan stage.toml` and `apply-goals.sh --plan stage.toml --run <new id> --skip-tasks <done task ids>` for its goals (also give it
+   the repository, base, tools and wrapper it asks for; RUNBOOK.md, section 4).
 
 The tasks, in the order of the roadmap (the goal of each is `g-<task>`):
 

@@ -16,6 +16,9 @@
 #   PACKAGE        a cargo package name (`fleet-infra`): the package of a flaky test
 #   TEST_NAME      the name of that test function (`a_reply_that_is_delivered`): it must still be in FILE_PATH
 #   TEST_FILTER    the filter that selects exactly that test for `cargo test` (`server::tests::a_reply_that_is_delivered`)
+#   ALSO           optional, comma separated paths or globs added to the `allow` list of the scope check: the scopes of the
+#                  tasks this one depends on (fleet merges finished dependencies into a dependent's branch and the diff
+#                  check reads the whole diff since the run's base). apply-goals.sh works it out from the plan.
 #   (a template with TEST_NAME is a reviewed exception: FILE_PATH must then be crates/<crate>/src/**.rs or crates/<crate>/tests/**.rs)
 # Values may contain only letters, digits and . _ / - (BASE also ^ and ~, TEST_FILTER also :); nothing else is
 # substituted, so a value can never add a field to the JSON. A placeholder left unfilled, a value
@@ -52,6 +55,7 @@ for arg in "$@"; do
   case $k in
     BASE) case $v in *[!A-Za-z0-9_./^~-]*|-*) fail "BASE has characters a ref does not" ;; esac ;;
     TEST_FILTER) case $v in *[!A-Za-z0-9_:]*|[!a-z_]*) fail "TEST_FILTER may contain only letters, digits, _ and :, and starts with a lowercase letter or _" ;; esac ;;
+    ALSO) case $v in *[!A-Za-z0-9_./*,-]*) fail "ALSO may contain only letters, digits and . _ / * - , (a comma separated list of paths or globs)" ;; esac ;;
     *) case $v in *[!A-Za-z0-9_./-]*) fail "$k may contain only letters, digits and . _ / -" ;; esac ;;
   esac
   case $k in
@@ -65,6 +69,21 @@ for arg in "$@"; do
                case $v in *[!a-z0-9_]*) fail "TEST_NAME may contain only a-z 0-9 _" ;; esac ;;
     LOCK_SHA256) case $v in *[!0-9a-f]*) fail "LOCK_SHA256 must be lowercase hex" ;; esac
                  [ ${#v} -eq 64 ] || fail "LOCK_SHA256 must be 64 hex digits" ;;
+    ALSO) also_json=; also_n=0
+          case $v in ,*|*,|*,,*) fail "ALSO has an empty entry" ;; esac
+          oldifs=$IFS; IFS=,
+          for item in $v; do
+            IFS=$oldifs
+            [ -n "$item" ] || fail "ALSO has an empty entry"
+            case $item in /*) fail "ALSO entries must be relative" ;; esac
+            no_dotdot ALSO "$item"
+            case $item in *'***'*) fail "ALSO: a run of three stars in $item" ;; esac
+            [ ${#item} -le 120 ] || fail "ALSO: an entry is longer than 120 bytes"
+            also_n=$((also_n + 1)); [ "$also_n" -le 40 ] || fail "ALSO has more than 40 entries"
+            also_json="$also_json, \"$item\""
+            IFS=,
+          done
+          IFS=$oldifs ;;
   esac
   eval "val_$k=\$v"
 done
@@ -100,9 +119,13 @@ tmp=$(mktemp "${TMPDIR:-/tmp}/render-contract.XXXXXX") || fail "cannot create a 
 trap 'rm -f "$tmp" "$tmp.next"' EXIT HUP INT TERM
 cp "$template" "$tmp"
 for n in $names; do
-  v=$(get "$n")
-  [ -n "$v" ] || fail "the placeholder @$n@ has no value (give $n=...)"
-  sed "s|@$n@|$v|g" "$tmp" > "$tmp.next" && mv "$tmp.next" "$tmp"
+  if [ "$n" = ALSO ]; then
+    v=${also_json:-}   # `, "a", "b"` built above from validated entries, or nothing
+  else
+    v=$(get "$n")
+    [ -n "$v" ] || fail "the placeholder @$n@ has no value (give $n=...)"
+  fi
+  sed "s|@$n@|$(printf '%s' "$v" | sed 's/[&|\\]/\\&/g')|g" "$tmp" > "$tmp.next" && mv "$tmp.next" "$tmp"
 done
 if grep -q '@[A-Z_][A-Z0-9_]*@' "$tmp"; then fail "a placeholder is left in the output"; fi
 mv "$tmp" "$out"

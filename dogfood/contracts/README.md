@@ -87,6 +87,7 @@ something changed. A test (`crates/fleet-infra/tests/dogfood.rs`) proves it with
 | `@RUN@`, `@TASK@` | the run id and the task id | the task's branch is `fleet/<run>/<task>` |
 | `@LOCK_SHA256@` | derived by `render-contract.sh` from `Cargo.lock` at `@BASE@` | never typed |
 | `@FILE_PATH@`, `@CRATE@` | a relative path without wildcards; a crate name | from the `params` column of the goal list |
+| `@ALSO@` | optional: `, "a", "b"` built from `ALSO=a,b` (paths or globs) | the scopes of the tasks this one depends on, added to the `scope` allow list of `single-file`, `docs-only` and `crate-src`; `apply-goals.sh --plan` works it out (RUNBOOK.md, section 9) |
 | `@PACKAGE@`, `@TEST_NAME@`, `@TEST_FILTER@` | a cargo package; a test function name; the filter that selects it (`module::tests::name`) | `flaky-test.json` only; its `@FILE_PATH@` must be `crates/<crate>/src/**.rs` or `crates/<crate>/tests/**.rs` |
 
 Values may contain only letters, digits and `. _ / -` (a base may also contain `^ ~`, a test filter `:`): nothing that could add a

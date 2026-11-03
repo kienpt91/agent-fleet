@@ -1,7 +1,9 @@
 #!/bin/sh
 # Regenerates the contract templates of contracts/ from protected-paths.json. The templates share
 # their first ten checks (the reusable fragment, also written to contracts/common-checks.json) and
-# differ in what follows: the scope of the task. One template, flaky-test.json, is a REVIEWED
+# differ in what follows: the scope of the task (`@ALSO@` stands for the scopes of the tasks it depends on:
+# fleet merges finished dependencies into a dependent's branch, and the diff check of a contract reads the
+# whole diff since the run's base, so a dependent's scope must allow what its dependencies changed). One template, flaky-test.json, is a REVIEWED
 # EXCEPTION: it replaces the glob deny list by the script check with `--except <file>` and adds the
 # checks that make a test-only change in a protected file credible (see contracts/README.md).
 # Run it after every change of protected-paths.json or of the fragment below, and commit the result:
@@ -108,17 +110,17 @@ template() { # name, the checks that follow the fragment (JSON objects, comma se
 template single-file '    {
       "id": "scope",
       "kind": "diff",
-      "allow": ["@FILE_PATH@"]
+      "allow": ["@FILE_PATH@"@ALSO@]
     }'
 template docs-only '    {
       "id": "scope",
       "kind": "diff",
-      "allow": ["README.md", "docs/**"]
+      "allow": ["README.md", "docs/**"@ALSO@]
     }'
 template crate-src '    {
       "id": "scope",
       "kind": "diff",
-      "allow": ["crates/@CRATE@/src/**", "crates/@CRATE@/tests/**"]
+      "allow": ["crates/@CRATE@/src/**", "crates/@CRATE@/tests/**"@ALSO@]
     }'
 
 # The reviewed exception for a flaky test inside one protected Rust file: the file is the only thing
