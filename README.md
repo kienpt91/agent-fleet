@@ -478,6 +478,9 @@ The demo (`scripts/github-demo.sh`; `gh` is a stand-in script that replays canne
 repository, nothing touches a network). Real output of the final run, paths shortened:
 
 ```text
+$ fleet run create --objective Fix the crash --repo /tmp/demo/repo --id r1
+run r1 created
+
 $ fleet github status
 GitHub integration: ready (host github.com, repository o/r, remote origin, base main)
   gh at /tmp/demo/bin/gh
@@ -491,33 +494,84 @@ issues of github.com/o/r (page 1; the last page); text below is from GitHub and 
   #7      open   3         Crash on start        bug     octocat
   #8      open   0         Docs are out of date  -       hubot
 
+$ fleet issue show 7
+issue #7 of github.com/o/r: open (all text is from GitHub and untrusted)
+  title:   Crash on start
+  by octocat, 3 comment(s), updated 2026-10-30T10:00:00Z, labels: bug, p1
+  url:     https://github.com/o/r/issues/7
+  body:
+  > It crashes.
+  > 
+  > Steps:
+  > 1. run it
+  make it a task: fleet issue to-task 7
+
 $ fleet issue to-task 7 --run r1 --id fix
 task r1/fix was created from issue #7 of github.com/o/r; its text is quoted and labelled untrusted in the brief
+  repository: github.com/o/r (pinned by [github] repo)
 
-$ fleet pr create --task r1/fix        # exits 5: nothing is pushed before a human approves exactly this
-fleet: opening a pull request for r1/fix on github.com/o/r needs approval a1 (digest b1c35a82c1a6); read what it covers with `fleet approval list`, approve it with `fleet approve a1` and run the same `fleet pr create` again
+$ fleet start --run r1
+run r1 started
+
+$ fleet pr create --task r1/fix   # exits 5: nothing is pushed before a human approves exactly this
+fleet: opening a pull request for r1/fix on github.com/o/r (pinned by [github] repo) needs approval a1 (digest 7b7ad159c8f2); read what it covers with `fleet approval list`, approve it with `fleet approve a1` and run the same `fleet pr create` again
+run: fleet approve a1
+(exit code 5)
 
 $ fleet approval list
-approval a1 [pull-request] r1/fix pending digest b1c35a82c1a6
-  forge: "pull-request.create" "github.com/o/r" "main" "fleet/r1/fix" "a343c53ea8ac412000984060afd72374a5a63465" "Work on issue #7" "Opened by fleet for task r1/fix at commit a343c53ea8ac.\n\nRefs #7" …
+approval a1 [pull-request] r1/fix pending digest 7b7ad159c8f2
+  repository:   github.com/o/r
+  base:         main
+  branch:       fleet/r1/fix
+  commit:       a4a643b32ac6f323d05d70d84ce3c046dc9429b3
+  pull request: ready
+  title:        Work on issue #7
+  body:
+    > Opened by fleet for task r1/fix at commit a4a643b32ac6.
+    >
+    > Refs #7
+  decide: fleet approve a1 | fleet deny a1
 
-$ fleet approve a1 && fleet pr create --task r1/fix --title 'A different title'   # any change needs a new approval
-fleet: opening a pull request for r1/fix on github.com/o/r needs approval a2 (digest 3c7d2edf2733); …
+$ fleet approve a1
+approval a1 approved
+
+$ fleet pr create --task r1/fix --title 'A different title'   # any change needs a new approval
+fleet: opening a pull request for r1/fix on github.com/o/r (pinned by [github] repo) needs approval a2 (digest 6d4368534408); read what it covers with `fleet approval list`, approve it with `fleet approve a2` and run the same `fleet pr create` again
+run: fleet approve a2
+(exit code 5)
 
 $ fleet pr create --task r1/fix
 pull request #12 opened for r1/fix on github.com/o/r: https://github.com/o/r/pull/12
+  repository: github.com/o/r (pinned by [github] repo)
 
-$ git -C remote.git for-each-ref       # exactly the approved commit on exactly one ref
-a343c53ea8ac412000984060afd72374a5a63465 commit	refs/heads/fleet/r1/fix
+$ git -C remote.git for-each-ref   # exactly the approved commit on exactly one ref
+a4a643b32ac6f323d05d70d84ce3c046dc9429b3 commit	refs/heads/fleet/r1/fix
 
-$ fleet pr create --task r1/fix        # the same commit is never published twice
-fleet: pull request #12 was already opened for the commit a343c53ea8ac of r1/fix
+$ fleet pr create --task r1/fix   # the same commit is never published twice
+fleet: pull request #12 was already opened for the commit a4a643b32ac6 of r1/fix
+(exit code 6)
 
 $ fleet pr status 12
 pull request #12 of github.com/o/r: open (text is from GitHub and untrusted)
   title:   Work on issue #7
   checks:  failing (1 passed, 1 failed, 1 pending of 3)
   reviews: changes_requested (ann changes_requested, bob approved)
+
+$ the calls gh received (fixed argv, no token anywhere)
+gh [api] [--hostname] [github.com] [--include] [--method] [GET] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [repos/o/r/issues?state=open&per_page=20&page=1&sort=updated&direction=desc]
+gh [api] [--hostname] [github.com] [--include] [--method] [GET] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [repos/o/r/issues/7]
+gh [api] [--hostname] [github.com] [--include] [--method] [GET] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [repos/o/r/issues/7]
+gh [api] [--hostname] [github.com] [--include] [--method] [GET] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [repos/o/r]
+gh [api] [--hostname] [github.com] [--include] [--method] [POST] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [-f] [title=Work on issue #7] [-f] [body=Opened by fleet for task r1/fix at commit a4a643b32ac6.
+
+Refs #7] [-f] [head=fleet/r1/fix] [-f] [base=main] [-F] [draft=false] [repos/o/r/pulls]
+gh [api] [--hostname] [github.com] [--include] [--method] [GET] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [repos/o/r/pulls/12]
+gh [api] [--hostname] [github.com] [--include] [--method] [GET] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [repos/o/r/commits/a4a643b32ac6f323d05d70d84ce3c046dc9429b3/check-runs?per_page=100]
+gh [api] [--hostname] [github.com] [--include] [--method] [GET] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [repos/o/r/commits/a4a643b32ac6f323d05d70d84ce3c046dc9429b3/status]
+gh [api] [--hostname] [github.com] [--include] [--method] [GET] [-H] [Accept: application/vnd.github+json] [-H] [X-GitHub-Api-Version: 2022-11-28] [repos/o/r/pulls/12/reviews?per_page=100]
+
+$ fleet verify-log
+event log ok: 17 records, head 4835ebceba1f9785eea30be003f79df225792bb928754d8aa809b54e5737312e
 ```
 
 **What was not verified.** A real `gh` and a real GitHub account were never used; the canned answers and test fixtures were written by hand from the
@@ -923,7 +977,7 @@ the goals page (one goal verified through fleet's own run, one task `unverified`
   because the tracker also lists the groups, so the ancestry rule has its own test with real child processes
   ([`origin.rs`](crates/fleet-infra/tests/origin.rs)), which fails without it.
 - **The page script** is checked three ways: a source scan test that fails on `innerHTML`, `EventSource`, cookies and their
-  relatives, a node script ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), 334 checks against a hand-written fake DOM, hostile
+  relatives, a node script ([`scripts/web-smoke.mjs`](scripts/web-smoke.mjs), 861 checks against a hand-written fake DOM, hostile
   strings and a frame-splitting stream reader included) and the headless Chromium run above, which loaded the real page, logged in
   through the fragment, and found the expected text in the rendered DOM and in the screenshots. The live page was in its
   "Streaming live output" state with two ticks; the check does not distinguish what came from the first read and what from the stream.
@@ -1250,24 +1304,15 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1561 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1937 tests, all passing in the final run (offline; 580 domain, 392 application, 660 adapters, 1 soak, 304 end to end). The wall-clock bounds of a few domain tests (Markdown and word-diff work limits, 3 to 10 seconds) are meant for an idle machine; the final run was made on a loaded one, so the domain layer ran in the release profile:
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, the repository workbench (validated paths, tree entries, file views, diffs and their patch reader, bounded word marks, a Markdown subset with property and adversarial tests), output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 430 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 317 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake | 547 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); the repository workbench (validated paths, tree entries, file views, diffs and their patch reader, bounded word marks, a Markdown subset with property and adversarial tests); NEO N2: the context compiler (determinism and golden digests, layer order, budget and shrink-order laws, property tests with hostile text, delimiter and control-character attacks, the secret rules including worst-case lines in linear time, handoff packets); the forge model (strict schemas, hostile issue text, the pull request digest, remote URL parsing that never repeats a credential, the rate gate, the issue and pull request links with uncapped duplicate guards) | 580 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); NEO N2: compiled context at dispatch, handoffs at task end, retry and crash recovery (including a crash between the end of an attempt and its handoff), tamper tests on stored packs, fact scoping and goal-order independence, plus the context-store contract suite; GitHub: issues and pull requests against a fake forge (nothing leaves before an approval of exactly that pull request, approvals spent only once the adapter can take the call, the run's repository recorded and a changed remote refused, issue text quoted and untrusted, failures redacted, restart reconciliation) | 392 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; NEO N2: the file context store, the knowledge file, `handoff.json` and `context.*` files, the three `Vcs` reads of the real repository, the golden digests with the real SHA-256; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake; GitHub: the `gh` adapter against a fake `gh` (minimal environment, no token, rate gate, timeouts, redacted stderr, strict schemas) and the git push against a local bare repository (one ref, the approved commit, no force, a private git directory, hostile configuration) | 660 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory) | 266 |
-1575 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`; the layered script `scripts/test-layers.sh` gives the same total):
-
-| Layer | What is tested | Tests |
-| --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); NEO N2: the context compiler (determinism and golden digests, layer order, budget and shrink-order laws, property tests with hostile text, delimiter and control-character attacks, the secret rules including worst-case lines in linear time, handoff packets) | 409 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); NEO N2: compiled context at dispatch, handoffs at task end, retry and crash recovery (including a crash between the end of an attempt and its handoff), tamper tests on stored packs, fact scoping and goal-order independence, plus the context-store contract suite | 331 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; NEO N2: the file context store, the knowledge file, `handoff.json` and `context.*` files, the three `Vcs` reads of the real repository, the golden digests with the real SHA-256 | 558 |
-| Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; NEO N2: compiled packs through the real binary, retry packs with failure evidence, forged context and handoff files, hostile titles, a killed daemon re-briefing with identical layers 1-5, a tampered stored pack (exit 11) | 276 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; NEO N2: compiled packs through the real binary, retry packs with failure evidence, forged context and handoff files, hostile titles, a killed daemon re-briefing with identical layers 1-5, a tampered stored pack (exit 11); the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory); GitHub through the real binary against a fake `gh` (approval, push, one pull request, worker refusal) | 304 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -1282,11 +1327,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               7434     7279    97.9%
-application          3132     2959    94.5%
-infrastructure       5974     5494    92.0%
-cli                  2705     2433    89.9%
-overall             19245    18165    94.4%
+domain              10723    10520    98.1%
+application          5179     4827    93.2%
+infrastructure       7532     6960    92.4%
+cli                  3566     3265    91.6%
+overall             27000    25572    94.7%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -1377,9 +1422,9 @@ remove it from the tree and rewrite the history if it was not published.
 
 What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
-warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
-`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
-`node scripts/web-smoke.mjs` (843 checks), `node scripts/web-smoke-panes.mjs` (558 checks), `scripts/workbench-demo.sh` (headless Chromium) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
+warnings`, the test suites above, the release build, the soak (20 seconds by default, with the dashboard and an event stream), a coverage run (see Tests),
+`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/neo-n2-demo.sh`, `scripts/github-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
+`node scripts/web-smoke.mjs` (861 checks), `node scripts/web-smoke-panes.mjs` (558 checks), `scripts/workbench-demo.sh` (headless Chromium) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
 
@@ -1408,7 +1453,7 @@ IMAGE=fleet-web DOCKER_NET=none run 'cargo build --release --locked --offline &&
 DOCKER_NET=none run 'scripts/neo-demo.sh /target/release/fleet'   # the NEO N1 demo
 ```
 
-Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/fleet-app`, `crates/fleet-infra`,
+Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/neo-context`, `crates/fleet-forge`, `crates/fleet-app`, `crates/fleet-infra`,
 `crates/fleet-cli`, `docs/`, `examples/`, `scripts/`, `docker/`.
 
 ## License
