@@ -155,13 +155,15 @@ for g in g-starter-error-tests g-starter-value-property; do
   say "the checks that failed for $g (fleet goals show $g --json)"
   failed_output "$g"
 done
+# `goals show` lists the newest 20 pieces of evidence only; the audit log has all of them
+say "fleet events --limit 200 | grep ... # every failed protected-path check of the run (the daemon keeps the last 200 events in memory: enough here)"
+"$fleet" events --limit 1000 | grep -E 'check "protected-(diff|script)" failed' || echo "(none found)"
 say "the worker that costs nothing: fleet tail n3-scaffold"
 "$fleet" tail n3-scaffold || true
 
 say "fleet verify r/task: run the contract again, by hand, on the task's current commit"
 "$fleet" verify neo-roadmap/starter-docs-glossary || echo "exit $?"
-say "fleet verify g-n3-scaffold: the human-only contract. The task has a worktree (its worker ran and failed), which carries the work"
-say "of the three tasks it waited for: so nothing may change fails, and the evidence does not count because the task was never reviewed"
+say "fleet verify g-n3-scaffold   # the human-only contract; its task's worker failed, so there is no reviewed commit and no evidence can count"
 "$fleet" verify g-n3-scaffold --task neo-roadmap/n3-scaffold || echo "exit $?"
 
 # ---- the person reviews and merges ---------------------------------------------------------------------
