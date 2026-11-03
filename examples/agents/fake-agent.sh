@@ -140,11 +140,11 @@ RUST
     fi
     result "checked the links"
     ;;
-  starter-value-property)
+  starter-dag-property)
     # a careless first attempt also "tidies" a sentence of the security policy; any retry (its brief quotes a
     # failed check of this task, `verify <goal>/<check>`) takes its own line out again: the line was appended, so
     # the file is as it was
-    if ! grep -q 'verify g-starter-value-property/' "$brief"; then
+    if ! grep -q 'verify g-starter-dag-property/' "$brief"; then
       echo "agent: tidying SECURITY.md while I am here"
       printf 'A note added by the agent.\n' >> SECURITY.md
     else
@@ -153,21 +153,12 @@ RUST
       mv SECURITY.md.new SECURITY.md
     fi
     # the test goes before the closing brace of the existing test module (once)
-    if ! grep -q 'canonical_text_is_the_same_whatever_the_order_of_the_pairs' crates/fleet-domain/src/value.rs; then
-    sed '$d' crates/fleet-domain/src/value.rs > crates/fleet-domain/src/value.rs.new
-    cat >> crates/fleet-domain/src/value.rs.new <<'RUST'
+    if ! grep -q 'a_random_graph_is_ordered_with_every_dependency_first' crates/fleet-domain/src/dag.rs; then
+    sed '$d' crates/fleet-domain/src/dag.rs > crates/fleet-domain/src/dag.rs.new
+    cat >> crates/fleet-domain/src/dag.rs.new <<'RUST'
 
     #[test]
-    fn canonical_text_is_the_same_whatever_the_order_of_the_pairs() {
-        #[derive(Clone)]
-        enum Spec {
-            Null,
-            Bool(bool),
-            Int(i64),
-            Str(String),
-            Array(Vec<Spec>),
-            Object(Vec<(String, Spec)>),
-        }
+    fn a_random_graph_is_ordered_with_every_dependency_first() {
         struct Lcg(u64);
         impl Lcg {
             fn next(&mut self, n: u64) -> u64 {
@@ -178,75 +169,43 @@ RUST
                 (self.0 >> 33) % n
             }
         }
-        fn spec(rng: &mut Lcg, depth: u32) -> Spec {
-            let kinds = if depth == 0 { 4 } else { 6 };
-            match rng.next(kinds) {
-                0 => Spec::Null,
-                1 => Spec::Bool(rng.next(2) == 0),
-                2 => Spec::Int(rng.next(2000) as i64 - 1000),
-                3 => Spec::Str(format!("s \"{}\" \\ end", rng.next(100))),
-                4 => Spec::Array((0..rng.next(4)).map(|_| spec(rng, depth - 1)).collect()),
-                _ => Spec::Object(
-                    (0..rng.next(4))
-                        .map(|i| (format!("k{i}"), spec(rng, depth - 1)))
-                        .collect(),
-                ),
-            }
-        }
-        fn build(spec: &Spec, reversed: bool) -> Value {
-            match spec {
-                Spec::Null => Value::Null,
-                Spec::Bool(b) => Value::Bool(*b),
-                Spec::Int(n) => Value::int(*n),
-                Spec::Str(s) => Value::str(s.clone()),
-                Spec::Array(items) => Value::array(items.iter().map(|i| build(i, reversed))),
-                Spec::Object(pairs) => {
-                    let mut built: Vec<(String, Value)> = pairs
-                        .iter()
-                        .map(|(k, v)| (k.clone(), build(v, reversed)))
-                        .collect();
-                    if reversed {
-                        built.reverse();
-                    }
-                    Value::object(built)
-                }
-            }
-        }
-        fn space_outside_strings(text: &str) -> bool {
-            let (mut in_string, mut escaped) = (false, false);
-            for c in text.chars() {
-                if in_string {
-                    if escaped {
-                        escaped = false;
-                    } else if c == '\\' {
-                        escaped = true;
-                    } else if c == '"' {
-                        in_string = false;
-                    }
-                } else if c == '"' {
-                    in_string = true;
-                } else if c == ' ' {
-                    return true;
-                }
-            }
-            false
-        }
         let mut rng = Lcg(2024);
         for _ in 0..300 {
-            let s = spec(&mut rng, 4);
-            let (forward, backward) = (build(&s, false), build(&s, true));
-            assert_eq!(forward, backward);
-            let text = forward.canonical();
-            assert_eq!(text, backward.canonical());
-            assert!(!text.contains('\n'));
-            assert!(!space_outside_strings(&text), "{text}");
+            let n = 2 + rng.next(10) as usize;
+            // task i may depend on tasks with a smaller number only, so there is no cycle
+            let mut nodes: Vec<Node> = Vec::new();
+            for i in 0..n {
+                let mut deps: Vec<String> = Vec::new();
+                for j in 0..i {
+                    if rng.next(3) == 0 {
+                        deps.push(format!("t{j}"));
+                    }
+                }
+                let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
+                nodes.push(node(&format!("t{i}"), &deps));
+            }
+            for i in (1..n).rev() {
+                let j = rng.next(i as u64 + 1) as usize;
+                nodes.swap(i, j);
+            }
+            let order = order_new_tasks(&none(), &nodes).unwrap();
+            let mut once = order.clone();
+            once.sort_unstable();
+            assert_eq!(once, (0..n).collect::<Vec<_>>());
+            let mut done = BTreeSet::new();
+            for &i in &order {
+                for dep in &nodes[i].deps {
+                    assert!(done.contains(dep), "{} came before {dep}", nodes[i].id);
+                }
+                done.insert(nodes[i].id.clone());
+            }
         }
     }
 }
 RUST
-    mv crates/fleet-domain/src/value.rs.new crates/fleet-domain/src/value.rs
+    mv crates/fleet-domain/src/dag.rs.new crates/fleet-domain/src/dag.rs
     fi
-    result "added a property test of the canonical form"
+    result "added a property test of the task order"
     ;;
   *)
     echo "agent: no script for task $task" >&2

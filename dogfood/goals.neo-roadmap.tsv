@@ -5,7 +5,7 @@
 # Read by dogfood/apply-goals.sh. Titles and intents contain no tab and no pipe.
 m-starters	-	-	-	-	The loop works end to end on small safe tasks	Three starter tasks were done by the real agent, verified by fleet's own run and reviewed by a person before any other task starts
 g-starter-error-tests	m-starters	starter-error-tests	single-file	FILE_PATH=crates/fleet-domain/src/error.rs	fleet-domain error.rs has unit tests	error.rs has a test module that pins names, parsing, exit codes and constructors; only that file changed
-g-starter-value-property	m-starters	starter-value-property	single-file	FILE_PATH=crates/fleet-domain/src/value.rs	Value canonical form has a property test	value.rs has a property-style test of key-order independence; only that file changed
+g-starter-dag-property	m-starters	starter-dag-property	single-file	FILE_PATH=crates/fleet-domain/src/dag.rs	Task ordering has a property test	dag.rs has a property-style test that a random task graph is ordered with every dependency first; only that file changed
 g-starter-docs-glossary	m-starters	starter-docs-glossary	single-file	FILE_PATH=docs/domain.md	The glossary names the self-development terms	docs/domain.md has rows for protected path, human-only task and self-development; only that file changed
 m-maint	-	-	-	-	Maintenance stays small and under control	Docs links resolve, dependencies are refreshed by a script and numbers by a person
 g-maint-docs-links	m-maint	maint-docs-links	docs-only	-	Relative links and anchors in the docs resolve	Broken links and anchors in README.md and docs/ are fixed without touching any measured number

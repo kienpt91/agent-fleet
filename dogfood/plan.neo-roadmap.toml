@@ -58,23 +58,23 @@ You cannot run commands in this setup (no build, no test run): edit the named fi
 '''
 
 [[tasks]]
-id = "starter-value-property"
-title = "Starter: a property test for the canonical form of fleet-domain Value"
+id = "starter-dag-property"
+title = "Starter: a property test for the task order of fleet-domain dag.rs"
 worker = "agent"
 spec = '''
-Add one property-style test to crates/fleet-domain/src/value.rs, in its existing `#[cfg(test)]` module.
+Add one property-style test to crates/fleet-domain/src/dag.rs, in its existing `#[cfg(test)]` module.
 
-Property: `Value::canonical()` does not depend on the order in which the keys of an object were
-inserted, and equal values have equal canonical text.
+Property: for a random acyclic set of new tasks given in any order, `order_new_tasks` returns every
+index of the input exactly once, and every task comes after each of the tasks it depends on.
 
 Use a small deterministic pseudo-random generator written inside the test (a linear congruential
 generator, as other tests of this workspace do; look at neo-verify/src/contract.rs for the style).
-No crate. Generate at least 200 random values (nested objects and arrays of strings, integers,
-booleans and null, depth at most 4), build each object twice with the keys in different orders, and
-assert that the canonical texts are equal. Also assert that the canonical text of a value never
-contains a newline or a space outside string contents.
+No crate. Run at least 200 rounds: in each, make 2 to 11 tasks where task `i` may depend only on
+tasks with a smaller number (so there is no cycle), shuffle the list that is passed in, call
+`order_new_tasks` with no existing tasks, and assert the property above. The helpers `t`, `node` and
+`none` of the module can be used.
 
-Change ONLY crates/fleet-domain/src/value.rs and only inside the existing test module. Do not change
+Change ONLY crates/fleet-domain/src/dag.rs and only inside the existing test module. Do not change
 any non-test line. Standard library only, no unsafe. Do not edit numbers in README.md or docs/.
 
 You cannot run commands in this setup (no build, no test run): edit the named file with care. Commit nothing yourself: fleet commits your work and runs every check itself.
@@ -109,7 +109,7 @@ You cannot run commands in this setup (no build, no test run): edit the named fi
 id = "maint-docs-links"
 title = "Maintenance: make the relative links and anchors in README.md and docs/ resolve"
 worker = "agent"
-after = ["starter-error-tests", "starter-value-property", "starter-docs-glossary"]
+after = ["starter-error-tests", "starter-dag-property", "starter-docs-glossary"]
 spec = '''
 Check every relative link and every `#anchor` in README.md and docs/*.md (not docs/adr, which is
 protected) and fix the ones that do not resolve: a moved file, a heading that was renamed. Use the
@@ -128,7 +128,7 @@ You cannot run commands in this setup (no build, no test run): edit the named fi
 id = "maint-deps-refresh"
 title = "HUMAN-ONLY maintenance: dependency refresh under the 7 day policy"
 worker = "human-only"
-after = ["starter-error-tests", "starter-value-property", "starter-docs-glossary"]
+after = ["starter-error-tests", "starter-dag-property", "starter-docs-glossary"]
 spec = '''
 HUMAN-ONLY. Cargo.toml and Cargo.lock are protected; a worker never changes dependencies.
 A person runs dogfood/deps-refresh.sh (it updates Cargo.lock in the container, runs the age check
@@ -157,7 +157,7 @@ the soak test and check-crates-age (fresh docker volumes), never by a task. See 
 id = "n3-scaffold"
 title = "HUMAN-ONLY N3: scaffold the neo-knowledge crate"
 worker = "human-only"
-after = ["starter-error-tests", "starter-value-property", "starter-docs-glossary"]
+after = ["starter-error-tests", "starter-dag-property", "starter-docs-glossary"]
 spec = '''
 HUMAN-ONLY (workspace Cargo.toml, Cargo.lock and the architecture tests are protected).
 Create crates/neo-knowledge: Cargo.toml (std and fleet-domain only, `[lints] workspace = true`), a

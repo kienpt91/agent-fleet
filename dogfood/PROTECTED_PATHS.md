@@ -146,6 +146,7 @@ narrowing of the directory would not silently release it.
 | --- | --- |
 | `crates/fleet-domain/src/events.rs` | The events the log records and replay applies, including the goal and evidence events. |
 | `crates/fleet-domain/src/chain.rs` | The hash chain that makes the audit log tamper evident. |
+| `crates/fleet-domain/src/value.rs` | Canonical JSON: the exact bytes that approval digests, the hash chain, contract ids and pack digests are computed over; a change makes them ambiguous. |
 | `crates/fleet-domain/src/quality.rs` | How a gate result is judged, including the refcheck-json rules. |
 | `crates/fleet-domain/src/redact.rs` | Secret redaction before anything is stored. |
 | `crates/fleet-domain/src/sanitize.rs` | Removes escape sequences and invisible characters from worker output. |
@@ -164,7 +165,7 @@ narrowing of the directory would not silently release it.
 Everything not listed, and nothing the contract of the task does not allow: every contract of
 [`contracts/`](contracts/README.md) also carries a `scope` check that allows only the file (or the
 documents, or the `src` and `tests` of one new crate) the task is about. Today that is, for example,
-`crates/fleet-domain/src/{dag,error,status,value}.rs`, README.md and the documents directly in `docs/` (their
+`crates/fleet-domain/src/{dag,error,status}.rs`, README.md and the documents directly in `docs/` (their
 measured numbers are guarded by a separate check), new documents, and the modules of crates that a person
 scaffolded for the milestones: `crates/neo-knowledge/src/**`, `crates/neo-governor/src/**`,
 `crates/neo-broker/src/**` (each crate's `Cargo.toml` stays protected through `crates/*/Cargo.toml`, so a

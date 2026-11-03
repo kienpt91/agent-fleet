@@ -210,7 +210,7 @@ task behind it), adds the goals with their rendered contracts, starts the run wi
 then does the reviewer's steps. **What you must see** (the appendix is the real output of that script):
 
 1. `starter-docs-glossary` and `starter-error-tests` complete after their contracts passed (`goals list`: `verified`).
-2. `starter-value-property` touches `SECURITY.md` on its first attempt: its contract **fails** (`protected-diff`,
+2. `starter-dag-property` touches `SECURITY.md` on its first attempt: its contract **fails** (`protected-diff`,
    `protected-script`), the failing checks are quoted in the brief, the retry leaves `SECURITY.md` alone and then it passes.
 3. `maint-docs-links` waits for the three starters; fleet merges their work into its branch, and its contract's scope check, rendered
    by `apply-goals.sh` from the plan, allows the files they changed as well as `README.md` and `docs/**` (section 9, "A dependent task").
@@ -457,7 +457,7 @@ docker wrapper, and in an image without an sshd: the `remote` layer prints `skip
 that run; it took 28 minutes on a machine that other jobs were loading heavily (load average above 50 on 12 cores). Things to read in it:
 
 - the three starters and `maint-docs-links` completing only after every check passed (`goals list`: `verified`);
-- `starter-value-property` failing its first attempt on `SECURITY.md` (`protected-diff` and `protected-script` in the audit log, shown by
+- `starter-dag-property` failing its first attempt on `SECURITY.md` (`protected-diff` and `protected-script` in the audit log, shown by
   `fleet events`), as scripted;
 - the load: its next attempt, and the first of `starter-docs-glossary`, failed the `layers` check on wall-clock bounds of `fleet-domain`
   tests (the Markdown and word-diff work limits that the README says are meant for an idle machine); the failed output is quoted in the section of failed

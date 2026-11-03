@@ -33,7 +33,7 @@ n_label=$(grep -c '^title = "HUMAN-ONLY' "$plan")
 expect_eq "the label and the worker agree" "$human" "$n_label"
 
 # ---- plan-without ------------------------------------------------------------------------------------
-"$pw" "$plan" starter-error-tests,starter-value-property,starter-docs-glossary > "$work/stage2.toml"
+"$pw" "$plan" starter-error-tests,starter-dag-property,starter-docs-glossary > "$work/stage2.toml"
 expect_eq "three tasks fewer" "$((tasks - 3))" "$(grep -c '^\[\[tasks\]\]' "$work/stage2.toml")"
 if grep -q 'starter-' "$work/stage2.toml"; then bad "a starter task is still mentioned (an after list?)"; else ok; fi
 grep -q '^\[run\]' "$work/stage2.toml" && ok || bad "the run table is gone"
@@ -106,9 +106,9 @@ done
 # shellcheck disable=SC2086
 expect_exit 2 "no --out" "$ag" --tsv "$tsv" --plan "$plan" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c
 # shellcheck disable=SC2086
-expect_exit 0 "skipping the tasks of an earlier stage" "$ag" $common --skip-tasks starter-error-tests,starter-value-property,starter-docs-glossary
+expect_exit 0 "skipping the tasks of an earlier stage" "$ag" $common --skip-tasks starter-error-tests,starter-dag-property,starter-docs-glossary
 # shellcheck disable=SC2086
-"$ag" $common --skip-tasks starter-error-tests,starter-value-property,starter-docs-glossary 2>/dev/null > "$work/cmds2.txt"
+"$ag" $common --skip-tasks starter-error-tests,starter-dag-property,starter-docs-glossary 2>/dev/null > "$work/cmds2.txt"
 expect_eq "three goals fewer" "$((goals - 3))" "$(wc -l < "$work/cmds2.txt" | tr -d ' ')"
 # shellcheck disable=SC2086
 expect_exit 2 "a relative tools directory is refused by the renderer" "$ag" --tsv "$tsv" --plan "$plan" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools tools --container-run /opt/c --out "$work/c2"
@@ -164,7 +164,7 @@ expect_eq "maint-docs-links: after the three starters" \
   "README.md
 docs/**
 crates/fleet-domain/src/error.rs
-crates/fleet-domain/src/value.rs
+crates/fleet-domain/src/dag.rs
 docs/domain.md" "$(allow_of "$work/contracts/g-maint-docs-links.json")"
 expect_eq "n3-base (a crate template) keeps its own globs first" \
   "crates/neo-knowledge/src/**
@@ -173,8 +173,8 @@ crates/neo-knowledge/src/fact.rs
 crates/neo-knowledge/src/source.rs" "$(allow_of "$work/contracts/g-n3-base.json")"
 expect_eq "a starter has no dependency: its contract allows its own file only" "crates/fleet-domain/src/error.rs" "$(allow_of "$work/contracts/g-starter-error-tests.json")"
 # a stage cut away from its dependencies (plan-without) adds nothing for them
-"$pw" --repo /work/c "$plan" starter-error-tests,starter-value-property,starter-docs-glossary > "$work/stage-cut.toml"
-"$ag" --tsv "$tsv" --plan "$work/stage-cut.toml" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools /opt/dogfood/bin --container-run /opt/dogfood/container-run --out "$work/contracts-cut" --skip-tasks starter-error-tests,starter-value-property,starter-docs-glossary > /dev/null 2>&1
+"$pw" --repo /work/c "$plan" starter-error-tests,starter-dag-property,starter-docs-glossary > "$work/stage-cut.toml"
+"$ag" --tsv "$tsv" --plan "$work/stage-cut.toml" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools /opt/dogfood/bin --container-run /opt/dogfood/container-run --out "$work/contracts-cut" --skip-tasks starter-error-tests,starter-dag-property,starter-docs-glossary > /dev/null 2>&1
 expect_eq "after the starters were landed, maint-docs-links needs nothing extra" "README.md
 docs/**" "$(allow_of "$work/contracts-cut/g-maint-docs-links.json")"
 expect_exit 2 "no --plan" "$ag" --tsv "$tsv" --run neo-roadmap --repo "$work/fake-repo" --base "$real_base" --tools /opt/t --container-run /opt/c --out "$work/c7"

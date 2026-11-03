@@ -205,6 +205,8 @@ fn every_entry_matches_something_that_exists_and_every_guard_matches_nothing_yet
     for f in [
         "crates/fleet-domain/src/approval.rs",
         "crates/fleet-domain/src/events.rs",
+        // the canonical JSON every digest, the hash chain, contract ids and pack digests are computed over
+        "crates/fleet-domain/src/value.rs",
         "crates/fleet-infra/src/server.rs",
         "crates/fleet-infra/src/daemon.rs",
         "crates/fleet-infra/src/jobs.rs",
@@ -232,7 +234,6 @@ fn every_entry_matches_something_that_exists_and_every_guard_matches_nothing_yet
         "docs/domain.md",
         "docs/neo.md",
         "crates/fleet-domain/src/error.rs",
-        "crates/fleet-domain/src/value.rs",
         "crates/fleet-domain/src/dag.rs",
         "crates/fleet-domain/src/status.rs",
         "examples/plan.example.toml",

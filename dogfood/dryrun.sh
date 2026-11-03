@@ -85,7 +85,7 @@ daemon=$!
 i=0; until "$fleet" status >/dev/null 2>&1; do i=$((i + 1)); [ "$i" -lt 200 ] || { cat "$work/daemon.log" >&2; fail "the daemon did not start"; }; sleep 0.1; done
 
 # ---- the stage: starters, one human-only barrier and the task behind it ----------------------------
-keep_ids="starter-error-tests starter-value-property starter-docs-glossary maint-docs-links n3-scaffold n3-source"
+keep_ids="starter-error-tests starter-dag-property starter-docs-glossary maint-docs-links n3-scaffold n3-source"
 all_ids=$(sed -n '/^\[\[tasks\]\]/,$ s/^id = "\(.*\)"$/\1/p' "$clone/dogfood/plan.neo-roadmap.toml")
 drop=
 for id in $all_ids; do
@@ -122,7 +122,7 @@ while :; do
   sleep 1
   "$fleet" status | grep -q ', completed 4,' && break
   rounds=$((rounds + 1)); [ "$rounds" -le 3 ] || { echo "a task did not complete after three retries:" >&2; "$fleet" status >&2; exit 1; }
-  for t in starter-error-tests starter-value-property starter-docs-glossary maint-docs-links; do
+  for t in starter-error-tests starter-dag-property starter-docs-glossary maint-docs-links; do
     say "fleet retry $t   # only a failed task can be retried; the others answer with a conflict"
     "$fleet" retry "$t" || true
   done
@@ -130,7 +130,7 @@ done
 sleep 1
 run "$fleet" status
 run "$fleet" goals list
-run "$fleet" goals show g-starter-value-property
+run "$fleet" goals show g-starter-dag-property
 run "$fleet" goals show g-starter-docs-glossary
 run "$fleet" goals show g-maint-docs-links
 run "$fleet" goals remaining
@@ -151,7 +151,7 @@ failed_output() {
       for (i = first; i <= n; i++) if (lines[i] != "") printf "      %s\n", lines[i]
     }'
 }
-for g in g-starter-error-tests g-starter-value-property; do
+for g in g-starter-error-tests g-starter-dag-property; do
   say "the checks that failed for $g (fleet goals show $g --json)"
   failed_output "$g"
 done
@@ -167,12 +167,12 @@ say "fleet verify g-n3-scaffold   # the human-only contract; its task's worker f
 "$fleet" verify g-n3-scaffold --task neo-roadmap/n3-scaffold || echo "exit $?"
 
 # ---- the person reviews and merges ---------------------------------------------------------------------
-say "git log --oneline $base..fleet/neo-roadmap/starter-value-property   # what the retry committed"
-git -C "$clone" log --oneline "$base..fleet/neo-roadmap/starter-value-property"
-say "git diff --stat $base fleet/neo-roadmap/starter-value-property"
-git -C "$clone" diff --stat "$base" fleet/neo-roadmap/starter-value-property
-run sh "$tools/check-protected.sh" --repo "$clone" "$base..fleet/neo-roadmap/starter-value-property"
-run sh "$tools/check-docs-claims.sh" --repo "$clone" "$base..fleet/neo-roadmap/starter-value-property"
+say "git log --oneline $base..fleet/neo-roadmap/starter-dag-property   # what the retry committed"
+git -C "$clone" log --oneline "$base..fleet/neo-roadmap/starter-dag-property"
+say "git diff --stat $base fleet/neo-roadmap/starter-dag-property"
+git -C "$clone" diff --stat "$base" fleet/neo-roadmap/starter-dag-property
+run sh "$tools/check-protected.sh" --repo "$clone" "$base..fleet/neo-roadmap/starter-dag-property"
+run sh "$tools/check-docs-claims.sh" --repo "$clone" "$base..fleet/neo-roadmap/starter-dag-property"
 say "fleet merge starter-docs-glossary   # needs an approval bound to the exact commit"
 "$fleet" merge starter-docs-glossary || echo "exit $?"
 run "$fleet" approval list

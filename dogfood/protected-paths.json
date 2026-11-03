@@ -54,6 +54,7 @@
     {"path": "crates/fleet-fanout/**", "kind": "dir", "group": "approval-admission", "why": "Fan-out groups: the state machine, the comparison and the ranking rule; a pick is a merge and needs its own approval."},
     {"path": "crates/fleet-domain/src/events.rs", "kind": "file", "group": "verification-evidence", "why": "The events the log records and replay applies, including the goal and evidence events."},
     {"path": "crates/fleet-domain/src/chain.rs", "kind": "file", "group": "verification-evidence", "why": "The hash chain that makes the audit log tamper evident."},
+    {"path": "crates/fleet-domain/src/value.rs", "kind": "file", "group": "verification-evidence", "why": "Canonical JSON: the exact bytes that approval digests, the hash chain, contract ids and pack digests are computed over; a change makes them ambiguous."},
     {"path": "crates/fleet-domain/src/quality.rs", "kind": "file", "group": "verification-evidence", "why": "How a gate result is judged, including the refcheck-json rules."},
     {"path": "crates/fleet-domain/src/redact.rs", "kind": "file", "group": "verification-evidence", "why": "Secret redaction before anything is stored."},
     {"path": "crates/fleet-domain/src/sanitize.rs", "kind": "file", "group": "verification-evidence", "why": "Removes escape sequences and invisible characters from worker output."},

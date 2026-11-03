@@ -247,7 +247,7 @@ done < "$work/concrete.txt"
 # and the paths that tasks are meant to change are not protected by the real list
 r=$(new_repo real-free README.md)
 tag_base "$r"
-for p in README.md docs/neo.md docs/domain.md docs/parity.md examples/plan.example.toml crates/fleet-domain/src/dag.rs crates/fleet-domain/src/error.rs crates/fleet-domain/src/status.rs crates/fleet-domain/src/value.rs crates/neo-knowledge/src/fact.rs crates/neo-knowledge/tests/props.rs crates/neo-governor/src/budget.rs crates/neo-broker/src/lease.rs; do
+for p in README.md docs/neo.md docs/domain.md docs/parity.md examples/plan.example.toml crates/fleet-domain/src/dag.rs crates/fleet-domain/src/error.rs crates/fleet-domain/src/status.rs crates/neo-knowledge/src/fact.rs crates/neo-knowledge/tests/props.rs crates/neo-governor/src/budget.rs crates/neo-broker/src/lease.rs; do
   mkdir -p "$r/$(dirname "$p")"; echo y > "$r/$p"
 done
 commit_all "$r"
