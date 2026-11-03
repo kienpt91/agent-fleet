@@ -357,6 +357,13 @@ impl ForgeJobs for FakeForgeJobs {
         Ok(())
     }
 
+    fn can_start(&self, _repos: &[String]) -> Result<()> {
+        match self.world.lock().fail_start.clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     fn poll(&mut self) -> Vec<(u64, Result<ForgeAnswer>)> {
         if !self.world.lock().hold {
             for (ticket, req) in std::mem::take(&mut self.queued) {

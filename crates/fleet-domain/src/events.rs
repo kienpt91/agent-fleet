@@ -175,6 +175,9 @@ define_events! {
     },
     /// A task was made from an issue of a forge (`repo` is `host/owner/name`).
     IssueLinked = "issue_linked" { run: RunId, task: TaskId, repo: String, number: u64 },
+    /// The repository a run's GitHub requests go to was read from the remote of its repository
+    /// (`repo` is `host/owner/name`) and recorded; a later change of that remote is refused.
+    ForgeRepoRecorded = "forge_repo_recorded" { run: RunId, repo: String },
     /// A pull request is being opened for an approved action; its approval was consumed at this
     /// moment, so the publication is never started a second time, whatever happens afterwards.
     PullRequestStarted = "pull_request_started" {
@@ -221,6 +224,7 @@ impl DomainEvent {
             | ContextCompiled { run, .. }
             | HandoffCreated { run, .. }
             | IssueLinked { run, .. }
+            | ForgeRepoRecorded { run, .. }
             | PullRequestStarted { run, .. }
             | PullRequestOpened { run, .. }
             | PullRequestFailed { run, .. } => Some(run),
@@ -283,6 +287,7 @@ impl DomainEvent {
             | GoalAdded { .. }
             | GoalStatusChanged { .. }
             | CriteriaAttached { .. }
+            | ForgeRepoRecorded { .. }
             | Warning { .. } => None,
         }
     }
@@ -394,6 +399,7 @@ impl DomainEvent {
             IssueLinked {
                 run, task, number, ..
             } => format!("{run}/{task} linked to issue #{number}"),
+            ForgeRepoRecorded { run, repo } => format!("{run} uses {repo} on GitHub"),
             PullRequestStarted { run, task, .. } => format!("{run}/{task} pull request started"),
             PullRequestOpened {
                 run, task, number, ..

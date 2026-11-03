@@ -237,6 +237,7 @@ impl Orchestrator {
     fn create_run(&mut self, args: NewRunArgs) -> Result<Reply> {
         let (id, event) = self.create_run_event(args)?;
         self.commit(vec![event])?;
+        self.record_forge_repo(&id);
         Ok(data(
             "fleet.run.create/1",
             vec![("run", Value::str(id.as_str()))],
@@ -289,6 +290,7 @@ impl Orchestrator {
                 scratch.apply(&event);
                 scratch.add_tasks(&id, tasks.clone())?;
                 self.commit(vec![event])?;
+                self.record_forge_repo(&id);
                 id
             }
         };

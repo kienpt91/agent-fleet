@@ -148,6 +148,9 @@ pub trait ForgeJobs: Send {
     /// lies inside one of them.
     fn status(&self, repos: &[String]) -> ForgeStatus;
     fn start(&mut self, ticket: u64, req: ForgeRequest, repos: &[String]) -> Result<()>;
+    /// Whether `start` would take a call now (the program is trusted, the rate gate is open, a
+    /// slot is free), without starting anything. A publication asks before its approval is spent.
+    fn can_start(&self, repos: &[String]) -> Result<()>;
     fn poll(&mut self) -> Vec<(u64, Result<ForgeAnswer>)>;
     /// Calls in flight.
     fn running(&self) -> usize;

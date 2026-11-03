@@ -27,7 +27,7 @@ use fleet_domain::run::NewTask;
 use fleet_domain::sanitize::flatten_line;
 use fleet_domain::status::TaskStatus;
 use fleet_domain::value::Value;
-use fleet_forge::links::{ForgeLedger, PublishState};
+use fleet_forge::links::ForgeLedger;
 use fleet_forge::publish::{
     clean_body, clean_title, default_body, default_title, PullRequestDraft,
 };
@@ -383,30 +383,79 @@ impl Orchestrator {
 
     /// The repository a command is about: `[github] repo`, or the one the configured remote of
     /// the run's repository (or of every run's repository) names.
-    fn forge_repo(&self, run: Option<&RunId>) -> Result<RepoRef> {
-        let cfg = &self.cfg.forge;
-        if let Some(r) = &cfg.repo {
+    ///
+    /// A remote is a line of `.git/config`, which a worker can rewrite. The first repository a run
+    /// uses is therefore recorded (at the run's creation, or here at the latest), and a later
+    /// answer that differs is refused: the operator pins `repo` in `[github]` to go on.
+    fn forge_repo(&mut self, run: Option<&RunId>) -> Result<RepoRef> {
+        if let Some(r) = &self.cfg.forge.repo {
             return Ok(r.clone());
         }
-        let paths: BTreeSet<String> = match run {
-            Some(r) => BTreeSet::from([self.state.run(r)?.repo.clone()]),
-            None => self.state.runs().map(|r| r.repo.clone()).collect(),
+        let runs: Vec<(RunId, String)> = match run {
+            Some(r) => vec![(r.clone(), self.state.run(r)?.repo.clone())],
+            None => self
+                .state
+                .runs()
+                .map(|r| (r.id.clone(), r.repo.clone()))
+                .collect(),
         };
-        if paths.is_empty() {
+        if runs.is_empty() {
             return Err(FleetError::invalid(
                 "no repository is known: set `repo = \"owner/name\"` in [github], or create a run first",
             ));
         }
         let mut found = BTreeSet::new();
-        for path in &paths {
-            found.insert(self.repo_of_remote(path)?);
+        let mut record = Vec::new();
+        for (id, path) in &runs {
+            let derived = self.repo_of_remote(path)?;
+            match self.forge.ledger.recorded_repo(id) {
+                Some(recorded) if recorded != derived.full() => {
+                    return Err(FleetError::forbidden(format!(
+                        "the remote {} of the repository of run {id} now names {}, but {recorded} was recorded when the run first used GitHub; a worker can rewrite a remote. Nothing was sent. Pin the repository with `repo = \"owner/name\"` in [github] (and restart the daemon) to go on",
+                        self.cfg.forge.remote,
+                        derived.full(),
+                    )));
+                }
+                Some(_) => {}
+                None => record.push(DomainEvent::ForgeRepoRecorded {
+                    run: id.clone(),
+                    repo: derived.full(),
+                }),
+            }
+            found.insert(derived);
         }
         let mut it = found.into_iter();
-        match (it.next(), it.next()) {
-            (Some(one), None) => Ok(one),
-            _ => Err(FleetError::invalid(
-                "the runs use remotes that name several repositories; set `repo` in [github] or name a run",
-            )),
+        let repo = match (it.next(), it.next()) {
+            (Some(one), None) => one,
+            _ => {
+                return Err(FleetError::invalid(
+                    "the runs use remotes that name several repositories; set `repo` in [github] or name a run",
+                ))
+            }
+        };
+        if !record.is_empty() {
+            self.commit(record)?;
+        }
+        Ok(repo)
+    }
+
+    /// Where the repository of a reply came from, said next to it so that it is read.
+    fn repo_source(&self) -> String {
+        if self.cfg.forge.repo.is_some() {
+            "pinned by [github] repo".to_string()
+        } else {
+            format!(
+                "read from the remote {} of the run's repository, which a worker can rewrite; pin it with `repo` in [github]",
+                self.cfg.forge.remote
+            )
+        }
+    }
+
+    /// Run creation: records the repository the run's remote names, while only the operator has
+    /// had a chance to touch it. A remote that cannot be read yet is left to the first use.
+    pub(crate) fn record_forge_repo(&mut self, run: &RunId) {
+        if self.forge.jobs.is_some() && self.cfg.forge.repo.is_none() {
+            let _ = self.forge_repo(Some(run));
         }
     }
 
@@ -597,6 +646,7 @@ impl Orchestrator {
             ("task", Value::str(format!("{run}/{task}"))),
             ("issue", Value::int(number)),
             ("repo", Value::str(repo.full())),
+            ("repo_source", Value::str(self.repo_source())),
             ("title", Value::str(draft.title)),
         ]))
     }
@@ -619,7 +669,7 @@ impl Orchestrator {
     /// Everything a publication is made of, from the repository and the arguments as they are
     /// now. Used twice (before the preflight and after it) so that nothing can change in between
     /// without a different digest.
-    fn pr_plan(&self, args: &PrCreateArgs) -> Result<PrPlan> {
+    fn pr_plan(&mut self, args: &PrCreateArgs) -> Result<PrPlan> {
         let key = self.state.find_task(&args.task)?;
         let (repo_path, branch, status, base_ref, task_title) = {
             let run = self.state.run(&key.0)?;
@@ -682,17 +732,11 @@ impl Orchestrator {
             draft: args.draft,
         };
         draft.validate()?;
-        let opened = self
+        if let Some(number) = self
             .forge
             .ledger
-            .pulls_of(&key.0, &key.1)
-            .into_iter()
-            .find(|p| {
-                p.head == head
-                    && p.repo == repo.full()
-                    && matches!(p.state, PublishState::Opened { .. })
-            });
-        if let Some(PublishState::Opened { number, .. }) = opened.map(|p| &p.state) {
+            .opened_number(&key.0, &key.1, &repo.full(), &head)
+        {
             return Err(FleetError::conflict(format!(
                 "pull request #{number} was already opened for the commit {} of {}",
                 head.as_str().get(..12).unwrap_or(head.as_str()),
@@ -752,9 +796,10 @@ impl Orchestrator {
                 Err(FleetError::new(
                     ErrorCode::ApprovalRequired,
                     format!(
-                        "opening a pull request for {} on {} needs approval {approval} (digest {prefix}); read what it covers with `fleet approval list`, approve it with `fleet approve {approval}` and run the same `fleet pr create` again",
+                        "opening a pull request for {} on {} ({}) needs approval {approval} (digest {prefix}); read what it covers with `fleet approval list`, approve it with `fleet approve {approval}` and run the same `fleet pr create` again",
                         qualified(&plan.key),
-                        plan.repo
+                        plan.repo,
+                        self.repo_source()
                     ),
                 )
                 .with_subject(approval.as_str()))
@@ -787,6 +832,17 @@ impl Orchestrator {
                 "the pull request changed while it was being prepared (the branch moved or its text differs); nothing was published. Run the command again",
             ));
         }
+        // The adapter may refuse now (the preflight just spent a request, a slot may be taken): that
+        // is found out before the approval is spent, so a refusal costs the operator nothing.
+        let repos = self.repo_paths();
+        match self.forge.jobs.as_ref() {
+            Some(jobs) => jobs.can_start(&repos)?,
+            None => {
+                return Err(FleetError::unavailable(
+                    "the GitHub integration has no adapter in this daemon",
+                ))
+            }
+        }
         let now = self.now();
         let gate = self.state.request_publication(
             &plan.key.0,
@@ -818,7 +874,6 @@ impl Orchestrator {
             head: plan.draft.head_sha.clone(),
         });
         self.commit(events)?;
-        let repos = self.repo_paths();
         let started = match self.forge.jobs.as_mut() {
             Some(jobs) => jobs.start(
                 ticket,
@@ -849,7 +904,8 @@ impl Orchestrator {
             id: approval.clone(),
             run: key.0.clone(),
             task: key.1.clone(),
-            reason: flatten_line(why, 300),
+            // the text may come from a program or a server: it is redacted before it is recorded
+            reason: flatten_line(&self.cfg.redactor.redact(&flatten_line(why, 2000)), 300),
         };
         if let Err(e) = self.commit(vec![event]) {
             self.warn(e.message);
@@ -935,6 +991,7 @@ impl Orchestrator {
                         data: Value::object([
                             ("task", Value::str(qualified(&key))),
                             ("repo", Value::str(repo.full())),
+                            ("repo_source", Value::str(self.repo_source())),
                             ("number", Value::int(created.number)),
                             ("url", Value::str(created.url)),
                             ("head", Value::str(head.as_str())),

@@ -1,12 +1,15 @@
 //! The forge events, folded: which task came from which issue, which pull request came from which
 //! task, and which publication started but never reported back. A projection of the event log like
-//! the fleet state and the goal ledger, so it survives a restart; bounded, so it cannot grow
-//! without limit.
+//! the fleet state and the goal ledger, so it survives a restart. The lists the views show keep
+//! the newest [`MAX_LINKS`] entries. What decides something is never dropped with them: the issue
+//! and pull request keys that guard against doing the same thing twice are small and kept whole,
+//! and so is every publication that has not reported back (a restart must mark it).
 
 use crate::limits::MAX_LINKS;
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{ApprovalId, RunId, Sha, TaskId};
 use fleet_domain::value::Value;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueLink {
@@ -42,8 +45,16 @@ pub struct Publication {
 
 #[derive(Clone, Debug, Default)]
 pub struct ForgeLedger {
+    /// The repository each run first used on the forge when `[github] repo` was not set.
+    repos: BTreeMap<RunId, String>,
     issues: Vec<IssueLink>,
     publications: Vec<Publication>,
+    /// Every issue that was made a task, by (repository, number); not capped.
+    issue_keys: BTreeMap<(String, u64), IssueLink>,
+    /// Every opened pull request, by (run, task, repository, head commit): its number; not capped.
+    opened: BTreeMap<(RunId, TaskId, String, String), u64>,
+    /// Every publication that started and has no outcome yet; not capped.
+    pending: BTreeMap<ApprovalId, Publication>,
 }
 
 impl ForgeLedger {
@@ -51,20 +62,33 @@ impl ForgeLedger {
         ForgeLedger::default()
     }
 
+    /// The repository (`host/owner/name`) recorded for a run, if any.
+    pub fn recorded_repo(&self, run: &RunId) -> Option<&str> {
+        self.repos.get(run).map(String::as_str)
+    }
+
     pub fn apply(&mut self, ev: &DomainEvent) {
         match ev {
+            DomainEvent::ForgeRepoRecorded { run, repo } => {
+                self.repos
+                    .entry(run.clone())
+                    .or_insert_with(|| repo.clone());
+            }
             DomainEvent::IssueLinked {
                 run,
                 task,
                 repo,
                 number,
             } => {
-                self.issues.push(IssueLink {
+                let link = IssueLink {
                     run: run.clone(),
                     task: task.clone(),
                     repo: repo.clone(),
                     number: *number,
-                });
+                };
+                self.issue_keys
+                    .insert((repo.clone(), *number), link.clone());
+                self.issues.push(link);
                 if self.issues.len() > MAX_LINKS {
                     self.issues.remove(0);
                 }
@@ -78,7 +102,7 @@ impl ForgeLedger {
                 branch,
                 head,
             } => {
-                self.publications.push(Publication {
+                let publication = Publication {
                     approval: id.clone(),
                     run: run.clone(),
                     task: task.clone(),
@@ -87,14 +111,32 @@ impl ForgeLedger {
                     branch: branch.clone(),
                     head: head.clone(),
                     state: PublishState::Started,
-                });
+                };
+                self.pending.insert(id.clone(), publication.clone());
+                self.publications.push(publication);
                 if self.publications.len() > MAX_LINKS {
                     self.publications.remove(0);
                 }
             }
             DomainEvent::PullRequestOpened {
-                id, number, url, ..
+                id,
+                run,
+                task,
+                repo,
+                number,
+                url,
+                head,
             } => {
+                self.pending.remove(id);
+                self.opened.insert(
+                    (
+                        run.clone(),
+                        task.clone(),
+                        repo.clone(),
+                        head.as_str().to_string(),
+                    ),
+                    *number,
+                );
                 if let Some(p) = self.publications.iter_mut().find(|p| p.approval == *id) {
                     p.state = PublishState::Opened {
                         number: *number,
@@ -103,6 +145,7 @@ impl ForgeLedger {
                 }
             }
             DomainEvent::PullRequestFailed { id, reason, .. } => {
+                self.pending.remove(id);
                 if let Some(p) = self.publications.iter_mut().find(|p| p.approval == *id) {
                     p.state = PublishState::Failed(reason.clone());
                 }
@@ -127,21 +170,27 @@ impl ForgeLedger {
             .find(|l| l.run == *run && l.task == *task)
     }
 
-    /// The task already made from issue `number` of `repo`.
+    /// The task already made from issue `number` of `repo` (whatever else was linked since).
     pub fn task_of_issue(&self, repo: &str, number: u64) -> Option<&IssueLink> {
-        self.issues
-            .iter()
-            .rev()
-            .find(|l| l.repo == repo && l.number == number)
+        self.issue_keys.get(&(repo.to_string(), number))
+    }
+
+    /// The number of the pull request already opened for this task's commit on `repo`.
+    pub fn opened_number(&self, run: &RunId, task: &TaskId, repo: &str, head: &Sha) -> Option<u64> {
+        self.opened
+            .get(&(
+                run.clone(),
+                task.clone(),
+                repo.to_string(),
+                head.as_str().to_string(),
+            ))
+            .copied()
     }
 
     /// Publications that started and never reported back: the daemon stopped meanwhile, and the
     /// branch may or may not have been pushed, the pull request may or may not exist.
     pub fn unfinished(&self) -> Vec<&Publication> {
-        self.publications
-            .iter()
-            .filter(|p| p.state == PublishState::Started)
-            .collect()
+        self.pending.values().collect()
     }
 
     /// The pull requests opened for a task, oldest first.
@@ -329,5 +378,52 @@ mod tests {
             pulls[0].get("state").and_then(Value::as_str),
             Some("started")
         );
+    }
+
+    #[test]
+    fn what_guards_against_doing_it_twice_outlives_the_capped_lists() {
+        let mut l = ForgeLedger::new();
+        let total = MAX_LINKS as u64 + 10;
+        for n in 0..total {
+            l.apply(&DomainEvent::IssueLinked {
+                run: run(),
+                task: task("a"),
+                repo: "h/o/r".into(),
+                number: n + 1,
+            });
+            l.apply(&started(n + 1, "a"));
+        }
+        // the oldest entries are gone from the lists, not from the guards
+        assert!(l.issues().iter().all(|i| i.number > 10));
+        assert!(l.publications().iter().all(|p| p.approval != approval(1)));
+        assert!(l.task_of_issue("h/o/r", 1).is_some());
+        assert_eq!(l.unfinished().len() as u64, total);
+        assert!(l.unfinished().iter().any(|p| p.approval == approval(1)));
+        // an outcome closes it, and an opened one is found by (task, commit)
+        l.apply(&DomainEvent::PullRequestOpened {
+            id: approval(1),
+            run: run(),
+            task: task("a"),
+            repo: "github.com/o/r".into(),
+            number: 55,
+            url: "https://github.com/o/r/pull/55".into(),
+            head: sha('a'),
+        });
+        assert_eq!(l.unfinished().len() as u64, total - 1);
+        let at = |c: char| l.opened_number(&run(), &task("a"), "github.com/o/r", &sha(c));
+        assert_eq!((at('a'), at('b')), (Some(55), None));
+    }
+
+    #[test]
+    fn a_run_keeps_the_first_repository_recorded_for_it() {
+        let mut l = ForgeLedger::new();
+        assert_eq!(l.recorded_repo(&run()), None);
+        for repo in ["h/o/r", "h/evil/r"] {
+            l.apply(&DomainEvent::ForgeRepoRecorded {
+                run: run(),
+                repo: repo.into(),
+            });
+        }
+        assert_eq!(l.recorded_repo(&run()), Some("h/o/r"));
     }
 }

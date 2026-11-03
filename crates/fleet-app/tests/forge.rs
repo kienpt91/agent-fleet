@@ -399,6 +399,70 @@ fn an_issue_and_a_pull_request_are_shown_and_a_pull_request_has_checks_and_revie
 }
 
 #[test]
+fn a_remote_that_changes_after_the_run_began_is_refused_until_the_repository_is_pinned() {
+    let mut cfg = forge_cfg();
+    cfg.forge.repo = None;
+    let mut h = Harness::with_config(cfg);
+    h.forge.set_remote("/repo", "https://github.com/o/r.git");
+    completed(&mut h, "a");
+    // the repository was recorded when the run was created
+    assert_eq!(count(&h, "forge_repo_recorded"), 1);
+    // a worker rewrites the remote to another repository on the same host
+    h.forge
+        .set_remote("/repo", "https://github.com/evil/other.git");
+    for (cmd, args) in [
+        ("issue.list", Value::Null),
+        ("issue.to-task", obj(vec![("number", Value::int(1))])),
+        ("pr.create", obj(vec![("task", s("a"))])),
+    ] {
+        let err = h.call(cmd, args).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden, "{cmd}: {err:?}");
+        assert!(
+            err.message.contains("evil/other") && err.message.contains("o/r"),
+            "{cmd}: {}",
+            err.message
+        );
+    }
+    assert!(h.forge.calls().is_empty(), "{:?}", h.forge.calls());
+    // put back, it works again
+    h.forge.set_remote("/repo", "https://github.com/o/r.git");
+    h.forge.add_issue(1, "One", "", &[]);
+    call_data(&mut h, "issue.list", Value::Null).unwrap();
+}
+
+#[test]
+fn the_repository_a_task_or_pull_request_goes_to_is_said_with_where_it_came_from() {
+    let mut cfg = forge_cfg();
+    cfg.forge.repo = None;
+    let mut h = Harness::with_config(cfg);
+    h.forge.set_remote("/repo", "https://github.com/o/r.git");
+    new_run(&mut h);
+    h.forge.add_issue(3, "Three", "text", &[]);
+    let done = call_data(
+        &mut h,
+        "issue.to-task",
+        obj(vec![("number", Value::int(3))]),
+    )
+    .unwrap();
+    assert_eq!(text(&done, "repo"), "github.com/o/r");
+    assert!(
+        text(&done, "repo_source").contains("remote origin")
+            && text(&done, "repo_source").contains("worker can rewrite"),
+        "{done:?}"
+    );
+    let mut pinned = harness();
+    new_run(&mut pinned);
+    pinned.forge.add_issue(3, "Three", "text", &[]);
+    let done = call_data(
+        &mut pinned,
+        "issue.to-task",
+        obj(vec![("number", Value::int(3))]),
+    )
+    .unwrap();
+    assert_eq!(text(&done, "repo_source"), "pinned by [github] repo");
+}
+
+#[test]
 fn the_repository_is_found_from_the_remote_when_it_is_not_configured() {
     let mut cfg = forge_cfg();
     cfg.forge.repo = None;
@@ -856,6 +920,57 @@ fn an_unreachable_forge_fails_the_preflight_before_the_approval_is_spent() {
     let t = ticket(&create(&mut h, vec![]).unwrap());
     finish(&mut h, t).unwrap();
     assert_eq!(approval_status(&mut h, &id), "consumed");
+}
+
+#[test]
+fn an_adapter_that_cannot_take_the_publication_does_not_spend_the_approval() {
+    let mut h = harness();
+    completed(&mut h, "a");
+    let id = request(&mut h, vec![]);
+    decide(&mut h, &id, true);
+    h.forge.hold(true);
+    let t = ticket(&create(&mut h, vec![]).unwrap());
+    // the gate closes while the preflight runs
+    h.forge.fail_start(Some(FleetError::unavailable(
+        "GitHub: rate limited until later",
+    )));
+    h.forge.hold(false);
+    let err = finish(&mut h, t).unwrap_err();
+    assert!(err.message.contains("rate limited"), "{}", err.message);
+    assert_eq!(approval_status(&mut h, &id), "approved");
+    assert_eq!(count(&h, "pull_request_started"), 0);
+    assert_eq!(count(&h, "pull_request_failed"), 0);
+    assert_eq!(count(&h, "approval_consumed"), 0);
+    // the same approval still opens the pull request once the gate is open
+    h.forge.fail_start(None);
+    let t = ticket(&create(&mut h, vec![]).unwrap());
+    finish(&mut h, t).unwrap();
+    assert_eq!(approval_status(&mut h, &id), "consumed");
+}
+
+#[test]
+fn what_a_failed_publication_says_is_redacted_before_it_is_recorded() {
+    let mut h = harness();
+    completed(&mut h, "a");
+    let id = request(&mut h, vec![]);
+    decide(&mut h, &id, true);
+    let leaked = format!("Bearer {}", "x".repeat(24));
+    h.forge.fail_push(Some(FleetError::unavailable(format!(
+        "the remote answered: {leaked}"
+    ))));
+    let t = ticket(&create(&mut h, vec![]).unwrap());
+    finish(&mut h, t).unwrap_err();
+    let links = h.call("forge.links", Value::Null).unwrap();
+    let reason = text(
+        &links.data().get("pulls").and_then(Value::as_array).unwrap()[0],
+        "reason",
+    );
+    assert!(reason.contains("the remote answered"), "{reason}");
+    assert!(!reason.contains(&"x".repeat(24)), "{reason}");
+    let events = h
+        .call("events", obj(vec![("limit", Value::int(200))]))
+        .unwrap();
+    assert!(!format!("{:?}", events.data()).contains(&"x".repeat(24)));
 }
 
 #[test]

@@ -553,20 +553,24 @@ pub fn render_pull_status(v: &Value) -> String {
 
 pub fn render_to_task(v: &Value) -> String {
     format!(
-        "task {} was created from issue #{} of {}; its text is quoted and labelled untrusted in the brief\n",
+        "task {} was created from issue #{} of {}; its text is quoted and labelled untrusted in the brief\n  repository: {} ({})\n",
         text_or_dash(v, "task"),
         num(v, "issue"),
-        text_or_dash(v, "repo")
+        text_or_dash(v, "repo"),
+        text_or_dash(v, "repo"),
+        text_or_dash(v, "repo_source")
     )
 }
 
 pub fn render_created(v: &Value) -> String {
     format!(
-        "pull request #{} opened for {} on {}: {}\n",
+        "pull request #{} opened for {} on {}: {}\n  repository: {} ({})\n",
         num(v, "number"),
         text_or_dash(v, "task"),
         text_or_dash(v, "repo"),
-        text_or_dash(v, "url")
+        text_or_dash(v, "url"),
+        text_or_dash(v, "repo"),
+        text_or_dash(v, "repo_source")
     )
 }
 
@@ -969,19 +973,23 @@ mod tests {
             ("number", Value::int(12u64)),
             ("task", s("r1/a")),
             ("repo", s("github.com/o/r")),
+            ("repo_source", s("pinned by [github] repo")),
             ("url", s("https://github.com/o/r/pull/12")),
         ]));
         assert_eq!(
             t,
-            "pull request #12 opened for r1/a on github.com/o/r: https://github.com/o/r/pull/12\n"
+            "pull request #12 opened for r1/a on github.com/o/r: https://github.com/o/r/pull/12\n  repository: github.com/o/r (pinned by [github] repo)\n"
         );
         let t = render_to_task(&Value::object([
             ("task", s("r1/t1")),
             ("issue", Value::int(7u64)),
             ("repo", s("github.com/o/r")),
+            ("repo_source", s("read from the remote origin")),
         ]));
         assert!(
-            t.contains("task r1/t1 was created from issue #7") && t.contains("untrusted"),
+            t.contains("task r1/t1 was created from issue #7")
+                && t.contains("untrusted")
+                && t.contains("repository: github.com/o/r (read from the remote origin)"),
             "{t}"
         );
         let show = render_pull_show(&Value::object([
