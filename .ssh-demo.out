@@ -1,0 +1,105 @@
+The operator compares this fingerprint with the one on the host's console:
+256 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms demo (ED25519)
+
+$ /target/release/fleet host add build --config /tmp/tmp.AIJNF2xrgc/fleet.toml --address 127.0.0.1 --port 23642 --user fleetssh --identity /tmp/tmp.AIJNF2xrgc/sshd/client_key --base-dir /tmp/tmp.AIJNF2xrgc/remote-work --worker sh
+host build added to /tmp/tmp.AIJNF2xrgc/fleet.toml
+next: compare the host's key and pin it with `fleet host trust build`, then check it with `fleet host doctor build`
+
+$ /target/release/fleet host list --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+NAME   ADDRESS          USER      BASE DIRECTORY                   WORKERS  PINNED KEY
+build  127.0.0.1:23642  fleetssh  /tmp/tmp.AIJNF2xrgc/remote-work  sh       not pinned
+
+$ /target/release/fleet host doctor build --config /tmp/tmp.AIJNF2xrgc/fleet.toml   # nothing is trusted yet: no connection is made
+[ok  ] ssh program: /usr/bin/ssh (OpenSSH 9.2)
+[ok  ] host build: identity file: /tmp/tmp.AIJNF2xrgc/sshd/client_key
+[FAIL] host build: pinned key: not pinned yet: run `fleet host trust build`
+[info] host build: connection: not tried: fix the checks above first
+unhealthy: 1 check(s) failed
+(exit code 13)
+
+$ /target/release/fleet host trust build --config /tmp/tmp.AIJNF2xrgc/fleet.toml   # needs a terminal; here one is made with script(1) and "yes" is typed
+yes
+host build (127.0.0.1:23642) presented this key:
+  type:        ssh-ed25519
+  fingerprint: SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+nothing is pinned for this host yet.
+Compare the fingerprint with one you know to be the host's own, over another channel (for example on its console: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
+Type yes to pin this key for host build: pinned SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms for host build; check the host with `fleet host doctor build`
+
+$ /target/release/fleet host list --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+NAME   ADDRESS          USER      BASE DIRECTORY                   WORKERS  PINNED KEY
+build  127.0.0.1:23642  fleetssh  /tmp/tmp.AIJNF2xrgc/remote-work  sh       ssh-ed25519 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+
+$ /target/release/fleet host doctor build --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+[ok  ] ssh program: /usr/bin/ssh (OpenSSH 9.2)
+[ok  ] host build: identity file: /tmp/tmp.AIJNF2xrgc/sshd/client_key
+[ok  ] host build: pinned key: ssh-ed25519 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+[ok  ] host build: connection: 591 ms, pinned key accepted, key file accepted
+[ok  ] host build: quoting: the login shell reads quoted text unchanged
+[ok  ] host build: system: Linux
+[ok  ] host build: remote user: uid 501
+[ok  ] host build: git: git version 2.39.5
+[ok  ] host build: base directory: /tmp/tmp.AIJNF2xrgc/remote-work is writable
+healthy
+
+$ /target/release/fleet plan /tmp/tmp.AIJNF2xrgc/plan.toml
+plan loaded into run r1 (1 tasks)
+
+$ /target/release/fleet start --run r1
+run r1 started
+
+$ /target/release/fleet status
+daemon pid 3728 | v0.1.0 | up 17s | sessions 0/4 | undo unavailable | rss 4672 kB
+
+run r1 [finished] max-parallel 2
+  objective  Try a worker on another machine
+  repo       /tmp/tmp.AIJNF2xrgc/repo (base HEAD @ 2c5a6876)
+  branch     fleet/r1/integration
+  tasks      pending 0, ready 0, running 0, review 0, completed 1, failed 0, blocked 0
+  ID      STATUS     DEPS  TRY  WORKER        NOTE
+  remote  completed  -     1    - host:build  wrote a file on the host
+
+recent
+  #1 daemon started (pid 3728)
+  #2 run r1 created
+  #3 r1/remote added
+  #4 r1/remote ready
+  #5 run r1 started (max parallel 2)
+  #6 r1/remote dispatched (attempt 1)
+  #7 r1/remote session exited
+  #8 r1/remote in review
+  #9 r1/remote committed
+  #10 r1/remote completed
+
+$ git -C $REPO show fleet/r1/remote:from-the-host.txt   # the file was written on the host and came back as a commit of the local repository
+hello from Linux, written for task remote in /tmp/tmp.AIJNF2xrgc/remote-work/r1/remote
+
+$ git -C $REPO log --format='%an <%ae>: %s' fleet/r1/remote   # one commit of fleet's own on top of the base
+fleet <fleet@localhost>: fleet: changes made on host build
+demo <demo@example.invalid>: initial commit
+
+$ ls $WORK/remote-work/r1   # nothing is left on the host
+0
+
+$ fleet tail remote   # what fleet recorded about the attempt
+fleet: remote: host build returned 1 commit(s) changing 1 path(s); verified and applied as 7c17a4146e4a
+fleet: remote: the worktree on host build was removed
+
+--- the host is reinstalled: its key changes ---
+256 SHA256:1dI8Jw3XjIWqk/fVln9olas4cE4DLO1Sbm3x6dNGGV0 demo (ED25519)
+
+$ /target/release/fleet task add --run r1 --title Another file --id again --host build
+task added to run r1
+
+$ /target/release/fleet start --run r1
+run r1 started
+
+$ /target/release/fleet events --limit 5
+#12 r1/again ready
+#14 r1/again dispatched (attempt 1)
+#15 r1/again session spawn_failed
+#16 r1/again failed
+#17 run r1 started (max parallel 2)
+
+$ ls $WORK/remote-work/r1   # still nothing: the changed key was refused before anything was sent
+0

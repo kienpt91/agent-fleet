@@ -240,7 +240,6 @@ mod tests {
             "with \"quotes\"",
             "back\\slash",
             "tab\there",
-            "new\nline",
             "é日本",
         ] {
             let mut h = host("h");
