@@ -1223,6 +1223,29 @@ fn no_contract_runs_the_remote_layer_and_the_documents_say_why() {
 }
 
 #[test]
+fn the_shell_tests_of_the_checkers_run_in_ci_and_in_the_layer_runner() {
+    // the checker scripts are the second judge of every contract: a regression in one must fail CI
+    let layers = read("scripts/test-layers.sh");
+    assert!(
+        layers.contains("shell_layer dogfood sh dogfood/tests/run.sh"),
+        "scripts/test-layers.sh has no dogfood layer"
+    );
+    let ci = read(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("run: sh dogfood/tests/run.sh"),
+        "CI does not run dogfood/tests/run.sh"
+    );
+    // every action is pinned to a full commit SHA and the workflow's permissions are read only
+    for line in ci.lines().filter(|l| l.trim_start().starts_with("- uses:")) {
+        let at = line.rsplit('@').next().unwrap();
+        let sha: String = at.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        assert_eq!(sha.len(), 40, "an action is not pinned to a SHA: {line}");
+    }
+    assert!(ci.contains("permissions:\n  contents: read"), "{ci}");
+    assert!(!ci.contains("write"), "a CI permission is not read only");
+}
+
+#[test]
 fn the_documents_name_every_part_and_every_protected_path() {
     let entries = protected();
     let doc = read("dogfood/PROTECTED_PATHS.md");

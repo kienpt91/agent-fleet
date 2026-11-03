@@ -55,6 +55,19 @@ jobs:
       - run: sh scripts/ssh-env.sh cargo test --locked -p fleet-infra --test ssh_remote
       - run: sh scripts/ssh-env.sh cargo test --locked -p fleet-cli --test e2e_remote
 
+  dogfood-shell:
+    # The shell tests of the checker scripts of dogfood/ (check-protected.sh and the others are the second judge in
+    # every self-development contract). They need only git and a POSIX shell; read-only permissions, no secrets.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # pinned to a full commit SHA
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: sh dogfood/tests/run.sh
+
   secret-scan:
     runs-on: ubuntu-latest
     permissions:
