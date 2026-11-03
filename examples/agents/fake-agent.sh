@@ -141,13 +141,14 @@ RUST
     result "checked the links"
     ;;
   starter-value-property)
-    # a careless first attempt also "tidies" a sentence of the security policy; a retry that is told
-    # which check failed takes its own line out again (the line was appended, so the file is as it was)
-    if ! grep -q 'protected-diff' "$brief"; then
+    # a careless first attempt also "tidies" a sentence of the security policy; any retry (its brief quotes a
+    # failed check of this task, `verify <goal>/<check>`) takes its own line out again: the line was appended, so
+    # the file is as it was
+    if ! grep -q 'verify g-starter-value-property/' "$brief"; then
       echo "agent: tidying SECURITY.md while I am here"
       printf 'A note added by the agent.\n' >> SECURITY.md
     else
-      echo "agent: the verification complained about a protected path; taking my note out of SECURITY.md"
+      echo "agent: the verification complained; taking my note out of SECURITY.md if it is still there"
       grep -v '^A note added by the agent\.$' SECURITY.md > SECURITY.md.new || true
       mv SECURITY.md.new SECURITY.md
     fi

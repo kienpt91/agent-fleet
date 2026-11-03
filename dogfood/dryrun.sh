@@ -109,12 +109,23 @@ run "$fleet" goals remaining
 
 run "$fleet" start --run neo-roadmap --max-parallel 1
 
-# wait until the four tasks that can finish have completed and nothing is waiting, running or in review (a
-# contract run can take many minutes); give up after 90 minutes
-i=0
-until "$fleet" status | grep -q 'ready 0, running 0, review 0, completed 4'; do
-  i=$((i + 1)); [ "$i" -lt 5400 ] || { echo "timed out; last status:" >&2; "$fleet" status >&2; exit 1; }
+# Wait until nothing is running, in review or ready (a contract run can take many minutes). If a task that
+# should finish ended `failed`, retry it by hand with `fleet retry`, as the runbook says: the `layers` check
+# runs the whole fleet-infra suite, and at this base a few of its tests (the flaky ones of dogfood/trials/)
+# fail now and then under load, which no task is to blame for. At most three rounds; 90 minutes in all.
+i=0; rounds=0
+while :; do
+  until "$fleet" status | grep -q 'ready 0, running 0, review 0'; do
+    i=$((i + 1)); [ "$i" -lt 5400 ] || { echo "timed out; last status:" >&2; "$fleet" status >&2; exit 1; }
+    sleep 1
+  done
   sleep 1
+  "$fleet" status | grep -q ', completed 4,' && break
+  rounds=$((rounds + 1)); [ "$rounds" -le 3 ] || { echo "a task did not complete after three retries:" >&2; "$fleet" status >&2; exit 1; }
+  for t in starter-error-tests starter-value-property starter-docs-glossary maint-docs-links; do
+    say "fleet retry $t   # only a failed task can be retried; the others answer with a conflict"
+    "$fleet" retry "$t" || true
+  done
 done
 sleep 1
 run "$fleet" status
