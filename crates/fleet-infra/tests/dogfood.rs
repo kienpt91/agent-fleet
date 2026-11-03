@@ -178,8 +178,26 @@ fn every_entry_matches_something_that_exists_and_every_guard_matches_nothing_yet
                 "{} exists now: change its kind in dogfood/protected-paths.json (a human decision)",
                 e.path
             );
-        } else {
-            assert!(hits > 0, "{} matches no file of the repository", e.path);
+            continue;
+        }
+        assert!(hits > 0, "{} matches no file of the repository", e.path);
+        match e.kind.as_str() {
+            // a named file is a regular file of the tree, not merely a path some glob reaches
+            "file" => assert!(
+                files.binary_search(&e.path).is_ok(),
+                "{} is listed as a file and is not one",
+                e.path
+            ),
+            // a directory entry names a directory that exists and has files in it
+            "dir" => {
+                let dir = e.path.trim_end_matches("**").trim_end_matches('/');
+                assert!(
+                    root().join(dir).is_dir(),
+                    "{} is listed as a directory and is not one",
+                    e.path
+                );
+            }
+            _ => {}
         }
     }
     // everything the guardrails are made of is covered: each file of the code that holds an
@@ -220,6 +238,94 @@ fn every_entry_matches_something_that_exists_and_every_guard_matches_nothing_yet
         "examples/plan.example.toml",
     ] {
         assert!(!is_protected(&entries, f), "{f} must stay open to tasks");
+    }
+}
+
+#[test]
+fn the_guardrail_files_of_the_later_features_exist_and_are_protected_by_name() {
+    let entries = protected();
+    let files = tree();
+    // Each of these is code or a script that decides something a task must not be able to loosen:
+    // SSH host key pinning and the remote host, the forge push and approval rules, the messaging
+    // policy and secret shapes, the fan-out pick, the context compiler's secret rules and the check
+    // of stored packs, the web admission and the read-only workbench allowlist, and the scripts and
+    // CI that run the tests. A file renamed away from here fails the test (the list is then wrong).
+    for f in [
+        ".github/workflows/ci.yml",
+        "docker/Dockerfile.ssh",
+        "scripts/ssh-env.sh",
+        "scripts/test-layers.sh",
+        "scripts/coverage.sh",
+        "scripts/secret-scan.sh",
+        "examples/fanout-contract.json",
+        "examples/github/README.md",
+        "crates/fleet-domain/src/remote.rs",
+        "crates/fleet-domain/src/msg/channel.rs",
+        "crates/fleet-domain/src/msg/secrets.rs",
+        "crates/fleet-domain/src/msg/loops.rs",
+        "crates/fleet-domain/src/msg/ratelimit.rs",
+        "crates/fleet-domain/src/repo/markdown.rs",
+        "crates/fleet-domain/src/repo/path.rs",
+        "crates/fleet-forge/src/publish.rs",
+        "crates/fleet-forge/src/push.rs",
+        "crates/fleet-forge/src/rate.rs",
+        "crates/fleet-forge/src/untrusted.rs",
+        "crates/fleet-fanout/src/group.rs",
+        "crates/fleet-fanout/src/rank.rs",
+        "crates/fleet-app/src/remote.rs",
+        "crates/fleet-app/src/hosts.rs",
+        "crates/fleet-app/src/fanout/pick.rs",
+        "crates/fleet-app/src/forge/exec.rs",
+        "crates/fleet-app/src/orchestrator/messaging.rs",
+        "crates/fleet-app/src/orchestrator/forge.rs",
+        "crates/fleet-app/src/neo/context.rs",
+        "crates/fleet-app/src/neo/context_cmds.rs",
+        "crates/fleet-app/src/neo/context_state.rs",
+        "crates/fleet-infra/src/ssh/known_hosts.rs",
+        "crates/fleet-infra/src/ssh/trust.rs",
+        "crates/fleet-infra/src/ssh/argv.rs",
+        "crates/fleet-infra/src/ssh/host.rs",
+        "crates/fleet-infra/src/hosts_file.rs",
+        "crates/fleet-infra/src/git/push.rs",
+        "crates/fleet-infra/src/git/remote_sync.rs",
+        "crates/fleet-infra/src/forge_gh.rs",
+        "crates/fleet-infra/src/msgfs.rs",
+        "crates/fleet-infra/src/context_store.rs",
+        "crates/fleet-infra/src/web/routes.rs",
+        "crates/fleet-infra/src/web/repo.rs",
+        "crates/fleet-infra/web/panes.js",
+        "crates/fleet-infra/web/workbench.js",
+        "crates/fleet-infra/tests/ssh_remote.rs",
+        "crates/fleet-infra/tests/dogfood.rs",
+        "crates/fleet-cli/tests/e2e_remote.rs",
+        "crates/fleet-cli/tests/architecture.rs",
+        "crates/neo-context/src/secret.rs",
+        "crates/neo-context/src/pack.rs",
+        "crates/neo-context/src/compile.rs",
+    ] {
+        assert!(
+            files.iter().any(|x| x == f),
+            "{f} does not exist: fix this list"
+        );
+        assert!(is_protected(&entries, f), "{f} must be protected");
+    }
+    // the entries that name one of these files (not only a directory above it) carry its reason
+    for named in [
+        "docker/Dockerfile.ssh",
+        "scripts/ssh-env.sh",
+        "scripts/test-layers.sh",
+        "crates/fleet-infra/src/ssh/known_hosts.rs",
+        "crates/fleet-infra/src/ssh/trust.rs",
+        "crates/fleet-infra/src/git/push.rs",
+        "crates/fleet-fanout/**",
+        "crates/fleet-forge/**",
+        "crates/neo-context/src/secret.rs",
+        ".github/workflows/**",
+    ] {
+        assert!(
+            entries.iter().any(|e| e.path == named),
+            "{named} has no entry of its own"
+        );
     }
 }
 

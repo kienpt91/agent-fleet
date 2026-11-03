@@ -17,7 +17,11 @@ task may edit finds only what the task allows. The worker is also the same user 
 - **A list of protected paths exists and is data** (`dogfood/protected-paths.json`, with the reasons in
   `dogfood/PROTECTED_PATHS.md`): the approval and admission code, the verification and evidence code, the secret scanner
   and hooks, CI and dependabot, SECURITY.md, the examples that define commands, the dependency manifests and lock file,
-  the toolchain and lint configuration, the architecture tests and the `dogfood/` directory itself. Names that do not
+  the toolchain and lint configuration, the architecture tests and the `dogfood/` directory itself, and the guardrail code
+  that the later features brought: the SSH host key pinning and the remote host (ADR 27), the forge push and approval
+  rules (ADR 20 to 22), the message policy, channel authorization and secret shapes (ADR 24 to 26), the fan-out pick
+  (ADR 23), the context compiler's secret rules and the check of stored packs (ADR 17, 18), the web admission and the
+  read-only workbench allowlist (ADR 19), and the scripts, image and CI job that run the test layers. Names that do not
   exist but would change how the repository is built, checked or steered (`.cargo/`, `.gitattributes`, `.omp/`, ...) are
   on it as guards.
 - **A change to a protected path needs a person**: a commit authored by one, or an explicit human approval of the exact
@@ -59,4 +63,6 @@ task may edit finds only what the task allows. The worker is also the same user 
   whole proof (observed in trial runs that predate this scaffold; two real tasks completed with every check passing). That is the safe
   default and the reason the checks must live outside what the agent can touch. **The scaffold itself has not been run with a real
   agent**; only the scripted dry run, the shell tests and the consistency tests exist.
+- The list was written before those features landed and was extended when they did; a guardrail file that a later feature adds is
+  on it only after a person adds it, and the consistency test (`crates/fleet-infra/tests/dogfood.rs`) only checks that what is listed exists.
 - The ADR number is 28 because `main` took 17 to 27 (context compiler, workbench, GitHub, fan-out, messages, SSH) while this was written.

@@ -209,7 +209,10 @@ decision is [ADR 28](adr/0028-neo-may-not-modify-its-own-guardrails.md). Exactly
 
 - A list of protected paths NEO may never change by itself (the approval and admission code, the verification and evidence
   code, the secret scanner and hooks, CI, SECURITY.md, the examples that define commands, the dependency manifests and the
-  lock file, the architecture tests, the `dogfood/` directory), with the reason of each entry
+  lock file, the architecture tests, the `dogfood/` directory, and the guardrail code of the later milestones: the SSH
+  host key pinning and remote host code, the forge push and approval code, the messaging policy and secret shapes, the
+  fan-out pick, the context compiler's secret rules and stored-pack check, the web admission and the read-only workbench
+  allowlist, and the scripts that run the test layers), with the reason of each entry
   ([PROTECTED_PATHS.md](../dogfood/PROTECTED_PATHS.md)). A change to one needs a commit authored by a person, or a human
   approval of the exact diff plus an independent security review.
 - The `diff` check takes a `deny` list: every self-development contract forbids the whole list, next to a scope that allows

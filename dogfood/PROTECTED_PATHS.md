@@ -31,13 +31,20 @@ the file, which would change how the repository is built, checked or steered.
 | Path | Why |
 | --- | --- |
 | `.github/**` | CI workflows and dependabot are the independent second judge of every push; weakening them removes it. |
+| `.github/workflows/**` | The CI jobs, among them ssh-tests, which runs the sshd tests with a missing server as a failure; a job removed or made optional removes a gate. |
 | `SECURITY.md` | The threat model and the dependency policy state what is promised; a task must not edit the promise it is held to. |
 | `scripts/**` | The secret scanner, the layered test runner, the coverage script and the demos define what 'tests pass', 'coverage met' and 'no secrets' mean. |
+| `scripts/test-layers.sh` | Defines which suites make up each test layer, including the remote layer that must run when an sshd exists; a dropped suite is a silent pass. |
+| `scripts/ssh-env.sh` | Starts the throwaway sshd of the remote tests and sets FLEET_SSH_TESTS=1 so that a missing server fails the test instead of skipping it. |
+| `scripts/coverage.sh` | Defines how coverage is measured per layer and which code is left out of the measurement. |
 | `docker/**` | The development images (pinned by digest) are the environment every check runs in. |
+| `docker/Dockerfile.ssh` | The image with an OpenSSH server that the remote tests run against; changing the server changes what host key pinning is proven against. |
 | `docs/adr/**` | The decisions of record about the guardrails; a task must not rewrite the reasons it is bound by. |
 | `examples/fleet.example.toml` | A daemon configuration names the commands fleet runs; examples are copied into real configurations. |
 | `examples/agents/**` | Scripts that fleet starts as workers and gates in the demos and the end-to-end tests. |
 | `examples/neo/**` | Example verification contracts, used by the demo and read as the model for real ones. |
+| `examples/fanout-contract.json` | The example verification contract of the fan-out demo, read as a model for real ones. |
+| `examples/github/**` | Recorded gh answers that the GitHub demo serves through a fake gh; examples are copied into real set-ups. |
 
 ### The guardrails of self-development itself
 
@@ -86,7 +93,14 @@ what is passed to children and how names are validated. The whole application, a
 are on the list as directories (`crates/fleet-app/**`, `crates/fleet-infra/**`, `crates/fleet-cli/**`):
 they hold the job origin rule (ADR 15), the control socket and the web admission, the approval digest,
 the completion rule, the safe file reads, the git hardening and the daemon wiring, and the end-to-end
-and security tests that pin all of that.
+and security tests that pin all of that. The crates and modules that arrived later are on the list as
+well: the SSH remote worktrees (host key pinning, the remote host, the remote command line, ADR 27), the forge
+(`gh` as the only transport, the pull request digest and the push rule, ADR 20 to 22), fan-out and its pick
+approval (ADR 23), the context compiler with its secret rules and the check of stored packs (ADR 17, 18), messaging (channel authorization, loop limits, secret-shaped text, ADR 24 to 26), and the read-only
+web workbench with its Markdown allowlist (ADR 19). Several of these also have an entry of their own inside a
+directory that is protected already (for example `crates/fleet-infra/src/ssh/known_hosts.rs` inside
+`crates/fleet-infra/**`): the directory entry is the net, the named entry carries the reason, and a later
+narrowing of the directory would not silently release it.
 
 | Path | Why |
 | --- | --- |
@@ -100,9 +114,31 @@ and security tests that pin all of that.
 | `crates/fleet-domain/src/limits.rs` | The hard caps that keep memory and inputs bounded. |
 | `crates/fleet-domain/src/brief.rs` | Argument placeholders and the quoting that keeps worker text from posing as fleet's own words. |
 | `crates/fleet-domain/src/contract.rs` | The worker contract: which files a worker may write in .fleet/ and how they are read. |
+| `crates/fleet-domain/src/remote.rs` | Remote hosts: what a host description may contain, where a remote worktree lives and the one place a remote command line is assembled. |
+| `crates/fleet-domain/src/msg/**` | Message policy: channels declared by the operator and never by a worker, loop and storm limits, rate limits and the refusal of text shaped like a secret. |
+| `crates/fleet-domain/src/repo/**` | The read-only workbench rules: validated repository paths, the Markdown element and attribute allowlist the web renders, and the diff limits. |
+| `crates/fleet-forge/**` | The forge model: the pull request digest an approval is bound to, where a branch may be pushed, the rate gate and the rules for untrusted issue text. |
+| `crates/fleet-fanout/**` | Fan-out groups: the state machine, the comparison and the ranking rule; a pick is a merge and needs its own approval. |
 | `crates/fleet-app/**` | The use cases: the completion rule, merge only of the proven commit, approval handling, the NEO module, the port contract suites. |
+| `crates/fleet-app/src/remote.rs` | Remote tasks: the host port and the session host; a task on a host gets no message channel and its handoff is read back through it. |
+| `crates/fleet-app/src/fanout/pick.rs` | fleet pick, the one way a group's result reaches the integration branch: an approval bound to the digest of the exact merge. |
+| `crates/fleet-app/src/forge/**` | The forge use cases: a pull request is opened only under an approval bound to its digest, and one executor defines what a request means. |
+| `crates/fleet-app/src/orchestrator/messaging.rs` | Decides and delivers messages under the policy of the channel and the daemon; the daemon is the only party that writes an inbox. |
 | `crates/fleet-infra/**` | The adapters: job origin, control socket and web admission, git hardening, safe file reads, the export and check runner, the event log, the daemon wiring and their tests. |
+| `crates/fleet-infra/src/ssh/**` | The OpenSSH adapter: the fixed client command line, host key pinning, quoting of the remote command and the verification of what a host returns. |
+| `crates/fleet-infra/src/ssh/known_hosts.rs` | Host key pinning: one known_hosts file per host, written only by fleet host trust, holding exactly the key the operator confirmed. |
+| `crates/fleet-infra/src/ssh/trust.rs` | Learning a host's key: it only reports what the host presents; a person at a terminal confirms the fingerprint before anything is pinned. |
+| `crates/fleet-infra/src/hosts_file.rs` | Edits the hosts tables of fleet.toml for fleet host add and remove; a host entry decides where a worker's command runs. |
+| `crates/fleet-infra/src/git/push.rs` | The push of a task branch: the remote URL is read again and compared with the repository the approval names before anything is sent. |
+| `crates/fleet-infra/src/git/remote_sync.rs` | The local half of the remote worktree protocol: the one-commit bundle that goes out and the checks on what comes back. |
+| `crates/fleet-infra/src/forge_gh.rs` | The only transport to GitHub is gh with a minimal environment: fleet never sees, stores or passes a token. |
+| `crates/fleet-infra/src/msgfs.rs` | The outbox and inbox directories of a worktree: every path below the worktree is untrusted and only the daemon writes an inbox. |
+| `crates/fleet-infra/src/web/**` | The web adapter: Host and Origin checks, tokens, sessions, CSRF, rate limits, the refusal of worker processes and the read-only repository routes. |
+| `crates/fleet-infra/web/**` | The pages the dashboard serves, among them the DOM builder with its element and attribute allowlist for rendered Markdown. |
+| `crates/fleet-infra/tests/ssh_remote.rs` | The tests against a real sshd: pinning, a changed key, quoting through a real login shell, hostile bundles; weakening one weakens the pinning claim. |
+| `crates/fleet-infra/tests/dogfood.rs` | The consistency test of the self-development data: it fails when the protected list, the contracts and the plan drift apart. |
 | `crates/fleet-cli/**` | What the operator sees when approving (digest and exact action), the commands, the attach filter, the end-to-end and security tests. |
+| `crates/fleet-cli/tests/e2e_remote.rs` | The end-to-end remote tests through the real binary and daemon, including the refusal of message channels for a remote task. |
 
 ### Verification, evidence, the ledger, redaction and the architecture tests
 
@@ -116,6 +152,11 @@ and security tests that pin all of that.
 | `crates/fleet-domain/src/output.rs` | Bounded capture of worker output through the sanitizer and the redactor. |
 | `crates/neo-verify/**` | Verification contracts, the glob matcher, judging and evidence: the rules for what counts as proof. |
 | `crates/neo-goals/**` | The goal ledger: when a goal is verified and which evidence counts. |
+| `crates/neo-context/**` | The context compiler: which layers may hold agent text, the secret rules, the budgets and the digests that stored packs are verified against. |
+| `crates/neo-context/src/secret.rs` | The secret rules of the compiler: file names and contents that a pack names but never shows. |
+| `crates/neo-context/src/pack.rs` | The canonical text, the manifest and the digests of a pack: what fleet context verify computes again. |
+| `crates/fleet-app/src/neo/context*.rs` | Compiling at dispatch, the handoff flow and the commands that verify a stored pack against the hash-chained log (exit 11 on a mismatch). |
+| `crates/fleet-infra/src/context_store.rs` | Stored context packs and handoffs on disk: the files that are re-hashed and compared with what the log recorded. |
 | `crates/fleet-cli/tests/architecture.rs` | The architecture tests: layering, no I/O in the domain, no new dependency kinds, forbid(unsafe_code) everywhere. |
 
 ## What a task may change (and why that is enough to be useful)

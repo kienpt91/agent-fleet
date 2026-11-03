@@ -713,7 +713,9 @@ NEO can be pointed at its own repository: agents write the code of the remaining
 fleet's own verification contracts decide whether a task may complete. The scaffold is in [`dogfood/`](dogfood/RUNBOOK.md).
 The principle (ADR 28): **a system must not be able to loosen its own guardrails.** The approval and admission code, the
 verification and evidence code, the secret scanner and hooks, CI, SECURITY.md, the examples that define commands, the dependency
-manifests and lock file, the architecture tests and the `dogfood/` directory itself are [protected
+manifests and lock file, the architecture tests, the `dogfood/` directory itself and the guardrail code of the later features (SSH host key
+pinning and the remote host, the forge push and approval, the message policy, the fan-out pick, the context compiler's secret rules, the web
+admission and the read-only workbench allowlist) are [protected
 paths](dogfood/PROTECTED_PATHS.md): no task may change them, and a change needs a commit authored by a person or a human approval of
 the exact diff plus an independent security review. Every task's contract (the `diff` check now takes a `deny` list) forbids them and
 also runs formatting, clippy with `-D warnings`, the architecture tests, the layered tests, the secret scanner, an unchanged
