@@ -1205,11 +1205,10 @@ fn no_contract_runs_the_remote_layer_and_the_documents_say_why() {
         "the remote layer no longer depends on sshd"
     );
     // the wrapper's image has no sshd, so the layer is skipped inside a check
-    for wrapper in ["dogfood/container-run.example.sh"] {
-        let text = read(wrapper);
-        assert!(text.contains("image=fleet-dev"), "{wrapper}");
-        assert!(!text.contains("image=fleet-ssh"), "{wrapper}");
-    }
+    let wrapper = "dogfood/container-run.example.sh";
+    let text = read(wrapper);
+    assert!(text.contains("image=fleet-dev"), "{wrapper}");
+    assert!(!text.contains("image=fleet-ssh"), "{wrapper}");
     let readme = read("dogfood/contracts/README.md");
     assert!(
         readme.contains("The `remote` layer is not part of the contract"),
