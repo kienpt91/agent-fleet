@@ -53,7 +53,6 @@ fleet plan plan.toml  ->  fleet start  ->  one worker per ready task, in .fleet-
   (gates, approved commands, git). It is a hand-written HTTP server on `std::net`, loopback only unless you say
   otherwise, with no new dependency. Its credentials are defence in depth, not a boundary against code running as you. See
   [Web dashboard](#web-dashboard).
-
 - **Remote worktrees over SSH.** A task can name a host (`task add --host build`): its worker then runs on that machine,
   in a terminal that is a local `ssh -tt` process, so the output is sanitized, bounded and redacted like any worker's.
   Host keys are pinned by an explicit step (`fleet host trust`, with a fingerprint and a terminal), ssh runs with a fixed
@@ -1102,10 +1101,10 @@ the goals page (one goal verified through fleet's own run, one task `unverified`
 
 ### What was and was not verified
 
-- **Protocol level, over real sockets:** [`web_http.rs`](crates/fleet-infra/tests/web_http.rs) (43 tests: authentication, per-client
+- **Protocol level, over real sockets:** [`web_http.rs`](crates/fleet-infra/tests/web_http.rs) (58 tests: authentication, per-client
   lockout, Host, Origin, `Sec-Fetch-Site`, CSRF, header sessions and the rejected old-style cookie, strict JSON, control characters
   in input, malformed and oversized requests, a trickling client and an idle one, the connection cap, event-stream bounds and
-  their end with the session, shutdown) and [`e2e_web.rs`](crates/fleet-cli/tests/e2e_web.rs) (16 tests against the real daemon:
+  their end with the session, shutdown) and [`e2e_web.rs`](crates/fleet-cli/tests/e2e_web.rs) (23 tests against the real daemon:
   login, the gate/approval/merge flow, live output and input, the token absent from every worker-visible place and from disk,
   a worker, a quality-gate child and a descendant of an approved command that were all handed the token and are all still
   refused on the web port and on the socket, the flag policy, the quiet start, shutdown, hostile text, health and tamper
@@ -1472,68 +1471,68 @@ after; in the `fleet-ssh` image, see [Development](#development)); the paths are
 
 ```text
 The operator compares this fingerprint with the one on the host's console:
-256 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms demo (ED25519)
+256 SHA256:7ZnV09BynZDqsdu6fs9XQ8zpriBrog6aiL75L5UrraY demo (ED25519)
 
-$ /target/release/fleet host add build --config /tmp/tmp.AIJNF2xrgc/fleet.toml --address 127.0.0.1 --port 23642 --user fleetssh --identity /tmp/tmp.AIJNF2xrgc/sshd/client_key --base-dir /tmp/tmp.AIJNF2xrgc/remote-work --worker sh
-host build added to /tmp/tmp.AIJNF2xrgc/fleet.toml
+$ /target/release/fleet host add build --config /tmp/tmp.pm4WHz5KEk/fleet.toml --address 127.0.0.1 --port 20007 --user fleetssh --identity /tmp/tmp.pm4WHz5KEk/sshd/client_key --base-dir /tmp/tmp.pm4WHz5KEk/remote-work --worker sh
+host build added to /tmp/tmp.pm4WHz5KEk/fleet.toml
 next: compare the host's key and pin it with `fleet host trust build`, then check it with `fleet host doctor build`
 
-$ /target/release/fleet host list --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+$ /target/release/fleet host list --config /tmp/tmp.pm4WHz5KEk/fleet.toml
 NAME   ADDRESS          USER      BASE DIRECTORY                   WORKERS  PINNED KEY
-build  127.0.0.1:23642  fleetssh  /tmp/tmp.AIJNF2xrgc/remote-work  sh       not pinned
+build  127.0.0.1:20007  fleetssh  /tmp/tmp.pm4WHz5KEk/remote-work  sh       not pinned
 
-$ /target/release/fleet host doctor build --config /tmp/tmp.AIJNF2xrgc/fleet.toml   # nothing is trusted yet: no connection is made
+$ /target/release/fleet host doctor build --config /tmp/tmp.pm4WHz5KEk/fleet.toml   # nothing is trusted yet: no connection is made
 [ok  ] ssh program: /usr/bin/ssh (OpenSSH 9.2)
-[ok  ] host build: identity file: /tmp/tmp.AIJNF2xrgc/sshd/client_key
+[ok  ] host build: identity file: /tmp/tmp.pm4WHz5KEk/sshd/client_key
 [FAIL] host build: pinned key: not pinned yet: run `fleet host trust build`
 [info] host build: connection: not tried: fix the checks above first
 unhealthy: 1 check(s) failed
 (exit code 13)
 
-$ /target/release/fleet host trust build --config /tmp/tmp.AIJNF2xrgc/fleet.toml   # needs a terminal; here one is made with script(1) and "yes" is typed
+$ /target/release/fleet host trust build --config /tmp/tmp.pm4WHz5KEk/fleet.toml   # needs a terminal; here one is made with script(1) and "yes" is typed
 yes
-host build (127.0.0.1:23642) presented this key:
+host build (127.0.0.1:20007) presented this key:
   type:        ssh-ed25519
-  fingerprint: SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+  fingerprint: SHA256:7ZnV09BynZDqsdu6fs9XQ8zpriBrog6aiL75L5UrraY
 nothing is pinned for this host yet.
 Compare the fingerprint with one you know to be the host's own, over another channel (for example on its console: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
-Type yes to pin this key for host build: pinned SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms for host build; check the host with `fleet host doctor build`
+Type yes to pin this key for host build: pinned SHA256:7ZnV09BynZDqsdu6fs9XQ8zpriBrog6aiL75L5UrraY for host build; check the host with `fleet host doctor build`
 
-$ /target/release/fleet host list --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+$ /target/release/fleet host list --config /tmp/tmp.pm4WHz5KEk/fleet.toml
 NAME   ADDRESS          USER      BASE DIRECTORY                   WORKERS  PINNED KEY
-build  127.0.0.1:23642  fleetssh  /tmp/tmp.AIJNF2xrgc/remote-work  sh       ssh-ed25519 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+build  127.0.0.1:20007  fleetssh  /tmp/tmp.pm4WHz5KEk/remote-work  sh       ssh-ed25519 SHA256:7ZnV09BynZDqsdu6fs9XQ8zpriBrog6aiL75L5UrraY
 
-$ /target/release/fleet host doctor build --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+$ /target/release/fleet host doctor build --config /tmp/tmp.pm4WHz5KEk/fleet.toml
 [ok  ] ssh program: /usr/bin/ssh (OpenSSH 9.2)
-[ok  ] host build: identity file: /tmp/tmp.AIJNF2xrgc/sshd/client_key
-[ok  ] host build: pinned key: ssh-ed25519 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
-[ok  ] host build: connection: 591 ms, pinned key accepted, key file accepted
+[ok  ] host build: identity file: /tmp/tmp.pm4WHz5KEk/sshd/client_key
+[ok  ] host build: pinned key: ssh-ed25519 SHA256:7ZnV09BynZDqsdu6fs9XQ8zpriBrog6aiL75L5UrraY
+[ok  ] host build: connection: 203 ms, pinned key accepted, key file accepted
 [ok  ] host build: quoting: the login shell reads quoted text unchanged
 [ok  ] host build: system: Linux
 [ok  ] host build: remote user: uid 501
 [ok  ] host build: git: git version 2.39.5
-[ok  ] host build: base directory: /tmp/tmp.AIJNF2xrgc/remote-work is writable
+[ok  ] host build: base directory: /tmp/tmp.pm4WHz5KEk/remote-work is writable
 healthy
 
-$ /target/release/fleet plan /tmp/tmp.AIJNF2xrgc/plan.toml
+$ /target/release/fleet plan /tmp/tmp.pm4WHz5KEk/plan.toml
 plan loaded into run r1 (1 tasks)
 
 $ /target/release/fleet start --run r1
 run r1 started
 
 $ /target/release/fleet status
-daemon pid 3728 | v0.1.0 | up 17s | sessions 0/4 | undo unavailable | rss 4672 kB
+daemon pid 93 | v0.1.0 | up 2s | sessions 0/4 | undo unavailable | rss 6084 kB
 
 run r1 [finished] max-parallel 2
   objective  Try a worker on another machine
-  repo       /tmp/tmp.AIJNF2xrgc/repo (base HEAD @ 2c5a6876)
+  repo       /tmp/tmp.pm4WHz5KEk/repo (base HEAD @ 6addb94e)
   branch     fleet/r1/integration
   tasks      pending 0, ready 0, running 0, review 0, completed 1, failed 0, blocked 0
   ID      STATUS     DEPS  TRY  WORKER        NOTE
   remote  completed  -     1    - host:build  wrote a file on the host
 
 recent
-  #1 daemon started (pid 3728)
+  #1 daemon started (pid 93)
   #2 run r1 created
   #3 r1/remote added
   #4 r1/remote ready
@@ -1545,7 +1544,7 @@ recent
   #10 r1/remote completed
 
 $ git -C $REPO show fleet/r1/remote:from-the-host.txt   # the file was written on the host and came back as a commit of the local repository
-hello from Linux, written for task remote in /tmp/tmp.AIJNF2xrgc/remote-work/r1/remote
+hello from Linux, written for task remote in /tmp/tmp.pm4WHz5KEk/remote-work/r1/remote
 
 $ git -C $REPO log --format='%an <%ae>: %s' fleet/r1/remote   # one commit of fleet's own on top of the base
 fleet <fleet@localhost>: fleet: changes made on host build
@@ -1555,11 +1554,11 @@ $ ls $WORK/remote-work/r1   # nothing is left on the host
 0
 
 $ fleet tail remote   # what fleet recorded about the attempt
-fleet: remote: host build returned 1 commit(s) changing 1 path(s); verified and applied as 7c17a4146e4a
+fleet: remote: host build returned 1 commit(s) changing 1 path(s); verified and applied as a9e5e6446e0f
 fleet: remote: the worktree on host build was removed
 
 --- the host is reinstalled: its key changes ---
-256 SHA256:1dI8Jw3XjIWqk/fVln9olas4cE4DLO1Sbm3x6dNGGV0 demo (ED25519)
+256 SHA256:gKNvdhVm0oZUeVb0kP+sK+mcj4QYhY0HaJ9uXAReCOU demo (ED25519)
 
 $ /target/release/fleet task add --run r1 --title Another file --id again --host build
 task added to run r1
@@ -1610,16 +1609,16 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-2269 tests, all passing in the final run (offline; 743 domain, 463 application, 704 adapters, 1 soak, 358 end to end). The wall-clock bounds of a few domain tests (Markdown and word-diff work limits, 3 to 10 seconds) are meant for an idle machine:
+2415 tests, all passing in the final run (offline; 754 domain, 494 application, 758 adapters, 1 soak, 27 remote against a real sshd, 381 end to end). The wall-clock bounds of a few domain tests (Markdown and word-diff work limits, 3 to 10 seconds) are meant for an idle machine:
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); the repository workbench (validated paths, tree entries, file views, diffs and their patch reader, bounded word marks, a Markdown subset with property and adversarial tests); NEO N2: the context compiler (determinism and golden digests, layer order, budget and shrink-order laws, property tests with hostile text, delimiter and control-character attacks, the secret rules including worst-case lines in linear time, handoff packets); the forge model (strict schemas, hostile issue text, the pull request digest, remote URL parsing that never repeats a credential, the rate gate, the issue and pull request links with uncapped duplicate guards); fan-out: the group state machine with restart reconcile, diff statistics and scope, comparison facts and overlap, the ranking rule with property tests (deterministic, total and strict, only the listed criteria matter, monotone); messaging: channel and message rules, the board (policy order, rates with a fake clock, loop and storm detection, duplicates, secret shapes, mutes, approvals, replay), the secret-shape scanner against every rule of `scripts/secret-scan.sh`; the review's scenarios at this level (one-way traffic and self-replies never trip the loop rule, a loop mutes the sender and not the channel, the refusal budget, coalesced junk files, the high-water mark of seen files, replies that name a message the sender received, per-run caps, the inbox share, approvals waiting per channel, the shares of the decision pool) | 743 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); NEO N2: compiled context at dispatch, handoffs at task end, retry and crash recovery (including a crash between the end of an attempt and its handoff), tamper tests on stored packs, fact scoping and goal-order independence, plus the context-store contract suite; GitHub: issues and pull requests against a fake forge (nothing leaves before an approval of exactly that pull request, approvals spent only once the adapter can take the call, the run's repository recorded and a changed remote refused, issue text quoted and untrusted, failures redacted, restart reconciliation); fan-out: creation (caps, atomic refusal), partial failures, comparison from facts, pick approval binding, unverified/failed/moved-branch refusals, superseding and cleanup, hostile text; messaging: delivery, refusals and floods, loops with their gate, expiry, approvals, restart, adapter failures, operator commands; the outbox and inbox contract suites against the fakes; the review's scenarios with fakes (`messaging_security.rs`: a refusal flood and secret-shaped floods below the per-minute rate, one-way spam and self-reply chains that must not mute a shared channel, ping-pong across channels, a saturated approval pool next to a worker question, replies to messages the sender never got, one run starving another, one sender filling an inbox) | 463 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; NEO N2: the file context store, the knowledge file, `handoff.json` and `context.*` files, the three `Vcs` reads of the real repository, the golden digests with the real SHA-256; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake; GitHub: the `gh` adapter against a fake `gh` (minimal environment, no token, rate gate, timeouts, redacted stderr, strict schemas) and the git push against a local bare repository (one ref, the approved commit, no force, a private git directory, hostile configuration); `diff_summary` against real git repositories (overlap, binary files, renames, odd names, hardening), the read-only group routes, `[compare]` config; the outbox and inbox adapters (FIFO, link, oversize, partial write, forged files, an inbox swapped for a link) and the same contract suites against them; the typed notice (bounded, printable ASCII, never Enter) on a real pty; the `[messages]` config limits; the web messages routes | 704 |
-| Remote (OpenSSH) | `crates/fleet-infra/tests/ssh_remote.rs` (a real sshd started by the test: pinning, changed key, wrong key, forwarding and environment, quoting through the real login shell, hostile bundles, kill escalation, keepalive on a frozen server, a jump host, origin refusal, the `RemoteHost` contract suite) and `crates/fleet-cli/tests/e2e_remote.rs` (the real binary and daemon, 11 tests); skipped when the image has no sshd (`docker/Dockerfile.ssh`, `scripts/ssh-env.sh`) | 27 (and 11 more in the end-to-end layer) |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); the repository workbench (validated paths, tree entries, file views, diffs and their patch reader, bounded word marks, a Markdown subset with property and adversarial tests); NEO N2: the context compiler (determinism and golden digests, layer order, budget and shrink-order laws, property tests with hostile text, delimiter and control-character attacks, the secret rules including worst-case lines in linear time, handoff packets); the forge model (strict schemas, hostile issue text, the pull request digest, remote URL parsing that never repeats a credential, the rate gate, the issue and pull request links with uncapped duplicate guards); fan-out: the group state machine with restart reconcile, diff statistics and scope, comparison facts and overlap, the ranking rule with property tests (deterministic, total and strict, only the listed criteria matter, monotone); messaging: channel and message rules, the board (policy order, rates with a fake clock, loop and storm detection, duplicates, secret shapes, mutes, approvals, replay), the secret-shape scanner against every rule of `scripts/secret-scan.sh`; the review's scenarios at this level (one-way traffic and self-replies never trip the loop rule, a loop mutes the sender and not the channel, the refusal budget, coalesced junk files, the high-water mark of seen files, replies that name a message the sender received, per-run caps, the inbox share, approvals waiting per channel, the shares of the decision pool); remote host rules (validated host settings, strict quoting and the closed set of remote calls, property-tested) | 754 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); NEO N2: compiled context at dispatch, handoffs at task end, retry and crash recovery (including a crash between the end of an attempt and its handoff), tamper tests on stored packs, fact scoping and goal-order independence, plus the context-store contract suite; GitHub: issues and pull requests against a fake forge (nothing leaves before an approval of exactly that pull request, approvals spent only once the adapter can take the call, the run's repository recorded and a changed remote refused, issue text quoted and untrusted, failures redacted, restart reconciliation); fan-out: creation (caps, atomic refusal), partial failures, comparison from facts, pick approval binding, unverified/failed/moved-branch refusals, superseding and cleanup, hostile text; messaging: delivery, refusals and floods, loops with their gate, expiry, approvals, restart, adapter failures, operator commands; the outbox and inbox contract suites against the fakes; the review's scenarios with fakes (`messaging_security.rs`: a refusal flood and secret-shaped floods below the per-minute rate, one-way spam and self-reply chains that must not mute a shared channel, ping-pong across channels, a saturated approval pool next to a worker question, replies to messages the sender never got, one run starving another, one sender filling an inbox); remote tasks with a fake host (`RemoteSessions`, per-host limits, the pack and brief of a compiled run, the refusal of channels for remote tasks) | 494 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; NEO N2: the file context store, the knowledge file, `handoff.json` and `context.*` files, the three `Vcs` reads of the real repository, the golden digests with the real SHA-256; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake; GitHub: the `gh` adapter against a fake `gh` (minimal environment, no token, rate gate, timeouts, redacted stderr, strict schemas) and the git push against a local bare repository (one ref, the approved commit, no force, a private git directory, hostile configuration); `diff_summary` against real git repositories (overlap, binary files, renames, odd names, hardening), the read-only group routes, `[compare]` config; the outbox and inbox adapters (FIFO, link, oversize, partial write, forged files, an inbox swapped for a link) and the same contract suites against them; the typed notice (bounded, printable ASCII, never Enter) on a real pty; the `[messages]` config limits; the web messages routes; the OpenSSH adapter (argument list, program checks, executor, pins, hostile bundles) | 758 |
+| Remote (OpenSSH) | `crates/fleet-infra/tests/ssh_remote.rs` (a real sshd started by the test: pinning, changed key, wrong key, forwarding and environment, quoting through the real login shell, hostile bundles, kill escalation, keepalive on a frozen server, a jump host, origin refusal, the `RemoteHost` contract suite) and `crates/fleet-cli/tests/e2e_remote.rs` (the real binary and daemon, 13 tests); skipped when the image has no sshd (`docker/Dockerfile.ssh`, `scripts/ssh-env.sh`) | 27 (and 13 more in the end-to-end layer) |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; NEO N2: compiled packs through the real binary, retry packs with failure evidence, forged context and handoff files, hostile titles, a killed daemon re-briefing with identical layers 1-5, a tampered stored pack (exit 11); the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory); GitHub through the real binary against a fake `gh` (approval, push, one pull request, worker refusal); fan-out through the real binary with fake workers (passing, failing, out-of-scope and overlapping members, approvals, restarts, hostile text in the CLI, the terminal dashboard and the web); messaging with the real binary: two workers exchanging messages, a worker refused on `fleet msg`, secret and hostile text, a ping-pong that mutes with its gate, expiry, a restart without loss or repeat, the operator on a `to_lead` channel, hostile subjects in a brief, a loop that mutes one member while a third keeps talking (and a reply to somebody else's message), junk files recorded once and then only counted, the notice typed without Enter and not at all by default, the read-only web routes | 358 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; NEO N2: compiled packs through the real binary, retry packs with failure evidence, forged context and handoff files, hostile titles, a killed daemon re-briefing with identical layers 1-5, a tampered stored pack (exit 11); the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory); GitHub through the real binary against a fake `gh` (approval, push, one pull request, worker refusal); fan-out through the real binary with fake workers (passing, failing, out-of-scope and overlapping members, approvals, restarts, hostile text in the CLI, the terminal dashboard and the web); messaging with the real binary: two workers exchanging messages, a worker refused on `fleet msg`, secret and hostile text, a ping-pong that mutes with its gate, expiry, a restart without loss or repeat, the operator on a `to_lead` channel, hostile subjects in a brief, a loop that mutes one member while a third keeps talking (and a reply to somebody else's message), junk files recorded once and then only counted, the notice typed without Enter and not at all by default, the read-only web routes; remote tasks through the real binary and daemon against an sshd (run when the image has one) | 381 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -1634,11 +1633,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain              13735    13449    97.9%
-application          6985     6553    93.8%
-infrastructure       7993     7370    92.2%
-cli                  4518     4308    95.4%
-overall             33231    31680    95.3%
+domain              14127    13836    97.9%
+application          7459     7002    93.9%
+infrastructure      10465     9633    92.0%
+cli                  4941     4656    94.2%
+overall             36992    35127    95.0%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -1656,17 +1655,17 @@ run on every byte) and samples the process's resident memory from `/proc/self/st
 buffer is capped (64 KiB in the test). A 120 second run in release mode, in the Linux container:
 
 ```text
-soak: 8 workers x 120s, 31720 MiB of terminal output (264 MiB/s), rss start 5136 kB, steady min 7228 kB / max 7832 kB / first 7756 kB, growth after warm-up 76 kB, 240 samples
-soak web: sse client 647210898 bytes, 38402 output events (per third [12626, 13229, 12547]), 156 reconnects, 0 refused, max 1 open stream(s); 230 status polls (0 failed); rss start 5136 kB, steady min 7228 kB / max 7832 kB, growth after warm-up 76 kB
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 121.00s
+soak: 8 workers x 120s, 6607 MiB of terminal output (55 MiB/s), rss start 6468 kB, steady min 8656 kB / max 9656 kB / first 9000 kB, growth after warm-up 656 kB, 229 samples
+soak web: sse client 208075948 bytes, 12412 output events (per third [3695, 4082, 4635]), 56 reconnects, 0 refused, max 1 open stream(s); 215 status polls (0 failed); rss start 6468 kB, steady min 8656 kB / max 9656 kB, growth after warm-up 656 kB
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 121.62s
 ```
 
 Since phase 2 the soak runs the daemon **with the web dashboard on**: one client holds an event stream (`/api/stream`) of a
 flooding task for the whole run (reconnecting with `Last-Event-ID` when the server ends the stream at its limits and
 counting bytes only, so the client keeps no buffer), and a second polls `/api/status` every 500 ms. Memory is flat after
-the buffers fill: it did not grow with the volume of output (about 31 GiB went through the daemon, 647 MB of it through the
-event stream), and the growth after warm-up (76 kB) is within the 4 MiB the test allows. Across all 120 second runs with the
-dashboard on made since the dashboard exists (eight, before and after the later changes, the last one after the security fixes of the merged tree)
+the buffers fill: it did not grow with the volume of output (about 6.5 GiB went through the daemon, 208 MB of it through the
+event stream), and the growth after warm-up (656 kB) is within the 4 MiB the test allows. Across all 120 second runs with the
+dashboard on made since the dashboard exists (nine, before and after the later changes, the last one on the tree that merges remote worktrees)
 the growth was 76 to 840 kB; the throughput ranged from 26 to 184 MiB/s on a machine that was shared with other containers, so
 no throughput comparison is claimed (the earlier run without the dashboard measured 271 MiB/s). By default the test runs 20 seconds;
 `FLEET_SOAK_SECS=120 cargo test --release -p fleet-infra --test soak -- --nocapture` reproduces the numbers above
