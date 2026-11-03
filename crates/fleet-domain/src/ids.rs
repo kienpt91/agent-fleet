@@ -252,6 +252,12 @@ string_id!(
     |s| validate_counter_id("evidence", 'e', s)
 );
 string_id!(
+    /// Identifies a fan-out group: the same prompt given to several agents. Shorter than other ids
+    /// because the member tasks are named `<group>-<n>`.
+    GroupId,
+    validate_group_id
+);
+string_id!(
     /// A git object id in lowercase hex (SHA-1 or SHA-256 repositories).
     Sha,
     validate_sha
@@ -300,6 +306,26 @@ impl EvidenceId {
             .and_then(|d| d.parse().ok())
             .unwrap_or(0)
     }
+}
+
+impl GroupId {
+    /// The id a group gets when none was asked for: `fan<n>`.
+    pub fn from_seq(n: u64) -> Self {
+        GroupId(format!("fan{n}"))
+    }
+}
+
+/// Longest group id: the member tasks `<group>-<n>` have to stay valid task ids.
+pub const MAX_GROUP_ID_LEN: usize = 32;
+
+fn validate_group_id(s: &str) -> Result<()> {
+    validate_id("group", s)?;
+    if s.len() > MAX_GROUP_ID_LEN {
+        return Err(FleetError::invalid(format!(
+            "group id is longer than {MAX_GROUP_ID_LEN} characters"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_counter_id(kind: &str, prefix: char, s: &str) -> Result<()> {
@@ -354,6 +380,20 @@ mod tests {
         for bad in ["12", "e", "e1x", "g1", "e-1"] {
             assert!(EvidenceId::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn group_ids() {
+        assert_eq!(GroupId::from_seq(2).as_str(), "fan2");
+        assert!(GroupId::parse("fan2").is_ok());
+        assert!(GroupId::parse(&"a".repeat(32)).is_ok());
+        assert!(GroupId::parse(&"a".repeat(33)).is_err());
+        for bad in ["", "A", "a/b", "a b", "integration", "-x"] {
+            assert!(GroupId::parse(bad).is_err(), "{bad:?}");
+        }
+        // every member task id stays a valid task id
+        let longest = GroupId::parse(&"a".repeat(32)).unwrap();
+        assert!(TaskId::parse(&format!("{longest}-16")).is_ok());
     }
 
     #[test]

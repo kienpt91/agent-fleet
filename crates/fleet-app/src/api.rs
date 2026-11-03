@@ -6,7 +6,7 @@
 use crate::browse::{CommitSel, RepoQuery, RepoRequest};
 use crate::ports::SessionId;
 use fleet_domain::error::{FleetError, Result};
-use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, RunId, TaskId, WorkerName};
+use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, GroupId, RunId, TaskId, WorkerName};
 use fleet_domain::limits::MAX_SEND_BYTES;
 use fleet_domain::repo::RepoPath;
 use fleet_domain::run::NewTask;
@@ -34,6 +34,22 @@ pub struct NewGoalArgs {
     /// `run/task` references (or bare task ids that are unique across runs).
     pub tasks: Vec<String>,
     /// A verification contract document, validated by the application.
+    pub contract: Option<Document>,
+}
+
+/// One prompt to give to several agents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewFanoutArgs {
+    pub id: Option<GroupId>,
+    pub run: RunId,
+    pub title: String,
+    pub spec: String,
+    /// The workers to run the prompt with; a name may repeat.
+    pub workers: Vec<WorkerName>,
+    /// How many members each entry of `workers` makes.
+    pub count: u32,
+    /// The verification contract every member is judged by (a document, validated by the
+    /// application).
     pub contract: Option<Document>,
 }
 
@@ -164,6 +180,27 @@ pub enum Command {
     },
     /// The forge integration: issues, pull requests and their links to tasks.
     Forge(crate::forge::api::ForgeCommand),
+    /// Creates the member tasks of a fan-out group (and the goal that carries their contract).
+    Fanout(NewFanoutArgs),
+    GroupList,
+    GroupShow {
+        group: GroupId,
+    },
+    /// The structured comparison of a group's members; `rank` replaces the default order of the
+    /// ranking criteria for this view.
+    GroupCompare {
+        group: GroupId,
+        rank: Option<Vec<String>>,
+    },
+    /// Picks the winner: requests the merge approval for its exact action and, once approved and
+    /// merged, supersedes the other members.
+    GroupPick {
+        group: GroupId,
+        task: String,
+        allow_unverified: bool,
+        /// Remove the worktrees and branches of the superseded members now.
+        remove_others: bool,
+    },
     Shutdown,
 }
 
@@ -306,6 +343,26 @@ fn parse_new_goal(v: &Value) -> Result<NewGoalArgs> {
             .into_iter()
             .map(str::to_string)
             .collect(),
+        contract: match v.get("contract") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(parse_document(v, "contract")?),
+        },
+    })
+}
+
+fn parse_fanout(v: &Value) -> Result<NewFanoutArgs> {
+    let a = Args(v);
+    Ok(NewFanoutArgs {
+        id: a.opt_str("id")?.map(GroupId::parse).transpose()?,
+        run: RunId::parse(a.req_str("run")?)?,
+        title: a.req_str("title")?.to_string(),
+        spec: a.req_str("spec")?.to_string(),
+        workers: a
+            .str_list("workers")?
+            .into_iter()
+            .map(WorkerName::parse)
+            .collect::<Result<Vec<_>>>()?,
+        count: a.opt_u32("count")?.unwrap_or(1),
         contract: match v.get("contract") {
             None | Some(Value::Null) => None,
             Some(_) => Some(parse_document(v, "contract")?),
@@ -501,6 +558,29 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
         "repo.tree" | "repo.file" | "repo.blob" | "repo.markdown" | "repo.diff" => {
             Command::Repo(parse_repo_query(name, &a)?)
         }
+        "group.fanout" => Command::Fanout(parse_fanout(args)?),
+        "group.list" => Command::GroupList,
+        "group.show" => Command::GroupShow {
+            group: GroupId::parse(a.req_str("group")?)?,
+        },
+        "group.compare" => Command::GroupCompare {
+            group: GroupId::parse(a.req_str("group")?)?,
+            rank: match args.get("rank") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(
+                    a.str_list("rank")?
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                ),
+            },
+        },
+        "group.pick" => Command::GroupPick {
+            group: GroupId::parse(a.req_str("group")?)?,
+            task: task()?,
+            allow_unverified: a.opt_bool("allow_unverified")?.unwrap_or(false),
+            remove_others: a.opt_bool("remove_others")?.unwrap_or(false),
+        },
         "context.show" => Command::ContextShow {
             task: task()?,
             digest: a.opt_str("digest")?.map(str::to_string),
@@ -552,6 +632,9 @@ pub fn is_read_only(cmd: &Command) -> bool {
             | Command::ContextDiff { .. }
             | Command::ContextVerify { .. }
             | Command::ContextExplain { .. }
+            | Command::GroupList
+            | Command::GroupShow { .. }
+            | Command::GroupCompare { .. }
     )
 }
 

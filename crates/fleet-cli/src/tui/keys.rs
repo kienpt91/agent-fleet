@@ -49,6 +49,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Action {
     {
         return Action::None;
     }
+    if model.groups_view {
+        return handle_groups(model, key);
+    }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Char('?') => {
@@ -75,6 +78,10 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Action {
             };
             Action::None
         }
+        KeyCode::Char('g') => {
+            model.groups_view = true;
+            Action::Refresh
+        }
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('a') => decide(model, true),
         KeyCode::Char('d') => decide(model, false),
@@ -82,6 +89,40 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Action {
         KeyCode::Char('t') => selected_task(model).map_or(Action::None, Action::Retry),
         KeyCode::Char('m') => selected_task(model).map_or(Action::None, Action::Merge),
         KeyCode::Enter => enter(model),
+        _ => Action::None,
+    }
+}
+
+/// The groups view only looks: moving, scrolling, refreshing and leaving. There is no key that
+/// creates a group or picks a winner (a pick is a merge: `fleet pick <group> <task>`).
+fn handle_groups(model: &mut Model, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('q') => Action::Quit,
+        KeyCode::Char('?') => {
+            model.show_help = true;
+            Action::None
+        }
+        KeyCode::Char('g') | KeyCode::Esc => {
+            model.groups_view = false;
+            Action::None
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            model.move_group_selection(1);
+            Action::Refresh
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            model.move_group_selection(-1);
+            Action::Refresh
+        }
+        KeyCode::PageDown => {
+            model.scroll_group_text(10);
+            Action::None
+        }
+        KeyCode::PageUp => {
+            model.scroll_group_text(-10);
+            Action::None
+        }
+        KeyCode::Char('r') => Action::Refresh,
         _ => Action::None,
     }
 }

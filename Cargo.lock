@@ -277,8 +277,9 @@ version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
- "neo-context",
+ "fleet-fanout",
  "fleet-forge",
+ "neo-context",
  "neo-goals",
  "neo-verify",
 ]
@@ -301,6 +302,14 @@ name = "fleet-domain"
 version = "0.1.0"
 
 [[package]]
+name = "fleet-fanout"
+version = "0.1.0"
+dependencies = [
+ "fleet-domain",
+ "neo-verify",
+]
+
+[[package]]
 name = "fleet-forge"
 version = "0.1.0"
 dependencies = [
@@ -313,8 +322,9 @@ version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
- "neo-context",
+ "fleet-fanout",
  "fleet-forge",
+ "neo-context",
  "neo-verify",
  "nix 0.31.3",
  "portable-pty",

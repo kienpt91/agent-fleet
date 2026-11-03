@@ -1261,6 +1261,110 @@ fn hostile_goal_text_and_evidence_output_stay_inert_in_the_served_documents() {
 }
 
 #[test]
+fn fan_out_groups_and_their_comparison_are_served_read_only_through_the_daemons_own_commands() {
+    let r = Running::start();
+    assert_eq!(r.get_bearer("/api/groups").status, 200);
+    assert_eq!(r.get_bearer("/api/group?id=fan1").status, 200);
+    assert_eq!(r.get_bearer("/api/group/compare?id=fan1").status, 200);
+    let calls = r.fake.calls();
+    let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["group.list", "group.show", "group.compare"]);
+    assert_eq!(
+        calls[1].1.get("group").and_then(Value::as_str),
+        Some("fan1")
+    );
+    assert_eq!(
+        calls[2].1.get("group").and_then(Value::as_str),
+        Some("fan1")
+    );
+    // they need credentials like everything else
+    for path in ["/api/groups", "/api/group?id=g", "/api/group/compare?id=g"] {
+        assert_eq!(r.get(path, &[]).status, 401, "{path}");
+    }
+    // nothing here creates a group or picks a winner: no write method reaches the daemon, and
+    // there is no route by which the commands that do could be named
+    for (m, path) in [
+        ("POST", "/api/groups"),
+        ("POST", "/api/group"),
+        ("POST", "/api/group/compare"),
+        ("POST", "/api/group/pick"),
+        ("POST", "/api/group/fanout"),
+        ("POST", "/api/fanout"),
+        ("POST", "/api/pick"),
+        ("PUT", "/api/group"),
+        ("DELETE", "/api/group"),
+    ] {
+        let resp = r.request(m, path, &[], Some("{}"));
+        assert!(
+            matches!(resp.status, 404 | 405 | 401),
+            "{m} {path} -> {}",
+            resp.status
+        );
+    }
+    for path in ["/api/group/pick", "/api/group/fanout", "/api/groups/pick"] {
+        assert_eq!(r.get_bearer(path).status, 404, "{path}");
+    }
+    let (session, csrf) = r.login();
+    for path in ["/api/groups", "/api/group", "/api/group/compare"] {
+        let resp = r.post_session(path, &session, &csrf, "{}");
+        assert_eq!(resp.status, 405, "{path}");
+    }
+    assert_eq!(r.fake.calls().len(), 3, "no write reached the daemon");
+}
+
+#[test]
+fn group_queries_are_validated() {
+    let r = Running::start();
+    for q in [
+        "/api/group",
+        "/api/group?id=",
+        "/api/group?id=a&id=b",
+        "/api/group?id=a&rank=diff",
+        "/api/group/compare",
+        "/api/group/compare?id=",
+        "/api/group/compare?id=a&x=1",
+        "/api/groups?x=1",
+        "/api/group?id=%ZZ",
+    ] {
+        let resp = r.get_bearer(q);
+        assert_eq!(resp.status, 400, "{q}: {}", resp.body);
+    }
+    assert!(r.fake.calls().is_empty());
+}
+
+#[test]
+fn hostile_group_text_stays_inert_in_the_served_documents() {
+    let r = Running::start();
+    let nasty = "<img src=x onerror=alert(1)>\u{1b}]8;;http://evil\u{7}x\u{202e}y";
+    let expected = nasty.to_string();
+    r.fake.on(move |cmd, _| {
+        Ok(Value::object([
+            ("schema", Value::str(format!("fleet.{cmd}/1"))),
+            ("title", Value::str(nasty)),
+            (
+                "members",
+                Value::array([Value::object([
+                    ("summary", Value::str(nasty)),
+                    ("task", Value::str("fan1-1")),
+                ])]),
+            ),
+        ]))
+    });
+    for path in ["/api/groups", "/api/group?id=g", "/api/group/compare?id=g"] {
+        let resp = r.get_bearer(path);
+        assert_eq!(resp.status, 200, "{path}");
+        for c in ['<', '>', '&', '\u{1b}', '\u{202e}', '\u{7}'] {
+            assert!(!resp.body.contains(c), "{path}: raw {c:?}");
+        }
+        let doc = parse(&resp.body);
+        assert_eq!(
+            doc.get("title").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+    }
+}
+
+#[test]
 fn text_sent_to_a_worker_may_not_carry_terminal_control_characters() {
     let r = Running::start();
     // what a pasted escape sequence, a carriage return or a bidi override could do to a terminal

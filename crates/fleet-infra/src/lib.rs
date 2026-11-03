@@ -20,6 +20,7 @@ pub mod forge_gh;
 pub mod forge_jobs;
 pub mod fsx;
 pub mod git;
+mod git_diff;
 pub mod jobs;
 pub mod json;
 pub mod knowledge;

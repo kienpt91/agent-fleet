@@ -16,6 +16,7 @@ use fleet_domain::repo::tree::{EntryKind, ModeClass, TreeEntry};
 use fleet_domain::repo::RepoPath;
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
 use fleet_domain::value::Value;
+use fleet_fanout::diff::DiffStat;
 use neo_context::input::Fact;
 use neo_verify::contract::{ContractId, VerificationContract};
 use neo_verify::judge::CheckReport;
@@ -170,6 +171,11 @@ pub trait Vcs: Send {
     /// git directory says; a worktree that does not belong to the repository, or is not on its
     /// task's branch, is refused.
     fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState>;
+    /// What `head` changes relative to `base` (`git diff base head`: files, lines inserted and
+    /// deleted, renames detected), read from the repository itself and never through a worktree,
+    /// so a branch that was deleted or a worktree that was removed still has its numbers while
+    /// the commits exist. Binary files are listed without line counts.
+    fn diff_summary(&self, repo: &str, base: &Sha, head: &Sha) -> Result<DiffStat>;
     /// The regular files of `commit` as the repository itself has them (never through a worktree),
     /// in path order, at most `max` of them. Symbolic links and submodules are not listed.
     fn tree_files(&self, repo: &str, commit: &Sha, max: usize) -> Result<TreeListing>;

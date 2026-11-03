@@ -13,7 +13,7 @@ use neo_verify::contract::VerificationContract;
 
 impl Orchestrator {
     /// Validates a contract document and gives it its id (the SHA-256 of its canonical text).
-    fn attached_contract(&self, doc: &Document) -> Result<AttachedContract> {
+    pub(crate) fn attached_contract(&self, doc: &Document) -> Result<AttachedContract> {
         let contract = VerificationContract::from_value(&doc.0)
             .map_err(|e| FleetError::invalid(format!("invalid verification contract: {e}")))?;
         // The contract text is stored in the audit log and shown by `fleet goals show`: a secret

@@ -152,6 +152,8 @@ pub struct AppConfig {
     pub redactor: Arc<Redactor>,
     /// The `[github]` section: the forge integration (off by default).
     pub forge: ForgeConfig,
+    /// The criteria `fleet compare` ranks fan-out members by when the request names none.
+    pub compare_rank: fleet_fanout::rank::RankRule,
 }
 
 impl AppConfig {
@@ -180,6 +182,7 @@ impl AppConfig {
             images: ImageLimits::default(),
             redactor: Arc::new(redactor),
             forge: ForgeConfig::disabled(),
+            compare_rank: fleet_fanout::rank::RankRule::default(),
         }
     }
 

@@ -6,6 +6,7 @@ members = [
   "crates/neo-goals",
   "crates/neo-context",
   "crates/fleet-forge",
+  "crates/fleet-fanout",
   "crates/fleet-app",
   "crates/fleet-infra",
   "crates/fleet-cli",

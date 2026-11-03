@@ -1,0 +1,4 @@
+{"version": 1, "checks": [
+  {"id": "answer", "kind": "file", "path": "src/answer.txt", "assert": "contains", "value": "ready"},
+  {"id": "scope", "kind": "diff", "allow": ["src/**"]}
+]}

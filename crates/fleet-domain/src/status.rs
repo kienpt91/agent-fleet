@@ -151,6 +151,24 @@ string_enum!(
     }
 );
 
+string_enum!(
+    /// How the task of a fan-out member ended.
+    MemberOutcome {
+        Completed => "completed",
+        Failed => "failed",
+    }
+);
+
+string_enum!(
+    /// Why a fan-out group was closed.
+    CloseReason {
+        /// A winner was picked and merged, and every member's worktree was cleaned up.
+        Resolved => "resolved",
+        /// Every member ended and none completed: there is nothing to pick.
+        NoCompletion => "no_completion",
+    }
+);
+
 impl TaskStatus {
     /// Statuses a task never leaves without an operator or a dependency change.
     pub fn is_terminal(self) -> bool {
@@ -200,5 +218,17 @@ mod tests {
     fn only_completed_and_failed_are_terminal() {
         let terminal: Vec<_> = TaskStatus::ALL.iter().filter(|s| s.is_terminal()).collect();
         assert_eq!(terminal, vec![&TaskStatus::Completed, &TaskStatus::Failed]);
+    }
+
+    #[test]
+    fn group_vocabularies_round_trip() {
+        for o in MemberOutcome::ALL {
+            assert_eq!(MemberOutcome::parse(o.as_str()), Some(*o));
+            assert_eq!(MemberOutcome::from_value(&o.to_value()), Some(*o));
+        }
+        for r in CloseReason::ALL {
+            assert_eq!(CloseReason::parse(r.as_str()), Some(*r));
+        }
+        assert_eq!(MemberOutcome::parse("superseded"), None);
     }
 }

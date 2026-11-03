@@ -72,6 +72,8 @@ struct Inner {
     now_ms: u64,
     events: Vec<StoredEvent>,
     fail_append: bool,
+    /// Appends that still succeed before the store starts failing (a crash between two commits).
+    appends_left: Option<usize>,
     published: Vec<StoredEvent>,
 
     base_sha: Option<Sha>,
@@ -88,6 +90,10 @@ struct Inner {
     removed: Vec<(String, bool)>,
     merged_branches: BTreeSet<String>,
     sha_counter: u64,
+    /// What `diff_summary` answers for a head commit (an empty change when none was set).
+    diffs: BTreeMap<String, fleet_fanout::diff::DiffStat>,
+    diff_failures: BTreeSet<String>,
+    diff_calls: usize,
 
     sessions: BTreeMap<u64, FakeSession>,
     next_session: u64,
@@ -191,7 +197,14 @@ impl World {
         self.lock().published.clone()
     }
     pub fn fail_appends(&self, fail: bool) {
-        self.lock().fail_append = fail;
+        let mut g = self.lock();
+        g.fail_append = fail;
+        g.appends_left = None;
+    }
+    /// Lets `n` more appends succeed, then makes every append fail until `fail_appends(false)`:
+    /// the daemon dying between two commits of one use case.
+    pub fn fail_appends_after(&self, n: usize) {
+        self.lock().appends_left = Some(n);
     }
 
     // ---- vcs ----
@@ -399,6 +412,18 @@ impl World {
     pub fn set_commit_tree(&self, tree: Option<Sha>) {
         self.lock().commit_tree = tree;
     }
+    /// What the fake repository says commit `head` changes relative to the base.
+    pub fn set_diff(&self, head: &Sha, stat: fleet_fanout::diff::DiffStat) {
+        self.lock().diffs.insert(head.to_string(), stat);
+    }
+    /// Makes `diff_summary` fail for `head` (the commit cannot be read).
+    pub fn fail_diff(&self, head: &Sha) {
+        self.lock().diff_failures.insert(head.to_string());
+    }
+    /// How many times `diff_summary` was asked.
+    pub fn diff_calls(&self) -> usize {
+        self.lock().diff_calls
+    }
 
     /// The paths the fake worktrees report as changed (for diff constraints).
     pub fn set_worktree_changes(&self, paths: &[&str], truncated: bool) {
@@ -562,6 +587,14 @@ pub struct MemoryEventStore(World);
 impl EventStore for MemoryEventStore {
     fn append(&mut self, ts_ms: u64, events: &[DomainEvent]) -> Result<u64> {
         let mut g = self.0.lock();
+        if let Some(left) = g.appends_left {
+            if left == 0 {
+                g.fail_append = true;
+                g.appends_left = None;
+            } else {
+                g.appends_left = Some(left - 1);
+            }
+        }
         if g.fail_append {
             return Err(FleetError::internal("the store is unavailable"));
         }
@@ -756,6 +789,22 @@ impl Vcs for FakeVcs {
             truncated: g.worktree_truncated,
             dirty: g.worktree_dirty,
         })
+    }
+
+    fn diff_summary(
+        &self,
+        _repo: &str,
+        _base: &Sha,
+        head: &Sha,
+    ) -> Result<fleet_fanout::diff::DiffStat> {
+        let mut g = self.0.lock();
+        g.diff_calls += 1;
+        if g.diff_failures.contains(head.as_str()) {
+            return Err(FleetError::not_found(format!(
+                "commit {head} does not exist in the repository"
+            )));
+        }
+        Ok(g.diffs.get(head.as_str()).cloned().unwrap_or_default())
     }
 
     fn tree_files(&self, _repo: &str, commit: &Sha, max: usize) -> Result<TreeListing> {

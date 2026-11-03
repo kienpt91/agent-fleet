@@ -61,10 +61,11 @@ use fleet_domain::contract::{
 use fleet_domain::error::{ErrorCode, FleetError};
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{
-    ApprovalId, DecisionId, EvidenceId, GoalId, RunId, Sha, TaskId, WorkerName,
+    ApprovalId, DecisionId, EvidenceId, GoalId, GroupId, RunId, Sha, TaskId, WorkerName,
 };
 use fleet_domain::status::{
-    BlockKind, ContextMode, DecisionKind, EndKind, GoalStatus, Purpose, Verdict,
+    BlockKind, CloseReason, ContextMode, DecisionKind, EndKind, GoalStatus, MemberOutcome, Purpose,
+    Verdict,
 };
 use fleet_domain::value::{Document, Value};
 use std::fmt::Debug;
@@ -341,6 +342,30 @@ fn sample_events() -> Vec<DomainEvent> {
                 ("schema", Value::str("neo-handoff/1")),
                 ("summary", Value::str(tricky)),
             ])),
+        },
+        DomainEvent::GroupCreated {
+            group: GroupId::parse("fan1").unwrap(),
+            run: run.clone(),
+            title: tricky.into(),
+            members: vec![t1.clone(), t2.clone()],
+            goal: Some(GoalId::parse("fanout-fan1").unwrap()),
+            contract_id: Some("ab".repeat(32)),
+        },
+        DomainEvent::MemberFinished {
+            group: GroupId::parse("fan1").unwrap(),
+            task: t1.clone(),
+            outcome: MemberOutcome::Completed,
+        },
+        DomainEvent::WinnerPicked {
+            group: GroupId::parse("fan1").unwrap(),
+            task: t1.clone(),
+            merge_sha: sha(&"d".repeat(40)),
+            verification: tricky.into(),
+            superseded: vec![t2.clone()],
+        },
+        DomainEvent::GroupClosed {
+            group: GroupId::parse("fan1").unwrap(),
+            reason: CloseReason::NoCompletion,
         },
         DomainEvent::EvidenceRecorded {
             id: EvidenceId::from_seq(1),

@@ -1,8 +1,13 @@
 //! Domain events: the facts the system records. State is rebuilt by applying them in order, and
 //! the audit log is their serialized form, so the field names here are a stable format.
 
-use crate::ids::{ApprovalId, DecisionId, EvidenceId, GoalId, RunId, Sha, TaskId, WorkerName};
-use crate::status::{BlockKind, ContextMode, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
+use crate::ids::{
+    ApprovalId, DecisionId, EvidenceId, GoalId, GroupId, RunId, Sha, TaskId, WorkerName,
+};
+use crate::status::{
+    BlockKind, CloseReason, ContextMode, DecisionKind, EndKind, GoalStatus, MemberOutcome, Purpose,
+    Verdict,
+};
 use crate::value::{Document, Field, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -189,6 +194,23 @@ define_events! {
     },
     /// The publication did not complete, or its outcome is unknown (the daemon stopped meanwhile).
     PullRequestFailed = "pull_request_failed" { id: ApprovalId, run: RunId, task: TaskId, reason: String },
+    /// One prompt was given to several agents. `members` are the sibling tasks (same spec, one
+    /// worktree and branch each), `goal` and `contract_id` name the goal that carries their shared
+    /// verification contract when there is one.
+    GroupCreated = "group_created" {
+        group: GroupId, run: RunId, title: String, members: Vec<TaskId>, goal: Option<GoalId>,
+        contract_id: Option<String>,
+    },
+    /// A member's task ended (completed or failed); recorded again when a failed one is retried
+    /// and ends again.
+    MemberFinished = "member_finished" { group: GroupId, task: TaskId, outcome: MemberOutcome },
+    /// The operator picked `task`: its branch was merged as `merge_sha` after the approval of the
+    /// exact action. `verification` says how its evidence stood (`verified` or `unverified`);
+    /// every other member is `superseded`.
+    WinnerPicked = "winner_picked" {
+        group: GroupId, task: TaskId, merge_sha: Sha, verification: String, superseded: Vec<TaskId>,
+    },
+    GroupClosed = "group_closed" { group: GroupId, reason: CloseReason },
 }
 
 impl DomainEvent {
@@ -238,6 +260,10 @@ impl DomainEvent {
             | GoalAdded { .. }
             | GoalStatusChanged { .. }
             | CriteriaAttached { .. }
+            | GroupCreated { .. }
+            | MemberFinished { .. }
+            | WinnerPicked { .. }
+            | GroupClosed { .. }
             | Warning { .. } => None,
         }
     }
@@ -273,7 +299,9 @@ impl DomainEvent {
             | IssueLinked { task, .. }
             | PullRequestStarted { task, .. }
             | PullRequestOpened { task, .. }
-            | PullRequestFailed { task, .. } => Some(task),
+            | PullRequestFailed { task, .. }
+            | MemberFinished { task, .. }
+            | WinnerPicked { task, .. } => Some(task),
             DaemonStarted { .. }
             | RunCreated { .. }
             | RunStarted { .. }
@@ -288,6 +316,8 @@ impl DomainEvent {
             | GoalStatusChanged { .. }
             | CriteriaAttached { .. }
             | ForgeRepoRecorded { .. }
+            | GroupCreated { .. }
+            | GroupClosed { .. }
             | Warning { .. } => None,
         }
     }
@@ -407,6 +437,14 @@ impl DomainEvent {
                 format!("{run}/{task} pull request #{number} opened")
             }
             PullRequestFailed { run, task, .. } => format!("{run}/{task} pull request failed"),
+            GroupCreated { group, run, .. } => format!("fan-out {group} created in run {run}"),
+            MemberFinished {
+                group,
+                task,
+                outcome,
+            } => format!("fan-out {group}: {task} {outcome}"),
+            WinnerPicked { group, task, .. } => format!("fan-out {group}: {task} picked"),
+            GroupClosed { group, reason } => format!("fan-out {group} closed ({reason})"),
         }
     }
 }
@@ -535,6 +573,30 @@ mod tests {
                 trigger: "retry".into(),
                 digest: "ef".repeat(32),
                 packet: Document(Value::object([("schema", Value::str("neo-handoff/1"))])),
+            },
+            DomainEvent::GroupCreated {
+                group: GroupId::parse("fan1").unwrap(),
+                run: run(),
+                title: "compare\nthem".into(),
+                members: vec![task(), TaskId::parse("t2").unwrap()],
+                goal: Some(GoalId::parse("fanout-fan1").unwrap()),
+                contract_id: Some("ab".repeat(32)),
+            },
+            DomainEvent::MemberFinished {
+                group: GroupId::parse("fan1").unwrap(),
+                task: task(),
+                outcome: MemberOutcome::Failed,
+            },
+            DomainEvent::WinnerPicked {
+                group: GroupId::parse("fan1").unwrap(),
+                task: task(),
+                merge_sha: Sha::parse(&"a".repeat(40)).unwrap(),
+                verification: "unverified".into(),
+                superseded: vec![TaskId::parse("t2").unwrap()],
+            },
+            DomainEvent::GroupClosed {
+                group: GroupId::parse("fan1").unwrap(),
+                reason: CloseReason::Resolved,
             },
             DomainEvent::Warning {
                 message: "w".into(),

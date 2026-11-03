@@ -990,3 +990,47 @@ a.rlink {
     max-height: 70vh;
   }
 }
+
+/* ------------------------------------------------------ fan-out groups */
+
+.fx-running {
+  --st: #1565c0;
+}
+
+.fx-finished,
+.fx-completed,
+.fx-decided,
+.fx-winner,
+.fx-verified {
+  --st: #2e7d32;
+}
+
+.fx-closed,
+.fx-superseded,
+.fx-unknown {
+  --st: #5b6573;
+}
+
+.fx-unverified {
+  --st: #8a5a00;
+}
+
+.fx-failed {
+  --st: #b3261e;
+}
+
+.fxline {
+  margin: 4px 0;
+}
+
+.fxdetail {
+  margin: 6px 0;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.fxbad {
+  color: var(--bad-line);
+}

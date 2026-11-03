@@ -650,6 +650,11 @@ pub const WEB_COMMANDS: &[&str] = &[
     "forge.status",
     "forge.snapshot",
     "forge.links",
+    // fan-out groups, read only: `group.fanout` (creates tasks) and `group.pick` (merges) stay on
+    // the control socket
+    "group.list",
+    "group.show",
+    "group.compare",
 ];
 
 /// The dashboard's view of the daemon: the same handler as the control socket, restricted to
@@ -802,6 +807,9 @@ mod tests {
             ("goal.show", args(&[("goal", "g")])),
             ("goal.remaining", args(&[])),
             ("verify.status", args(&[("target", "r1/a")])),
+            ("group.list", args(&[])),
+            ("group.show", args(&[("group", "fan1")])),
+            ("group.compare", args(&[("group", "fan1")])),
         ] {
             assert!(WEB_COMMANDS.contains(&cmd), "{cmd}");
             let parsed = parse_command(cmd, &a).unwrap();
@@ -810,12 +818,15 @@ mod tests {
                 "{cmd} changes nothing"
             );
         }
-        // everything that changes the ledger, starts a process or controls the daemon stays on the socket
+        // everything that changes the ledger, starts a process, creates or merges a group's work
+        // or controls the daemon stays on the socket
         for cmd in [
             "goal.add",
             "goal.attach",
             "goal.status",
             "verify",
+            "group.fanout",
+            "group.pick",
             "run.create",
             "task.add",
             "plan.load",
@@ -838,6 +849,7 @@ mod tests {
                     "task.send" | "gate.resolve" | "approval.decide" | "merge"
                 ) || cmd.starts_with("goal.")
                     || cmd.starts_with("repo.")
+                    || cmd.starts_with("group.")
                     || matches!(
                         *cmd,
                         "status"
@@ -850,6 +862,12 @@ mod tests {
                     ),
                 "{cmd}"
             );
+        }
+        // the group commands on the list change nothing, whatever they are called
+        for cmd in WEB_COMMANDS.iter().filter(|c| c.starts_with("group.")) {
+            let a = args(&[("group", "fan1")]);
+            let parsed = parse_command(cmd, &a).unwrap();
+            assert!(fleet_app::api::is_read_only(&parsed), "{cmd}");
         }
     }
 

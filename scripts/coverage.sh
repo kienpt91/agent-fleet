@@ -46,7 +46,7 @@ awk '
     if ((cmd | getline hit) > 0) { split(hit, parts, ":"); cutoff = parts[1] }
     close(cmd)
     crate = "other"
-    if (file ~ /crates\/(fleet-domain|neo-verify|neo-goals|neo-context|fleet-forge)\//) crate = "domain"
+    if (file ~ /crates\/(fleet-domain|neo-verify|neo-goals|neo-context|fleet-forge|fleet-fanout)\//) crate = "domain"
     else if (file ~ /crates\/fleet-app\//) crate = "application"
     else if (file ~ /crates\/fleet-infra\//) crate = "infrastructure"
     else if (file ~ /crates\/fleet-cli\//) crate = "cli"

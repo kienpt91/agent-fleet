@@ -13,7 +13,7 @@ use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::{show, WorkerName};
 use fleet_domain::limits::{
-    DEFAULT_RING_BYTES, MAX_CONFIG_FILE, MAX_PLAN_FILE, MAX_REDACT_RULES, MAX_RING_BYTES,
+    DEFAULT_RING_BYTES, MAX_CONFIG_FILE, MAX_PLAN_FILE, MAX_REDACT_RULES, MAX_RING_BYTES, MAX_SPEC,
     MAX_TOTAL_TASKS,
 };
 use fleet_domain::quality::GateFormat;
@@ -59,6 +59,7 @@ struct FileConfig {
     web: WebSection,
     gates: Vec<GateSection>,
     github: GithubSection,
+    compare: CompareSection,
 }
 
 /// `[web]`. The values are read as TOML values so that every error names the key.
@@ -79,6 +80,13 @@ fn web_limit(key: &str, v: &Option<toml::Value>, max: u64) -> Result<Option<u64>
         Ok(n) if (1..=max).contains(&n) => Ok(Some(n)),
         _ => Err(invalid(format!("web.{key} must be between 1 and {max}"))),
     }
+}
+
+/// `[compare]`: how `fleet compare` orders fan-out members unless asked otherwise.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct CompareSection {
+    rank: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -342,6 +350,12 @@ fn parse_config(text: &str, parent_env: Vec<(String, String)>) -> Result<LoadedC
 
 fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<LoadedConfig> {
     let mut app = AppConfig::new(parent_env.clone());
+
+    if let Some(names) = &file.compare.rank {
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        app.compare_rank = fleet_fanout::rank::RankRule::parse(&names)
+            .map_err(|e| invalid(format!("compare.rank: {}", e.message)))?;
+    }
 
     let d = file.daemon;
     if let Some(n) = d.max_sessions {
@@ -713,6 +727,15 @@ pub fn load_contract(path: &Path) -> Result<Value> {
     Ok(doc)
 }
 
+/// Reads the prompt of a fan-out from a file (`--spec-file`): a regular file of at most
+/// [`MAX_SPEC`] bytes, UTF-8 text. Links and special files are refused before a byte is read.
+pub fn load_spec(path: &Path) -> Result<String> {
+    let bytes =
+        read_regular(path, MAX_SPEC as u64).map_err(|e| read_error("the spec file", path, &e))?;
+    String::from_utf8(bytes)
+        .map_err(|_| invalid(format!("{}: the spec is not valid UTF-8", shown_path(path))))
+}
+
 fn toml_to_value(v: &toml::Value, depth: usize) -> Result<Value> {
     if depth > MAX_PLAN_DEPTH {
         return Err(invalid("the plan is nested too deeply"));
@@ -868,6 +891,58 @@ mod tests {
         assert!(load_contract(&link).is_err(), "a symlink is refused");
         let missing = load_contract(&dir.join("nope.json")).unwrap_err();
         assert!(!missing.message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn spec_files_are_read_as_bounded_regular_utf8_text() {
+        let dir = TempDir::new("spec-file");
+        let good = dir.write(
+            "prompt.md",
+            "Make the parser reject trailing commas.\n\nKeep the error text.\n",
+        );
+        assert_eq!(
+            load_spec(&good).unwrap(),
+            "Make the parser reject trailing commas.\n\nKeep the error text.\n"
+        );
+        let big = dir.write("big.md", &"x".repeat(MAX_SPEC + 1));
+        assert_eq!(load_spec(&big).unwrap_err().code, ErrorCode::Limit);
+        let binary = dir.join("binary.md");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(load_spec(&binary).unwrap_err().code, ErrorCode::Invalid);
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert!(load_spec(&link).is_err(), "a symlink is refused");
+        assert!(load_spec(dir.path()).is_err(), "a directory is refused");
+        let missing = load_spec(&dir.join("nope\u{1b}.md")).unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
+        assert!(!missing.message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn the_ranking_criteria_are_configurable_and_validated_strictly() {
+        let default = parse("").unwrap().app.compare_rank;
+        assert_eq!(default, fleet_fanout::rank::RankRule::default());
+        let set = parse("[compare]\nrank = [\"diff\", \"verified\"]")
+            .unwrap()
+            .app
+            .compare_rank;
+        assert_eq!(set.formula(), "sort by (diff, verified), then by task id a-z; advisory only, nothing is merged or picked from it");
+        for bad in [
+            "[compare]\nrank = []",
+            "[compare]\nrank = [\"luck\"]",
+            "[compare]\nrank = [\"diff\", \"diff\"]",
+            "[compare]\nrank = \"diff\"",
+            "[compare]\nrank = [1]",
+            "[compare]\nweights = [1]",
+            "[compare]\nrank = [\"diff\"]\nauto_pick = true",
+        ] {
+            let err = parse(bad)
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {bad}"));
+            assert_eq!(err.code, ErrorCode::Invalid, "{bad}");
+        }
+        let err = parse("[compare]\nrank = [\"luck\"]").err().unwrap();
+        assert!(err.message.contains("compare.rank"), "{}", err.message);
     }
 
     fn env(items: &[(&str, &str)]) -> Vec<(String, String)> {

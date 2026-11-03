@@ -9,6 +9,11 @@ approval_ttl_secs = 900       # an approval expires if nobody uses it
 sensitive = ["merge", "external-command"]   # actions that always need an approval
 # ring_bytes = 262144         # output kept per session (hard cap 4 MiB)
 
+[compare]
+# Order of the criteria `fleet compare` ranks fan-out members by (advisory only; `--rank` overrides it for one call).
+# Known: completed, verified, in-scope, diff, time, attempts. Each at most once; ties fall to the task id.
+rank = ["completed", "verified", "in-scope", "diff", "time"]
+
 [env]
 # Variables workers, gates and git receive from the daemon's own environment. Nothing else is inherited.
 allow = ["PATH", "HOME", "USER", "LANG", "TERM"]

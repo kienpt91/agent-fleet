@@ -1,0 +1,20 @@
+[package]
+name = "fleet-fanout"
+description = "Fan-out groups of agent-fleet: one prompt given to several agents, the comparison of their results and the advisory ranking rule. Pure; depends on fleet-domain, neo-verify and std only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "fleet_fanout"
+path = "src/lib.rs"
+
+[dependencies]
+fleet-domain = { path = "../fleet-domain" }
+neo-verify = { path = "../neo-verify" }
+
+[lints]
+workspace = true

@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 fleet-domain = { path = "../fleet-domain" }
 fleet-app = { path = "../fleet-app" }
+fleet-fanout = { path = "../fleet-fanout" }
 fleet-forge = { path = "../fleet-forge" }
 neo-verify = { path = "../neo-verify" }
 neo-context = { path = "../neo-context" }
