@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-const ALL_SUBCOMMANDS: [&str; 32] = [
+const ALL_SUBCOMMANDS: [&str; 37] = [
     "daemon",
     "run create",
     "task add",
@@ -48,6 +48,11 @@ const ALL_SUBCOMMANDS: [&str; 32] = [
     "goals show",
     "goals remaining",
     "verify",
+    "context show",
+    "context diff",
+    "context verify",
+    "context explain",
+    "handoff",
 ];
 
 /// `PATH` without any directory that holds `tool`.
@@ -328,6 +333,7 @@ fn status_json_has_exactly_the_documented_keys() {
         [
             "base_ref",
             "base_sha",
+            "context",
             "counts",
             "id",
             "integration_branch",

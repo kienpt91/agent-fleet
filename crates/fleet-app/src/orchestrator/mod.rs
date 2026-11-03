@@ -13,7 +13,7 @@ mod reconcile;
 mod supervise;
 
 use crate::config::AppConfig;
-use crate::neo::{VerifyOutcome, Verifying};
+use crate::neo::{ContextState, VerifyOutcome, Verifying};
 use crate::ports::{Ports, SessionId, StoredEvent};
 use crate::views::Recent;
 use fleet_domain::error::Result;
@@ -52,6 +52,14 @@ pub struct Orchestrator {
     pub(crate) state: FleetState,
     /// The goal ledger, a projection of the same event log as `state`.
     pub(crate) ledger: Ledger,
+    /// What the context compiler remembers: handoffs and per-task event history, also rebuilt by
+    /// replay.
+    pub(crate) context: ContextState,
+    /// Summaries workers left in `.fleet/handoff.json`, kept (UNVERIFIED) until the handoff of
+    /// their attempt is made.
+    pub(crate) handoff_summaries: BTreeMap<Key, String>,
+    /// Ticks a task's next attempt has waited for the handoff of the last one.
+    pub(crate) handoff_waits: BTreeMap<Key, u32>,
     pub(crate) policy: Policy,
     pub(crate) live: BTreeMap<Key, Live>,
     /// Quality-gate jobs in flight: (run, task, attempt).
@@ -85,11 +93,13 @@ impl Orchestrator {
         cfg.validate()?;
         let mut state = FleetState::new();
         let mut ledger = Ledger::new();
+        let mut context = ContextState::default();
         let mut recent: VecDeque<Recent> = VecDeque::new();
         ports.store.replay(&mut |s: StoredEvent| {
             push_recent(&mut recent, s.seq, s.ts_ms, &s.event);
             state.apply(&s.event);
             ledger.apply_checked(&s.event, ports.digest.as_ref());
+            context.apply(s.seq, &s.event, ports.digest.as_ref());
             Ok(())
         })?;
         let policy = Policy {
@@ -106,6 +116,9 @@ impl Orchestrator {
             ports,
             state,
             ledger,
+            context,
+            handoff_summaries: BTreeMap::new(),
+            handoff_waits: BTreeMap::new(),
             policy,
             live: BTreeMap::new(),
             gate_jobs: BTreeSet::new(),
@@ -174,11 +187,24 @@ impl Orchestrator {
         let first = last.saturating_add(1).saturating_sub(count);
         let mut stored = Vec::with_capacity(events.len());
         let mut committed_task = false;
+        let handoff_events: Vec<DomainEvent> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    DomainEvent::TaskCompleted { .. }
+                        | DomainEvent::TaskFailed { .. }
+                        | DomainEvent::RetryQueued { .. }
+                )
+            })
+            .cloned()
+            .collect();
         for (i, event) in events.into_iter().enumerate() {
             let seq = first.saturating_add(i as u64);
             self.state.apply(&event);
             self.ledger
                 .apply_checked(&event, self.ports.digest.as_ref());
+            self.context.apply(seq, &event, self.ports.digest.as_ref());
             committed_task |= matches!(event, DomainEvent::TaskCommitted { .. });
             push_recent(&mut self.recent, seq, ts, &event);
             stored.push(StoredEvent {
@@ -193,6 +219,9 @@ impl Orchestrator {
             // commit is not verified any more.
             let settle = self.ledger.resettle();
             self.commit(settle)?;
+        }
+        if !handoff_events.is_empty() {
+            self.handoffs_for(&handoff_events);
         }
         Ok(())
     }

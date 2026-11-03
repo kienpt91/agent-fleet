@@ -24,8 +24,8 @@ layer() {
   printf '%s\n' "$out" | grep -E '^test result' | awk -v n="$name" '{p+=$4; f+=$6} END {printf "%s: %d passed, %d failed\n", n, p, f}'
 }
 
-layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals
+layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals -p neo-context
 layer application  cargo test $OPTS -p fleet-app --features testing
-layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test web_http --test origin
+layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test web_http --test origin --test golden_pack
 layer soak         cargo test $OPTS -p fleet-infra --test soak
 layer end-to-end   cargo test $OPTS -p fleet-cli

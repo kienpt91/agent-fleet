@@ -834,7 +834,7 @@ side, changed words marked, context 0/3/10/25, fold of unchanged context, `j`/`k
 Explorer of the task, and every pane shows the task's `UNVERIFIED`/`dirty` badge like the evidence views do. Everything it
 shows is read from the **real repository at a commit the daemon recorded for the task** (`head`, `base`, or a recorded
 id), never from the worktree a worker can write to ([ADR 16](docs/adr/0016-evidence-is-about-the-repository-not-about-what-a-worktree-says.md),
-[ADR 17](docs/adr/0017-the-read-only-workbench-and-its-markdown-and-image-rules.md)). It adds no listener, no dependency and no write path.
+[ADR 19](docs/adr/0019-the-read-only-workbench-and-its-markdown-and-image-rules.md)). It adds no listener, no dependency and no write path.
 
 ![Explorer, file and diff panes in one layout: the explorer lists the head commit with a hostile file name shown escaped, the diff lists 16 files](docs/img/workbench-layout.png)
 ![A rename with an edit in the side-by-side diff: similarity 77 percent, the changed words marked](docs/img/workbench-split.png)
@@ -903,6 +903,220 @@ Memory (`e2e_web.rs::many_large_diffs_and_files_keep_memory_flat_and_every_cap_h
 a 400000-line file, 60 files of 2000 lines and a 3000-entry directory take the daemon from 22 MB to a plateau of 90 to 125 MB
 (a diff document of a few megabytes is built per read) and a second identical phase of 192 reads does not raise it (0 kB of growth).
 
+## NEO N2: compiled context packs and handoffs
+
+A run created with `context = "compiled"` (in the plan's `[run]` table, or `fleet run create --context compiled`) does not get
+the plain brief. Fleet compiles a **context pack** from its own state, in eight layers in a fixed order (invariants, charter,
+plan position, task and acceptance contract, verified knowledge, working set, recent events, scratch), each with a hard token
+budget, and writes it to `.fleet/context.md` (+ `.fleet/context.json`, the manifest). The pack is deterministic: the same inputs
+give the same bytes and the same SHA-256 digest. Text that agents wrote is only ever in layer 7, labelled `UNVERIFIED` and
+quoted. A **handoff packet** is made when a task ends, when it is retried, when the daemon finds it running after a crash, and on
+demand; the next pack is compiled from it. Design: [docs/neo.md](docs/neo.md), [ADR 17](docs/adr/0017-the-context-compiler-is-a-pure-deterministic-function.md),
+[ADR 18](docs/adr/0018-handoffs-are-made-before-the-next-attempt-and-rebuilt-after-a-crash.md).
+
+```
+fleet context show <task> [--digest <hex>] [--json]      fleet context diff <task> <digest1> <digest2> [--json]
+fleet context verify <task> [--json]  (exit 6 if it differs)   fleet context explain [<task>] [--profile <name>] [--json]
+fleet handoff <task> [--json]
+```
+
+What is tested: determinism (golden digests, two SHA-256 implementations), layer order, budgets and the shrink order,
+layers 1-5 free of agent-written text (layer 6 shows repository files at the base commit; which ones follows the worker's
+committed paths), labelled UNVERIFIED text in layer 7, delimiter and control-character attacks, secret rules (worst-case lines in
+linear time), stored packs re-hashed against the audit log (an edited, truncated, swapped or missing pack is `tampered`, exit
+11, no content), and crash re-briefing with identical layers 1-5 *for the same plan and ledger state* (they change when the
+plan or a check result does). What is not claimed: that a pack makes a model correct or reduces hallucination; token counts
+are estimates; the secret rules are a filter, not a guarantee. Not built yet: the knowledge store (N3), the token governor
+(N4), the credential broker (N5).
+
+Complete output of [`scripts/neo-n2-demo.sh`](scripts/neo-n2-demo.sh), run in a throwaway container with a fake HOME, a fake
+repository and the fake agent `examples/agents/n2-agent.sh` (its first attempt is wrong; its second reads layer 4 of its pack).
+Nothing is abridged; paths, commits and digests differ from run to run.
+
+```
+
+$ /target/release/fleet plan /tmp/tmp.2fJZMOFaV4/plan.toml
+plan loaded into run r1 (1 tasks)
+
+$ /target/release/fleet goals add --id feature --title The answer file says ready --intent answer.txt exists, says ready, and nothing else changed --task r1/answer --contract /work/examples/neo/contract.json
+goal feature added (open), contract dd2a18ee6128
+
+$ /target/release/fleet context explain r1/answer
+profile default: 32000 tokens at most, 4 characters per token, 125% safety margin
+estimator: tokens = ceil(bytes x 125% / (4 x 100)), counted over UTF-8 bytes
+policy: label
+knowledge file: none
+for task r1/answer
+  #  LAYER        SHARE  BUDGET  PURPOSE                                                                           WHEN TOO LARGE
+  1  invariants   12%    3840    rules that never change, and how to report; never truncated                       never cut
+  2  charter      15%    4800    project goal, constraints, glossary; cut only by section priority, last of all    never cut
+  3  plan         35%    11200   this task's place in the goal tree: done, remaining, dependencies; never cut      never cut
+  4  task         50%    16000   what to do and exactly how fleet will verify it; never cut                        never cut
+  5  knowledge    15%    4800    verified facts with their sources (static file until N3); dropped third           dropped when the pack is too large
+  6  working-set  35%    11200   bounded excerpts of the files the task touches, at a recorded commit; dropped s…  dropped when the pack is too large
+  7  events       15%    4800    recent events and everything agents wrote, labelled UNVERIFIED; dropped first     dropped when the pack is too large
+  8  scratch      5%     1600    the token budget that is left for the agent                                       never cut
+when the pack is too large, layers are shrunk in this order: 7, 6, 5, 2 (the first goes first)
+
+$ /target/release/fleet start --run r1
+run r1 started
+
+$ /target/release/fleet status
+daemon pid 20 | v0.1.0 | up 1s | sessions 0/2 | undo unavailable | rss 5000 kB
+
+run r1 [finished] max-parallel 2
+  objective  NEO N2 demo: answer.txt must say ready
+  repo       /tmp/tmp.2fJZMOFaV4/repo (base HEAD @ ab60c6a7)
+  branch     fleet/r1/integration
+  tasks      pending 0, ready 0, running 0, review 0, completed 1, failed 0, blocked 0
+  ID      STATUS     DEPS  TRY  WORKER  NOTE
+  answer  completed  -     2    -       done, every check passes
+
+recent
+  #23 r1/answer dispatched (attempt 2)
+  #24 r1/answer session exited
+  #25 r1/answer in review
+  #26 r1/answer committed
+  #27 evidence e4: goal feature check "answer" passed
+  #28 evidence e5: goal feature check "tests" passed
+  #29 evidence e6: goal feature check "scope" passed
+  #30 goal feature is verified
+  #31 r1/answer completed
+  #32 r1/answer handoff made (f65a5db7deba)
+
+$ fleet context show r1/answer --digest 9c8d7dad3552   # the retry's pack: header and layer table
+context pack of r1/answer
+digest:  9c8d7dad3552955f684054606a9f0f2ba40d75af7e358f6574b9ac58732c0b3d
+stable:  b3cb74eaa0f81e0bb65bbdcd0296c5773ecb23f6bbafe216961731318fdee10d
+profile: default
+tokens 2471 of 32000
+  #  LAYER        TOKENS     DIGEST            TRUST             ITEMS  NOTES
+  1  invariants   757/3840   61ddecdb95efe269  trusted           1      -
+  2  charter      352/4800   c0307217af848b85  trusted           3      -
+  3  plan         139/11200  838819fe960de432  trusted           4      -
+  4  task         337/16000  828d3b2e8f354bc6  trusted           3      -
+  5  knowledge    69/4800    cb09c64623bfba17  trusted           0      -
+  6  working-set  65/11200   3d3276a1dba71842  trusted           0      -
+  7  events       613/4800   83c3bd35e96ce957  contains-unveri…  20     -
+  8  scratch      121/1600   3257533030bf2eff  trusted           1      -
+
+$ ... layer 4 of the retry's pack (what to do, how it is checked, what fleet's own runs said)
+@@neo-layer 4 task trust=trusted bytes=00000913 tokens=0000337 sha256=828d3b2e8f354bc6a041a8f00d0ea6fcfde8691a7e9f4720e5445c492e8e1639
+## Task answer: Write the answer file
+  Create answer.txt with the single word ready.
+
+### How fleet will verify it
+Fleet runs these checks itself, on a clean export of the commit it records for your work, after you finish. Every mandatory check has to pass for the task to count as done; a statement that you finished does not.
+- goal feature, contract dd2a18ee6128:
+  - [mandatory] answer (file): answer.txt contains "ready"
+  - [mandatory] tests (command): /bin/sh -c test -s answer.txt (must exit with 0; at most 30 s)
+  - [mandatory] scope (diff): every path your commits change matches one of: answer.txt
+
+### State of those checks now (fleet's own runs)
+- goal feature check answer (mandatory): failed on commit b093ed60a637 (evidence e1)
+- goal feature check tests (mandatory): passed on commit b093ed60a637 (evidence e2)
+- goal feature check scope (mandatory): passed on commit b093ed60a637 (evidence e3)
+@@neo-end 4 828d3b2e8f354bc6
+
+$ ... layer 7 of the retry's pack (events, and everything agents wrote, labelled UNVERIFIED)
+@@neo-layer 7 events trust=contains-unverified bytes=00001782 tokens=0000613 sha256=83c3bd35e96ce957094931bdc1fa0b679adcb62956982f731fac9952bce868ff
+## Earlier attempts and decisions
+UNVERIFIED (fleet statements, operator answers and quoted worker output, mixed; a line starting with `> ` inside quotes the worker):
+> Attempt 1 failed: quality gate failed: verify feature/answer.
+> Quality gate 'verify feature/answer' failed: the file does not contain the text
+
+## Handoff
+Handoff b581c1a1e4ec from attempt 1 (retry): fleet recorded this state when that attempt ended.
+  layers 1 to 5 of its pack had the digest b3cb74eaa0f8
+  evidence pointers: e1, e2, e3
+UNVERIFIED (summary the worker attached to the handoff; fleet did not check it):
+> wrote a first answer, not sure it is right
+
+## Evidence of fleet's own runs (the verdicts are in layer 4; the output is whatever the checked code printed)
+UNVERIFIED (output of evidence e1: goal feature, check answer, verdict failed):
+> summary: the file does not contain the text
+> (no output)
+
+## Work already committed on this task's branch (written by the worker)
+UNVERIFIED (1 paths the worker's commits changed since the base commit):
+> - answer.txt
+UNVERIFIED (a file as the worker committed it):
+> ### answer.txt
+>   6 bytes, blob 8e933d077e0b, sha256 of the whole file shown 543df89fec85
+>     wrong
+
+## Recent events (fleet's own record, oldest first)
+- #3 r1/answer added
+- #4 r1/answer ready
+- #9 r1/answer dispatched (attempt 1)
+- #10 r1/answer session exited
+- #11 r1/answer in review
+- #12 r1/answer committed
+- #13 evidence e1: goal feature check "answer" failed
+- #14 evidence e2: goal feature check "tests" passed
+- #15 evidence e3: goal feature check "scope" passed
+- #16 r1/answer gate verify feature/answer failed
+- #17 r1/answer gate verify feature/tests passed
+- #18 r1/answer gate verify feature/scope passed
+- #19 r1/answer retry 1 queued
+- #20 r1/answer note added
+@@neo-end 7 83c3bd35e96ce957
+
+$ /target/release/fleet context diff r1/answer 7e9b640c0e8b 9c8d7dad3552
+context diff of r1/answer
+a: 7e9b640c0e8b4984e246397482014aa73a1ec10f3f657508373993e4ebdc27b4
+b: 9c8d7dad3552955f684054606a9f0f2ba40d75af7e358f6574b9ac58732c0b3d
+tokens 1910 -> 2471
+  #  LAYER        STATE    TOKENS (a -> b)  DIGEST
+  1  invariants   same     757 -> 757       61ddecdb95efe269
+  2  charter      same     352 -> 352       c0307217af848b85
+  3  plan         same     139 -> 139       838819fe960de432
+  4  task         CHANGED  307 -> 337       8709d613a2b319d2 -> 828d3b2e8f354bc6
+  5  knowledge    same     69 -> 69         cb09c64623bfba17
+  6  working-set  same     65 -> 65         3d3276a1dba71842
+  7  events       CHANGED  82 -> 613        1e72b3a0d857c9b3 -> 83c3bd35e96ce957
+  8  scratch      CHANGED  121 -> 121       9c0e94f3b0ed7b4f -> 3257533030bf2eff
+3 of 8 layers changed: 4 task, 7 events, 8 scratch
+
+$ /target/release/fleet context verify r1/answer   # the plan has moved since the last pack was made: exit status 6
+DIFFERS: the pack compiled now has the digest e78d218e9ba534f0b2029ecb727f5c9831380e49ea3b0aa2f81ed663dc695123, the stored pack 9c8d7dad3552955f684054606a9f0f2ba40d75af7e358f6574b9ac58732c0b3d
+  #  LAYER        STATE    TOKENS (stored -> now)  DIGEST
+  1  invariants   same     757 -> 757              61ddecdb95efe269
+  2  charter      same     352 -> 352              c0307217af848b85
+  3  plan         CHANGED  139 -> 140              838819fe960de432 -> b27cc80f7437ea1c
+  4  task         CHANGED  337 -> 337              828d3b2e8f354bc6 -> 5b66a24735f6212c
+  5  knowledge    same     69 -> 69                cb09c64623bfba17
+  6  working-set  same     65 -> 65                3d3276a1dba71842
+  7  events       CHANGED  613 -> 513              83c3bd35e96ce957 -> bc47c95de8dabf43
+  8  scratch      CHANGED  121 -> 121              3257533030bf2eff -> 3ecadda3c4b2402c
+4 of 8 layers changed: 3 plan, 4 task, 7 events, 8 scratch
+exit status 6
+
+$ /target/release/fleet handoff r1/answer
+Handoff of r1/answer, attempt 2, trigger on-demand
+digest: 3be5644c147a07868d25a6ea9e9b57a6a59e71d82a2a25f213a79a54b0c4c521
+pack: 258aafba4701abbb30b2651933a8fc0c797156a1d8ad909d66c0820a4ebb3676 (profile default)
+layers 1-5 digest: c384c37c085d2e0854895902a312cf53becd9a6414b6b55a990e3d58f1abd71d
+layers:
+  1 invariants      757 tokens  61ddecdb95efe269
+  2 charter         352 tokens  c0307217af848b85
+  3 plan            140 tokens  b27cc80f7437ea1c
+  4 task            337 tokens  5b66a24735f6212c
+  5 knowledge        69 tokens  cb09c64623bfba17
+  6 working-set      65 tokens  3d3276a1dba71842
+  7 events          609 tokens  679476437e4aee57
+  8 scratch         121 tokens  90e20bd67c48846d
+open verification state (fleet's own runs):
+  goal feature check answer (mandatory): passed on 59a4bed7fa0b (evidence e4)
+  goal feature check tests (mandatory): passed on 59a4bed7fa0b (evidence e5)
+  goal feature check scope (mandatory): passed on 59a4bed7fa0b (evidence e6)
+evidence pointers: e4, e5, e6
+no summary from the worker
+
+$ /target/release/fleet verify-log
+event log ok: 33 records, head 92f700735e5ab667bb827040fd01795ce101e41599812491c55ece2d9277014e
+```
+
 ## Architecture
 
 Domain-driven layers in a cargo workspace; the compiler enforces the dependency rule and an architecture test checks
@@ -913,7 +1127,8 @@ the manifests.
 | `fleet-domain` | pure rules: runs/tasks (aggregate), decision gates, approvals, quality judgement, supervision rules, sanitizer, redactor, output buffer, events, hash chain | `std` only |
 | `neo-verify` | NEO: verification contracts, checks, glob matcher, judging, evidence | `std`, `fleet-domain` |
 | `neo-goals` | NEO: the goal ledger aggregate and its status machine | `std`, `fleet-domain`, `neo-verify` |
-| `fleet-app` | use cases (`Orchestrator`, with a `neo` module for goals and verification), commands, read models, port traits, in-memory fakes and port contract suites | the three domain crates |
+| `neo-context` | NEO: the context pack compiler (eight layers, budgets, manifest, digests), the secret rules and handoff packets | `std`, `fleet-domain` |
+| `fleet-app` | use cases (`Orchestrator`, with a `neo` module for goals, verification, context packs and handoffs), commands, read models, port traits, in-memory fakes and port contract suites | the four domain crates |
 | `fleet-infra` | adapters: git, ptys, files, event log, job runner (gates, approved commands, verification contracts), sockets, TOML, the web dashboard (hand-written HTTP on `std::net`), daemon wiring | app, domain crates |
 | `fleet-cli` | the `fleet` binary: argument parsing, rendering, dashboard, attach | all |
 
@@ -935,6 +1150,15 @@ later phases, see [docs/parity.md](docs/parity.md).
 | Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake | 547 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
 | End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory) | 266 |
+1575 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`; the layered script `scripts/test-layers.sh` gives the same total):
+
+| Layer | What is tested | Tests |
+| --- | --- | --- |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); NEO N2: the context compiler (determinism and golden digests, layer order, budget and shrink-order laws, property tests with hostile text, delimiter and control-character attacks, the secret rules including worst-case lines in linear time, handoff packets) | 409 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); NEO N2: compiled context at dispatch, handoffs at task end, retry and crash recovery (including a crash between the end of an attempt and its handoff), tamper tests on stored packs, fact scoping and goal-order independence, plus the context-store contract suite | 331 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; NEO N2: the file context store, the knowledge file, `handoff.json` and `context.*` files, the three `Vcs` reads of the real repository, the golden digests with the real SHA-256 | 558 |
+| Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; NEO N2: compiled packs through the real binary, retry packs with failure evidence, forged context and handoff files, hostile titles, a killed daemon re-briefing with identical layers 1-5, a tampered stored pack (exit 11) | 276 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -954,6 +1178,11 @@ application          3132     2959    94.5%
 infrastructure       5974     5494    92.0%
 cli                  2705     2433    89.9%
 overall             19245    18165    94.4%
+domain               6853     6700    97.8%
+application          3783     3519    93.0%
+infrastructure       6128     5677    92.6%
+cli                  3013     2732    90.7%
+overall             19777    18628    94.2%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard

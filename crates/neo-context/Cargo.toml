@@ -1,0 +1,26 @@
+[package]
+name = "neo-context"
+description = "Context compiler of NEO: deterministic, budgeted context packs with a fixed layer order, a manifest and a digest, and handoff packets. Pure; depends on fleet-domain and std only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "neo_context"
+path = "src/lib.rs"
+
+[features]
+# A reference SHA-256 and fixtures, for the tests of this crate and of the layers above it.
+testing = []
+
+[dependencies]
+fleet-domain = { path = "../fleet-domain" }
+
+[dev-dependencies]
+neo-context = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true

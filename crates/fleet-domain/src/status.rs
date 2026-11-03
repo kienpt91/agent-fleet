@@ -139,6 +139,16 @@ string_enum!(
     }
 );
 
+string_enum!(
+    /// How a run's workers are briefed.
+    ContextMode {
+        /// The plain brief (the default; what every run did before context packs existed).
+        Off => "off",
+        /// A context pack compiled by NEO from the run's state, in a fixed layer order.
+        Compiled => "compiled",
+    }
+);
+
 impl TaskStatus {
     /// Statuses a task never leaves without an operator or a dependency change.
     pub fn is_terminal(self) -> bool {

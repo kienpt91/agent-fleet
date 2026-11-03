@@ -88,6 +88,7 @@ fn run_value(run: &Run, live: &BTreeSet<(RunId, TaskId)>) -> Value {
         ("base_sha", Value::str(run.base_sha.as_str())),
         ("status", Value::str(run_phase(run))),
         ("max_parallel", Value::int(run.max_parallel)),
+        ("context", Value::str(run.context.as_str())),
         ("integration_branch", Value::str(run.integration_branch())),
         (
             "counts",
@@ -221,6 +222,7 @@ mod tests {
                 base_ref: "main".into(),
                 base_sha: sha(),
                 max_parallel: 2,
+                context: fleet_domain::status::ContextMode::Off,
             })
             .unwrap();
         s.apply(&ev);
@@ -309,6 +311,7 @@ mod tests {
             vec![
                 "base_ref",
                 "base_sha",
+                "context",
                 "counts",
                 "id",
                 "integration_branch",
@@ -364,6 +367,7 @@ mod tests {
                 base_ref: "main".into(),
                 base_sha: sha(),
                 max_parallel: 1,
+                context: fleet_domain::status::ContextMode::Off,
             })
             .unwrap();
         s.apply(&ev);

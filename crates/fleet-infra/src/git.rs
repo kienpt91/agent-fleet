@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use crate::jobs::{JobTracker, Sweeper};
 use fleet_app::ports::{
-    BaseCommit, Identity, IntegrationMerge, IntegrationResult, MergeOutcome, Vcs, WorktreeState,
+    BaseCommit, Identity, IntegrationMerge, IntegrationResult, MergeOutcome, TreeFile, TreeListing,
+    Vcs, WorktreeState,
 };
 use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
@@ -39,6 +40,51 @@ mod read;
 
 /// Hard cap per captured stream of one git call.
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+
+/// Largest blob `read_blob` reads at all.
+const MAX_BLOB_READ: u64 = 1024 * 1024;
+
+/// The regular files of a `git ls-tree -r -z -l` listing (`<mode> <type> <object> <size>\t<path>`
+/// records): blobs of mode 100644 and 100755 only, paths that are valid UTF-8 only, at most `max`.
+fn parse_tree_listing(raw: &[u8], max: usize) -> Result<TreeListing> {
+    let mut listing = TreeListing::default();
+    for rec in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let Some(tab) = rec.iter().position(|b| *b == b'\t') else {
+            return Err(FleetError::internal(
+                "git listed a tree entry without a path",
+            ));
+        };
+        let (meta, path) = rec.split_at(tab);
+        let path = path.get(1..).unwrap_or_default();
+        let meta = String::from_utf8_lossy(meta);
+        let mut fields = meta.split_whitespace();
+        let (Some(mode), Some(kind), Some(object), Some(size)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(FleetError::internal("git listed an unreadable tree entry"));
+        };
+        if kind != "blob" || !(mode == "100644" || mode == "100755") {
+            continue;
+        }
+        let Ok(size) = size.parse::<u64>() else {
+            continue;
+        };
+        let Ok(path) = std::str::from_utf8(path) else {
+            continue;
+        };
+        if listing.files.len() >= max {
+            listing.truncated = true;
+            break;
+        }
+        listing.files.push(TreeFile {
+            path: path.to_string(),
+            size,
+            blob: Sha::parse(object)?,
+        });
+    }
+    Ok(listing)
+}
+
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long collecting the pipes may take after git itself exited (a straggler that escaped the
 /// process group could otherwise hold them open forever).
@@ -1588,6 +1634,78 @@ impl Vcs for GitVcs {
         self.real_tree_of(&dir, commit)
     }
 
+    fn tree_files(&self, repo: &str, commit: &Sha, max: usize) -> Result<TreeListing> {
+        let dir = self.open_repo(repo)?;
+        let out = self.run_ok(
+            &dir,
+            None,
+            &["ls-tree", "-r", "-z", "-l", "--full-tree", commit.as_str()],
+        )?;
+        parse_tree_listing(&out.stdout, max)
+    }
+
+    fn read_blob(&self, repo: &str, blob: &Sha, max: usize) -> Result<Vec<u8>> {
+        let dir = self.open_repo(repo)?;
+        let size = self.run(&dir, None, &["cat-file", "-s", blob.as_str()])?;
+        if !size.ok() {
+            return Err(FleetError::not_found(format!(
+                "object {} does not exist in the repository",
+                blob.as_str()
+            )));
+        }
+        let size: u64 = size
+            .text()
+            .trim()
+            .parse()
+            .map_err(|_| FleetError::internal("git reported an unreadable object size"))?;
+        if size > MAX_BLOB_READ {
+            return Err(FleetError::limit(format!(
+                "object {} is larger than {MAX_BLOB_READ} bytes",
+                blob.as_str()
+            )));
+        }
+        let out = self.run(&dir, None, &["cat-file", "blob", blob.as_str()])?;
+        if !out.ok() {
+            return Err(FleetError::not_found(format!(
+                "blob {} does not exist in the repository",
+                blob.as_str()
+            )));
+        }
+        let mut bytes = out.stdout;
+        bytes.truncate(max);
+        Ok(bytes)
+    }
+
+    fn changed_paths(
+        &self,
+        repo: &str,
+        base: &Sha,
+        head: &Sha,
+        max: usize,
+    ) -> Result<(Vec<String>, bool)> {
+        let dir = self.open_repo(repo)?;
+        let diff = self.run_ok(
+            &dir,
+            None,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-renames",
+                base.as_str(),
+                head.as_str(),
+                "--",
+            ],
+        )?;
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        for raw in diff.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            paths.insert(String::from_utf8_lossy(raw).into_owned());
+        }
+        let truncated = paths.len() > max;
+        Ok((paths.into_iter().take(max).collect(), truncated))
+    }
+
     fn merge_into_integration(&self, req: &IntegrationMerge) -> Result<IntegrationResult> {
         validate_identity(&req.identity)?;
         validate_fleet_branch(&req.integration_branch)?;
@@ -2213,6 +2331,219 @@ mod tests {
         fx.edit_and_commit(&wt, "naïve.txt", "x");
         let s = fx.vcs.worktree_state(&wt, &base).unwrap();
         assert_eq!(s.changed, ["naïve.txt", "odd name\twith tab.txt"]);
+    }
+
+    fn head_of(fx: &Fx) -> Sha {
+        Sha::parse(&git(&fx.repo, &["rev-parse", "HEAD"])).unwrap()
+    }
+
+    fn commit_files(fx: &Fx, files: &[(&str, &str)]) -> Sha {
+        for (name, content) in files {
+            let p = fx.repo.join(name);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(p, content).unwrap();
+        }
+        git(&fx.repo, &["add", "-A"]);
+        git(&fx.repo, &["commit", "-q", "-m", "more"]);
+        head_of(fx)
+    }
+
+    #[test]
+    fn tree_files_lists_regular_files_sorted_with_sizes_and_blobs() {
+        need_git!();
+        let fx = Fx::new();
+        let head = commit_files(&fx, &[("b/run.sh", "#!/bin/sh\n"), ("a.txt", "hello")]);
+        let list = fx.vcs.tree_files(fx.repo_s(), &head, 100).unwrap();
+        assert!(!list.truncated);
+        let paths: Vec<&str> = list.files.iter().map(|f| f.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted);
+        assert!(paths.contains(&"README.md") && paths.contains(&"src/lib.txt"));
+        let a = list.files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert_eq!(a.size, 5);
+        assert_eq!(a.blob.as_str(), git(&fx.repo, &["rev-parse", "HEAD:a.txt"]));
+        let run = list.files.iter().find(|f| f.path == "b/run.sh").unwrap();
+        assert_eq!(run.size, 10);
+    }
+
+    #[test]
+    fn tree_files_lists_executables_and_skips_symlinks_and_gitlinks() {
+        need_git!();
+        let fx = Fx::new();
+        std::os::unix::fs::symlink("README.md", fx.repo.join("link")).unwrap();
+        let script = fx.repo.join("tool.sh");
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        git(&fx.repo, &["add", "-A"]);
+        let gitlink = format!("160000,{},sub", "1".repeat(40));
+        git(
+            &fx.repo,
+            &["update-index", "--add", "--cacheinfo", &gitlink],
+        );
+        git(&fx.repo, &["commit", "-q", "-m", "special"]);
+        let head = head_of(&fx);
+        let list = fx.vcs.tree_files(fx.repo_s(), &head, 100).unwrap();
+        let paths: Vec<&str> = list.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"tool.sh"), "{paths:?}");
+        assert!(!paths.contains(&"link"), "{paths:?}");
+        assert!(!paths.contains(&"sub"), "{paths:?}");
+    }
+
+    #[test]
+    fn tree_files_reports_odd_names_verbatim() {
+        need_git!();
+        let fx = Fx::new();
+        let head = commit_files(
+            &fx,
+            &[
+                ("with space.txt", "x"),
+                ("new\nline.txt", "x"),
+                ("naïve/日本.txt", "x"),
+            ],
+        );
+        let list = fx.vcs.tree_files(fx.repo_s(), &head, 100).unwrap();
+        let paths: Vec<&str> = list.files.iter().map(|f| f.path.as_str()).collect();
+        for want in ["with space.txt", "new\nline.txt", "naïve/日本.txt"] {
+            assert!(paths.contains(&want), "{want:?} in {paths:?}");
+        }
+    }
+
+    #[test]
+    fn tree_files_truncates_at_max() {
+        need_git!();
+        let fx = Fx::new();
+        let head = commit_files(&fx, &[("a", "1"), ("b", "2"), ("c", "3")]);
+        let total = fx.vcs.tree_files(fx.repo_s(), &head, 100).unwrap();
+        let n = total.files.len();
+        assert!(n >= 5 && !total.truncated);
+        let exact = fx.vcs.tree_files(fx.repo_s(), &head, n).unwrap();
+        assert_eq!(exact.files.len(), n);
+        assert!(!exact.truncated);
+        let cut = fx.vcs.tree_files(fx.repo_s(), &head, 2).unwrap();
+        assert_eq!(cut.files, total.files[..2]);
+        assert!(cut.truncated);
+    }
+
+    #[test]
+    fn tree_files_of_an_unknown_commit_is_an_error() {
+        need_git!();
+        let fx = Fx::new();
+        let missing = Sha::parse(&"1".repeat(40)).unwrap();
+        assert!(fx.vcs.tree_files(fx.repo_s(), &missing, 10).is_err());
+    }
+
+    #[test]
+    fn parse_tree_listing_skips_what_is_not_a_plain_file() {
+        let sha = "a".repeat(40);
+        let mut raw = Vec::new();
+        for (meta, path) in [
+            (format!("100644 blob {sha}       3"), &b"ok.txt"[..]),
+            (format!("120000 blob {sha}       3"), b"link"),
+            (format!("160000 commit {sha}       -"), b"sub"),
+            (format!("100644 blob {sha}       3"), b"bad\xff.txt"),
+            (format!("100755 blob {sha}      12"), b"z.sh"),
+        ] {
+            raw.extend_from_slice(meta.as_bytes());
+            raw.push(b'\t');
+            raw.extend_from_slice(path);
+            raw.push(0);
+        }
+        let list = parse_tree_listing(&raw, 10).unwrap();
+        let got: Vec<(&str, u64)> = list
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.size))
+            .collect();
+        assert_eq!(got, [("ok.txt", 3), ("z.sh", 12)]);
+        assert!(!list.truncated);
+        assert!(parse_tree_listing(b"garbage", 10).is_err());
+    }
+
+    #[test]
+    fn read_blob_returns_truncates_and_refuses() {
+        need_git!();
+        let fx = Fx::new();
+        let big = "x".repeat(1024 * 1024 + 1);
+        let head = commit_files(&fx, &[("small.txt", "0123456789"), ("big.txt", &big)]);
+        let list = fx.vcs.tree_files(fx.repo_s(), &head, 100).unwrap();
+        let blob_of = |name: &str| {
+            list.files
+                .iter()
+                .find(|f| f.path == name)
+                .unwrap()
+                .blob
+                .clone()
+        };
+        let small = blob_of("small.txt");
+        assert_eq!(
+            fx.vcs.read_blob(fx.repo_s(), &small, 100).unwrap(),
+            b"0123456789"
+        );
+        assert_eq!(fx.vcs.read_blob(fx.repo_s(), &small, 4).unwrap(), b"0123");
+        let err = fx
+            .vcs
+            .read_blob(fx.repo_s(), &blob_of("big.txt"), 10)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Limit, "{err:?}");
+        let missing = Sha::parse(&"1".repeat(40)).unwrap();
+        let err = fx.vcs.read_blob(fx.repo_s(), &missing, 10).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound, "{err:?}");
+    }
+
+    #[test]
+    fn changed_paths_lists_added_modified_and_deleted_sorted() {
+        need_git!();
+        let fx = Fx::new();
+        let base = head_of(&fx);
+        fs::write(fx.repo.join("README.md"), "changed\n").unwrap();
+        fs::remove_file(fx.repo.join("src/lib.txt")).unwrap();
+        let head = commit_files(&fx, &[("z new.txt", "1"), ("a/new.txt", "2")]);
+        let (paths, truncated) = fx
+            .vcs
+            .changed_paths(fx.repo_s(), &base, &head, 100)
+            .unwrap();
+        assert_eq!(
+            paths,
+            ["README.md", "a/new.txt", "src/lib.txt", "z new.txt"]
+        );
+        assert!(!truncated);
+        let (cut, truncated) = fx.vcs.changed_paths(fx.repo_s(), &base, &head, 2).unwrap();
+        assert_eq!(cut, ["README.md", "a/new.txt"]);
+        assert!(truncated);
+        let (none, truncated) = fx
+            .vcs
+            .changed_paths(fx.repo_s(), &head, &head, 100)
+            .unwrap();
+        assert!(none.is_empty() && !truncated);
+    }
+
+    #[test]
+    fn context_reads_describe_the_repository_even_when_a_worktree_is_forged() {
+        need_git!();
+        let fx = Fx::new();
+        let base = fx.base();
+        let wt = fx.prepare("r1", "t1");
+        let work = fx.edit_and_commit(&wt, "work.txt", "real work\n");
+        let f = forge(&fx, &wt, "fleet/r1/t1");
+        let list = fx.vcs.tree_files(fx.repo_s(), &work, 100).unwrap();
+        let paths: Vec<&str> = list.files.iter().map(|x| x.path.as_str()).collect();
+        assert!(paths.contains(&"work.txt") && !paths.contains(&"forged.txt"));
+        let blob = list.files.iter().find(|x| x.path == "work.txt").unwrap();
+        assert_eq!(
+            fx.vcs.read_blob(fx.repo_s(), &blob.blob, 100).unwrap(),
+            b"real work\n"
+        );
+        let (changed, _) = fx
+            .vcs
+            .changed_paths(fx.repo_s(), &base, &work, 100)
+            .unwrap();
+        assert_eq!(changed, ["work.txt"]);
+        // a worktree is not a repository for these calls
+        assert!(fx.vcs.tree_files(&wt, &work, 10).is_err());
+        let _ = f.gitdir;
     }
 
     #[test]

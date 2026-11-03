@@ -1,7 +1,7 @@
-# NEO, milestone N1: the goal ledger and verification contracts
+# NEO: milestone N1 (the goal ledger and verification contracts) and milestone N2 (context packs and handoffs, below)
 
-NEO is the planned cognition and governance layer of agent-fleet. **Only milestone N1 exists.** This page says what
-it does, how to use it and, as important, what is not there.
+NEO is the planned cognition and governance layer of agent-fleet. **Milestones N1 and N2 exist** (N2 is described in its own
+section at the end of this page). This part says what N1 does, how to use it and, as important, what is not there.
 
 ## What exists
 
@@ -162,8 +162,8 @@ daemon) are refused when they are added.
 
 ## What does not exist
 
-- The **context compiler** and handoff packets (N2), the **knowledge store** (N3), the **token governor** (N4) and
-  the **credential broker** (N5). Nothing here meters tokens, builds context packs or touches credentials.
+- The **knowledge store** (N3), the **token governor** (N4) and the **credential broker** (N5); the context compiler and
+  handoff packets of N2 are described below. Nothing here meters tokens or touches credentials.
 - The scheduler does **not** use the ledger to choose tasks: it only enforces the completion rule. `fleet goals remaining`
   is a view; there is no `fleet goals` command without a subcommand.
 - Check kinds from the design that are not implemented: test selectors and knowledge assertions. A command check can
@@ -202,3 +202,64 @@ isolation, as for workers. A weak check passes a weak result.
 See the decisions in [docs/adr/0011](adr/0011-neo-domain-crates-and-application-module.md),
 [0012](adr/0012-goals-and-evidence-are-event-sourced.md), [0013](adr/0013-verification-by-fleet-gates-completion.md) and [0014](adr/0014-checks-run-on-an-export-and-their-processes-are-untrusted.md),
 and the vocabulary in [domain.md](domain.md).
+
+# Milestone N2: the context compiler and handoff packets
+
+What exists after N2, how it is checked, and what does not exist.
+
+## What exists
+
+- **`neo-context`**, a pure std-only domain crate: a deterministic compiler (no model, clock or randomness) that turns fleet's own
+  state into a **context pack** of eight layers in a fixed order: invariants, charter, plan position, task and acceptance
+  contract, verified knowledge, working set, recent events, scratch. Each layer has a hard token budget (a share of the
+  profile's `max_tokens`); the estimate is `ceil(bytes x safety% / (chars_per_token x 100))` over UTF-8 bytes. When the pack
+  is too large, layers 7, 6 and 5 give way in that order, then sections of the charter; layers 1, 3 and 4 are never cut and
+  an overflow is an error, never a silent cut. The pack renders to a canonical text with length-prefixed, escaped framing,
+  plus a canonical JSON manifest (tokens, SHA-256 digest, what was dropped per layer); the pack digest covers both.
+- **Trust.** Layers 1-5 hold only text fleet or its operator wrote. Text an agent or a program wrote (notes, worker
+  summaries, the output and summaries of checks, the worker's committed files) appears in layer 7 only, labelled
+  `UNVERIFIED` and quoted line by line, or is left out by `[context] unverified = "exclude"`. Every string is sanitized and
+  redacted, and a line that matches a secret rule is replaced whole; files whose name or content matches the secret rules
+  are named, not shown. Layer 6 shows files as the repository has them at the run's base commit, read from the real
+  repository, never from the worktree; *which* files it shows first follows the paths the task's commits changed, so layer 6
+  is not part of the stable digest. Layer 5 facts that carry `paths` are scoped by the base commit's tree and the paths the
+  task's contracts allow, never by what the worker committed.
+- **What decides layers 1-5.** For the same plan, goal ledger, results of fleet's own checks and configuration they are the
+  same on every attempt and after a crash (the *stable digest*); they change when that state does (layer 3 lists the plan and
+  layer 4 what fleet's own runs said). A pack lists goals in the order of their ids, not in the order they were added.
+- **Stored packs are checked.** `fleet context show`, `diff` and `verify` take the digest from the hash-chained log
+  (`context_compiled`), never from file names or sequence numbers in the store, and re-hash the stored text (layer digests,
+  stable digest, pack digest) and compare the stored manifest with the logged one. A mismatch, a pack the log recorded that the
+  store lacks, or an unreadable file is a hard error with exit status 11 (`tampered`) and no content. A pack the store forgot
+  by retention (the newest 8 per task are kept) is `not found`.
+- **Handoff packets** (`HandoffCreated`): made when a task completes or fails, when it goes back in line (retry), when the
+  daemon finds it running after a crash, and on demand (`fleet handoff <task>`). The next pack is compiled from fleet's state
+  plus the handoff; a worker's `.fleet/handoff.json` summary is stored and shown only as UNVERIFIED. An on-demand packet is
+  only the source of the next brief when no packet made by the flow exists. A task whose handoff cannot be recorded waits at
+  most 5 ticks and is then failed with the reason.
+- **Opt-in per run**: `context = "compiled"` in the plan's `[run]` table (or `fleet run create --context compiled`). Runs
+  without it are briefed exactly as before. A compiled run's worker gets `.fleet/context.md` and `.fleet/context.json`
+  and a short brief that points at them; `ContextCompiled` is appended to the hash-chained log. Fleet never reads those
+  two files back.
+- Commands: `fleet context show|diff|verify|explain` and `fleet handoff`.
+- Configuration: `[context]` (`default_profile`, `unverified`, `knowledge`, `constraints`, `[context.glossary]`) and
+  `[context.profile.<name>]` (`max_tokens`, `chars_per_token`, `safety_percent`); `[workers.<name>] profile`.
+
+## What does not exist
+
+- The **knowledge store** (N3): layer 5 is fed only from a static, human-written file with explicit sources, which must not
+  be inside the run's repository.
+- The **token governor** (N4) and the **credential broker** (N5). Token counts are estimates, not provider usage.
+- The compiler makes the input identical and checkable; it does not make a model obey it, and no claim is made about
+  hallucination. What is tested: determinism, layer order, budgets, layers 1-5 free of agent-written text, labelled
+  UNVERIFIED text in layer 7, tamper detection of stored packs, and crash re-briefing.
+- The secret rules are the commit gate's rules made case-insensitive plus more credential file names and directories; they are
+  a filter, not a guarantee. Not recognised: unquoted `NAME=value` assignments, AWS secret keys, base64 or line-wrapped keys,
+  a secret that is only a password in prose. Files are scanned up to 64 KiB.
+- Someone who can write both the state directory and the audit log can still rewrite both: the log's hash chain and head
+  file are tamper-evident, not tamper-proof (ADR 2).
+
+## N2 status
+
+N2 as built: everything above, the crash-safe handoff of ADR 18, the end-to-end tests in
+`crates/fleet-cli/tests/e2e_context.rs` and the demo `scripts/neo-n2-demo.sh` (its output is in the README).

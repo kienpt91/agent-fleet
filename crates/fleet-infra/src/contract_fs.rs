@@ -8,7 +8,7 @@ use crate::fsx::{self, FileKind, ReadError};
 use crate::jobs::redact_block;
 use crate::json;
 use fleet_app::ports::ContractFiles;
-use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
+use fleet_domain::contract::{ContractRead, WorkerHandoff, WorkerQuestion, WorkerResult};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::{MAX_BRIEF_FILE_BYTES, MAX_CONTRACT_FILE};
 use fleet_domain::redact::Redactor;
@@ -21,6 +21,11 @@ const DIR_NAME: &str = ".fleet";
 const RESULT_FILE: &str = "result.json";
 const QUESTION_FILE: &str = "question.json";
 const BRIEF_FILE: &str = "brief.md";
+const HANDOFF_FILE: &str = "handoff.json";
+const CONTEXT_FILE: &str = "context.md";
+const MANIFEST_FILE: &str = "context.json";
+/// The largest compiled context handed to a worker.
+const MAX_CONTEXT_FILE: usize = 2 * 1024 * 1024;
 
 /// Reads and prepares the contract files. Free text a worker writes (result summary, question
 /// text and choices) is redacted on the way in, so no secret reaches the log or other briefs.
@@ -32,6 +37,25 @@ pub struct FsContractFiles {
 impl FsContractFiles {
     pub fn new(redactor: Arc<Redactor>) -> FsContractFiles {
         FsContractFiles { redactor }
+    }
+
+    /// The worktree's private `.fleet` directory, created if needed. A symlink, file or FIFO named
+    /// `.fleet` (left by a previous attempt) is unlinked, never followed, so nothing outside the
+    /// worktree is touched.
+    fn fleet_dir(worktree: &str) -> Result<std::path::PathBuf> {
+        let root = Path::new(worktree);
+        if !fsx::is_real_dir(root) {
+            return Err(FleetError::invalid(format!(
+                "worktree {worktree} is not a directory"
+            )));
+        }
+        let dir = root.join(DIR_NAME);
+        if !matches!(fsx::lstat_kind(&dir), None | Some(FileKind::Dir)) {
+            fsx::remove_nofollow(&dir)
+                .map_err(|e| FleetError::io("cannot replace .fleet in the worktree", &e))?;
+        }
+        fsx::ensure_private_dir(&dir)?;
+        Ok(dir)
     }
 
     fn read<T>(
@@ -60,22 +84,14 @@ impl FsContractFiles {
 
 impl ContractFiles for FsContractFiles {
     fn prepare(&self, worktree: &str, brief: &str) -> Result<()> {
-        let root = Path::new(worktree);
-        if !fsx::is_real_dir(root) {
-            return Err(FleetError::invalid(format!(
-                "worktree {worktree} is not a directory"
-            )));
-        }
-        let dir = root.join(DIR_NAME);
-        // A symlink, file or FIFO named `.fleet` (left by a previous attempt) is unlinked, never
-        // followed, so nothing outside the worktree is touched.
-        if !matches!(fsx::lstat_kind(&dir), None | Some(FileKind::Dir)) {
-            fsx::remove_nofollow(&dir)
-                .map_err(|e| FleetError::io("cannot replace .fleet in the worktree", &e))?;
-        }
-        fsx::ensure_private_dir(&dir)?;
-
-        for name in [RESULT_FILE, QUESTION_FILE] {
+        let dir = Self::fleet_dir(worktree)?;
+        for name in [
+            RESULT_FILE,
+            QUESTION_FILE,
+            CONTEXT_FILE,
+            MANIFEST_FILE,
+            HANDOFF_FILE,
+        ] {
             let path = dir.join(name);
             match fsx::lstat_kind(&path) {
                 None => {}
@@ -92,6 +108,36 @@ impl ContractFiles for FsContractFiles {
 
         let brief = head_str(brief, MAX_BRIEF_FILE_BYTES);
         fsx::write_private_atomic(&dir.join(BRIEF_FILE), brief.as_bytes())
+    }
+
+    fn prepare_context(&self, worktree: &str, text: &str, manifest_json: &str) -> Result<()> {
+        if text.len() > MAX_CONTEXT_FILE {
+            return Err(FleetError::invalid(format!(
+                "the context is larger than {MAX_CONTEXT_FILE} bytes"
+            )));
+        }
+        let dir = Self::fleet_dir(worktree)?;
+        // The worker may have left anything under these names; the atomic write replaces a
+        // symlink or file by a new file and never writes through it. A directory is refused.
+        for (name, content) in [(CONTEXT_FILE, text), (MANIFEST_FILE, manifest_json)] {
+            if fsx::lstat_kind(&dir.join(name)) == Some(FileKind::Dir) {
+                return Err(FleetError::invalid(format!(
+                    ".fleet/{name} is a directory; remove it before the task can run"
+                )));
+            }
+            fsx::write_private_atomic(&dir.join(name), content.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn read_handoff(&self, worktree: &str) -> ContractRead<WorkerHandoff> {
+        match self.read(worktree, HANDOFF_FILE, WorkerHandoff::from_value) {
+            ContractRead::Valid(mut h) => {
+                h.summary = redact_block(&self.redactor, &h.summary);
+                ContractRead::Valid(h)
+            }
+            other => other,
+        }
     }
 
     fn read_question(&self, worktree: &str) -> ContractRead<WorkerQuestion> {
@@ -404,5 +450,153 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    const GOOD_HANDOFF: &str = r#"{"version":1,"summary":"left off at step 3"}"#;
+
+    #[test]
+    fn reads_a_valid_handoff_and_reports_absent_and_invalid() {
+        let t = TempDir::new("contract-handoff");
+        let c = files();
+        assert_eq!(c.read_handoff(&wt(&t)), ContractRead::Absent);
+        t.write(".fleet/handoff.json", GOOD_HANDOFF);
+        match c.read_handoff(&wt(&t)) {
+            ContractRead::Valid(h) => assert_eq!(h.summary, "left off at step 3"),
+            other => panic!("{other:?}"),
+        }
+        t.write(".fleet/handoff.json", "{not json");
+        assert!(invalid_text(c.read_handoff(&wt(&t))).starts_with("handoff.json: "));
+        t.write(".fleet/handoff.json", r#"{"version":1,"summary":7}"#);
+        assert!(invalid_text(c.read_handoff(&wt(&t))).contains("summary"));
+        let big = format!(
+            r#"{{"version":1,"summary":"{}"}}"#,
+            "x".repeat(usize::try_from(MAX_CONTRACT_FILE).unwrap())
+        );
+        t.write(".fleet/handoff.json", &big);
+        assert!(invalid_text(c.read_handoff(&wt(&t))).contains("larger than"));
+    }
+
+    #[test]
+    fn a_symlinked_or_fifo_handoff_is_refused() {
+        let t = TempDir::new("contract-handoff-link");
+        fs::create_dir(t.join(".fleet")).unwrap();
+        let good = t.write("elsewhere.json", GOOD_HANDOFF);
+        symlink(&good, t.join(".fleet/handoff.json")).unwrap();
+        assert_eq!(
+            invalid_text(files().read_handoff(&wt(&t))),
+            "handoff.json: is a symlink"
+        );
+        fs::remove_file(t.join(".fleet/handoff.json")).unwrap();
+        nix::unistd::mkfifo(&t.join(".fleet/handoff.json"), Mode::S_IRWXU).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let path = wt(&t);
+        let handle = std::thread::spawn(move || {
+            let r = files().read_handoff(&path);
+            flag.store(true, Ordering::SeqCst);
+            r
+        });
+        assert!(
+            wait_until(3000, || done.load(Ordering::SeqCst)),
+            "blocked on a FIFO"
+        );
+        assert!(invalid_text(handle.join().unwrap()).starts_with("handoff.json: "));
+    }
+
+    #[test]
+    fn the_handoff_summary_is_redacted() {
+        let t = TempDir::new("contract-redact-handoff");
+        t.write(
+            ".fleet/handoff.json",
+            &format!(r#"{{"version":1,"summary":"key {}"}}"#, token()),
+        );
+        match files().read_handoff(&wt(&t)) {
+            ContractRead::Valid(h) => assert_eq!(h.summary, "key [REDACTED:github-token]"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_removes_stale_context_and_handoff_files() {
+        let t = TempDir::new("contract-stale-context");
+        t.write(".fleet/context.md", "forged");
+        t.write(".fleet/context.json", "{}");
+        t.write(".fleet/handoff.json", GOOD_HANDOFF);
+        let c = files();
+        c.prepare(&wt(&t), "b").unwrap();
+        for name in ["context.md", "context.json", "handoff.json"] {
+            assert!(!t.exists(&format!(".fleet/{name}")), "{name}");
+        }
+        assert_eq!(c.read_handoff(&wt(&t)), ContractRead::Absent);
+
+        // links and FIFOs are unlinked without touching their targets
+        let victim = t.write("victim.txt", "keep");
+        symlink(&victim, t.join(".fleet/context.md")).unwrap();
+        nix::unistd::mkfifo(&t.join(".fleet/handoff.json"), Mode::S_IRWXU).unwrap();
+        c.prepare(&wt(&t), "b").unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(!t.exists(".fleet/context.md") && !t.exists(".fleet/handoff.json"));
+
+        // a directory with one of the names is refused
+        fs::create_dir(t.join(".fleet/handoff.json")).unwrap();
+        let err = c.prepare(&wt(&t), "b").unwrap_err();
+        assert!(err.message.contains("handoff.json"));
+    }
+
+    #[test]
+    fn prepare_context_writes_private_files_and_replaces_forgeries() {
+        let t = TempDir::new("contract-context");
+        let c = files();
+        c.prepare_context(&wt(&t), "# pack\n", "{\"digest\":\"d\"}")
+            .unwrap();
+        assert_eq!(t.read(".fleet/context.md"), "# pack\n");
+        assert_eq!(t.read(".fleet/context.json"), "{\"digest\":\"d\"}");
+        for name in ["context.md", "context.json"] {
+            let m = fs::metadata(t.join(&format!(".fleet/{name}"))).unwrap();
+            assert_eq!(m.mode() & 0o777, 0o600, "{name}");
+        }
+        assert_eq!(
+            fs::metadata(t.join(".fleet")).unwrap().mode() & 0o777,
+            0o700
+        );
+
+        // a worker's forged copies (a plain file, a link to a victim) are replaced
+        let victim = t.write("victim.txt", "keep");
+        fs::remove_file(t.join(".fleet/context.md")).unwrap();
+        symlink(&victim, t.join(".fleet/context.md")).unwrap();
+        t.write(".fleet/context.json", "forged");
+        c.prepare_context(&wt(&t), "second", "{}").unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(t.read(".fleet/context.md"), "second");
+        assert_eq!(t.read(".fleet/context.json"), "{}");
+        assert!(!fs::symlink_metadata(t.join(".fleet/context.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn prepare_context_refuses_bad_worktrees_oversize_text_and_directories() {
+        let t = TempDir::new("contract-context-bad");
+        let c = files();
+        assert!(c
+            .prepare_context(t.join("missing").to_str().unwrap(), "a", "{}")
+            .is_err());
+        let big = "x".repeat(2 * 1024 * 1024 + 1);
+        assert!(c.prepare_context(&wt(&t), &big, "{}").is_err());
+        assert!(!t.exists(".fleet/context.md"));
+        fs::create_dir_all(t.join(".fleet/context.md")).unwrap();
+        assert!(c.prepare_context(&wt(&t), "a", "{}").is_err());
+
+        // a symlinked .fleet is replaced, nothing is written through it
+        let t2 = TempDir::new("contract-context-link");
+        let outside = t2.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(t2.join("work")).unwrap();
+        symlink(&outside, t2.join("work/.fleet")).unwrap();
+        c.prepare_context(t2.join("work").to_str().unwrap(), "a", "{}")
+            .unwrap();
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(t2.exists("work/.fleet/context.md"));
     }
 }

@@ -16,7 +16,9 @@ use crate::limits::{
 };
 use crate::run::{validate_parallel, NewTask, RetryPolicy, Run, WorkerEnd};
 use crate::sanitize::{flatten_line, quote_lines, tail_str};
-use crate::status::{ApprovalStatus, BlockKind, DecisionKind, EndKind, Purpose, TaskStatus};
+use crate::status::{
+    ApprovalStatus, BlockKind, ContextMode, DecisionKind, EndKind, Purpose, TaskStatus,
+};
 use std::collections::BTreeMap;
 
 /// What a command whose outcome the daemon lost track of is recorded as.
@@ -32,6 +34,7 @@ pub struct NewRun {
     pub base_ref: String,
     pub base_sha: Sha,
     pub max_parallel: u32,
+    pub context: ContextMode,
 }
 
 /// Settings the decisions below depend on.
@@ -266,6 +269,9 @@ impl FleetState {
             base_ref: new.base_ref,
             base_sha: new.base_sha,
             max_parallel: new.max_parallel,
+            // A run that is briefed the plain way records nothing, so that the log of such a run
+            // reads as it always did.
+            context: (new.context != ContextMode::Off).then_some(new.context),
         };
         Ok((id, ev))
     }
@@ -864,6 +870,7 @@ mod tests {
             base_ref: "main".into(),
             base_sha: sha('a'),
             max_parallel: 2,
+            context: ContextMode::Off,
         }
     }
 

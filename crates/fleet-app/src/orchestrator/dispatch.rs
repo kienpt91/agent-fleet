@@ -2,7 +2,7 @@
 
 use super::{Key, Live, Orchestrator};
 use crate::ports::{GateSpec, Job, JobDone, MergeOutcome, SessionSpec, VerifyOrigin};
-use fleet_domain::brief::{build_brief, expand_placeholders, BriefInput};
+use fleet_domain::brief::{build_brief, build_pointer_brief, expand_placeholders, BriefInput};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{RunId, TaskId};
@@ -12,6 +12,9 @@ use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::status::{EndKind, TaskStatus};
 use fleet_domain::supervision::SupervisionPolicy;
 use neo_verify::limits::MAX_CONCURRENT_VERIFICATIONS;
+
+/// Ticks the next attempt of a task waits for the handoff of the last one before the task fails.
+const MAX_HANDOFF_WAITS: u32 = 5;
 
 impl Orchestrator {
     /// Starts workers for ready tasks while capacity allows.
@@ -120,13 +123,65 @@ impl Orchestrator {
                 }
             }
         }
-        let brief = build_brief(&BriefInput {
-            run: run_id,
-            objective: &objective,
-            task: &task,
-            dependencies,
-            attempt,
-        });
+        if self.uses_compiled_context(&key) {
+            if let Err(e) = self.ensure_restart_handoff(&key, &worktree) {
+                // The next attempt waits for the handoff of the one before it, but not for ever:
+                // after a few ticks the task is failed with the reason, instead of being tried
+                // again by every tick.
+                let tries = {
+                    let n = self.handoff_waits.entry(key.clone()).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if tries >= MAX_HANDOFF_WAITS {
+                    self.handoff_waits.remove(&key);
+                    self.fail_task(
+                        &key,
+                        format!(
+                            "the handoff of the last attempt could not be recorded after {tries} tries: {}",
+                            e.message
+                        ),
+                    );
+                } else {
+                    self.warn(format!(
+                        "{run_id}/{task_id}: the handoff of the last attempt could not be recorded, so the next attempt waits: {}",
+                        e.message
+                    ));
+                }
+                return;
+            }
+            self.handoff_waits.remove(&key);
+            // a summary left from an earlier attempt must not be attached to a later handoff
+            self.handoff_summaries.remove(&key);
+        }
+        // A run that chose compiled context gets a pack compiled by NEO from fleet's own state
+        // (and a short brief that points at it); every other run gets the plain brief it always did.
+        let pack = if self.uses_compiled_context(&key) {
+            match self.compile_pack(&key, attempt, true) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.start_failed(
+                        &key,
+                        attempt,
+                        &worktree,
+                        &format!("could not compile the context: {}", e.message),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let brief = match &pack {
+            Some(p) => build_pointer_brief(task_id, &task.title, attempt, p.digest()),
+            None => build_brief(&BriefInput {
+                run: run_id,
+                objective: &objective,
+                task: &task,
+                dependencies,
+                attempt,
+            }),
+        };
         if let Err(e) = self.ports.contract.prepare(&worktree, &brief) {
             self.start_failed(
                 &key,
@@ -135,6 +190,17 @@ impl Orchestrator {
                 &format!("could not prepare .fleet: {}", e.message),
             );
             return;
+        }
+        if let Some(p) = &pack {
+            if let Err(e) = self.publish_pack(&key, attempt, &worktree, p) {
+                self.start_failed(
+                    &key,
+                    attempt,
+                    &worktree,
+                    &format!("could not write the context: {}", e.message),
+                );
+                return;
+            }
         }
         if self.ports.undo.available() {
             self.checkpoint(&key, &worktree, "before");

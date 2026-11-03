@@ -7,6 +7,7 @@
 
 use crate::args::Parsed;
 use crate::render;
+use crate::render_context;
 use crate::render_neo;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::ids::show;
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Every subcommand, as typed. The help text must mention each (a test enforces it).
-pub const SUBCOMMANDS: [&str; 32] = [
+pub const SUBCOMMANDS: [&str; 37] = [
     "daemon",
     "run create",
     "task add",
@@ -58,6 +59,11 @@ pub const SUBCOMMANDS: [&str; 32] = [
     "goals show",
     "goals remaining",
     "verify",
+    "context show",
+    "context diff",
+    "context verify",
+    "context explain",
+    "handoff",
 ];
 
 pub const HELP: &str = "\
@@ -83,6 +89,7 @@ daemon:
 
 runs and tasks:
   run create --objective <text> --repo <path> [--base <ref>] [--id <id>] [--max-parallel N]
+             [--context off|compiled]
   task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--id <id>]
                                      (--spec - reads the spec from stdin, at most 16 KiB)
   plan <file.toml|file.json> [--run <run>]
@@ -126,6 +133,18 @@ goals and verification (NEO):
   verify <goal|task> [--task <run>/<task>] [--timeout <secs>]
                                      run the contracts independently of the worker and record
                                      evidence; exit 6 when a mandatory check did not pass
+
+context packs and handoffs (<digest> is a hex prefix of at least 8 digits):
+  context show <task> [--digest <hex>]
+                                     the context pack the task's worker was given: layers, tokens,
+                                     what was dropped, and the rendered text
+  context diff <task> <digest> <digest>
+                                     compare two compiled packs layer by layer
+  context verify <task>              compile the pack again and compare it with the stored one;
+                                     exit 6 when they differ
+  context explain [<task>] [--profile <name>]
+                                     the layers, budgets and shrink order of a profile
+  handoff <task>                     the handoff packet for the next worker of the task
 
 dashboard:
   tui                                terminal dashboard
@@ -182,6 +201,10 @@ pub enum View {
     GoalList,
     GoalShow,
     GoalRemaining,
+    ContextShow,
+    ContextDiff,
+    ContextExplain,
+    Handoff,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -237,6 +260,10 @@ pub enum Command {
         target: String,
         task: Option<String>,
         timeout_secs: u64,
+    },
+    /// `fleet context verify`: exit 6 when the pack compiled now differs from the stored one.
+    ContextVerify {
+        task: String,
     },
     /// `approve` and `deny`. The daemon requires the digest of the action a decision covers; when
     /// the person gave none, the digest the daemon lists for the approval is used.
@@ -422,6 +449,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                     let base = p.opt("--base")?;
                     let id = p.opt("--id")?;
                     let parallel = max_parallel(&mut p)?;
+                    let context = p.opt("--context")?;
                     no_args(p)?;
                     let view = View::RunCreated(id.clone());
                     request(
@@ -432,6 +460,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                             ("base", base.and_then(st)),
                             ("id", id.and_then(st)),
                             ("max_parallel", parallel),
+                            ("context", context.and_then(st)),
                         ]),
                         view,
                     )
@@ -671,6 +700,12 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                 timeout_secs: timeout.unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS),
             }
         }
+        "context" => parse_context(p)?,
+        "handoff" => request(
+            "handoff",
+            obj(vec![("task", st(one_arg(p, "<task>")?))]),
+            View::Handoff,
+        ),
         other => {
             return Err(FleetError::usage(format!(
                 "unknown command {}",
@@ -758,6 +793,93 @@ fn parse_goals(mut p: Parsed, stdin: &mut dyn Read) -> Result<Command> {
     })
 }
 
+/// A digest argument: a hex prefix of at least 8 digits, as the daemon requires.
+fn digest_arg(value: String, what: &str) -> Result<String> {
+    let ok = value.len() >= 8 && value.len() <= 64 && value.chars().all(|c| c.is_ascii_hexdigit());
+    if ok {
+        Ok(value)
+    } else {
+        Err(FleetError::usage(format!(
+            "{what} must be a hex prefix of 8 to 64 digits, got {}",
+            show(&value)
+        )))
+    }
+}
+
+fn parse_context(mut p: Parsed) -> Result<Command> {
+    let sub = p.take_word();
+    Ok(match sub.as_deref() {
+        Some("show") => {
+            let digest = p
+                .opt("--digest")?
+                .map(|d| digest_arg(d, "option --digest"))
+                .transpose()?;
+            request(
+                "context.show",
+                obj(vec![
+                    ("task", st(one_arg(p, "<task>")?)),
+                    ("digest", digest.and_then(st)),
+                ]),
+                View::ContextShow,
+            )
+        }
+        Some("diff") => {
+            let mut words = p.finish()?.into_iter();
+            let task = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing <task>"))?;
+            let a = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing first <digest>"))?;
+            let b = words
+                .next()
+                .ok_or_else(|| FleetError::usage("missing second <digest>"))?;
+            if let Some(extra) = words.next() {
+                return Err(FleetError::usage(format!(
+                    "unexpected argument {}",
+                    show(&extra)
+                )));
+            }
+            let a = digest_arg(a, "the first <digest>")?;
+            let b = digest_arg(b, "the second <digest>")?;
+            request(
+                "context.diff",
+                obj(vec![("task", st(task)), ("a", st(a)), ("b", st(b))]),
+                View::ContextDiff,
+            )
+        }
+        Some("verify") => Command::ContextVerify {
+            task: one_arg(p, "<task>")?,
+        },
+        Some("explain") => {
+            let profile = p.opt("--profile")?;
+            let mut words = p.finish()?.into_iter();
+            let task = words.next();
+            if let Some(extra) = words.next() {
+                return Err(FleetError::usage(format!(
+                    "unexpected argument {}",
+                    show(&extra)
+                )));
+            }
+            request(
+                "context.explain",
+                obj(vec![
+                    ("task", task.and_then(st)),
+                    ("profile", profile.and_then(st)),
+                ]),
+                View::ContextExplain,
+            )
+        }
+        other => {
+            return Err(subcommand_error(
+                "context",
+                other,
+                "show, diff, verify or explain",
+            ))
+        }
+    })
+}
+
 fn subcommand_error(group: &str, got: Option<&str>, expected: &str) -> FleetError {
     match got {
         None => FleetError::usage(format!("{group} needs a subcommand: {expected}")),
@@ -821,6 +943,10 @@ fn render_view(view: &View, data: &Value) -> String {
         View::GoalList => render_neo::render_goal_list(data),
         View::GoalShow => render_neo::render_goal_show(data),
         View::GoalRemaining => render_neo::render_goal_remaining(data),
+        View::ContextShow => render_context::render_show(data),
+        View::ContextDiff => render_context::render_diff(data),
+        View::ContextExplain => render_context::render_explain(data),
+        View::Handoff => render_context::render_handoff(data),
     }
 }
 
@@ -948,6 +1074,29 @@ pub fn execute_verify(
             std::thread::sleep(poll);
         }
     }
+}
+
+/// `fleet context verify`: the daemon compiles the pack again and compares it with the stored one.
+/// The exit code is 0 when they are the same and 6 (conflict) when they differ.
+pub fn execute_context_verify(
+    task: &str,
+    caller: &mut dyn Caller,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<i32> {
+    let data = caller.call("context.verify", obj(vec![("task", st(task.to_string()))]))?;
+    let text = if json {
+        json_line(&data)
+    } else {
+        render_context::render_verify(&data)
+    };
+    write_out(out, &text)?;
+    let same = data.get("match").and_then(Value::as_bool) == Some(true);
+    Ok(if same {
+        0
+    } else {
+        ErrorCode::Conflict.exit_code()
+    })
 }
 
 /// The last `n` lines of `text`.
@@ -1223,6 +1372,9 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
                 out,
                 VERIFY_POLL,
             )
+        }
+        Command::ContextVerify { task } => {
+            return execute_context_verify(&task, &mut connect(ctx)?, ctx.json, out)
         }
         Command::Decide {
             id,
@@ -2446,6 +2598,206 @@ mod tests {
         let (r, out) = exec(parse_ok(&["goals", "list"]), &mut f, true);
         r.unwrap();
         assert_eq!(out, "{\"goals\":[]}\n");
+    }
+
+    #[test]
+    fn context_and_handoff_commands_parse() {
+        assert_eq!(
+            parse_ok(&["context", "show", "r1/t1"]),
+            req(
+                "context.show",
+                vec![("task", s("r1/t1"))],
+                View::ContextShow
+            )
+        );
+        assert_eq!(
+            parse_ok(&["context", "show", "r1/t1", "--digest", "abcdef12"]),
+            req(
+                "context.show",
+                vec![("task", s("r1/t1")), ("digest", s("abcdef12"))],
+                View::ContextShow
+            )
+        );
+        assert_eq!(
+            parse_ok(&["context", "diff", "r1/t1", "abcdef12", "0123456789ABCDEF"]),
+            req(
+                "context.diff",
+                vec![
+                    ("task", s("r1/t1")),
+                    ("a", s("abcdef12")),
+                    ("b", s("0123456789ABCDEF"))
+                ],
+                View::ContextDiff
+            )
+        );
+        assert_eq!(
+            parse_ok(&["context", "verify", "t1"]),
+            Command::ContextVerify { task: "t1".into() }
+        );
+        assert_eq!(
+            parse_ok(&["context", "explain"]),
+            req("context.explain", vec![], View::ContextExplain)
+        );
+        assert_eq!(
+            parse_ok(&["context", "explain", "r1/t1", "--profile", "small"]),
+            req(
+                "context.explain",
+                vec![("task", s("r1/t1")), ("profile", s("small"))],
+                View::ContextExplain
+            )
+        );
+        assert_eq!(
+            parse_ok(&["context", "explain", "--profile", "small"]),
+            req(
+                "context.explain",
+                vec![("profile", s("small"))],
+                View::ContextExplain
+            )
+        );
+        assert_eq!(
+            parse_ok(&["handoff", "r1/t1"]),
+            req("handoff", vec![("task", s("r1/t1"))], View::Handoff)
+        );
+    }
+
+    #[test]
+    fn context_and_handoff_usage_errors() {
+        let too_long = "f".repeat(65);
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec!["context"], "needs a subcommand"),
+            (vec!["context", "frobnicate"], "unknown context subcommand"),
+            (vec!["context", "show"], "missing <task>"),
+            (vec!["context", "show", "a", "b"], "unexpected argument"),
+            (
+                vec!["context", "show", "a", "--digest", "abc"],
+                "8 to 64 digits",
+            ),
+            (
+                vec!["context", "show", "a", "--digest", "xyz12345"],
+                "8 to 64 digits",
+            ),
+            (vec!["context", "show", "a", "--digest"], "--digest"),
+            (vec!["context", "diff"], "missing <task>"),
+            (vec!["context", "diff", "a"], "missing first <digest>"),
+            (
+                vec!["context", "diff", "a", "abcdef12"],
+                "missing second <digest>",
+            ),
+            (
+                vec!["context", "diff", "a", "abcdef12", "abcdef13", "x"],
+                "unexpected argument",
+            ),
+            (
+                vec!["context", "diff", "a", "abcdef12", "short"],
+                "second <digest>",
+            ),
+            (
+                vec!["context", "diff", "a", too_long.as_str(), "abcdef12"],
+                "first <digest>",
+            ),
+            (vec!["context", "verify"], "missing <task>"),
+            (vec!["context", "verify", "a", "b"], "unexpected argument"),
+            (vec!["context", "explain", "a", "b"], "unexpected argument"),
+            (vec!["handoff"], "missing <task>"),
+            (vec!["handoff", "a", "b"], "unexpected argument"),
+        ];
+        for (a, want) in cases {
+            let e = parse(&a).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Usage, "{a:?}");
+            assert!(e.message.contains(want), "{a:?}: {}", e.message);
+        }
+    }
+
+    fn pack_layer(id: u64, changed: bool) -> Value {
+        Value::object([
+            ("id", Value::int(id)),
+            ("name", s("layer")),
+            ("changed", Value::Bool(changed)),
+            (
+                "tokens",
+                Value::object([("a", Value::int(1u64)), ("b", Value::int(2u64))]),
+            ),
+            (
+                "digest",
+                Value::object([("a", s(&"11".repeat(32))), ("b", s(&"22".repeat(32)))]),
+            ),
+        ])
+    }
+
+    fn verify_doc(matches: bool) -> Value {
+        Value::object([
+            ("schema", s("fleet.context.verify/1")),
+            ("run", s("r1")),
+            ("task", s("t1")),
+            ("match", Value::Bool(matches)),
+            ("stored", s("old")),
+            ("current", s(if matches { "old" } else { "new" })),
+            ("stable_same", Value::Bool(matches)),
+            ("layers", Value::array([pack_layer(1, !matches)])),
+        ])
+    }
+
+    #[test]
+    fn context_verify_exits_0_on_a_match_and_6_when_the_pack_differs() {
+        for (matches, json, code) in [
+            (true, false, 0),
+            (false, false, 6),
+            (true, true, 0),
+            (false, true, 6),
+        ] {
+            let mut f = Fake::new(vec![Ok(verify_doc(matches))]);
+            let mut out = Vec::new();
+            let got = execute_context_verify("r1/t1", &mut f, json, &mut out).unwrap();
+            assert_eq!(got, code, "match {matches} json {json}");
+            assert_eq!(f.calls.len(), 1);
+            assert_eq!(f.calls[0].0, "context.verify");
+            assert_eq!(f.calls[0].1, Value::object([("task", s("r1/t1"))]));
+            let out = String::from_utf8(out).unwrap();
+            if json {
+                assert!(out.starts_with("{\"current\":"), "{out}");
+                assert!(out.contains("\"match\":"), "{out}");
+            } else if matches {
+                assert_eq!(out, "OK: the pack compiled now has the digest old\n");
+            } else {
+                assert!(out.starts_with("DIFFERS: "), "{out}");
+            }
+        }
+        let mut f = Fake::new(vec![Err(FleetError::not_found("no pack"))]);
+        let mut out = Vec::new();
+        let e = execute_context_verify("r1/t1", &mut f, false, &mut out).unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn context_views_render_and_json_prints_the_reply() {
+        let doc = Value::object([
+            ("schema", s("fleet.context.show/1")),
+            ("run", s("r1")),
+            ("task", s("t1")),
+            ("digest", s("dd")),
+            ("tokens", Value::int(1u64)),
+            ("max_tokens", Value::int(2u64)),
+            ("layers", Value::array([])),
+            ("text", s("hello \u{1b}[31mworld\u{1b}[0m\n")),
+        ]);
+        let mut f = Fake::new(vec![Ok(doc.clone())]);
+        let (r, out) = exec(parse_ok(&["context", "show", "r1/t1"]), &mut f, false);
+        r.unwrap();
+        assert!(out.contains("context pack of r1/t1"), "{out}");
+        assert!(out.contains("hello"), "{out:?}");
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert_eq!(f.calls[0].0, "context.show");
+        let mut f = Fake::new(vec![Ok(doc.clone())]);
+        let (r, out) = exec(parse_ok(&["context", "show", "r1/t1"]), &mut f, true);
+        r.unwrap();
+        assert_eq!(out, json_line(&doc));
+        let handoff = Value::object([("schema", s("fleet.handoff/1")), ("text", s("the handoff"))]);
+        let mut f = Fake::new(vec![Ok(handoff)]);
+        let (r, out) = exec(parse_ok(&["handoff", "r1/t1"]), &mut f, false);
+        r.unwrap();
+        assert_eq!(out, "the handoff\n");
+        assert_eq!(f.calls[0].0, "handoff");
     }
 
     #[test]

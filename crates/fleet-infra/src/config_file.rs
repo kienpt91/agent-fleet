@@ -7,7 +7,7 @@
 
 use crate::fsx::{read_regular, ReadError};
 use crate::json;
-use fleet_app::config::{AppConfig, GateDef, WorkerDef};
+use fleet_app::config::{AppConfig, ContextConfig, GateDef, WorkerDef};
 use fleet_app::ports::Identity;
 use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::{ErrorCode, FleetError, Result};
@@ -20,6 +20,10 @@ use fleet_domain::quality::GateFormat;
 use fleet_domain::redact::{Charset, Redactor, Rule};
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::value::Value;
+use neo_context::estimate::Profile;
+use neo_context::input::GlossaryEntry;
+use neo_context::layer::UnverifiedPolicy;
+use neo_context::limits::{DEFAULT_CHARS_PER_TOKEN, DEFAULT_MAX_TOKENS, DEFAULT_SAFETY_PERCENT};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -47,6 +51,8 @@ struct FileConfig {
     env: EnvSection,
     redact: RedactSection,
     workers: BTreeMap<String, WorkerSection>,
+    /// `[context]`, read by hand so that every error names the key.
+    context: toml::Table,
     gates: Vec<GateSection>,
 }
 
@@ -101,6 +107,7 @@ struct WorkerSection {
     env_set: BTreeMap<String, String>,
     timeout_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
+    profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +294,7 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
                 env_set: env_pairs(w.env_set),
                 timeout_ms,
                 idle_timeout_ms,
+                profile: w.profile,
             },
         );
     }
@@ -313,6 +321,8 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
             timeout_ms,
         });
     }
+
+    app.context = build_context(file.context)?;
 
     app.validate()?;
 
@@ -352,6 +362,133 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
         redactor,
         ring_bytes,
     })
+}
+
+// ---- context ---------------------------------------------------------------------------------------
+
+const CONTEXT_KEYS: [&str; 6] = [
+    "profile",
+    "default_profile",
+    "unverified",
+    "knowledge",
+    "constraints",
+    "glossary",
+];
+const PROFILE_KEYS: [&str; 3] = ["max_tokens", "chars_per_token", "safety_percent"];
+
+fn context_string(key: &str, v: &toml::Value) -> Result<String> {
+    v.as_str()
+        .map(str::to_string)
+        .ok_or_else(|| invalid(format!("context.{key} must be a string")))
+}
+
+fn profile_number(name: &str, sub: &toml::Table, key: &str, default: u32) -> Result<u32> {
+    match sub.get(key) {
+        None => Ok(default),
+        Some(v) => v
+            .as_integer()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "context.profile.{}.{key} must be a non-negative integer",
+                    show(name)
+                ))
+            }),
+    }
+}
+
+/// Reads `[context]`. `profile` is either the name of the default profile (a string) or the table
+/// of profiles `[context.profile.<name>]`; TOML has one key `profile`, so a file that defines
+/// profiles names its default with `default_profile`.
+fn build_context(table: toml::Table) -> Result<ContextConfig> {
+    let mut cfg = ContextConfig::default();
+    if let Some(key) = table.keys().find(|k| !CONTEXT_KEYS.contains(&k.as_str())) {
+        return Err(invalid(format!("context: unknown key {}", show(key))));
+    }
+
+    let mut default_name: Option<String> = None;
+    match table.get("profile") {
+        None => {}
+        Some(toml::Value::String(name)) => default_name = Some(name.clone()),
+        Some(toml::Value::Table(profiles)) => {
+            for (name, v) in profiles {
+                let sub = v.as_table().ok_or_else(|| {
+                    invalid(format!("context.profile.{} must be a table", show(name)))
+                })?;
+                if let Some(key) = sub.keys().find(|k| !PROFILE_KEYS.contains(&k.as_str())) {
+                    return Err(invalid(format!(
+                        "context.profile.{}: unknown key {}",
+                        show(name),
+                        show(key)
+                    )));
+                }
+                let profile = Profile::new(
+                    name,
+                    profile_number(name, sub, "max_tokens", DEFAULT_MAX_TOKENS)?,
+                    profile_number(name, sub, "chars_per_token", DEFAULT_CHARS_PER_TOKEN)?,
+                    profile_number(name, sub, "safety_percent", DEFAULT_SAFETY_PERCENT)?,
+                )
+                .map_err(|e| invalid(format!("context.profile.{}: {e}", show(name))))?;
+                cfg.profiles.insert(name.clone(), profile);
+            }
+        }
+        Some(_) => {
+            return Err(invalid(
+                "context.profile must be a profile name or a table of profiles",
+            ))
+        }
+    }
+    if let Some(v) = table.get("default_profile") {
+        if default_name.is_some() {
+            return Err(invalid(
+                "context.default_profile and a context.profile name are both set",
+            ));
+        }
+        default_name = Some(context_string("default_profile", v)?);
+    }
+    if let Some(name) = default_name {
+        cfg.default_profile = name;
+    }
+
+    if let Some(v) = table.get("unverified") {
+        let text = context_string("unverified", v)?;
+        cfg.policy = UnverifiedPolicy::parse(&text).ok_or_else(|| {
+            invalid(format!(
+                "context.unverified: {} is not known (use \"label\" or \"exclude\")",
+                show(&text)
+            ))
+        })?;
+    }
+    if let Some(v) = table.get("knowledge") {
+        cfg.knowledge = Some(context_string("knowledge", v)?);
+    }
+    if let Some(v) = table.get("constraints") {
+        let items = v
+            .as_array()
+            .ok_or_else(|| invalid("context.constraints must be a list of strings"))?;
+        for item in items {
+            cfg.constraints.push(
+                item.as_str()
+                    .ok_or_else(|| invalid("context.constraints must be a list of strings"))?
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(v) = table.get("glossary") {
+        let entries = v
+            .as_table()
+            .ok_or_else(|| invalid("context.glossary must be a table of term = \"meaning\""))?;
+        for (term, meaning) in entries {
+            let meaning = meaning.as_str().ok_or_else(|| {
+                invalid(format!("context.glossary.{} must be a string", show(term)))
+            })?;
+            cfg.glossary.push(GlossaryEntry {
+                term: term.clone(),
+                meaning: meaning.to_string(),
+            });
+        }
+    }
+    Ok(cfg)
 }
 
 // ---- plans ----------------------------------------------------------------------------------------
@@ -486,10 +623,16 @@ fn check_run(run: &Value) -> Result<()> {
     check_keys(
         "run",
         obj,
-        &["objective", "repo", "base", "id", "max_parallel"],
+        &["objective", "repo", "base", "id", "max_parallel", "context"],
     )?;
     for key in ["objective", "repo", "base", "id"] {
         check_string("run", obj, key, false)?;
+    }
+    check_string("run", obj, "context", false)?;
+    if let Some(Value::Str(mode)) = obj.get("context") {
+        if fleet_domain::status::ContextMode::parse(mode).is_none() {
+            return Err(invalid("run: context must be \"off\" or \"compiled\""));
+        }
     }
     match obj.get("max_parallel") {
         None | Some(Value::Int(_)) => Ok(()),
@@ -1187,5 +1330,126 @@ after = ["a"]
             "]".repeat(40)
         );
         assert!(plan(&dir, "deep.toml", &nested).is_err());
+    }
+
+    #[test]
+    fn no_context_table_gives_the_defaults() {
+        let loaded = parse("").unwrap();
+        assert_eq!(loaded.app.context, ContextConfig::default());
+        assert_eq!(loaded.app.context.default_profile, "default");
+        assert_eq!(loaded.app.context.policy, UnverifiedPolicy::Label);
+    }
+
+    #[test]
+    fn the_context_table_is_read_completely() {
+        let text = r#"
+[context]
+default_profile = "small"
+unverified = "exclude"
+knowledge = "/etc/fleet/knowledge.toml"
+constraints = ["no network", "keep it small"]
+
+[context.glossary]
+goal = "something to verify"
+task = "one unit of work"
+
+[context.profile.small]
+max_tokens = 8192
+
+[context.profile.large]
+max_tokens = 100000
+chars_per_token = 3
+safety_percent = 150
+
+[workers.a]
+command = "x"
+profile = "large"
+"#;
+        let c = parse(text).unwrap().app;
+        assert_eq!(c.context.default_profile, "small");
+        assert_eq!(c.context.policy, UnverifiedPolicy::Exclude);
+        assert_eq!(
+            c.context.knowledge.as_deref(),
+            Some("/etc/fleet/knowledge.toml")
+        );
+        assert_eq!(c.context.constraints, vec!["no network", "keep it small"]);
+        assert_eq!(c.context.glossary.len(), 2);
+        assert!(c.context.glossary.iter().any(|g| g.term == "goal"));
+        assert_eq!(c.context.profiles["small"].max_tokens(), 8192);
+        assert_eq!(c.context.profiles["large"].max_tokens(), 100_000);
+        assert_eq!(
+            c.context.profiles["large"].estimator().safety_percent(),
+            150
+        );
+        assert!(
+            c.context.profiles.contains_key("default"),
+            "the built-in one stays"
+        );
+        let worker = c.workers.values().next().unwrap();
+        assert_eq!(worker.profile.as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn a_default_profile_table_replaces_the_built_in_one() {
+        let c = parse("[context.profile.default]\nmax_tokens = 16000\n")
+            .unwrap()
+            .app;
+        assert_eq!(c.context.profiles["default"].max_tokens(), 16_000);
+        assert_eq!(c.context.profiles.len(), 1);
+    }
+
+    #[test]
+    fn the_default_profile_can_be_named_by_a_string() {
+        let c = parse("[context]\nprofile = \"default\"\n").unwrap().app;
+        assert_eq!(c.context.default_profile, "default");
+        let err = parse("[context]\nprofile = \"nope\"\n").err().unwrap();
+        assert!(err.message.contains("nope"), "{}", err.message);
+    }
+
+    #[test]
+    fn bad_context_settings_are_errors_that_name_the_key() {
+        let cases = [
+            ("[context]\nsurprise = 1", "surprise"),
+            ("[context]\nunverified = \"maybe\"", "unverified"),
+            ("[context]\nunverified = 3", "context.unverified"),
+            ("[context]\nknowledge = 3", "context.knowledge"),
+            ("[context]\nknowledge = \"relative.toml\"", "absolute"),
+            ("[context]\nconstraints = \"x\"", "context.constraints"),
+            ("[context]\nconstraints = [1]", "context.constraints"),
+            ("[context]\nglossary = [1]", "context.glossary"),
+            ("[context.glossary]\nterm = 1", "term"),
+            ("[context]\nprofile = 5", "context.profile"),
+            (
+                "[context]\nprofile = \"a\"\ndefault_profile = \"b\"",
+                "both set",
+            ),
+            ("[context.profile.x]\nmax_tokens = \"big\"", "max_tokens"),
+            ("[context.profile.x]\nmax_tokens = -1", "max_tokens"),
+            ("[context.profile.x]\nmax_tokens = 10", "max_tokens"),
+            (
+                "[context.profile.x]\nchars_per_token = 0",
+                "chars_per_token",
+            ),
+            ("[context.profile.x]\nsafety_percent = 10", "safety_percent"),
+            ("[context.profile.x]\nmax_token = 9000", "max_token"),
+            (
+                "[context.profile.\"Bad Name\"]\nmax_tokens = 9000",
+                "profile",
+            ),
+            ("[context.profile]\nx = 3", "context.profile"),
+            ("[context]\ndefault_profile = \"missing\"", "missing"),
+            (
+                "[workers.a]\ncommand = \"x\"\nprofile = \"missing\"",
+                "missing",
+            ),
+            ("[workers.a]\ncommand = \"x\"\nprofile = 3", "string"),
+        ];
+        for (text, needle) in cases {
+            let err = parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {text}"));
+            assert_eq!(err.code, ErrorCode::Invalid, "{text}");
+            assert!(err.message.contains(needle), "{text}: {}", err.message);
+        }
     }
 }

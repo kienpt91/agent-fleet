@@ -11,6 +11,7 @@
 //! | [`event_store_contract`] | `EventStore`    | `&mut dyn FnMut() -> Box<dyn EventStore>`       |
 //! | [`output_logs_contract`] | `OutputLogs`    | `&mut dyn FnMut() -> Box<dyn OutputLogs>`       |
 //! | [`contract_files_contract`] | `ContractFiles` | `&mut dyn ContractHarness`                   |
+//! | [`context_store_contract`] | `ContextStore` | `&mut dyn FnMut() -> Box<dyn ContextStore>`    |
 //! | [`verify_jobs_contract`] | `JobRunner` (verification jobs) | `&mut dyn VerifyHarness`          |
 //!
 //! # Running a suite against an in-memory fake
@@ -30,6 +31,10 @@
 //!   the same underlying storage*: the suites drop a handle and call the factory again to check
 //!   that data survives reopening, so a factory that builds an empty store each time fails. Use
 //!   a fresh temporary directory per suite run and capture its path in the closure.
+//! * **Context store.** Like the event store and the logs: a factory that returns a new handle
+//!   onto the same storage per call. The suite saves packs and handoff packets (a pack's document
+//!   and a packet are `Value`s that carry their own `digest` field), and checks prefix lookup,
+//!   replacement, retention of the newest 8 per task and `remove`.
 //! * **Contract files.** Implement [`ContractHarness`]: `files` returns the adapter, `worktree`
 //!   the worktree path the adapter is given, and `plant` makes a file of the given
 //!   [`ContractFile`] exist in the shape described by [`Plant`], *replacing* whatever was there
@@ -38,6 +43,8 @@
 //!   [`PLANT_MARKER`] in planted content that is not valid and use [`VALID_RESULT_JSON`] /
 //!   [`VALID_QUESTION_JSON`] for `Plant::Valid`, so the suite can check that error texts do not
 //!   echo worker-controlled content.
+//!   Also implement `plant_handoff` (the file `.fleet/handoff.json`, see [`VALID_HANDOFF_JSON`])
+//!   and `context_files` (what the worker finds in `.fleet/context.md` / `.fleet/context.json`).
 //!
 //! Only behaviour shared by *all* implementations belongs here. Things that exist for one medium
 //! only (the hash chain of the file log, symlink races, lock files, the 1 MiB retention of the
@@ -45,18 +52,20 @@
 
 use super::World;
 use crate::ports::{
-    ContractFiles, EventStore, Job, JobDone, JobRunner, OutputLogs, ReplayInfo, StoredEvent,
-    VerifyDone, VerifyJob, VerifyOrigin, VerifyTarget, WorktreeState,
+    ContextStore, ContractFiles, EventStore, Job, JobDone, JobRunner, OutputLogs, ReplayInfo,
+    StoredEvent, StoredPack, VerifyDone, VerifyJob, VerifyOrigin, VerifyTarget, WorktreeState,
 };
 use fleet_domain::contract::{
-    ContractRead, QuestionKind, ResultStatus, WorkerQuestion, WorkerResult,
+    ContractRead, QuestionKind, ResultStatus, WorkerHandoff, WorkerQuestion, WorkerResult,
 };
 use fleet_domain::error::{ErrorCode, FleetError};
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{
     ApprovalId, DecisionId, EvidenceId, GoalId, RunId, Sha, TaskId, WorkerName,
 };
-use fleet_domain::status::{BlockKind, DecisionKind, EndKind, GoalStatus, Purpose, Verdict};
+use fleet_domain::status::{
+    BlockKind, ContextMode, DecisionKind, EndKind, GoalStatus, Purpose, Verdict,
+};
 use fleet_domain::value::{Document, Value};
 use std::fmt::Debug;
 
@@ -95,6 +104,7 @@ fn sample_events() -> Vec<DomainEvent> {
             base_ref: "main".into(),
             base_sha: sha(&"a".repeat(40)),
             max_parallel: 3,
+            context: Some(ContextMode::Compiled),
         },
         DomainEvent::RunStarted {
             run: run.clone(),
@@ -306,6 +316,30 @@ fn sample_events() -> Vec<DomainEvent> {
                         ("note", Value::str(tricky)),
                     ])]),
                 ),
+            ])),
+        },
+        DomainEvent::ContextCompiled {
+            run: run.clone(),
+            task: t1.clone(),
+            attempt: 2,
+            profile: "default".into(),
+            pack_digest: "ab".repeat(32),
+            stable_digest: "cd".repeat(32),
+            tokens: 4_294_967_296,
+            manifest: Document(Value::object([
+                ("schema", Value::str("neo-context-manifest/1")),
+                ("note", Value::str(tricky)),
+            ])),
+        },
+        DomainEvent::HandoffCreated {
+            run: run.clone(),
+            task: t1.clone(),
+            attempt: 2,
+            trigger: "retry".into(),
+            digest: "ef".repeat(32),
+            packet: Document(Value::object([
+                ("schema", Value::str("neo-handoff/1")),
+                ("summary", Value::str(tricky)),
             ])),
         },
         DomainEvent::EvidenceRecorded {
@@ -873,6 +907,10 @@ pub const VALID_QUESTION_JSON: &str = r#"{"version":1,"kind":"question","text":"
 /// A string a harness embeds in every planted file that is not valid. A reason shown for such a
 /// file must never contain it, because the text is worker-controlled.
 pub const PLANT_MARKER: &str = "PLANTED-CONTENT-MARKER-7731";
+/// Text of a valid `handoff.json`.
+pub const VALID_HANDOFF_JSON: &str = r#"{"version":1,"summary":"left off at step 3"}"#;
+/// The summary of [`VALID_HANDOFF_JSON`].
+pub const HANDOFF_SUMMARY: &str = "left off at step 3";
 
 /// Which worker file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -955,6 +993,12 @@ pub trait ContractHarness {
     fn plant(&mut self, file: ContractFile, kind: Plant);
     /// Plants a valid result and a valid question, as a previous attempt would have left them.
     fn plant_stale_files(&mut self);
+    /// Makes `.fleet/handoff.json` exist as described by `kind` (a valid one holds
+    /// [`VALID_HANDOFF_JSON`]), replacing whatever was there before.
+    fn plant_handoff(&mut self, kind: Plant);
+    /// What the worker would find in `.fleet/context.md` and `.fleet/context.json`, `None` when
+    /// there are no such files.
+    fn context_files(&self) -> Option<(String, String)>;
 }
 
 /// [`ContractHarness`] over the in-memory fake of a [`World`].
@@ -1021,6 +1065,20 @@ impl ContractHarness for MemoryContractHarness {
     fn plant_stale_files(&mut self) {
         self.plant(ContractFile::Result, Plant::Valid);
         self.plant(ContractFile::Question, Plant::Valid);
+    }
+
+    fn plant_handoff(&mut self, kind: Plant) {
+        let read = match kind {
+            Plant::Valid => ContractRead::Valid(WorkerHandoff {
+                summary: HANDOFF_SUMMARY.to_string(),
+            }),
+            other => ContractRead::Invalid(format!("handoff.json: planted {other:?} file")),
+        };
+        self.world.write_handoff(&self.worktree, read);
+    }
+
+    fn context_files(&self) -> Option<(String, String)> {
+        self.world.context_files(&self.worktree)
     }
 }
 
@@ -1131,6 +1189,323 @@ fn prepare(h: &dyn ContractHarness, brief: &str) {
     h.files()
         .prepare(&h.worktree(), brief)
         .unwrap_or_else(|e| panic!("contract files contract: prepare failed: {e}"));
+}
+
+fn assert_handoff_absent(h: &dyn ContractHarness, when: &str) {
+    let read = h.files().read_handoff(&h.worktree());
+    assert!(
+        matches!(read, ContractRead::Absent),
+        "contract files contract: the handoff must be Absent {when}, got {read:?}"
+    );
+}
+
+// ---- context store --------------------------------------------------------------------------
+
+fn ctx_digest(seed: u32) -> String {
+    format!("{seed:08x}").repeat(8)
+}
+
+fn ctx_pack_with(digest: &str, text: &str) -> StoredPack {
+    StoredPack {
+        digest: digest.to_string(),
+        text: text.to_string(),
+        document: Value::object([
+            ("digest", Value::str(digest)),
+            ("schema", Value::str("neo-context-pack/1")),
+            ("layers", Value::array([Value::int(1u8), Value::int(2u8)])),
+        ]),
+    }
+}
+
+fn ctx_pack(seed: u32) -> StoredPack {
+    ctx_pack_with(&ctx_digest(seed), &format!("pack {seed}\nünï 日本語\n"))
+}
+
+fn ctx_packet(seed: u32) -> Value {
+    Value::object([
+        ("digest", Value::str(ctx_digest(seed))),
+        ("schema", Value::str("neo-context-handoff/1")),
+        ("summary", Value::str(format!("summary {seed}"))),
+    ])
+}
+
+fn ctx_save(store: &mut dyn ContextStore, run: &RunId, task: &TaskId, seed: u32) {
+    store
+        .save_pack(run, task, &ctx_pack(seed))
+        .unwrap_or_else(|e| panic!("context store contract: save_pack failed: {e}"));
+    store
+        .save_handoff(run, task, &ctx_digest(seed), &ctx_packet(seed))
+        .unwrap_or_else(|e| panic!("context store contract: save_handoff failed: {e}"));
+}
+
+fn ctx_list(store: &dyn ContextStore, run: &RunId, task: &TaskId) -> Vec<String> {
+    store
+        .list_packs(run, task)
+        .unwrap_or_else(|e| panic!("context store contract: list_packs failed: {e}"))
+}
+
+fn ctx_load(
+    store: &dyn ContextStore,
+    run: &RunId,
+    task: &TaskId,
+    d: Option<&str>,
+) -> Option<StoredPack> {
+    store
+        .load_pack(run, task, d)
+        .unwrap_or_else(|e| panic!("context store contract: load_pack({d:?}) failed: {e}"))
+}
+
+fn ctx_load_handoff(
+    store: &dyn ContextStore,
+    run: &RunId,
+    task: &TaskId,
+    d: Option<&str>,
+) -> Option<(String, Value)> {
+    store
+        .load_handoff(run, task, d)
+        .unwrap_or_else(|e| panic!("context store contract: load_handoff({d:?}) failed: {e}"))
+}
+
+/// Checks a [`ContextStore`]. Every call of `open` must return a handle onto the same storage.
+///
+/// Rules: a task without packs has none (newest, by prefix, listing); the newest saved pack is
+/// loaded when no digest is given and listing is oldest first; a pack is found by at least 8 hex
+/// digits of its digest or by the whole digest, a shorter or non-hex prefix is an error, and so is
+/// a prefix of more than one saved pack; an unknown digest is `None`; saving a digest that is
+/// stored replaces it and makes it the newest; only the newest 8 packs and the newest 8 handoffs of
+/// a task are kept; handoffs follow the same rules for loading; tasks and runs do not see each
+/// other's data; `remove` forgets one task and is idempotent; data survives reopening.
+pub fn context_store_contract(open: &mut dyn FnMut() -> Box<dyn ContextStore>) {
+    let (r1, t1) = ids("r1", "t1");
+    let (_, t2) = ids("r1", "t2");
+    let (r2, _) = ids("r2", "t1");
+    let mut store = open();
+
+    // 1. Nothing saved.
+    assert!(
+        ctx_list(store.as_ref(), &r1, &t1).is_empty(),
+        "context store contract: a new store lists nothing"
+    );
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t1, None),
+        None,
+        "context store contract: no newest pack"
+    );
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t1, Some("deadbeef")),
+        None,
+        "context store contract: an unknown digest is None"
+    );
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t1, None),
+        None,
+        "context store contract: no newest handoff"
+    );
+    store.remove(&r1, &t1); // nothing there: no effect, no panic
+
+    // 2. Save three; newest, listing order, load by whole digest and by prefix.
+    for seed in 1..=3 {
+        ctx_save(store.as_mut(), &r1, &t1, seed);
+    }
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t1, None),
+        Some(ctx_pack(3)),
+        "context store contract: the newest pack is loaded without a digest, text and document intact"
+    );
+    assert_eq!(
+        ctx_list(store.as_ref(), &r1, &t1),
+        vec![ctx_digest(1), ctx_digest(2), ctx_digest(3)],
+        "context store contract: packs are listed oldest first"
+    );
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t1, Some(&ctx_digest(1))),
+        Some(ctx_pack(1))
+    );
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t1, Some(&ctx_digest(2)[..8])),
+        Some(ctx_pack(2))
+    );
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t1, Some(&ctx_digest(2)[..20])),
+        Some(ctx_pack(2))
+    );
+    assert_eq!(ctx_load(store.as_ref(), &r1, &t1, Some("ffffffff")), None);
+    assert_eq!(
+        ctx_load(
+            store.as_ref(),
+            &r1,
+            &t1,
+            Some(&format!("{}0", ctx_digest(1)))
+        ),
+        None,
+        "context store contract: a longer string than a digest matches nothing"
+    );
+
+    // 3. Prefix rules, for packs and handoffs alike.
+    for bad in ["", "abc", "deadbee", "zzzzzzzz", "../../etc", "dead beef"] {
+        assert!(
+            store.load_pack(&r1, &t1, Some(bad)).is_err(),
+            "context store contract: the pack prefix {bad:?} must be refused"
+        );
+        assert!(
+            store.load_handoff(&r1, &t1, Some(bad)).is_err(),
+            "context store contract: the handoff prefix {bad:?} must be refused"
+        );
+    }
+    let a = format!("abcdef01{}", "1".repeat(56));
+    let b = format!("abcdef01{}", "2".repeat(56));
+    for d in [&a, &b] {
+        store.save_pack(&r1, &t2, &ctx_pack_with(d, "x")).unwrap();
+        let packet = Value::object([("digest", Value::str(d)), ("summary", Value::str("s"))]);
+        store.save_handoff(&r1, &t2, d, &packet).unwrap();
+    }
+    assert!(
+        store.load_pack(&r1, &t2, Some("abcdef01")).is_err(),
+        "context store contract: an ambiguous pack prefix is an error"
+    );
+    assert!(
+        store.load_handoff(&r1, &t2, Some("abcdef01")).is_err(),
+        "context store contract: an ambiguous handoff prefix is an error"
+    );
+    assert_eq!(
+        ctx_load(
+            store.as_ref(),
+            &r1,
+            &t2,
+            Some(&format!("abcdef01{}", "2".repeat(10)))
+        ),
+        Some(ctx_pack_with(&b, "x")),
+        "context store contract: more digits resolve the ambiguity"
+    );
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t2, None),
+        Some(ctx_pack_with(&b, "x"))
+    );
+
+    // 4. Handoffs: newest, by prefix, by whole digest.
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t1, None),
+        Some((ctx_digest(3), ctx_packet(3))),
+        "context store contract: the newest handoff comes with its digest"
+    );
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t1, Some(&ctx_digest(1)[..8])),
+        Some((ctx_digest(1), ctx_packet(1)))
+    );
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t1, Some(&ctx_digest(2))),
+        Some((ctx_digest(2), ctx_packet(2)))
+    );
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t1, Some("ffffffff")),
+        None
+    );
+
+    // 5. Saving a stored digest replaces it and makes it the newest.
+    store
+        .save_pack(&r1, &t1, &ctx_pack_with(&ctx_digest(1), "replaced text"))
+        .unwrap();
+    assert_eq!(
+        ctx_list(store.as_ref(), &r1, &t1),
+        vec![ctx_digest(2), ctx_digest(3), ctx_digest(1)],
+        "context store contract: a replaced pack moves to the newest place and is not duplicated"
+    );
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t1, None),
+        Some(ctx_pack_with(&ctx_digest(1), "replaced text"))
+    );
+    store
+        .save_handoff(&r1, &t1, &ctx_digest(1), &ctx_packet(1))
+        .unwrap();
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t1, None),
+        Some((ctx_digest(1), ctx_packet(1))),
+        "context store contract: a replaced handoff is the newest"
+    );
+
+    // 6. Tasks and runs are separate.
+    assert_eq!(ctx_list(store.as_ref(), &r2, &t1), Vec::<String>::new());
+    assert_eq!(ctx_load(store.as_ref(), &r2, &t1, None), None);
+    assert_eq!(ctx_load_handoff(store.as_ref(), &r2, &t1, None), None);
+    assert_eq!(
+        ctx_list(store.as_ref(), &r1, &t2),
+        vec![a.clone(), b.clone()]
+    );
+
+    // 7. Retention: the newest 8 of each kind.
+    let (_, t3) = ids("r1", "t3");
+    for seed in 100..112 {
+        ctx_save(store.as_mut(), &r1, &t3, seed);
+    }
+    let kept: Vec<String> = (104..112).map(ctx_digest).collect();
+    assert_eq!(
+        ctx_list(store.as_ref(), &r1, &t3),
+        kept,
+        "context store contract: only the newest 8 packs of a task are kept"
+    );
+    assert_eq!(
+        ctx_load(store.as_ref(), &r1, &t3, Some(&ctx_digest(103)[..8])),
+        None
+    );
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t3, Some(&ctx_digest(103)[..8])),
+        None,
+        "context store contract: only the newest 8 handoffs of a task are kept"
+    );
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t3, Some(&ctx_digest(104)[..8])),
+        Some((ctx_digest(104), ctx_packet(104))),
+        "context store contract: the 8th newest handoff is still there"
+    );
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t3, None),
+        Some((ctx_digest(111), ctx_packet(111)))
+    );
+    assert_eq!(
+        ctx_list(store.as_ref(), &r1, &t1).len(),
+        3,
+        "context store contract: retention is per task"
+    );
+
+    // 8. Another handle onto the same storage sees the same data, also after a reopen.
+    let other = open();
+    assert_eq!(ctx_list(other.as_ref(), &r1, &t3), kept);
+    assert_eq!(
+        ctx_load(other.as_ref(), &r1, &t1, None),
+        Some(ctx_pack_with(&ctx_digest(1), "replaced text"))
+    );
+    let mut store = reopen(open, store);
+    drop(other);
+    assert_eq!(
+        ctx_list(store.as_ref(), &r1, &t3),
+        kept,
+        "context store contract: data survives reopening"
+    );
+    assert_eq!(
+        ctx_load_handoff(store.as_ref(), &r1, &t3, None),
+        Some((ctx_digest(111), ctx_packet(111)))
+    );
+
+    // 9. `remove` forgets one task only, and is idempotent.
+    store.remove(&r1, &t3);
+    store.remove(&r1, &t3);
+    assert!(ctx_list(store.as_ref(), &r1, &t3).is_empty());
+    assert_eq!(ctx_load(store.as_ref(), &r1, &t3, None), None);
+    assert_eq!(ctx_load_handoff(store.as_ref(), &r1, &t3, None), None);
+    assert_eq!(
+        ctx_list(store.as_ref(), &r1, &t1).len(),
+        3,
+        "context store contract: remove touched another task"
+    );
+    assert_eq!(ctx_list(store.as_ref(), &r1, &t2), vec![a, b]);
+    store.remove(&r1, &t1);
+    store.remove(&r1, &t2);
+    assert_eq!(ctx_load(store.as_ref(), &r1, &t1, None), None);
+
+    // 10. A forgotten task starts afresh.
+    ctx_save(store.as_mut(), &r1, &t1, 7);
+    assert_eq!(ctx_list(store.as_ref(), &r1, &t1), vec![ctx_digest(7)]);
+    assert_eq!(ctx_load(store.as_ref(), &r1, &t1, None), Some(ctx_pack(7)));
 }
 
 /// Checks a [`ContractFiles`] adapter through a [`ContractHarness`] that starts with nothing
@@ -1254,6 +1629,95 @@ pub fn contract_files_contract(h: &mut dyn ContractHarness) {
     );
     h.plant(ContractFile::Result, Plant::Malformed);
     assert_invalid(h, ContractFile::Result, Plant::Malformed);
+
+    // 9. The compiled context is made visible to the worker, and replaced by the next one.
+    assert_eq!(
+        h.context_files(),
+        None,
+        "contract files contract: no context files before prepare_context (or after prepare)"
+    );
+    let manifest = r#"{"digest":"abc","schema":"neo-context-pack/1"}"#;
+    h.files()
+        .prepare_context(&h.worktree(), "# context\nfirst ünï 日本語\n", manifest)
+        .unwrap_or_else(|e| panic!("contract files contract: prepare_context failed: {e}"));
+    assert_eq!(
+        h.context_files(),
+        Some((
+            "# context\nfirst ünï 日本語\n".to_string(),
+            manifest.to_string()
+        )),
+        "contract files contract: prepare_context must make context.md and context.json visible"
+    );
+    h.files()
+        .prepare_context(&h.worktree(), "second", "{}")
+        .unwrap_or_else(|e| panic!("contract files contract: second prepare_context failed: {e}"));
+    assert_eq!(
+        h.context_files(),
+        Some(("second".to_string(), "{}".to_string())),
+        "contract files contract: a second prepare_context must replace the first"
+    );
+    assert!(
+        h.files()
+            .prepare_context(&h.worktree(), &"x".repeat(2 * 1024 * 1024 + 1), "{}")
+            .is_err(),
+        "contract files contract: a context above 2 MiB must be refused"
+    );
+    assert_eq!(
+        h.context_files(),
+        Some(("second".to_string(), "{}".to_string())),
+        "contract files contract: a refused context must leave the previous one alone"
+    );
+    prepare(h, "brief");
+    assert_eq!(
+        h.context_files(),
+        None,
+        "contract files contract: prepare must remove stale context files"
+    );
+
+    // 10. The handoff a worker left: absent, valid, broken in every way, cleared by prepare.
+    assert_handoff_absent(h, "when nothing was planted");
+    h.plant_handoff(Plant::Valid);
+    match h.files().read_handoff(&h.worktree()) {
+        ContractRead::Valid(handoff) => assert_eq!(
+            handoff,
+            WorkerHandoff {
+                summary: HANDOFF_SUMMARY.to_string()
+            },
+            "contract files contract: the handoff was read back wrongly"
+        ),
+        other => {
+            panic!("contract files contract: a valid handoff must read as Valid, got {other:?}")
+        }
+    }
+    assert_absent(h, ContractFile::Result, "when only a handoff was planted");
+    for kind in BROKEN {
+        h.plant_handoff(kind);
+        match h.files().read_handoff(&h.worktree()) {
+            ContractRead::Invalid(reason) => {
+                assert!(
+                    !reason.trim().is_empty() && !reason.chars().any(char::is_control),
+                    "contract files contract: the reason for a {kind:?} handoff is not printable: {reason:?}"
+                );
+                for secret in [PLANT_MARKER, HANDOFF_SUMMARY] {
+                    assert!(
+                        !reason.contains(secret),
+                        "contract files contract: the reason for a {kind:?} handoff echoes file content: {reason:?}"
+                    );
+                }
+            }
+            other => panic!(
+                "contract files contract: a {kind:?} handoff must read as Invalid, got {other:?}"
+            ),
+        }
+    }
+    for kind in CLEARABLE {
+        h.plant_handoff(kind);
+        prepare(h, "brief");
+        assert_handoff_absent(
+            h,
+            &format!("after prepare cleared a stale {kind:?} handoff"),
+        );
+    }
 }
 
 // ---- verification jobs --------------------------------------------------------------------------

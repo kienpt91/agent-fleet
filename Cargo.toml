@@ -4,6 +4,7 @@ members = [
   "crates/fleet-domain",
   "crates/neo-verify",
   "crates/neo-goals",
+  "crates/neo-context",
   "crates/fleet-app",
   "crates/fleet-infra",
   "crates/fleet-cli",

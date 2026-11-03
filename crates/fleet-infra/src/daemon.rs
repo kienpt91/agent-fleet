@@ -7,11 +7,13 @@
 //! input can never block the engine.
 
 use crate::clock::SystemClock;
+use crate::context_store::FileContextStore;
 use crate::contract_fs::FsContractFiles;
 use crate::digest::Sha256Digest;
 use crate::eventlog::FileEventStore;
 use crate::git::GitVcs;
 use crate::jobs::{JobTracker, ThreadJobRunner};
+use crate::knowledge::FileKnowledge;
 use crate::logs::FileOutputLogs;
 use crate::procid;
 use crate::pty::{PtySessionHost, SessionIo, SessionRegistry};
@@ -243,8 +245,15 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         ),
         digest: Box::new(Sha256Digest),
         publisher: Box::new(NullPublisher),
+        context: Box::new(FileContextStore::new(layout.context_dir.clone())),
+        knowledge: Box::new(FileKnowledge::new(
+            app.context.knowledge.clone().map(PathBuf::from),
+        )),
     };
     let kill_grace_ms = app.kill_grace_ms;
+    // Context packs are redacted with the same rules as everything else the daemon stores.
+    let mut app = app;
+    app.redactor = Arc::clone(&redactor);
     let mut orch = Orchestrator::new(app, ports)?;
     orch.startup(u64::from(std::process::id()), VERSION)?;
 

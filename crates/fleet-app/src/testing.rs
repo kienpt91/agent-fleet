@@ -13,7 +13,7 @@ use crate::config::{AppConfig, WorkerDef};
 use crate::orchestrator::Orchestrator;
 use crate::ports::*;
 use fleet_domain::approval::Digest;
-use fleet_domain::contract::{ContractRead, WorkerQuestion, WorkerResult};
+use fleet_domain::contract::{ContractRead, WorkerHandoff, WorkerQuestion, WorkerResult};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{ApprovalId, RunId, Sha, TaskId, WorkerName};
@@ -21,6 +21,7 @@ use fleet_domain::output::Chunk;
 use fleet_domain::quality::GateOutcome;
 use fleet_domain::status::Verdict;
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
+use fleet_domain::value::Value;
 use neo_verify::judge::CheckReport;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -96,6 +97,17 @@ struct Inner {
     questions: BTreeMap<String, ContractRead<WorkerQuestion>>,
     results: BTreeMap<String, ContractRead<WorkerResult>>,
     briefs: Vec<(String, String)>,
+    context_files: BTreeMap<String, (String, String)>,
+    handoff_files: BTreeMap<String, ContractRead<WorkerHandoff>>,
+    fail_prepare_context: bool,
+    /// Files per commit for `tree_files`; the empty key answers for any commit not listed.
+    repo_files: BTreeMap<String, Vec<(String, Vec<u8>)>>,
+    fail_repo_reads: bool,
+    packs: BTreeMap<(String, String), Vec<StoredPack>>,
+    handoff_store: BTreeMap<(String, String), Vec<(String, Value)>>,
+    fail_context_store: bool,
+    knowledge: Vec<KnowledgeEntry>,
+    knowledge_error: Option<String>,
     fail_prepare_contract: bool,
 
     gate_mode: Option<GateMode>,
@@ -154,6 +166,8 @@ impl World {
             undo: Box::new(FakeUndo(self.clone())),
             digest: Box::new(ToyDigest),
             publisher: Box::new(RecordingPublisher(self.clone())),
+            context: Box::new(MemoryContextStore(self.clone())),
+            knowledge: Box::new(FakeKnowledge(self.clone())),
         }
     }
 
@@ -310,6 +324,64 @@ impl World {
     }
     pub fn briefs(&self) -> Vec<(String, String)> {
         self.lock().briefs.clone()
+    }
+    /// What the worker would find in `.fleet/context.md` and `.fleet/context.json`.
+    pub fn context_files(&self, worktree: &str) -> Option<(String, String)> {
+        self.lock().context_files.get(worktree).cloned()
+    }
+    pub fn write_handoff(&self, worktree: &str, h: ContractRead<WorkerHandoff>) {
+        self.lock().handoff_files.insert(worktree.to_string(), h);
+    }
+    pub fn fail_context_prepare(&self, fail: bool) {
+        self.lock().fail_prepare_context = fail;
+    }
+    /// The files of a commit as the fake repository has them (`None`: every commit without files
+    /// of its own).
+    pub fn set_repo_files(&self, commit: Option<&Sha>, files: &[(&str, &[u8])]) {
+        let key = commit.map_or(String::new(), |c| c.to_string());
+        self.lock().repo_files.insert(
+            key,
+            files
+                .iter()
+                .map(|(p, c)| ((*p).to_string(), c.to_vec()))
+                .collect(),
+        );
+    }
+    pub fn fail_repo_reads(&self, fail: bool) {
+        self.lock().fail_repo_reads = fail;
+    }
+    pub fn saved_packs(&self, run: &str, task: &str) -> Vec<StoredPack> {
+        self.lock()
+            .packs
+            .get(&(run.to_string(), task.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// Changes the stored packs of a task behind the application's back, as someone who can write
+    /// the state directory could (for tamper tests).
+    pub fn tamper_packs(&self, run: &str, task: &str, change: impl FnOnce(&mut Vec<StoredPack>)) {
+        let mut g = self.lock();
+        let list = g
+            .packs
+            .entry((run.to_string(), task.to_string()))
+            .or_default();
+        change(list);
+    }
+    pub fn saved_handoffs(&self, run: &str, task: &str) -> Vec<(String, Value)> {
+        self.lock()
+            .handoff_store
+            .get(&(run.to_string(), task.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+    pub fn fail_context_store(&self, fail: bool) {
+        self.lock().fail_context_store = fail;
+    }
+    pub fn set_knowledge(&self, entries: Vec<KnowledgeEntry>) {
+        self.lock().knowledge = entries;
+    }
+    pub fn fail_knowledge(&self, message: Option<&str>) {
+        self.lock().knowledge_error = message.map(str::to_string);
     }
     pub fn fail_contract_prepare(&self, fail: bool) {
         self.lock().fail_prepare_contract = fail;
@@ -684,6 +756,71 @@ impl Vcs for FakeVcs {
             dirty: g.worktree_dirty,
         })
     }
+
+    fn tree_files(&self, _repo: &str, commit: &Sha, max: usize) -> Result<TreeListing> {
+        let g = self.0.lock();
+        if g.fail_repo_reads {
+            return Err(FleetError::internal("git could not list the tree"));
+        }
+        let files = g
+            .repo_files
+            .get(commit.as_str())
+            .or_else(|| g.repo_files.get(""))
+            .cloned()
+            .unwrap_or_default();
+        let mut listing: Vec<TreeFile> = files
+            .iter()
+            .map(|(path, content)| TreeFile {
+                path: path.clone(),
+                size: content.len() as u64,
+                blob: fake_blob(content),
+            })
+            .collect();
+        listing.sort_by(|a, b| a.path.cmp(&b.path));
+        let truncated = listing.len() > max;
+        listing.truncate(max);
+        Ok(TreeListing {
+            files: listing,
+            truncated,
+        })
+    }
+
+    fn read_blob(&self, _repo: &str, blob: &Sha, max: usize) -> Result<Vec<u8>> {
+        let g = self.0.lock();
+        if g.fail_repo_reads {
+            return Err(FleetError::internal("git could not read the blob"));
+        }
+        g.repo_files
+            .values()
+            .flatten()
+            .find(|(_, content)| fake_blob(content) == *blob)
+            .map(|(_, content)| content.iter().take(max).copied().collect())
+            .ok_or_else(|| FleetError::not_found("no such blob"))
+    }
+
+    fn changed_paths(
+        &self,
+        _repo: &str,
+        _base: &Sha,
+        _head: &Sha,
+        max: usize,
+    ) -> Result<(Vec<String>, bool)> {
+        let g = self.0.lock();
+        if g.fail_repo_reads {
+            return Err(FleetError::internal("git could not diff"));
+        }
+        let mut paths = g.worktree_changed.clone();
+        paths.sort();
+        let truncated = paths.len() > max;
+        paths.truncate(max);
+        Ok((paths, truncated))
+    }
+}
+
+/// The id the fake repository gives a file's content (a prefix of the toy digest).
+fn fake_blob(content: &[u8]) -> Sha {
+    let hex = ToyDigest.sha256_hex(content);
+    Sha::parse(hex.get(..40).unwrap_or(&hex)).unwrap()
 }
 
 // ---- sessions ------------------------------------------------------------------------------
@@ -860,6 +997,8 @@ impl ContractFiles for FakeContract {
         g.briefs.push((worktree.to_string(), brief.to_string()));
         g.questions.remove(worktree);
         g.results.remove(worktree);
+        g.handoff_files.remove(worktree);
+        g.context_files.remove(worktree);
         Ok(())
     }
 
@@ -883,6 +1022,160 @@ impl ContractFiles for FakeContract {
 
     fn question_present(&self, worktree: &str) -> bool {
         self.0.lock().questions.contains_key(worktree)
+    }
+
+    fn prepare_context(&self, worktree: &str, text: &str, manifest_json: &str) -> Result<()> {
+        let mut g = self.0.lock();
+        if g.fail_prepare_context {
+            return Err(FleetError::internal(".fleet/context.md is not writable"));
+        }
+        if text.len() > 2 * 1024 * 1024 {
+            return Err(FleetError::limit("the context pack is larger than 2 MiB"));
+        }
+        g.context_files.insert(
+            worktree.to_string(),
+            (text.to_string(), manifest_json.to_string()),
+        );
+        Ok(())
+    }
+
+    fn read_handoff(&self, worktree: &str) -> ContractRead<WorkerHandoff> {
+        self.0
+            .lock()
+            .handoff_files
+            .get(worktree)
+            .cloned()
+            .unwrap_or(ContractRead::Absent)
+    }
+}
+
+// ---- context packs --------------------------------------------------------------------------------
+
+pub struct MemoryContextStore(World);
+
+const KEPT_PER_TASK: usize = CONTEXT_PACKS_KEPT;
+
+fn pick<'a, T>(
+    items: &'a [T],
+    digest_of: impl Fn(&T) -> &str,
+    wanted: Option<&str>,
+) -> Result<Option<&'a T>> {
+    match wanted {
+        None => Ok(items.last()),
+        Some(prefix) => {
+            if prefix.len() < 8 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(FleetError::invalid(
+                    "a digest is given as at least 8 hexadecimal digits",
+                ));
+            }
+            let mut hits = items.iter().filter(|i| digest_of(i).starts_with(prefix));
+            let first = hits.next();
+            if hits.next().is_some() {
+                return Err(FleetError::invalid(format!(
+                    "the digest prefix {prefix} matches more than one saved item"
+                )));
+            }
+            Ok(first)
+        }
+    }
+}
+
+impl ContextStore for MemoryContextStore {
+    fn save_pack(&mut self, run: &RunId, task: &TaskId, pack: &StoredPack) -> Result<()> {
+        let mut g = self.0.lock();
+        if g.fail_context_store {
+            return Err(FleetError::internal("the context store is full"));
+        }
+        let list = g
+            .packs
+            .entry((run.to_string(), task.to_string()))
+            .or_default();
+        list.retain(|p| p.digest != pack.digest);
+        list.push(pack.clone());
+        while list.len() > KEPT_PER_TASK {
+            list.remove(0);
+        }
+        Ok(())
+    }
+
+    fn load_pack(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        digest: Option<&str>,
+    ) -> Result<Option<StoredPack>> {
+        let g = self.0.lock();
+        let list = g
+            .packs
+            .get(&(run.to_string(), task.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Ok(pick(list, |p| p.digest.as_str(), digest)?.cloned())
+    }
+
+    fn list_packs(&self, run: &RunId, task: &TaskId) -> Result<Vec<String>> {
+        let g = self.0.lock();
+        Ok(g.packs
+            .get(&(run.to_string(), task.to_string()))
+            .map(|l| l.iter().map(|p| p.digest.clone()).collect())
+            .unwrap_or_default())
+    }
+
+    fn save_handoff(
+        &mut self,
+        run: &RunId,
+        task: &TaskId,
+        digest: &str,
+        packet: &Value,
+    ) -> Result<()> {
+        let mut g = self.0.lock();
+        if g.fail_context_store {
+            return Err(FleetError::internal("the context store is full"));
+        }
+        let list = g
+            .handoff_store
+            .entry((run.to_string(), task.to_string()))
+            .or_default();
+        list.retain(|(d, _)| d != digest);
+        list.push((digest.to_string(), packet.clone()));
+        while list.len() > KEPT_PER_TASK {
+            list.remove(0);
+        }
+        Ok(())
+    }
+
+    fn load_handoff(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        digest: Option<&str>,
+    ) -> Result<Option<(String, Value)>> {
+        let g = self.0.lock();
+        let list = g
+            .handoff_store
+            .get(&(run.to_string(), task.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Ok(pick(list, |(d, _)| d.as_str(), digest)?.cloned())
+    }
+
+    fn remove(&mut self, run: &RunId, task: &TaskId) {
+        let mut g = self.0.lock();
+        let key = (run.to_string(), task.to_string());
+        g.packs.remove(&key);
+        g.handoff_store.remove(&key);
+    }
+}
+
+pub struct FakeKnowledge(World);
+
+impl KnowledgeSource for FakeKnowledge {
+    fn entries(&self) -> Result<Vec<KnowledgeEntry>> {
+        let g = self.0.lock();
+        match &g.knowledge_error {
+            Some(message) => Err(FleetError::invalid(message.clone())),
+            None => Ok(g.knowledge.clone()),
+        }
     }
 }
 
@@ -1121,6 +1414,7 @@ pub fn test_config() -> AppConfig {
             env_set: vec![("AGENT_MODE".to_string(), "test".to_string())],
             timeout_ms: Some(60_000),
             idle_timeout_ms: Some(30_000),
+            profile: None,
         },
     );
     cfg.default_worker = Some(name);

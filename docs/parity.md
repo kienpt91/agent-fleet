@@ -55,17 +55,17 @@ mobile app.
 | Merge conflict handling | implemented | `fleet-app/tests/merging.rs::a_merge_conflict_aborts_opens_a_gate_and_blocks_the_task` | The merge is aborted and a decision gate opens; the integration branch is unchanged. |
 | Agent undo | partial | `fleet-app/tests/recovery.rs::undo_previews_by_default_and_applies_only_when_asked`, `fleet-cli/tests/e2e_cli.rs::a_fake_agent_undo_gets_checkpoints_and_undo_requests` | Delegates to an optional external `agent-undo` tool. Only a fake tool was exercised. |
 | Agent-to-agent messaging | partial | `fleet-app/tests/decisions.rs::a_dependencys_summary_reaches_dependents_as_one_marked_line` | Only indirect: a finished task's summary and branch reach its dependents' briefs. No live messaging. |
-| Goal ledger and proof of completion (verification contracts, evidence bound to a commit) | implemented | `fleet-cli/tests/e2e_neo.rs::a_failing_contract_then_a_passing_one`, `fleet-cli/tests/e2e_neo.rs::a_worker_report_is_unverified_until_fleets_own_run_finished`, `fleet-app/tests/neo_verify.rs::a_task_with_a_contract_completes_only_after_fleets_own_run_passed`, `scripts/neo-demo.sh` | Not in the public docs summary; included because it is part of agent-fleet (docs/neo.md). Checks run on a clean export of the committed work, not in a sandbox. Only milestone N1 exists. |
+| Goal ledger and proof of completion (verification contracts, evidence bound to a commit) | implemented | `fleet-cli/tests/e2e_neo.rs::a_failing_contract_then_a_passing_one`, `fleet-cli/tests/e2e_neo.rs::a_worker_report_is_unverified_until_fleets_own_run_finished`, `fleet-app/tests/neo_verify.rs::a_task_with_a_contract_completes_only_after_fleets_own_run_passed`, `scripts/neo-demo.sh` | Not in the public docs summary; included because it is part of agent-fleet (docs/neo.md). Checks run on a clean export of the committed work, not in a sandbox. Milestones N1 and N2 (context packs and handoffs, opt-in per run) exist. |
 | Agents driving the orchestrator through its CLI | not planned | `fleet-cli/tests/e2e_security.rs::a_worker_cannot_approve_resolve_or_read_status_but_the_operator_can` | Workers are refused on purpose. Listed in public docs summary for the other product. |
 
 ### Review, editing and integrations
 
 | Capability | Status in agent-fleet | Evidence | Notes |
 | --- | --- | --- | --- |
-| Source-control view and diff view | implemented | `fleet-infra/tests/repo_read.rs::renames_are_detected_with_their_similarity_and_old_path`, `fleet-cli/tests/e2e_web.rs::the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository`, `scripts/web-smoke-panes.mjs` | Read-only diff of a task's commit against the run's base, unified and side by side (ADR 17). No staging, no working-tree status. Rust tests, a fake DOM and `scripts/workbench-demo.sh` (headless Chromium, 13 loads, screenshots in `docs/img`); no desktop browsers. |
+| Source-control view and diff view | implemented | `fleet-infra/tests/repo_read.rs::renames_are_detected_with_their_similarity_and_old_path`, `fleet-cli/tests/e2e_web.rs::the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository`, `scripts/web-smoke-panes.mjs` | Read-only diff of a task's commit against the run's base, unified and side by side (ADR 19). No staging, no working-tree status. Rust tests, a fake DOM and `scripts/workbench-demo.sh` (headless Chromium, 13 loads, screenshots in `docs/img`); no desktop browsers. |
 | Diff annotation (comments sent back to the agent) | not planned | none | A person can answer a gate or send text to a live worker (see the web rows and `fleet send`). |
 | File editor | planned | none | Phase 5.4 (edits through a daemon API with path containment). Nothing edits files today. |
-| File explorer and file viewer | implemented | `fleet-infra/tests/repo_read.rs::the_git_reader_satisfies_the_contract`, `fleet-cli/tests/e2e_web.rs::clients_cannot_name_paths_commits_or_tasks_the_daemon_did_not_record`, `scripts/web-smoke-panes.mjs` | Read-only tree and file view at the recorded commit, never the worktree (ADR 17). Also loaded in headless Chromium (`scripts/workbench-demo.sh`); no desktop browsers. |
+| File explorer and file viewer | implemented | `fleet-infra/tests/repo_read.rs::the_git_reader_satisfies_the_contract`, `fleet-cli/tests/e2e_web.rs::clients_cannot_name_paths_commits_or_tasks_the_daemon_did_not_record`, `scripts/web-smoke-panes.mjs` | Read-only tree and file view at the recorded commit, never the worktree (ADR 19). Also loaded in headless Chromium (`scripts/workbench-demo.sh`); no desktop browsers. |
 | Rich previews (Markdown, images; PDF) | partial | `fleet-domain/src/repo/markdown.rs` (property and adversarial tests), `fleet-cli/tests/e2e_web.rs::the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository`, `scripts/web-smoke-panes.mjs` | Markdown subset and png/jpeg/gif/webp images only (SVG excluded). PDF is planned for phase 5.5 (first step: the system viewer). Also loaded in headless Chromium (`scripts/workbench-demo.sh`); no desktop browsers. |
 | GitHub integration (PRs, issues) | planned | none | Phase 3. |
 | Linear integration (issues, boards) | planned | none | Phase 3. |
@@ -184,7 +184,7 @@ Acceptance criteria:
 ## 5. Not planned
 
 - (Reversed: the graphical workbench is in scope, see the plan below.) It is built as a web UI served by the daemon
-  (phase 5.x); read-only review panes exist (phase 5.1, ADR 17); the terminal panes, interactive terminal, editor, PDF
+  (phase 5.x); read-only review panes exist (phase 5.1, ADR 19); the terminal panes, interactive terminal, editor, PDF
   viewing and a thin desktop shell are **planned** in phases 5.2 to 5.6 (the shell is verified by the owner on macOS, not
   in CI). Diff annotation (comments back to the agent) is planned for phase 5.2.
 - Sandboxing of workers: it needs containers, VMs or another user and cannot be done honestly with the current

@@ -23,6 +23,7 @@ impl Orchestrator {
         }])?;
         self.reconcile_orphans();
         self.reconcile_commands();
+        self.reconcile_handoffs();
         // Whatever the replayed history leaves unsettled in the goal ledger (a verification that
         // no longer matches the commit of its task) is settled before anything runs.
         let settle = self.ledger.resettle();
@@ -118,6 +119,11 @@ impl Orchestrator {
                 self.warn(e.message);
                 continue;
             }
+            // The daemon found this task running after a crash or restart: record a handoff from
+            // fleet's own state (plus whatever summary the worker had written) before the task is
+            // queued again, so the next attempt is briefed from it.
+            self.stash_worker_summary(&o.key, &o.worktree);
+            self.auto_handoff(&o.key, neo_context::handoff::HandoffTrigger::Recovery);
             let end = self.worker_end(&o.worktree, o.attempt, EndKind::Orphaned, None, "", 0);
             self.settle(&o.key, end);
         }

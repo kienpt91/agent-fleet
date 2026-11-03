@@ -1,4 +1,4 @@
-# 17. The read-only workbench: the repository at recorded commits, a Markdown subset and four image types
+# 19. The read-only workbench: the repository at recorded commits, a Markdown subset and four image types
 
 Status: accepted. Builds on ADR 10 (web adapter), ADR 15 (one origin rule) and ADR 16 (the repository, not the worktree).
 

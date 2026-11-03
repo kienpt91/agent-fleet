@@ -10,7 +10,7 @@ use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, RunId, TaskId, WorkerNam
 use fleet_domain::limits::MAX_SEND_BYTES;
 use fleet_domain::repo::RepoPath;
 use fleet_domain::run::NewTask;
-use fleet_domain::status::GoalStatus;
+use fleet_domain::status::{ContextMode, GoalStatus};
 use fleet_domain::value::{Document, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +20,8 @@ pub struct NewRunArgs {
     pub repo: String,
     pub base: Option<String>,
     pub max_parallel: Option<u32>,
+    /// How the run's workers are briefed; the plain brief when absent.
+    pub context: Option<ContextMode>,
 }
 
 /// A goal to add to the goal ledger.
@@ -134,6 +136,32 @@ pub enum Command {
     },
     /// A read-only question about the repository at a task's recorded commits.
     Repo(RepoQuery),
+    /// The compiled context pack of a task: the newest, or the one whose digest starts with
+    /// `digest`.
+    ContextShow {
+        task: String,
+        digest: Option<String>,
+    },
+    /// Layer-by-layer comparison of two stored packs of a task.
+    ContextDiff {
+        task: String,
+        a: String,
+        b: String,
+    },
+    /// Compiles the task's pack from the current state and compares it with the newest stored one.
+    ContextVerify {
+        task: String,
+    },
+    /// Layer order, budgets and the shrink order of a profile (the profile of a task's worker, a
+    /// named one, or the default).
+    ContextExplain {
+        task: Option<String>,
+        profile: Option<String>,
+    },
+    /// Makes a handoff packet for a task now (and shows it).
+    Handoff {
+        task: String,
+    },
     Shutdown,
 }
 
@@ -294,6 +322,13 @@ fn parse_new_run(v: &Value) -> Result<NewRunArgs> {
         repo: a.req_str("repo")?.to_string(),
         base: a.opt_str("base")?.map(str::to_string),
         max_parallel: a.opt_u32("max_parallel")?,
+        context: a
+            .opt_str("context")?
+            .map(|s| {
+                ContextMode::parse(s)
+                    .ok_or_else(|| FleetError::invalid("`context` must be \"off\" or \"compiled\""))
+            })
+            .transpose()?,
     })
 }
 
@@ -464,6 +499,21 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
         "repo.tree" | "repo.file" | "repo.blob" | "repo.markdown" | "repo.diff" => {
             Command::Repo(parse_repo_query(name, &a)?)
         }
+        "context.show" => Command::ContextShow {
+            task: task()?,
+            digest: a.opt_str("digest")?.map(str::to_string),
+        },
+        "context.diff" => Command::ContextDiff {
+            task: task()?,
+            a: a.req_str("a")?.to_string(),
+            b: a.req_str("b")?.to_string(),
+        },
+        "context.verify" => Command::ContextVerify { task: task()? },
+        "context.explain" => Command::ContextExplain {
+            task: a.opt_str("task")?.map(str::to_string),
+            profile: a.opt_str("profile")?.map(str::to_string),
+        },
+        "handoff" => Command::Handoff { task: task()? },
         "shutdown" => Command::Shutdown,
         other => {
             return Err(FleetError::invalid(format!(
@@ -490,6 +540,10 @@ pub fn is_read_only(cmd: &Command) -> bool {
             | Command::GoalRemaining
             | Command::VerifyStatus { .. }
             | Command::Repo(_)
+            | Command::ContextShow { .. }
+            | Command::ContextDiff { .. }
+            | Command::ContextVerify { .. }
+            | Command::ContextExplain { .. }
     )
 }
 

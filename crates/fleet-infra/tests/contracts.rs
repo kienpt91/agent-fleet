@@ -3,15 +3,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fleet_app::ports::{ContractFiles, EventStore, JobRunner, OutputLogs, Vcs, WorktreeState};
+use fleet_app::ports::{
+    ContextStore, ContractFiles, EventStore, JobRunner, OutputLogs, Vcs, WorktreeState,
+};
 use fleet_app::testing::contracts::{
-    contract_files_contract, event_store_contract, output_logs_contract, verify_jobs_contract,
-    ContractFile, ContractHarness, Plant, VerifyHarness, PLANT_MARKER, VALID_QUESTION_JSON,
-    VALID_RESULT_JSON,
+    context_store_contract, contract_files_contract, event_store_contract, output_logs_contract,
+    verify_jobs_contract, ContractFile, ContractHarness, Plant, VerifyHarness, PLANT_MARKER,
+    VALID_HANDOFF_JSON, VALID_QUESTION_JSON, VALID_RESULT_JSON,
 };
 use fleet_domain::env::EnvPolicy;
 use fleet_domain::ids::{RunId, Sha, TaskId};
 use fleet_domain::redact::Redactor;
+use fleet_infra::context_store::FileContextStore;
 use fleet_infra::contract_fs::FsContractFiles;
 use fleet_infra::digest::Sha256Digest;
 use fleet_infra::eventlog::FileEventStore;
@@ -22,7 +25,7 @@ use fleet_infra::testutil::{git, make_repo, TempDir};
 use fleet_infra::verify::VerifyHost;
 use nix::sys::stat::Mode;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -226,6 +229,62 @@ impl ContractHarness for FsHarness {
         self.plant(ContractFile::Result, Plant::Valid);
         self.plant(ContractFile::Question, Plant::Valid);
     }
+
+    fn plant_handoff(&mut self, kind: Plant) {
+        let fleet_dir = self.dir.join("wt/.fleet");
+        fs::create_dir_all(&fleet_dir).unwrap();
+        let path = fleet_dir.join("handoff.json");
+        Self::clear(&path);
+        match kind {
+            Plant::Valid => fs::write(&path, VALID_HANDOFF_JSON).unwrap(),
+            Plant::Malformed => {
+                fs::write(
+                    &path,
+                    format!("{{\"version\":1, \"{PLANT_MARKER}\": [unterminated"),
+                )
+                .unwrap();
+            }
+            Plant::WrongShape => {
+                fs::write(
+                    &path,
+                    format!(r#"{{"version":1,"summary":["{PLANT_MARKER}"]}}"#),
+                )
+                .unwrap();
+            }
+            Plant::Oversize => {
+                let filler = "x".repeat(200 * 1024);
+                fs::write(
+                    &path,
+                    format!(r#"{{"version":1,"summary":"{PLANT_MARKER}{filler}"}}"#),
+                )
+                .unwrap();
+            }
+            Plant::Symlink => {
+                let outside = self.dir.join("outside");
+                fs::create_dir_all(&outside).unwrap();
+                let target = outside.join("handoff.json");
+                fs::write(&target, VALID_HANDOFF_JSON).unwrap();
+                symlink(&target, &path).unwrap();
+            }
+            Plant::Fifo => nix::unistd::mkfifo(&path, Mode::S_IRWXU).unwrap(),
+            Plant::Directory => fs::create_dir(&path).unwrap(),
+        }
+    }
+
+    fn context_files(&self) -> Option<(String, String)> {
+        let fleet_dir = self.dir.join("wt/.fleet");
+        let text = fs::read_to_string(fleet_dir.join("context.md")).ok();
+        let manifest = fs::read_to_string(fleet_dir.join("context.json")).ok();
+        match (text, manifest) {
+            (None, None) => None,
+            (Some(t), Some(m)) => Some((t, m)),
+            (t, m) => panic!(
+                "only one context file exists: {:?} {:?}",
+                t.is_some(),
+                m.is_some()
+            ),
+        }
+    }
 }
 
 #[test]
@@ -241,6 +300,28 @@ fn fs_contract_files_satisfy_the_contract() {
             "outside file was modified"
         );
     }
+}
+
+#[test]
+fn file_context_store_satisfies_the_contract() {
+    let dir = TempDir::new("contract-context");
+    let root = dir.join("context");
+    context_store_contract(&mut || {
+        Box::new(FileContextStore::new(root.clone())) as Box<dyn ContextStore>
+    });
+    // Everything the suite stored is private to this user.
+    fn check(path: &Path) {
+        for entry in fs::read_dir(path).unwrap().flatten() {
+            let meta = fs::symlink_metadata(entry.path()).unwrap();
+            if meta.is_dir() {
+                assert_eq!(meta.mode() & 0o777, 0o700, "{:?}", entry.path());
+                check(&entry.path());
+            } else {
+                assert_eq!(meta.mode() & 0o777, 0o600, "{:?}", entry.path());
+            }
+        }
+    }
+    check(&root);
 }
 
 // ---- verification jobs ------------------------------------------------------------------------
