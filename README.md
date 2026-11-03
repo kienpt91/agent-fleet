@@ -596,6 +596,7 @@ declared by the operator, bounded, rate limited, checked for loops and secrets, 
 cannot call the daemon (it is refused on the socket and the web port), so the worker-to-daemon channel is files, as for
 questions. Decisions: [ADR 24](docs/adr/0024-messages-are-mediated-files-not-terminal-input.md),
 [25](docs/adr/0025-loops-storms-and-the-kill-switch.md), [26](docs/adr/0026-peer-messages-are-untrusted-and-stay-out-of-trusted-places.md).
+A task that runs on a remote host ([SSH remote worktrees](#ssh-remote-worktrees)) cannot belong to a channel: the mailboxes are files in a worktree on this machine, and such a plan is refused with a clear error.
 
 ```toml
 # in a plan: channels are declared by the operator, never by a worker
@@ -1436,7 +1437,8 @@ fleet task add --run r1 --title "Build it" --host build --worker my-agent     # 
 How an attempt goes, and why each step is the way it is:
 
 1. **Prepare.** fleet makes one root commit with exactly the tree of the task branch's head, bundles it (at most
-   `max_bundle_mib`) and streams it over ssh stdin to a fixed script that creates `<base_dir>/<run>/<task>`; the brief follows.
+   `max_bundle_mib`) and streams it over ssh stdin to a fixed script that creates `<base_dir>/<run>/<task>`; the brief follows, and for a run with `context = "compiled"` the pack and its manifest (the
+   same `.fleet/context.md` and `.fleet/context.json` a local worker gets, written by fleet before anything is sent).
 2. **Run.** The worker starts through `ssh -tt` in a **local pty**: its output goes through the same sanitizer, ring buffer,
    redaction and limits as a local worker's, idle and total timeouts and TERM-then-KILL apply (the signal is also sent to the
    remote process group), and the ssh client is a live session, so the control socket and the dashboard refuse it and what it
@@ -1444,8 +1446,8 @@ How an attempt goes, and why each step is the way it is:
 3. **Collect.** The host commits what the worker left and sends a bundle back; fleet fetches it into a quarantine ref,
    checks it with `git fsck` in a scratch repository (so a refused bundle leaves nothing in yours), requires that it builds on the commit that was sent, touches no `.git` or `.fleet` path and stays
    within the commit, file and byte limits, and only then makes **one new local commit with the verified tree**, authored by fleet.
-   The host's commit objects and messages never enter your history. The worker's `result.json` and `question.json` come back
-   through bounded reads and are validated like local ones.
+   The host's commit objects and messages never enter your history. The worker's `result.json`, `question.json` and `handoff.json` come back
+   through bounded reads and are validated like local ones (a retry pack and a handoff are built as for a local task).
 4. **Clean up.** The remote process group is killed and the remote worktree removed (also after a failure; a host that was down
    keeps a marker and is cleaned at the next daemon start, which says so in the activity feed).
 
@@ -1453,6 +1455,13 @@ The host key is **pinned by you**: `fleet host trust` is the only command that w
 (0600), and every other connection is strict against that one file. An unpinned host is not connected to; a changed key is refused
 with a message that says why. There is no agent forwarding, no password login, no X11, no port forwarding, no multiplexing and
 no `ProxyJump`/`ProxyCommand` unless you name a `proxy_jump` host (whose hop uses that entry's own key and pin).
+
+**Messages and fan-out.** The mailboxes of a channel are files in a worktree that the daemon reads and writes while the worker runs,
+so they cannot work for a worktree on another machine: a channel that names a task on a host (as `task:<id>` or through its
+worker's `role:`) is refused when the plan is loaded, and a task that names a host cannot be added to a run whose channel would
+include it, with `messages are not available to tasks on a remote host`. Local tasks keep their channels next to remote ones.
+Fan-out members and tasks made from issues run locally; a pull request is made from the local task branch, which is where a remote
+task's verified work lands.
 
 **The remote worker is not sandboxed.** It runs as the remote user of the host entry with all of that account's rights; give
 fleet an account of its own. A verified tree is checked for form, not content: it is as untrusted as a local worker's output, and

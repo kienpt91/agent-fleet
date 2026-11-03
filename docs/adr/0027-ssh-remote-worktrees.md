@@ -1,7 +1,8 @@
 # 27. SSH remote worktrees: only the worker's process is remote, and nothing the host says is believed
 
 Status: accepted. Builds on ADR 4 (output is untrusted), ADR 6 (git is hardened), ADR 7 (configuration is daemon side), ADR 14
-and 15 (jobs are untrusted, one origin rule) and ADR 16 (evidence is about the repository). Phase 3c of the roadmap.
+and 15 (jobs are untrusted, one origin rule), ADR 16 (evidence is about the repository), ADR 17 and 18 (compiled context packs
+and handoffs), ADR 23 (fan-out groups) and ADR 24 to 26 (mediated messages between agents). Phase 3c of the roadmap.
 
 ## Context
 A task should be able to run its worker on another machine (a bigger one, one with the right toolchain) without fleet giving
@@ -18,13 +19,17 @@ four steps through the `RemoteHost` port:
 
 1. *Prepare.* fleet makes a **root commit with exactly the tree of the task branch's head** (no history, no other branch), keeps
    it under a quarantine ref and writes it to a git bundle (at most `max_bundle_mib`). The bundle streams over ssh stdin to a
-   script that creates `<base_dir>/<run>/<task>` as a fresh repository from it. The brief goes the same way.
+   script that creates `<base_dir>/<run>/<task>` as a fresh repository from it. What a local worker finds in `.fleet/` goes the
+   same way, read from the local worktree where fleet wrote it for every task: the brief, and for a run with compiled context the
+   pack (`context.md`) and its manifest (`context.json`) that the daemon compiled and stored; a remote worker is briefed by exactly
+   the files a local one is (the call that writes one is `PutFile`, whose file name comes from a closed set of three).
 2. *Launch.* The adapter returns the **local** command `ssh -tt ... <remote command>`; the pty session host runs it. So the
    sanitizer, the ring buffer, redaction, the output bounds, idle and total limits, kill escalation and the origin rule apply to a
    remote worker unchanged: the remote terminal is just the output of a local process.
 3. *Collect* (after the local client ended; on a helper thread, the orchestrator never waits for a host). The host commits what
-   the worker left (never `.fleet`) and sends a bundle of the new commits; the worker's `result.json`/`question.json` come through
-   bounded reads into the local `.fleet/`. The bundle is **never trusted**: it must name exactly the one ref the protocol
+   the worker left (never `.fleet`) and sends a bundle of the new commits; the worker's `result.json`, `question.json` and
+   `handoff.json` (the summary for the next attempt of a compiled run) come through bounded reads into the local `.fleet/`, where the
+   daemon reads them with the care it gives any worker file. The bundle is **never trusted**: it must name exactly the one ref the protocol
    uses; it is fetched into a **scratch bare repository** that holds only the commit that was sent and the incoming objects, where `git fsck` checks them (git does not check the objects of a bundle by itself; checking in the scratch repository means old malformed objects of your own repository cannot refuse an honest host and a refused bundle leaves nothing behind); only then is the verified tip fetched into the quarantine ref of the real repository; the tip must descend from the commit that was sent; no changed path may be `.git`-like or
    under `.fleet`; commits, changed paths, files and bytes are bounded; the local worktree must be clean and the task branch
    unchanged since the export. **Only the verified tree is used**: the task branch gets one new commit authored by fleet with that
@@ -42,7 +47,7 @@ the hop is a second client with its **own** key and pin, generated as a `ProxyCo
 `ProxyJump` would start the hop with default settings (the user's known_hosts and keys). Host, user, port and paths are validated
 to narrow character sets before they are used.
 
-**The remote command line is built from a closed set.** `fleet_domain::remote::RemoteCall` has ten variants and no way to pass a command
+**The remote command line is built from a closed set.** `fleet_domain::remote::RemoteCall` has eleven variants and no way to pass a command
 line. Each is `/usr/bin/env -i <explicit variables> <program> ...` where the program is `git` (only to print its version), the
 worker command the operator listed for that host (`allowed_workers`), or `/bin/sh -c <constant script>` with data as positional
 parameters. Every word goes through one `quote` function (property-tested against a lexer and, in the sshd tests, against
@@ -62,6 +67,16 @@ settings and are not sent; nothing travels through `SendEnv`/`AcceptEnv`.
 `JobTracker`: process group registered, descendants followed by the sweeper, refused on the control socket and the web port. The
 terminal client is a live session like any worker.
 
+**Messages are not available to remote tasks.** A mailbox is a set of files in the task's worktree that the daemon reads and writes
+*while the worker runs* (ADR 24); the worktree of a remote task is on another machine and comes back only when the attempt ends. Mirroring
+the mailboxes over ssh would put a second, slower and less bounded transport under the one place where peer text is made safe, so the
+choice is to refuse: a channel that names a task that runs on a host (as `task:<id>`, or through a `role:` whose worker such a task
+runs) is refused when the plan is loaded, and a task that names a host cannot be added to a run whose channel would include it; both
+say `messages are not available to tasks on a remote host` and create nothing. The session of a remote task also refuses the notice
+that `notify_input` would type into a terminal. Local tasks keep their channels next to remote ones. Fan-out members (ADR 23) and the
+tasks made from issues are always local; a pull request (ADR 21) is made from the local task branch, which is where a remote task's
+verified work lands, so it works for remote tasks as for local ones.
+
 ## Consequences
 - The remote history of a worker is lost: one local commit per attempt, with the verified tree. That is deliberate: it is the only
   part of a bundle that fleet can check by itself.
@@ -69,6 +84,8 @@ terminal client is a live session like any worker.
   between attempts.
 - Preparing runs synchronously on the engine thread. It is bounded by one 120 s budget for the whole of sending (silence limit 60 s; stderr does not count as progress), and a host that timed out or could not be reached is skipped for 120 s. That is a bound, not a fix: a hostile host can still hold the daemon for 120 s per two minutes. Collecting and signalling are asynchronous. Moving the transfer to a helper thread (a `starting` state for the task) was considered and not done in this phase.
 - Variables of a remote worker travel in a 0600 file that the launcher reads and deletes, never on a command line.
+- A remote task of a compiled run is briefed from the same stored pack as a local one; its retry pack and handoff are built from the
+  same records (the handoff summary a remote worker leaves is read back like a local one, and is just as unverified).
 - A worker that writes a question and keeps running is noticed when it ends or is stopped by its limits, not while it runs (the
   question file is on the host until collected).
 - Quality gates and verification contracts run locally, on the verified commit, in the local worktree and in an export. A remote
@@ -79,4 +96,5 @@ terminal client is a live session like any worker.
 Tests: `fleet-domain/src/remote.rs` (quoting and the closed set, property tests), `fleet-infra/src/ssh/*` (argv, binary, executor,
 pins), `fleet-infra/src/git/remote_sync.rs` (hostile bundles), `fleet-infra/tests/ssh_remote.rs` (a real sshd: pinning, wrong key,
 forwarding, environment, quoting through the login shell, kill escalation, keepalive, jump host, origin, the contract suite),
-`fleet-cli/tests/e2e_remote.rs` (the binary and the daemon end to end), `fleet-app/tests/remote.rs` and `fleet-app/src/remote.rs`.
+`fleet-cli/tests/e2e_remote.rs` (the binary and the daemon end to end, including a compiled run and the refusal of channels),
+`fleet-app/tests/remote.rs` and `fleet-app/src/remote.rs`.
