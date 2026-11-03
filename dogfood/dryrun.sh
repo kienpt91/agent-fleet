@@ -157,7 +157,7 @@ for g in g-starter-error-tests g-starter-value-property; do
 done
 # `goals show` lists the newest 20 pieces of evidence only; the audit log has all of them
 say "fleet events --limit 200 | grep ... # every failed protected-path check of the run (the daemon keeps the last 200 events in memory: enough here)"
-"$fleet" events --limit 1000 | grep -E 'check "protected-(diff|script)" failed' || echo "(none found)"
+"$fleet" events --limit 200 | grep -E 'check "protected-(diff|script)" failed' || echo "(none found)"
 say "the worker that costs nothing: fleet tail n3-scaffold"
 "$fleet" tail n3-scaffold || true
 
