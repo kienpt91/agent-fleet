@@ -818,11 +818,90 @@ the goals page (one goal verified through fleet's own run, one task `unverified`
   strings and a frame-splitting stream reader included) and the headless Chromium run above, which loaded the real page, logged in
   through the fragment, and found the expected text in the rendered DOM and in the screenshots. The live page was in its
   "Streaming live output" state with two ticks; the check does not distinguish what came from the first read and what from the stream.
-- **Not done:** no desktop browser (Chrome, Firefox, Safari) was used, no hostile payload was driven through the real page in
-  Chromium (the hostile-text evidence is the JSON, the source scan and the fake DOM), the send-input form and the Approve/Deny
+- **Not done:** no desktop browser (Chrome, Firefox, Safari) was used, the older pages were not driven with hostile payloads in
+  Chromium (their evidence is the JSON, the source scan and the fake DOM; the review workbench was, see above), the send-input form and the Approve/Deny
   buttons were exercised only against the fake DOM (their requests are tested at the protocol level), accessibility and touch
   layouts were not examined, and the macOS admission path (`lsof`) was type-checked only. There is no TLS; loopback or an SSH
   tunnel only. A one-time login code (which would make a captured URL expire) was considered and not built.
+
+## Review workbench (read only)
+
+The dashboard has a review workbench: a **dock** with tabs and splits (drag or buttons; keyboard: arrows move between tabs
+and resize splitters, `M` moves a tab, `Delete` closes) that hosts an **explorer**, a **file viewer** (line numbers,
+placeholders for binary and too-large files, links shown and never followed), a **diff viewer** (unified and side by
+side, changed words marked, context 0/3/10/25, fold of unchanged context, `j`/`k` between files, `n`/`p` between hunks), a
+**Markdown preview** and an **image viewer**, next to the runs, task output, goals and approvals panes. The task page links to the Diff and
+Explorer of the task, and every pane shows the task's `UNVERIFIED`/`dirty` badge like the evidence views do. Everything it
+shows is read from the **real repository at a commit the daemon recorded for the task** (`head`, `base`, or a recorded
+id), never from the worktree a worker can write to ([ADR 16](docs/adr/0016-evidence-is-about-the-repository-not-about-what-a-worktree-says.md),
+[ADR 17](docs/adr/0017-the-read-only-workbench-and-its-markdown-and-image-rules.md)). It adds no listener, no dependency and no write path.
+
+![Explorer, file and diff panes in one layout: the explorer lists the head commit with a hostile file name shown escaped, the diff lists 16 files](docs/img/workbench-layout.png)
+![A rename with an edit in the side-by-side diff: similarity 77 percent, the changed words marked](docs/img/workbench-split.png)
+![The same diff, unified](docs/img/workbench-unified.png)
+![The Markdown preview: heading, table, list, code fence, a repository link and an external link that opens only after a click and a confirmation](docs/img/workbench-markdown.png)
+![The image viewer](docs/img/workbench-image.png)
+![An image that declares 40000 x 40000 pixels in 33 bytes: a placeholder, no image element and no request for its bytes](docs/img/workbench-image-huge.png)
+![The explorer](docs/img/workbench-explorer.png)
+![The file viewer](docs/img/workbench-file.png)
+![A document that tries script tags, event handlers, javascript: and data: links and a remote image: all of it is text or a note](docs/img/workbench-hostile-md.png)
+
+Deep links open a state straight from the address (`#/work/<run>/<task>?open=diff&mode=split&path=src/a.rs`, `layout=default|review|single`).
+
+API (read only, behind the same token, Host, `Sec-Fetch-Site`, worker-origin and rate checks as the rest; at most three reads run at once):
+
+```text
+GET /api/repo/tree?task=<run/task>&commit=<head|base|sha>&path=<dir>     entries (dir, file, symlink, submodule), sorted, at most 2000
+GET /api/repo/file?task=&commit=&path=                                  text lines | binary | too_large | image | symlink | submodule
+GET /api/repo/blob?task=&commit=&path=                                  raw bytes, png/jpeg/gif/webp only (415 for anything else, 413 above 4 MiB or above the pixel limits); X-Image-Width/-Height headers
+GET /api/repo/markdown?task=&commit=&path=                              a closed tree (no raw HTML), at most 512 KiB of source
+GET /api/repo/diff?task=&base=&head=&context=<0..25>                    files with status, counts, hunks and truncation notes
+```
+
+A real session (output of [`scripts/workbench-demo.sh`](scripts/workbench-demo.sh) against a daemon whose scripted agent
+([`workbench-agent.sh`](examples/agents/workbench-agent.sh)) left Markdown, a PNG, an SVG with script, links, binary and large files,
+a rename and hostile names):
+
+```text
+GET /api/repo/file?task=r1/review&commit=head&path=src/main.rs
+{"at":"head","class":"text","clipped":0,"commit":"c2895e6c...","crlf":false,"image":null,"kind":"file","limit":1048576,"line_count":4,"lines":["fn main() {","    let greeting = \"hello\";", ...
+
+GET /api/repo/diff?task=r1/review         (path, status)
+README.md modified | src/renamed.txt renamed (similarity 77, old path src/lib.txt) | img/logo.png added (binary) | big.txt added (+3000) | ...
+"path":"we\\u{a}ird\\u{1b}[31mname.txt","path_ok":false,"similarity":null,"status":"added"      <- shown escaped, cannot be requested
+
+GET /api/repo/blob?task=r1/review&commit=head&path=img/logo.png
+HTTP/1.1 200 OK
+Content-Type: image/png
+Content-Security-Policy: default-src 'none'; sandbox
+X-Content-Type-Options: nosniff
+Content-Disposition: inline
+
+GET /api/repo/blob of an svg with script
+HTTP/1.1 415 Unsupported Media Type
+{"error":{"code":"invalid","message":"only png, jpeg, gif and webp images are served (decided by the file's first bytes)","subject":"not_an_image"},...}
+
+GET with a traversal path
+HTTP/1.1 400 Bad Request
+{"error":{"code":"invalid","message":"repository path \"../../etc/passwd\" has a `.` or `..` component","subject":null},...}
+```
+
+What protects it: paths are validated values (relative, no `..`, no backslash/NUL/control/bidi characters, at most 1024 bytes
+and 32 deep, nothing normalized); a client can name a task and `head`/`base`/a recorded commit id, never a ref;
+git runs hardened with literal pathspecs and sizes are checked before bytes are read; names, text and diffs are
+bounded (2000 entries, 1 MiB per text file, 4000 lines per file and 20000 per diff, 3 MiB of diff text) and shown escaped;
+Markdown is parsed on the server to a closed tree (raw HTML is text, only `http`/`https` and repository links, no remote or
+`data:` images) and turned into DOM nodes from an element and attribute allowlist; images are served only when their first bytes are a
+valid PNG, JPEG, GIF or WebP header whose declared size is at most 8192 pixels per side and 32 megapixels (a placeholder otherwise: a 33 byte file can declare 40000 x 40000 pixels), as `data:` URLs in the page, so the page's CSP is unchanged.
+
+Checked in **headless Chromium** (`scripts/workbench-demo.sh`, 13 page loads, the image of `docker/Dockerfile.web`): each pane and a split layout
+render the expected DOM (rows, table, code block, links with `rel="noopener noreferrer"`, `data:image/png` source, separators
+and tablists), and with hostile names and contents loaded the page has exactly its three script elements, no `onerror`/`onclick`
+attribute, no `<svg>`/`<iframe>`, no `javascript:` or `data:` link, no remote image and no token. Not checked: a desktop
+Chrome, Firefox or Safari, touch, accessibility tools, and repositories larger than the caps tested here.
+Memory (`e2e_web.rs::many_large_diffs_and_files_keep_memory_flat_and_every_cap_holds`, debug build): three reads at a time of a diff of
+a 400000-line file, 60 files of 2000 lines and a 3000-entry directory take the daemon from 22 MB to a plateau of 90 to 125 MB
+(a diff document of a few megabytes is built per read) and a second identical phase of 192 reads does not raise it (0 kB of growth).
 
 ## Architecture
 
@@ -847,15 +926,15 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1385 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1561 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 317 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 298 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | 509 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, the repository workbench (validated paths, tree entries, file views, diffs and their patch reader, bounded word marks, a Markdown subset with property and adversarial tests), output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 430 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 317 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake | 547 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | 260 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory) | 266 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -870,11 +949,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               4852     4726    97.4%
-application          2634     2485    94.3%
-infrastructure       5420     4998    92.2%
+domain               7434     7279    97.9%
+application          3132     2959    94.5%
+infrastructure       5974     5494    92.0%
 cli                  2705     2433    89.9%
-overall             15611    14642    93.8%
+overall             19245    18165    94.4%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -967,7 +1046,7 @@ What was run for this repository, all inside containers (the official Rust 1.95 
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
 `scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
-`node scripts/web-smoke.mjs` (334 checks) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
+`node scripts/web-smoke.mjs` (843 checks), `node scripts/web-smoke-panes.mjs` (558 checks), `scripts/workbench-demo.sh` (headless Chromium) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
 
@@ -991,6 +1070,8 @@ DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/demo.sh
 docker build -f docker/Dockerfile.web -t fleet-web docker/
 IMAGE=fleet-web DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/web-demo.sh /target/release/fleet'
 node scripts/web-smoke.mjs   # any node 22 or newer on the host or in a container; no npm packages
+node scripts/web-smoke-panes.mjs   # the workbench panes and the Markdown DOM builder, 558 checks
+IMAGE=fleet-web DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/workbench-demo.sh /target/release/fleet'   # headless Chromium, screenshots in docs/img
 DOCKER_NET=none run 'scripts/neo-demo.sh /target/release/fleet'   # the NEO N1 demo
 ```
 

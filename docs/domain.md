@@ -125,3 +125,14 @@ flowchart LR
 Anti-corruption: git, the pty library, the optional undo tool and the refcheck report format are
 reached only through ports or through neutral values (`Value`), so none of their types appear in
 the domain.
+
+## Workbench glossary (phase 5.1)
+
+| Term | Meaning |
+| --- | --- |
+| **Workbench** | The read-only review panes of the dashboard (explorer, file, diff, Markdown, image) in a dock with tabs and splits. ADR 17. |
+| **RepoPath** | A validated, relative path inside a repository at a commit (`fleet_domain::repo::RepoPath`); never a path on disk. |
+| **Recorded commit** | A commit the daemon recorded for a task: the run's base, the task's head or its merge commit. The only commits a client may name (with `head` and `base`). |
+| **RepoTarget / RepoBrowser** | The task's repository and recorded commits resolved by the orchestrator, and the use case that reads them through the `RepoReader` port on the caller's thread. |
+| **DiffSet** | Files with status, counts, hunks and truncation markers between two recorded commits; bounded in files, hunks, lines and bytes. |
+| **FileView** | Text with line offsets, an image, or a placeholder (binary, too large), a symlink's target text or a submodule's commit. |

@@ -743,3 +743,250 @@ a.rlink {
     grid-template-columns: 1fr;
   }
 }
+
+/* ----------------------------------------------------------- workbench */
+
+.view.wide {
+  max-width: none;
+}
+
+.worklinks {
+  display: flex;
+  gap: 14px;
+  margin: 4px 0 8px;
+}
+
+.workstate {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+
+.badge.dirty {
+  --st: #a04000;
+}
+
+.worktasks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.worktask {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.dock-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.dock-bar .dock-say {
+  flex: 1 1 200px;
+  margin: 0;
+  min-width: 0;
+}
+
+.dock {
+  display: flex;
+  height: calc(100vh - 300px);
+  min-height: 360px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.dock > .dock-group,
+.dock > .dock-split {
+  flex: 1 1 auto;
+}
+
+.dock-split {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.dock-split.dock-h {
+  flex-direction: row;
+}
+
+.dock-split.dock-v {
+  flex-direction: column;
+}
+
+/* the first child gets its size from flex-basis (a percentage written by the script) */
+.dock-split > .dock-first {
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.dock-split > .dock-second {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+.dock-splitter {
+  flex: 0 0 6px;
+  background: var(--line);
+  touch-action: none;
+}
+
+.dock-vbar {
+  cursor: col-resize;
+}
+
+.dock-hbar {
+  cursor: row-resize;
+}
+
+.dock-splitter:hover,
+.dock-splitter.dragging {
+  background: var(--accent);
+}
+
+.dock-splitter:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: -1px;
+  background: var(--accent);
+}
+
+.dock-group {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.dock-head {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+  background: var(--code-bg);
+}
+
+.dock-group.active > .dock-head {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.dock-tabs {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.dock-tabwrap {
+  display: flex;
+  align-items: center;
+  border-right: 1px solid var(--line);
+}
+
+.dock-tab,
+.dock-tabclose {
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.dock-tab {
+  padding: 7px 8px 7px 12px;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dock-tab.selected {
+  background: var(--panel);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.dock-tab:focus-visible,
+.dock-tabclose:focus-visible {
+  outline-offset: -3px;
+}
+
+.dock-tabclose {
+  padding: 2px 8px;
+  color: var(--muted);
+}
+
+.dock-tabclose:hover {
+  color: var(--bad-line);
+}
+
+.dock-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 3px 6px;
+}
+
+.dock-panels {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.dock-panel {
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+.dock-empty {
+  padding: 12px;
+}
+
+.dock-error {
+  margin: 8px;
+}
+
+@media (max-width: 700px) {
+  .dock {
+    display: block;
+    height: auto;
+    min-height: 0;
+  }
+
+  .dock-split,
+  .dock-split.dock-h,
+  .dock-split.dock-v {
+    flex-direction: column;
+  }
+
+  .dock-split > .dock-first,
+  .dock-split > .dock-second {
+    flex: 0 0 auto !important;
+  }
+
+  .dock-splitter {
+    display: none;
+  }
+
+  .dock-group {
+    min-height: 260px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .dock-panels {
+    max-height: 70vh;
+  }
+}

@@ -20,6 +20,7 @@ pub mod assets;
 pub mod auth;
 pub mod http;
 pub mod peer;
+mod repo;
 mod routes;
 
 use self::auth::{AuthLimits, WebAuth};
@@ -53,6 +54,18 @@ pub trait WebBackend: Send + Sync {
     fn log_status(&self) -> Result<VerifyReport>;
     /// The `fleet doctor` checklist as a `fleet.doctor/1` document.
     fn health(&self) -> Value;
+    /// The bytes of an image of a task's repository (`repo.blob`): only images of the kinds
+    /// the page may show are ever returned, with the content type that goes with them.
+    fn image(&self, args: Value) -> Result<WebImage>;
+}
+
+/// An image the dashboard may send: png, jpeg, gif or webp, recognized by its first bytes.
+pub struct WebImage {
+    pub content_type: &'static str,
+    pub bytes: Vec<u8>,
+    /// The size the file's header declares; the daemon has checked it against its limits.
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +79,9 @@ pub struct WebLimits {
     pub max_per_remote_ip: usize,
     /// Open event streams.
     pub max_streams: usize,
+    /// Repository reads (tree, file, image, Markdown, diff) that may run at once: each starts
+    /// git processes, so more are answered with 503 and the page retries.
+    pub max_repo_reads: usize,
     /// An event stream ends (and the browser reconnects) after this long.
     pub stream_lifetime: Duration,
     /// An event stream ends after sending this many bytes of output.
@@ -88,6 +104,7 @@ impl Default for WebLimits {
             max_connections: 32,
             max_per_remote_ip: 8,
             max_streams: 4,
+            max_repo_reads: 3,
             stream_lifetime: Duration::from_secs(600),
             stream_bytes: 4 * 1024 * 1024,
             stream_poll: Duration::from_millis(250),
@@ -212,6 +229,8 @@ pub(crate) struct Shared {
     pub stop: AtomicBool,
     active: AtomicUsize,
     pub streams_active: AtomicUsize,
+    /// Repository reads in progress (each one starts git processes in the daemon).
+    pub repo_active: AtomicUsize,
     next_id: AtomicU64,
     open: Mutex<HashMap<u64, TcpStream>>,
     per_remote: Mutex<HashMap<IpAddr, usize>>,
@@ -303,6 +322,7 @@ impl WebServer {
             stop: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             streams_active: AtomicUsize::new(0),
+            repo_active: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
             open: Mutex::new(HashMap::new()),
             per_remote: Mutex::new(HashMap::new()),
@@ -782,6 +802,9 @@ mod tests {
             }
             fn health(&self) -> Value {
                 Value::Null
+            }
+            fn image(&self, _: Value) -> Result<WebImage> {
+                Err(FleetError::not_found("none"))
             }
         }
         let s = WebServer::bind(&WebOptions::new(sa("127.0.0.1:0"), false), Arc::new(Nop)).unwrap();

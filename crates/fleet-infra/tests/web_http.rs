@@ -12,7 +12,7 @@ use fleet_infra::json;
 use fleet_infra::server::PeerInfo;
 use fleet_infra::web::auth::AuthLimits;
 use fleet_infra::web::http::Limits;
-use fleet_infra::web::{WebBackend, WebLimits, WebOptions, WebServer};
+use fleet_infra::web::{WebBackend, WebImage, WebLimits, WebOptions, WebServer};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -25,12 +25,15 @@ use std::time::{Duration, Instant};
 
 type Handler = Box<dyn FnMut(&str, &Value) -> Result<Value> + Send>;
 
+type ImageHandler = Box<dyn FnMut(&Value) -> Result<WebImage> + Send>;
+
 struct Fake {
     calls: Mutex<Vec<(String, Value)>>,
     handler: Mutex<Handler>,
     deny: AtomicBool,
     admitted_pids: Mutex<Vec<u32>>,
     health_computed: AtomicUsize,
+    image_handler: Mutex<ImageHandler>,
     log: Mutex<Result<VerifyReport>>,
 }
 
@@ -47,6 +50,7 @@ impl Fake {
             deny: AtomicBool::new(false),
             admitted_pids: Mutex::new(Vec::new()),
             health_computed: AtomicUsize::new(0),
+            image_handler: Mutex::new(Box::new(|_| Err(FleetError::not_found("no image")))),
             log: Mutex::new(Ok(VerifyReport {
                 records: 7,
                 head_hash: "ab".repeat(32),
@@ -56,6 +60,10 @@ impl Fake {
 
     fn on(&self, f: impl FnMut(&str, &Value) -> Result<Value> + Send + 'static) {
         *self.handler.lock().unwrap() = Box::new(f);
+    }
+
+    fn on_image(&self, f: impl FnMut(&Value) -> Result<WebImage> + Send + 'static) {
+        *self.image_handler.lock().unwrap() = Box::new(f);
     }
 
     fn calls(&self) -> Vec<(String, Value)> {
@@ -95,6 +103,14 @@ impl WebBackend for Fake {
 
     fn log_status(&self) -> Result<VerifyReport> {
         self.log.lock().unwrap().clone()
+    }
+
+    fn image(&self, args: Value) -> Result<WebImage> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("repo.blob".to_string(), args.clone()));
+        (self.image_handler.lock().unwrap())(&args)
     }
 
     fn health(&self) -> Value {
@@ -295,6 +311,7 @@ struct Resp {
     status: u16,
     headers: Vec<(String, String)>,
     body: String,
+    raw_body: Vec<u8>,
 }
 
 impl Resp {
@@ -340,10 +357,17 @@ fn parse_response(raw: &[u8]) -> Resp {
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
         .collect();
+    let raw_body = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .and_then(|i| raw.get(i + 4..))
+        .unwrap_or(&[])
+        .to_vec();
     Resp {
         status,
         headers,
         body: body.to_string(),
+        raw_body,
     }
 }
 
@@ -1437,7 +1461,7 @@ fn a_connection_that_sends_nothing_costs_no_lookup_and_is_cut_off_quickly() {
 fn malformed_requests_get_an_error_and_the_server_keeps_serving() {
     let r = Running::start();
     let host = r.host();
-    let long_target = format!("GET /{} HTTP/1.1\r\nHost: {host}\r\n\r\n", "a".repeat(3000));
+    let long_target = format!("GET /{} HTTP/1.1\r\nHost: {host}\r\n\r\n", "a".repeat(5000));
     let big_header = format!(
         "GET / HTTP/1.1\r\nHost: {host}\r\nX-Big: {}\r\n\r\n",
         "a".repeat(20_000)
@@ -2063,4 +2087,391 @@ fn shutdown_closes_open_streams_and_stops_listening() {
         "nothing listens any more"
     );
     assert_eq!(r.active(), 0);
+}
+
+// ---------- the repository routes ----------
+
+const REPO_READS: [(&str, &str); 5] = [
+    ("/api/repo/tree?task=r1%2Fa", "repo.tree"),
+    ("/api/repo/file?task=r1%2Fa&path=src%2Fa.txt", "repo.file"),
+    (
+        "/api/repo/markdown?task=r1%2Fa&path=README.md",
+        "repo.markdown",
+    ),
+    ("/api/repo/diff?task=r1%2Fa", "repo.diff"),
+    ("/api/repo/blob?task=r1%2Fa&path=logo.png", "repo.blob"),
+];
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\xff\xfe\x00\x01\x80";
+
+fn png_image() -> WebImage {
+    WebImage {
+        content_type: "image/png",
+        bytes: PNG.to_vec(),
+        width: 640,
+        height: 480,
+    }
+}
+
+#[test]
+fn the_repository_routes_need_credentials_and_pass_exact_arguments_to_one_command_each() {
+    let r = Running::start();
+    r.fake.on_image(|_| Ok(png_image()));
+    for (path, _) in REPO_READS {
+        assert_eq!(r.get(path, &[]).status, 401, "{path}");
+    }
+    assert!(
+        r.fake.calls().is_empty(),
+        "nothing reached the daemon without credentials"
+    );
+    for (path, cmd) in REPO_READS {
+        let resp = r.get_bearer(path);
+        assert_eq!(resp.status, 200, "{path}: {}", resp.body);
+        let calls = r.fake.calls();
+        let (name, args) = calls.last().unwrap();
+        assert_eq!(name, if cmd == "repo.blob" { "repo.blob" } else { cmd });
+        assert_eq!(args.get("task").and_then(Value::as_str), Some("r1/a"));
+    }
+    let calls = r.fake.calls();
+    assert_eq!(calls.len(), 5);
+    assert_eq!(
+        calls[1].1.get("path").and_then(Value::as_str),
+        Some("src/a.txt")
+    );
+    // a diff names its two commits and a context
+    r.get_bearer("/api/repo/diff?task=r1%2Fa&base=base&head=head&context=10");
+    let last = r.fake.calls().pop().unwrap();
+    assert_eq!(last.0, "repo.diff");
+    assert_eq!(last.1.get("context").and_then(Value::as_u64), Some(10));
+    assert_eq!(last.1.get("base").and_then(Value::as_str), Some("base"));
+    assert_eq!(last.1.get("head").and_then(Value::as_str), Some("head"));
+    // a session works like the token
+    let (session, _) = r.login();
+    let resp = r.get(
+        "/api/repo/tree?task=r1%2Fa",
+        &[("X-Fleet-Session", &session)],
+    );
+    assert_eq!(resp.status, 200);
+}
+
+#[test]
+fn the_repository_routes_are_reads_behind_the_same_checks_as_every_other_route() {
+    let r = Running::start();
+    r.fake.on_image(|_| Ok(png_image()));
+    let (k, v) = r.bearer();
+    for (path, _) in REPO_READS {
+        // not a write
+        for m in ["POST", "PUT", "DELETE", "PATCH"] {
+            let resp = r.request(
+                m,
+                path,
+                &[
+                    (&k, &v),
+                    ("Origin", &r.origin()),
+                    ("Content-Type", "application/json"),
+                ],
+                Some("{}"),
+            );
+            assert!(
+                matches!(resp.status, 405 | 400),
+                "{m} {path}: {}",
+                resp.status
+            );
+            assert_ne!(resp.status, 200);
+        }
+        // not cross-site
+        for site in ["cross-site", "same-site"] {
+            let resp = r.get(path, &[(&k, &v), ("Sec-Fetch-Site", site)]);
+            assert_eq!(resp.status, 403, "{site} {path}");
+        }
+        // a page of this origin and typing the address are fine
+        for site in ["same-origin", "none"] {
+            let resp = r.get(path, &[(&k, &v), ("Sec-Fetch-Site", site)]);
+            assert_eq!(resp.status, 200, "{site} {path}");
+        }
+        // the Host header is checked first
+        let resp = r.get(path, &[(&k, &v), ("Host", "evil.example:80")]);
+        assert_eq!(resp.status, 421, "{path}");
+        // and a cookie is not a credential
+        let resp = r.get(path, &[("Cookie", &format!("token={}", r.token))]);
+        assert_eq!(resp.status, 401);
+    }
+    assert!(r.fake.calls().iter().all(|(n, _)| n.starts_with("repo.")));
+    assert_eq!(
+        r.fake.calls().len(),
+        REPO_READS.len() * 2,
+        "only the same-origin and typed-address reads got through"
+    );
+}
+
+#[test]
+fn repository_queries_are_validated_before_the_daemon_sees_them() {
+    let r = Running::start();
+    let long_path = format!("/api/repo/file?task=r1%2Fa&path={}", "a".repeat(1100));
+    for q in [
+        "/api/repo/tree",
+        "/api/repo/tree?task=",
+        "/api/repo/tree?commit=head",
+        "/api/repo/tree?task=a&task=b",
+        "/api/repo/tree?task=a&ref=main",
+        "/api/repo/tree?task=a&base=base",
+        "/api/repo/tree?task=a&context=3",
+        "/api/repo/diff?task=a&path=x",
+        "/api/repo/diff?task=a&commit=head",
+        "/api/repo/diff?task=a&context=x",
+        "/api/repo/diff?task=a&context=-1",
+        "/api/repo/tree?task=a&path=%zz",
+        "/api/repo/tree?task=a&path=%ff%fe",
+        "/api/repo/tree?task=a&path=a%00b",
+        "/api/repo/file?task=a%00b",
+        long_path.as_str(),
+    ] {
+        let resp = r.get_bearer(q);
+        assert_eq!(resp.status, 400, "{q}: {}", resp.body);
+        assert_eq!(resp.error_code(), "invalid");
+        assert_hardened(&resp);
+    }
+    assert!(r.fake.calls().is_empty(), "{:?}", r.fake.calls());
+    // a path at the limit is the daemon's to judge
+    let ok = format!("/api/repo/file?task=r1%2Fa&path={}", "a".repeat(1024));
+    assert_eq!(r.get_bearer(&ok).status, 200);
+    // an unknown repository route does not exist
+    assert_eq!(r.get_bearer("/api/repo/exec?task=a").status, 404);
+    assert_eq!(r.get_bearer("/api/repo/").status, 404);
+    assert_eq!(r.get_bearer("/api/repo/tree/").status, 404);
+    assert_eq!(r.get_bearer("/api/repo/blob/../tree?task=a").status, 404);
+}
+
+#[test]
+fn repository_documents_are_hardened_and_hostile_text_stays_json_text() {
+    let r = Running::start();
+    let nasty = "<script>alert(1)</script>\u{1b}]0;t\u{7}\u{202e}evil & \"q\" \u{2028}";
+    let doc = Value::object([
+        ("schema", Value::str("fleet.repo.file/1")),
+        (
+            "lines",
+            Value::array([Value::str(nasty), Value::str("</body>")]),
+        ),
+    ]);
+    let sent = doc.clone();
+    r.fake.on(move |_, _| Ok(sent.clone()));
+    let resp = r.get_bearer("/api/repo/file?task=r1%2Fa&path=x");
+    assert_eq!(resp.status, 200);
+    assert_hardened(&resp);
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/json; charset=utf-8")
+    );
+    for raw in ['<', '>', '&', '\u{1b}', '\u{202e}', '\u{2028}'] {
+        assert!(
+            !resp.body.contains(raw),
+            "{raw:?} travelled raw: {}",
+            resp.body
+        );
+    }
+    assert_eq!(parse(&resp.body), doc);
+    // errors from the daemon are the usual error document with a status
+    use fleet_domain::error::ErrorCode;
+    for (code, status) in [
+        (ErrorCode::NotFound, 404),
+        (ErrorCode::Invalid, 400),
+        (ErrorCode::Limit, 413),
+        (ErrorCode::Forbidden, 403),
+        (ErrorCode::Timeout, 504),
+        (ErrorCode::Unavailable, 503),
+    ] {
+        r.fake
+            .on(move |_, _| Err(FleetError::new(code, "no <b>such</b> thing")));
+        let resp = r.get_bearer("/api/repo/diff?task=r1%2Fa");
+        assert_eq!(resp.status, status, "{code:?}");
+        assert_hardened(&resp);
+        assert_eq!(resp.error_code(), code.as_str());
+        assert!(!resp.body.contains('<'));
+    }
+}
+
+#[test]
+fn an_image_is_sent_with_a_closed_policy_nosniff_and_one_of_four_types() {
+    let r = Running::start();
+    r.fake.on_image(|_| Ok(png_image()));
+    let resp = r.get_bearer("/api/repo/blob?task=r1%2Fa&path=logo.png");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.raw_body, PNG);
+    assert_eq!(resp.header("content-type"), Some("image/png"));
+    assert_eq!(resp.header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(
+        resp.header("content-security-policy"),
+        Some("default-src 'none'; sandbox")
+    );
+    assert_eq!(resp.header("content-disposition"), Some("inline"));
+    assert_eq!(resp.header("x-image-width"), Some("640"));
+    assert_eq!(resp.header("x-image-height"), Some("480"));
+    assert_eq!(resp.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        resp.header("cross-origin-resource-policy"),
+        Some("same-origin")
+    );
+    assert_eq!(resp.header("referrer-policy"), Some("no-referrer"));
+    assert_eq!(resp.header("x-frame-options"), Some("DENY"));
+    assert_eq!(
+        resp.headers
+            .iter()
+            .filter(|(k, _)| k == "content-security-policy")
+            .count(),
+        1
+    );
+    assert_eq!(
+        resp.header("content-length"),
+        Some(PNG.len().to_string().as_str())
+    );
+    // the kinds the page can show, and nothing else
+    for ct in ["image/jpeg", "image/gif", "image/webp"] {
+        r.fake.on_image(move |_| {
+            Ok(WebImage {
+                content_type: ct,
+                bytes: vec![1, 2, 3],
+                width: 1,
+                height: 1,
+            })
+        });
+        let resp = r.get_bearer("/api/repo/blob?task=r1%2Fa&path=x");
+        assert_eq!((resp.status, resp.header("content-type")), (200, Some(ct)));
+    }
+    for ct in [
+        "image/svg+xml",
+        "text/html",
+        "application/octet-stream",
+        "image/png;charset=x",
+        "text/javascript",
+    ] {
+        r.fake.on_image(move |_| {
+            Ok(WebImage {
+                content_type: ct,
+                bytes: vec![1],
+                width: 1,
+                height: 1,
+            })
+        });
+        let resp = r.get_bearer("/api/repo/blob?task=r1%2Fa&path=x");
+        assert_eq!(resp.status, 500, "{ct}");
+        assert_eq!(
+            resp.header("content-type"),
+            Some("application/json; charset=utf-8")
+        );
+    }
+    // too large, whatever the backend says
+    r.fake.on_image(|_| {
+        Ok(WebImage {
+            content_type: "image/png",
+            bytes: vec![0; 4 * 1024 * 1024 + 1],
+            width: 1,
+            height: 1,
+        })
+    });
+    assert_eq!(
+        r.get_bearer("/api/repo/blob?task=r1%2Fa&path=x").status,
+        500
+    );
+    // errors: not an image (415), a malformed request (400), too large, missing
+    use fleet_domain::error::ErrorCode;
+    for (code, subject, status) in [
+        (ErrorCode::Invalid, Some("not_an_image"), 415),
+        (ErrorCode::Invalid, None, 400),
+        (ErrorCode::Invalid, Some("something_else"), 400),
+        (ErrorCode::Limit, None, 413),
+        (ErrorCode::NotFound, None, 404),
+    ] {
+        r.fake.on_image(move |_| {
+            let e = FleetError::new(code, "no");
+            Err(match subject {
+                Some(s) => e.with_subject(s),
+                None => e,
+            })
+        });
+        let resp = r.get_bearer("/api/repo/blob?task=r1%2Fa&path=x");
+        assert_eq!(resp.status, status, "{code:?} {subject:?}");
+        assert_hardened(&resp);
+    }
+}
+
+#[test]
+fn only_a_few_repository_reads_run_at_once_and_a_finished_one_frees_its_slot() {
+    use std::sync::mpsc;
+    let r = Running::with(WebLimits {
+        max_repo_reads: 1,
+        ..fast_limits()
+    });
+    let (release, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let started = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&started);
+    r.fake.on(move |_, _| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(10));
+        Ok(Value::object([("schema", Value::str("fleet.repo.tree/1"))]))
+    });
+    let addr = r.addr;
+    let (k, v) = r.bearer();
+    let first = std::thread::spawn(move || {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let req = format!(
+            "GET /api/repo/tree?task=r1%2Fa HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{k}: {v}\r\n\r\n",
+            addr.port()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        read_response(&mut s)
+    });
+    let start = Instant::now();
+    while started.load(Ordering::SeqCst) == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the first read never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // the second read finds no free slot and is told to come back
+    let busy = r.get_bearer("/api/repo/tree?task=r1%2Fa");
+    assert_eq!(busy.status, 503, "{}", busy.body);
+    assert_eq!(busy.header("retry-after"), Some("1"));
+    assert_eq!(busy.error_code(), "limit");
+    assert_hardened(&busy);
+    // other routes are not held up by it
+    assert_eq!(r.get_bearer("/api/session").status, 200);
+    release.send(()).unwrap();
+    assert_eq!(first.join().unwrap().status, 200);
+    // the slot is free again (and again after an error)
+    release.send(()).unwrap();
+    assert_eq!(r.get_bearer("/api/repo/tree?task=r1%2Fa").status, 200);
+    r.fake.on(|_, _| Err(FleetError::not_found("x")));
+    assert_eq!(r.get_bearer("/api/repo/tree?task=r1%2Fa").status, 404);
+    assert_eq!(r.get_bearer("/api/repo/tree?task=r1%2Fa").status, 404);
+}
+
+#[test]
+fn a_refused_process_cannot_read_the_repository() {
+    let r = Running::start();
+    r.fake.on_image(|_| Ok(png_image()));
+    r.fake.deny.store(true, Ordering::SeqCst);
+    for (path, _) in REPO_READS {
+        let resp = r.get_bearer(path);
+        assert_eq!(resp.status, 403, "{path}");
+        assert_eq!(resp.error_code(), "forbidden");
+        assert_hardened(&resp);
+    }
+    let (session, _) = {
+        r.fake.deny.store(false, Ordering::SeqCst);
+        let s = r.login();
+        r.fake.deny.store(true, Ordering::SeqCst);
+        s
+    };
+    for (path, _) in REPO_READS {
+        let resp = r.get(path, &[("X-Fleet-Session", &session)]);
+        assert_eq!(resp.status, 403, "{path} with a session");
+    }
+    assert!(
+        r.fake.calls().is_empty(),
+        "the request never reached the daemon: {:?}",
+        r.fake.calls()
+    );
 }

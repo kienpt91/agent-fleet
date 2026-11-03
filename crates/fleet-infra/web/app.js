@@ -371,7 +371,7 @@
 
   function statusParam() {
     const r = parseRoute();
-    if (r.name === 'run' || r.name === 'task') {
+    if (r.name === 'run' || r.name === 'task' || (r.name === 'work' && r.run)) {
       return '?run=' + enc(r.run);
     }
     return '';
@@ -506,6 +506,15 @@
     if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health' || parts[0] === 'goals') {
       return { name: parts[0] };
     }
+    if (parts[0].split('?')[0] === 'work') {
+      // #/work and #/work/<run>/<task>[?query]: the query is read by the workbench itself; only the run
+      // matters here, so the status request can name it
+      const path = String(location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/').map(safeDecode);
+      if (path.length === 3 && ID_OK.test(path[1]) && ID_OK.test(path[2])) {
+        return { name: 'work', run: path[1], task: path[2] };
+      }
+      return { name: 'work', run: null, task: null };
+    }
     return { name: 'runs' };
   }
 
@@ -523,7 +532,7 @@
 
   function setNav(name) {
     const section = name === 'run' || name === 'task' ? 'runs' : name === 'goal' ? 'goals' : name;
-    ['runs', 'goals', 'decisions', 'events', 'health'].forEach(function (id) {
+    ['runs', 'work', 'goals', 'decisions', 'events', 'health'].forEach(function (id) {
       const a = document.getElementById('nav-' + id);
       if (a) {
         a.classList.toggle('active', id === section);
@@ -553,9 +562,12 @@
       v = goalsView();
     } else if (r.name === 'goal') {
       v = goalView(r.id);
+    } else if (r.name === 'work') {
+      v = workView();
     } else {
       v = runsView();
     }
+    viewEl().classList.toggle('wide', r.name === 'work');
     view = v;
     viewEl().replaceChildren(v.node);
     if (v.start) {
@@ -565,6 +577,58 @@
       v.update(lastStatus);
     }
     poll();
+  }
+
+  // The workbench lives in workbench.js. It is looked up when the route is opened, never earlier, so
+  // neither the order of the scripts nor their timing matters. Until the page has loaded completely the
+  // route waits, so every pane kind is registered by then.
+  let workWaiting = false;
+
+  function workView() {
+    const wb = window.fleetWorkbench;
+    const loaded = typeof document.readyState !== 'string' || document.readyState === 'complete';
+    let v = null;
+    let text;
+    if (!loaded) {
+      text = 'Loading the workbench.';
+      if (!workWaiting) {
+        workWaiting = true;
+        window.addEventListener('load', function () {
+          workWaiting = false;
+          if (!loggedOut && parseRoute().name === 'work') {
+            route();
+          }
+        });
+      }
+    } else if (!wb || typeof wb.view !== 'function' || typeof wb.parse !== 'function') {
+      text = 'The workbench is not available: its script did not load.';
+    } else {
+      let wr = null;
+      try {
+        wr = wb.parse(String(location.hash || ''));
+      } catch (e) {
+        wr = null;
+      }
+      if (!wr) {
+        text = 'This workbench address is not valid. Use #/work/<run>/<task>.';
+      } else {
+        try {
+          v = wb.view(wr);
+        } catch (e) {
+          v = null;
+        }
+        if (!v || !v.node) {
+          v = null;
+          text = 'The workbench could not be opened.';
+        }
+      }
+    }
+    if (v === null) {
+      const n = el('section', 'page');
+      n.appendChild(el('p', 'notice', text));
+      return { node: n };
+    }
+    return v;
   }
 
   function onVisibility() {
@@ -861,6 +925,13 @@
     root.appendChild(back);
     const titlebar = el('div', 'titlebar');
     root.appendChild(titlebar);
+    // links to the workbench for this task: plain hash routes built from validated ids only
+    if (REF_OK.test(ref)) {
+      const wl = el('div', 'worklinks');
+      wl.appendChild(routeLink('#/work/' + ref + '?open=diff', 'Diff'));
+      wl.appendChild(routeLink('#/work/' + ref + '?open=explorer', 'Explorer'));
+      root.appendChild(wl);
+    }
     const fields = el('div', 'taskfields');
     root.appendChild(fields);
 
@@ -2284,6 +2355,220 @@
     };
   }
 
+  // ------------------------------------------------------ script bridge
+
+  // Everything workbench.js and panes.js may use of this file. The object is frozen; nothing else
+  // of the page is reachable from the other scripts.
+
+  const MAX_BLOB = 4194304;
+  const NO_VERIFICATION = Object.freeze({ state: 'none', dirty: null, commit: null });
+  let verifCache = { status: null, goals: null, docs: new Map(), refs: new Map() };
+
+  // header value -> positive integer or null
+  function headerDim(resp, name) {
+    if (!resp.headers || typeof resp.headers.get !== 'function') {
+      return null;
+    }
+    const v = resp.headers.get(name);
+    if (typeof v !== 'string' || !/^[0-9]{1,6}$/.test(v.trim())) {
+      return null;
+    }
+    const n = Number(v.trim());
+    return n > 0 ? n : null;
+  }
+
+  // GET with the session header; the body is returned as bytes (images only, from the daemon's blob
+  // endpoint) with the declared dimensions of the X-Image-Width/Height headers. A failure carries the
+  // parsed error document when there is one.
+  async function apiBlob(path) {
+    const miss = function (status, type, data) {
+      return { ok: false, status: status, type: type, bytes: null, width: null, height: null, data: data };
+    };
+    if (typeof path !== 'string' || path.slice(0, 5) !== '/api/') {
+      return miss(0, '', null);
+    }
+    let resp;
+    try {
+      resp = await fetch(path, { method: 'GET', credentials: 'omit', cache: 'no-store', headers: authHeaders() });
+    } catch (e) {
+      return miss(0, '', null);
+    }
+    let type = '';
+    if (resp.headers && typeof resp.headers.get === 'function') {
+      type = clean(resp.headers.get('Content-Type') || '', { max: 100 });
+    }
+    if (!resp.ok) {
+      let data = null;
+      try {
+        data = await resp.json();
+      } catch (e) {
+        data = null;
+      }
+      return miss(resp.status, type, data);
+    }
+    let bytes = null;
+    try {
+      bytes = await resp.arrayBuffer();
+    } catch (e) {
+      return miss(resp.status, type, null);
+    }
+    if (!bytes || typeof bytes.byteLength !== 'number' || bytes.byteLength > MAX_BLOB) {
+      return miss(413, type, null);
+    }
+    return { ok: true, status: resp.status, type: type, bytes: bytes, width: headerDim(resp, 'X-Image-Width'), height: headerDim(resp, 'X-Image-Height'), data: null };
+  }
+
+  function taskInfo(ref) {
+    if (typeof ref !== 'string' || !REF_OK.test(ref) || !lastStatus || !Array.isArray(lastStatus.runs)) {
+      return null;
+    }
+    const at = ref.indexOf('/');
+    const runId = ref.slice(0, at);
+    const taskId = ref.slice(at + 1);
+    const runInfo = lastStatus.runs.find(function (r) {
+      return r && r.id === runId;
+    });
+    const task = runInfo && Array.isArray(runInfo.tasks) ? runInfo.tasks.find(function (t) {
+      return t && t.id === taskId;
+    }) : null;
+    return task ? { run: runId, id: taskId, ref: ref, task: task, runInfo: runInfo } : null;
+  }
+
+  // One goal document per goal and one answer per task for every status poll.
+  function verifCacheNow() {
+    if (verifCache.status !== lastStatus || verifCache.goals !== lastGoals) {
+      verifCache = { status: lastStatus, goals: lastGoals, docs: new Map(), refs: new Map() };
+    }
+    return verifCache;
+  }
+
+  function goalDoc(cache, id) {
+    let p = cache.docs.get(id);
+    if (!p) {
+      p = api('GET', '/api/goal?id=' + enc(id)).then(function (res) {
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return null;
+        }
+        return res.ok && res.data && typeof res.data === 'object' ? res.data : null;
+      });
+      cache.docs.set(id, p);
+    }
+    return p;
+  }
+
+  async function computeVerification(cache, ref) {
+    const state = verificationMap().get(ref) || 'none';
+    const info = taskInfo(ref);
+    const head = info && typeof info.task.head === 'string' && info.task.head !== '' ? info.task.head : null;
+    let dirty = null;
+    if (head !== null) {
+      const gov = governing(ref).filter(function (g) {
+        return typeof g.id === 'string' && ID_OK.test(g.id);
+      }).slice(0, MAX_GOAL_DETAILS);
+      const docs = await Promise.all(gov.map(function (g) {
+        return goalDoc(cache, g.id);
+      }));
+      let best = null;
+      docs.forEach(function (doc) {
+        if (!doc || !Array.isArray(doc.history)) {
+          return;
+        }
+        doc.history.forEach(function (e) {
+          if (!e || typeof e !== 'object' || e.commit !== head || !(e.task === ref || e.task === info.id)) {
+            return;
+          }
+          const at = typeof e.at_ms === 'number' ? e.at_ms : -Infinity;
+          if (best === null || at > best.at) {
+            best = { at: at, dirty: e.dirty };
+          }
+        });
+      });
+      if (best !== null && (best.dirty === true || best.dirty === false)) {
+        dirty = best.dirty;
+      }
+    }
+    return { state: state, dirty: dirty, commit: head };
+  }
+
+  // The worst verification of the goals that name the task, and whether the newest evidence for the
+  // task's head commit came from a dirty worktree.
+  function taskVerification(ref) {
+    if (typeof ref !== 'string' || !REF_OK.test(ref)) {
+      return Promise.resolve(NO_VERIFICATION);
+    }
+    const cache = verifCacheNow();
+    let p = cache.refs.get(ref);
+    if (!p) {
+      p = computeVerification(cache, ref);
+      cache.refs.set(ref, p);
+    }
+    return p;
+  }
+
+  function badView(text) {
+    const n = el('section', 'page');
+    n.appendChild(el('p', 'notice', text));
+    return { node: n };
+  }
+
+  function plainId(id) {
+    return typeof id === 'string' && ID_OK.test(id);
+  }
+
+  window.fleetHost = Object.freeze({
+    el: el,
+    clean: clean,
+    short: short,
+    num: num,
+    enc: enc,
+    badge: badge,
+    tagged: tagged,
+    shortHash: shortHash,
+    fmtTime: fmtTime,
+    api: api,
+    apiBlob: apiBlob,
+    errText: errText,
+    unauthorized: function () {
+      showLoggedOut(NOT_LOGGED_IN);
+    },
+    status: function () {
+      return lastStatus;
+    },
+    goals: function () {
+      return lastGoals;
+    },
+    taskInfo: taskInfo,
+    taskVerification: taskVerification,
+    views: Object.freeze({
+      runs: function () {
+        return runsView();
+      },
+      run: function (runId) {
+        return plainId(runId) ? runView(runId) : badView('Not a valid run id.');
+      },
+      task: function (runId, taskId) {
+        return plainId(runId) && plainId(taskId) ? taskView(runId, taskId) : badView('Not a valid task.');
+      },
+      goals: function () {
+        return goalsView();
+      },
+      goal: function (id) {
+        return goalView(id);
+      },
+      decisions: function () {
+        return decisionsView();
+      },
+      events: function () {
+        return eventsView();
+      },
+      health: function () {
+        return healthView();
+      }
+    }),
+    go: go
+  });
+
   // ---------------------------------------------------------------- start
 
   async function start() {
@@ -2301,8 +2586,10 @@
     const frag = String(location.hash || '');
     const m = /(?:^|[#&?])token=([0-9a-f]{64})(?![0-9a-f])/.exec(frag);
     const nx = /(?:^|[#&?])next=([^&]*)/.exec(frag);
-    // A route to open after the login. Plain path characters only, never a protocol-relative form.
-    const next = nx && /^\/[A-Za-z0-9._~\/-]{0,200}$/.test(nx[1]) && nx[1].slice(0, 2) !== '//' ? nx[1] : '/runs';
+    // A route to open after the login, percent-encoded so that a workbench deep link (with its query) fits
+    // in the fragment. After decoding: plain path and query characters only, never a protocol-relative form.
+    const nextRaw = nx && /^[A-Za-z0-9._~\/%-]{1,600}$/.test(nx[1]) ? safeDecode(nx[1]) : '';
+    const next = /^\/[A-Za-z0-9._~\/?&=-]{0,300}$/.test(nextRaw) && nextRaw.slice(0, 2) !== '//' ? nextRaw : '/runs';
     let res = null;
     let authed = false;
     if (m) {

@@ -1,16 +1,31 @@
-//! The dashboard's static files, compiled into the binary. Hand-written HTML, one script and one
-//! stylesheet: no external requests, no inline code, no build step.
+//! The dashboard's static files, compiled into the binary. Hand-written HTML, three scripts and two
+//! stylesheets: no external requests, no inline code, no build step.
 
 pub const INDEX_HTML: &str = include_str!("../../web/index.html");
 pub const APP_JS: &str = include_str!("../../web/app.js");
+pub const WORKBENCH_JS: &str = include_str!("../../web/workbench.js");
+pub const PANES_JS: &str = include_str!("../../web/panes.js");
 pub const APP_CSS: &str = include_str!("../../web/app.css");
+pub const PANES_CSS: &str = include_str!("../../web/panes.css");
+
+/// The scripts, in the order the page loads them.
+pub const SCRIPTS: [(&str, &str); 3] = [
+    ("/app.js", APP_JS),
+    ("/workbench.js", WORKBENCH_JS),
+    ("/panes.js", PANES_JS),
+];
+/// The stylesheets, in the order the page loads them.
+pub const STYLESHEETS: [(&str, &str); 2] = [("/app.css", APP_CSS), ("/panes.css", PANES_CSS)];
 
 /// The file served for a path, with its content type.
 pub fn lookup(path: &str) -> Option<(&'static str, &'static str)> {
     match path {
         "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX_HTML)),
         "/app.js" => Some(("text/javascript; charset=utf-8", APP_JS)),
+        "/workbench.js" => Some(("text/javascript; charset=utf-8", WORKBENCH_JS)),
+        "/panes.js" => Some(("text/javascript; charset=utf-8", PANES_JS)),
         "/app.css" => Some(("text/css; charset=utf-8", APP_CSS)),
+        "/panes.css" => Some(("text/css; charset=utf-8", PANES_CSS)),
         _ => None,
     }
 }
@@ -28,7 +43,15 @@ mod tests {
 
     #[test]
     fn every_file_is_served_and_nothing_else() {
-        for p in ["/", "/index.html", "/app.js", "/app.css"] {
+        for p in [
+            "/",
+            "/index.html",
+            "/app.js",
+            "/workbench.js",
+            "/panes.js",
+            "/app.css",
+            "/panes.css",
+        ] {
             assert!(lookup(p).is_some(), "{p}");
         }
         for p in [
@@ -37,19 +60,25 @@ mod tests {
             "/../app.js",
             "/APP.JS",
             "/api/status",
+            "/web/panes.js",
+            "/panes.js/",
             "",
         ] {
             assert!(lookup(p).is_none(), "{p}");
         }
+        for (path, body) in SCRIPTS.iter().chain(STYLESHEETS.iter()) {
+            assert_eq!(lookup(path).map(|(_, b)| b), Some(*body), "{path}");
+        }
     }
 
-    /// The script renders everything the daemon sends with `textContent` or text nodes. These are
+    /// The scripts render everything the daemon sends with `textContent` or text nodes. These are
     /// the ways of turning a string into markup or code; none may appear in the source, not even
     /// in a comment, so the scan stays simple and strict.
     const FORBIDDEN_IN_JS: &[&str] = &[
         "innerHTML",
         "outerHTML",
         "insertAdjacentHTML",
+        "insertAdjacentElement",
         "document.write",
         "eval(",
         "new Function",
@@ -58,6 +87,7 @@ mod tests {
         "DOMParser",
         "srcdoc",
         "javascript:",
+        "vbscript:",
         "setAttribute('style'",
         "setAttribute(\"style\"",
         "cssText",
@@ -67,25 +97,56 @@ mod tests {
         "setInterval('",
         "localStorage",
         "document.cookie",
+        "document.domain",
         // EventSource cannot send the session header; the stream is read with fetch instead
         "EventSource",
         "import(",
         "importScripts",
         "XMLHttpRequest",
         "WebSocket",
+        "SharedWorker",
+        "ServiceWorker",
+        "serviceWorker",
+        "sendBeacon",
+        // images are shown from data: URLs only; an object URL would need `blob:` in the CSP
+        "createObjectURL",
+        // nothing the repository says may move the page: links are opened only by a click, in a new
+        // tab, through window.open
+        "location.assign",
+        "location.replace",
+        "location.href",
         "http://",
         "https://",
     ];
 
     #[test]
-    fn the_script_never_turns_text_into_markup_or_code() {
-        for bad in FORBIDDEN_IN_JS {
-            assert!(!APP_JS.contains(bad), "app.js contains {bad:?}");
+    fn the_scripts_never_turn_text_into_markup_or_code() {
+        for (path, body) in SCRIPTS {
+            for bad in FORBIDDEN_IN_JS {
+                assert!(!body.contains(bad), "{path} contains {bad:?}");
+            }
+            assert!(body.contains("textContent"), "{path} must use textContent");
+            assert!(body.contains("'use strict'"), "{path} must be strict");
         }
-        assert!(
-            APP_JS.contains("textContent"),
-            "the script must use textContent"
-        );
+    }
+
+    #[test]
+    fn no_script_touches_a_style_attribute_or_an_event_handler_attribute() {
+        for (path, body) in SCRIPTS {
+            for bad in [
+                "setAttribute('on",
+                "setAttribute(\"on",
+                "setAttribute('srcdoc",
+                "setAttribute('formaction",
+                "setAttributeNS",
+            ] {
+                // the SVG helper of the DAG is the only user of namespaced attributes
+                if bad == "setAttributeNS" && path == "/app.js" {
+                    continue;
+                }
+                assert!(!body.contains(bad), "{path} contains {bad:?}");
+            }
+        }
     }
 
     #[test]
@@ -97,29 +158,54 @@ mod tests {
     /// The credential is a header held in the page, never a cookie: cookies are not isolated by
     /// port and would travel to every other server on the host.
     #[test]
-    fn the_script_keeps_the_session_in_a_header_and_in_session_storage_only() {
+    fn the_scripts_keep_the_session_in_a_header_and_in_session_storage_only() {
         assert!(APP_JS.contains("X-Fleet-Session"));
-        assert!(!APP_JS.to_ascii_lowercase().contains("cookie"));
-        assert!(
-            !APP_JS.contains("credentials: 'include'")
-                && !APP_JS.contains("credentials: \"include\"")
-        );
-        assert!(APP_JS.contains("credentials: 'omit'"));
-        // the only thing ever stored is the session under one key, only in sessionStorage
-        for line in APP_JS.lines().filter(|l| l.contains("sessionStorage")) {
+        for (path, body) in SCRIPTS {
             assert!(
-                line.contains("fleet.session") || line.contains("STORE_KEY"),
-                "{line}"
+                !body.to_ascii_lowercase().contains("cookie"),
+                "{path} mentions a cookie"
             );
+            assert!(
+                !body.contains("credentials: 'include'")
+                    && !body.contains("credentials: \"include\""),
+                "{path}"
+            );
+            // the only things ever stored are the session and the layout, each under one key,
+            // only in sessionStorage
+            for line in body.lines().filter(|l| l.contains("sessionStorage")) {
+                assert!(
+                    line.contains("fleet.session")
+                        || line.contains("STORE_KEY")
+                        || line.contains("fleet.layout")
+                        || line.contains("LAYOUT_KEY"),
+                    "{path}: {line}"
+                );
+            }
+        }
+        assert!(APP_JS.contains("credentials: 'omit'"));
+        // requests are made by one function that sends the credential as a header; the other
+        // scripts go through it
+        for (path, body) in [("/workbench.js", WORKBENCH_JS), ("/panes.js", PANES_JS)] {
+            assert!(!body.contains("fetch("), "{path} must use fleetHost.api");
         }
     }
 
     #[test]
     fn the_page_has_no_inline_code_no_inline_style_and_no_external_resources() {
         let html = INDEX_HTML;
-        assert!(contains_ci(html, "<script src=\"/app.js\""));
-        assert!(contains_ci(html, "href=\"/app.css\""));
-        // every <script> element has a src and no body
+        for (path, _) in SCRIPTS {
+            assert!(
+                contains_ci(html, &format!("<script src=\"{path}\" defer></script>")),
+                "{path}"
+            );
+        }
+        for (path, _) in STYLESHEETS {
+            assert!(contains_ci(html, &format!("href=\"{path}\"")), "{path}");
+        }
+        // the scripts are loaded in the order the bridge needs
+        let at = |p: &str| html.find(&format!("src=\"{p}\"")).expect("script tag");
+        assert!(at("/app.js") < at("/workbench.js") && at("/workbench.js") < at("/panes.js"));
+        // every <script> element has a src that is one of ours and no body
         let mut rest = html.to_ascii_lowercase();
         let mut scripts = 0;
         while let Some(i) = rest.find("<script") {
@@ -127,7 +213,9 @@ mod tests {
             let end = tail.find('>').expect("script tag is closed");
             let tag = &tail[..end];
             assert!(
-                tag.contains("src=\"/app.js\""),
+                SCRIPTS
+                    .iter()
+                    .any(|(p, _)| tag.contains(&format!("src=\"{p}\""))),
                 "unexpected script tag: {tag}"
             );
             let after = &tail[end + 1..];
@@ -135,7 +223,7 @@ mod tests {
             scripts += 1;
             rest = after.to_string();
         }
-        assert_eq!(scripts, 1);
+        assert_eq!(scripts, SCRIPTS.len());
         for bad in [
             "<style", " style=", "http://", "https://", "//cdn", "<iframe", "<object", "<embed",
             "<form", "<base", "@import",
@@ -158,16 +246,30 @@ mod tests {
     }
 
     #[test]
-    fn the_stylesheet_loads_nothing_from_elsewhere() {
-        for bad in [
-            "@import",
-            "url(http",
-            "url(\"http",
-            "url('http",
-            "//",
-            "expression(",
-        ] {
-            assert!(!APP_CSS.contains(bad), "app.css contains {bad:?}");
+    fn the_stylesheets_load_nothing_from_elsewhere() {
+        for (path, body) in STYLESHEETS {
+            for bad in [
+                "@import",
+                "url(http",
+                "url(\"http",
+                "url('http",
+                "//",
+                "expression(",
+                "@font-face",
+                "behavior:",
+                "-moz-binding",
+            ] {
+                assert!(!body.contains(bad), "{path} contains {bad:?}");
+            }
+            // url() may only name a data: URI (the page's CSP allows img-src data:), never a path
+            for (i, _) in body.match_indices("url(") {
+                let after = body[i + 4..].trim_start_matches(['"', '\'', ' ']);
+                assert!(
+                    after.starts_with("data:"),
+                    "{path}: url({}",
+                    &after[..after.len().min(20)]
+                );
+            }
         }
     }
 
@@ -175,6 +277,9 @@ mod tests {
     fn the_assets_are_small_enough_to_review() {
         assert!(INDEX_HTML.len() < 16 * 1024);
         assert!(APP_JS.len() < 192 * 1024);
+        assert!(WORKBENCH_JS.len() < 96 * 1024);
+        assert!(PANES_JS.len() < 128 * 1024);
         assert!(APP_CSS.len() < 48 * 1024);
+        assert!(PANES_CSS.len() < 48 * 1024);
     }
 }

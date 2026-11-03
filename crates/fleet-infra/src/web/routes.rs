@@ -7,7 +7,7 @@
 
 use super::auth::{self, ClientKey, Presented, Verdict, SESSION_HEADER};
 use super::http::{Method, Request, Response};
-use super::{assets, host_allowed, url_host, Shared};
+use super::{assets, host_allowed, repo, url_host, Shared};
 use crate::eventlog::VerifyReport;
 use crate::json;
 use crate::statedir::tokens_equal;
@@ -105,14 +105,14 @@ fn status_for(code: ErrorCode) -> u16 {
     }
 }
 
-fn fleet_error_response(e: &FleetError) -> Response {
+pub(super) fn fleet_error_response(e: &FleetError) -> Response {
     Response::json(
         status_for(e.code),
         schema_error(e.code, &e.message, e.subject.as_deref()),
     )
 }
 
-fn ok_value(v: &Value) -> Response {
+pub(super) fn ok_value(v: &Value) -> Response {
     let text = json_text(v);
     if text.len() > crate::protocol::MAX_RESPONSE_BYTES {
         return error_response(500, ErrorCode::Limit, "the reply is too large");
@@ -160,6 +160,11 @@ enum Route {
     ApprovalDecide,
     Send,
     Merge,
+    RepoTree,
+    RepoFile,
+    RepoBlob,
+    RepoMarkdown,
+    RepoDiff,
 }
 
 fn route_for(path: &str) -> Option<(Route, Method)> {
@@ -181,6 +186,11 @@ fn route_for(path: &str) -> Option<(Route, Method)> {
         "/api/approval/decide" => (Route::ApprovalDecide, Method::Post),
         "/api/send" => (Route::Send, Method::Post),
         "/api/merge" => (Route::Merge, Method::Post),
+        "/api/repo/tree" => (Route::RepoTree, Method::Get),
+        "/api/repo/file" => (Route::RepoFile, Method::Get),
+        "/api/repo/blob" => (Route::RepoBlob, Method::Get),
+        "/api/repo/markdown" => (Route::RepoMarkdown, Method::Get),
+        "/api/repo/diff" => (Route::RepoDiff, Method::Get),
         _ => return None,
     })
 }
@@ -440,9 +450,18 @@ fn percent_decode(s: &str) -> Option<String> {
 
 /// `a=1&b=x%2Fy` into a map. Repeated keys, keys that are not in `allowed`, bad escapes and
 /// values longer than 256 bytes are errors.
-fn parse_query(
+pub(super) fn parse_query(
     query: &str,
     allowed: &[&str],
+) -> std::result::Result<BTreeMap<String, String>, Response> {
+    parse_query_limited(query, allowed, 256)
+}
+
+/// [`parse_query`] with another longest value (a repository path may be longer than an id).
+pub(super) fn parse_query_limited(
+    query: &str,
+    allowed: &[&str],
+    max_value: usize,
 ) -> std::result::Result<BTreeMap<String, String>, Response> {
     let bad = |m: &str| Err(error_response(400, ErrorCode::Invalid, m));
     let mut out = BTreeMap::new();
@@ -457,14 +476,14 @@ fn parse_query(
         if !allowed.contains(&k.as_str()) {
             return bad("unknown query parameter");
         }
-        if v.len() > 256 || out.insert(k, v).is_some() {
+        if v.len() > max_value || out.insert(k, v).is_some() {
             return bad("malformed query string");
         }
     }
     Ok(out)
 }
 
-fn query_u64(
+pub(super) fn query_u64(
     q: &BTreeMap<String, String>,
     key: &str,
 ) -> std::result::Result<Option<u64>, Response> {
@@ -707,6 +726,13 @@ fn run_route(
             let body = parse_body(req, &[req_str("task", 128)])?;
             respond(call(shared, "merge", body)?)
         }
+        Route::RepoTree => repo::handle(shared, repo::RepoRoute::Tree, req).map(Reply::Response),
+        Route::RepoFile => repo::handle(shared, repo::RepoRoute::File, req).map(Reply::Response),
+        Route::RepoBlob => repo::handle(shared, repo::RepoRoute::Blob, req).map(Reply::Response),
+        Route::RepoMarkdown => {
+            repo::handle(shared, repo::RepoRoute::Markdown, req).map(Reply::Response)
+        }
+        Route::RepoDiff => repo::handle(shared, repo::RepoRoute::Diff, req).map(Reply::Response),
     }
 }
 

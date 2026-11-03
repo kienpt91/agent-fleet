@@ -35,6 +35,8 @@ use neo_verify::limits::MAX_CHANGED_PATHS;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 
+mod read;
+
 /// Hard cap per captured stream of one git call.
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -93,6 +95,15 @@ const FIXED_ENV: [(&str, &str); 9] = [
 ];
 
 type Override = (Vec<u8>, Vec<u8>);
+
+/// How much output of one git call is kept.
+#[derive(Clone, Copy)]
+struct Cap {
+    /// Bytes kept per stream.
+    bytes: usize,
+    /// More output stops git and returns what fits (flagged), instead of being an error.
+    truncate: bool,
+}
 
 struct Out {
     code: Option<i32>,
@@ -420,6 +431,13 @@ impl GitVcs {
         self
     }
 
+    /// How long one git call may run. The adapter used for reading repositories for the dashboard
+    /// gives itself less than the 120 seconds that merges and commits may take.
+    pub fn with_timeout(mut self, timeout: Duration) -> GitVcs {
+        self.timeout = timeout;
+        self
+    }
+
     #[cfg(test)]
     fn with_limits(mut self, timeout: Duration, max_output: usize) -> GitVcs {
         self.timeout = timeout;
@@ -460,15 +478,17 @@ impl GitVcs {
         self.run_raw_env(cwd, ident, overrides, &[], args)
     }
 
-    /// [`GitVcs::run_raw`] with extra environment variables for this one call.
-    fn run_raw_env(
+    /// One run of git whose output is capped at `cap.bytes` per stream: more is an error, or
+    /// (when `cap.truncate`) git is stopped and the part that fits is returned, flagged.
+    fn run_raw_capped(
         &self,
         cwd: &Path,
         ident: Option<&Identity>,
         overrides: &[Override],
         extra_env: &[(&str, &OsStr)],
         args: &[&str],
-    ) -> Result<Out> {
+        cap: Cap,
+    ) -> Result<(Out, bool)> {
         let mut cmd = Command::new(self.find_git()?);
         cmd.env_clear();
         for (k, v) in &self.env {
@@ -519,14 +539,14 @@ impl GitVcs {
             sweeper.kill_all();
             return Err(FleetError::internal("git pipes are missing"));
         };
-        let cap = self.max_output;
+        let cap_bytes = cap.bytes;
         let spawn_reader = |is_out: bool, pipe: Box<dyn Read + Send>| {
             let tx = tx.clone();
             let over = Arc::clone(&over);
             thread::Builder::new()
                 .name("fleet-git-pipe".to_string())
                 .spawn(move || {
-                    let buf = read_capped(pipe, cap, &over);
+                    let buf = read_capped(pipe, cap_bytes, &over);
                     let _ = tx.send((is_out, buf));
                 })
         };
@@ -543,7 +563,7 @@ impl GitVcs {
         let mut delay = Duration::from_millis(1);
         let status = loop {
             match child.try_wait() {
-                Ok(Some(s)) => break s,
+                Ok(Some(s)) => break Some(s),
                 Ok(None) => {}
                 Err(e) => {
                     kill_group(&mut child, pgid);
@@ -554,10 +574,14 @@ impl GitVcs {
             if over.load(Ordering::SeqCst) {
                 kill_group(&mut child, pgid);
                 sweeper.kill_all();
-                return Err(FleetError::limit(format!(
-                    "git produced more than {} bytes of output",
-                    self.max_output
-                )));
+                if !cap.truncate {
+                    return Err(FleetError::limit(format!(
+                        "git produced more than {} bytes of output",
+                        cap.bytes
+                    )));
+                }
+                // the caller wants what fits: git is stopped and the prefix is returned
+                break None;
             }
             if start.elapsed() >= self.timeout {
                 kill_group(&mut child, pgid);
@@ -589,17 +613,38 @@ impl GitVcs {
                 }
             }
         }
-        if over.load(Ordering::SeqCst) {
+        let truncated = over.load(Ordering::SeqCst);
+        if truncated && !cap.truncate {
             return Err(FleetError::limit(format!(
                 "git produced more than {} bytes of output",
-                self.max_output
+                cap.bytes
             )));
         }
-        Ok(Out {
-            code: status.code(),
-            stdout,
-            stderr,
-        })
+        Ok((
+            Out {
+                code: status.and_then(|s| s.code()),
+                stdout,
+                stderr,
+            },
+            truncated,
+        ))
+    }
+
+    /// [`GitVcs::run_raw`] with extra environment variables for this one call.
+    fn run_raw_env(
+        &self,
+        cwd: &Path,
+        ident: Option<&Identity>,
+        overrides: &[Override],
+        extra_env: &[(&str, &OsStr)],
+        args: &[&str],
+    ) -> Result<Out> {
+        let cap = Cap {
+            bytes: self.max_output,
+            truncate: false,
+        };
+        self.run_raw_capped(cwd, ident, overrides, extra_env, args, cap)
+            .map(|(out, _)| out)
     }
 
     /// Runs git with the config of `cwd` neutralized (see the module comment).

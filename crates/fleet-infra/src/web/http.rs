@@ -32,7 +32,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Limits {
         Limits {
-            max_target: 2048,
+            // a repository path of 1024 bytes, percent-encoded, plus the other parameters
+            max_target: 4096,
             max_head: 8 * 1024,
             max_headers: 40,
             max_body: 16 * 1024,
@@ -385,6 +386,7 @@ pub struct Response {
     pub status: u16,
     pub content_type: &'static str,
     extra: Vec<(&'static str, String)>,
+    csp: Option<&'static str>,
     pub body: Vec<u8>,
 }
 
@@ -422,12 +424,21 @@ impl Response {
             status,
             content_type,
             extra: Vec::new(),
+            csp: None,
             body,
         }
     }
 
     pub fn json(status: u16, body: String) -> Response {
         Response::new(status, "application/json; charset=utf-8", body.into_bytes())
+    }
+
+    /// Replaces the page's content security policy of this response by `csp`, which must be
+    /// stricter than [`CSP`] (a response of raw bytes, such as an image, gets
+    /// `default-src 'none'; sandbox`). The header is never omitted.
+    pub fn with_csp(mut self, csp: &'static str) -> Response {
+        self.csp = Some(csp);
+        self
     }
 
     /// An extra header. The value is reduced to visible ASCII so no input can add a line.
@@ -451,6 +462,12 @@ impl Response {
             out.push_str(&format!("Content-Length: {length}\r\n"));
         }
         for (k, v) in SECURITY_HEADERS {
+            // a response may replace the policy by a stricter one, never drop it
+            let v = if *k == "Content-Security-Policy" {
+                self.csp.unwrap_or(v)
+            } else {
+                v
+            };
             out.push_str(&format!("{k}: {v}\r\n"));
         }
         for (k, v) in &self.extra {

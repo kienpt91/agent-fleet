@@ -11,6 +11,9 @@ use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{ApprovalId, GoalId, RunId, Sha, TaskId};
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::{GateFormat, GateOutcome};
+use fleet_domain::repo::diff::{DiffBudget, DiffSet};
+use fleet_domain::repo::tree::{EntryKind, ModeClass, TreeEntry};
+use fleet_domain::repo::RepoPath;
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
 use neo_verify::contract::{ContractId, VerificationContract};
 use neo_verify::judge::CheckReport;
@@ -165,6 +168,74 @@ pub trait Vcs: Send {
     /// git directory says; a worktree that does not belong to the repository, or is not on its
     /// task's branch, is refused.
     fn worktree_state(&self, worktree: &str, base: &Sha) -> Result<WorktreeState>;
+}
+
+// ---- reading a repository at a commit -------------------------------------------------------------
+
+/// What the repository says about one path at a commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryStat {
+    pub kind: EntryKind,
+    pub mode: ModeClass,
+    /// Bytes of a file or a link's target; `None` for a directory or a submodule.
+    pub size: Option<u64>,
+    /// The object id (for a submodule, the commit it records).
+    pub oid: String,
+}
+
+/// An entry and, when it is small enough, its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryRead {
+    pub stat: EntryStat,
+    /// The content of a file or the target of a link; `None` for a directory or a submodule and
+    /// for a file that is larger than the limit that was asked for (its size is in `stat`).
+    pub content: Option<Vec<u8>>,
+}
+
+/// The entries of one directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirListing {
+    pub entries: Vec<TreeEntry>,
+    /// The directory has more entries than were listed.
+    pub truncated: bool,
+}
+
+/// What a diff may contain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffRequest {
+    /// Lines of context around a change.
+    pub context: u32,
+    /// Files shown; more are counted and left out.
+    pub max_files: usize,
+    pub budget: DiffBudget,
+}
+
+/// Read-only access to the **real repository** at recorded commits (never to a worktree, ADR 16).
+/// Implementations are shared by connection threads, so every method takes `&self`, and every
+/// result is bounded by the limits the caller passes. Nothing here executes anything stored in
+/// the repository.
+pub trait RepoReader: Send + Sync {
+    /// The entries of directory `dir` at `commit`, at most `limit` of them. A path that does not
+    /// exist is `not_found`; one that is not a directory is `invalid`; an unknown commit is
+    /// `not_found`.
+    fn list_dir(
+        &self,
+        repo: &str,
+        commit: &Sha,
+        dir: &RepoPath,
+        limit: usize,
+    ) -> Result<DirListing>;
+    /// What is at `path` at `commit`, with its bytes when it is a file or a link of at most
+    /// `max_bytes` (the size is checked before anything is read). `None` when nothing is there.
+    fn read_entry(
+        &self,
+        repo: &str,
+        commit: &Sha,
+        path: &RepoPath,
+        max_bytes: usize,
+    ) -> Result<Option<EntryRead>>;
+    /// The changes from `base` to `head`, within the limits of `req`.
+    fn diff(&self, repo: &str, base: &Sha, head: &Sha, req: &DiffRequest) -> Result<DiffSet>;
 }
 
 // ---- sessions -----------------------------------------------------------------------------

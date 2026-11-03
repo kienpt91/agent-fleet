@@ -19,8 +19,9 @@ use crate::server::{AttachSession, HandlerReply, PeerInfo, RequestHandler, Serve
 use crate::statedir::{DaemonLock, StateLayout};
 use crate::undo::AgentUndo;
 use crate::verify::VerifyHost;
-use crate::web::{WebBackend, WebOptions, WebServer};
+use crate::web::{WebBackend, WebImage, WebOptions, WebServer};
 use fleet_app::api::{parse_command, Command, Reply};
+use fleet_app::browse::{RepoBrowser, RepoImage, RepoReply};
 use fleet_app::config::AppConfig;
 use fleet_app::orchestrator::Orchestrator;
 use fleet_app::ports::{EventPublisher, Ports, StoredEvent};
@@ -44,6 +45,8 @@ const TICK: Duration = Duration::from_millis(50);
 const ENGINE_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
 /// Upper bound for a graceful shutdown beyond the configured kill grace.
 const SHUTDOWN_EXTRA: Duration = Duration::from_secs(5);
+/// A git call that reads a repository for the dashboard gives up after this long.
+const REPO_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub struct DaemonOptions {
@@ -192,6 +195,13 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         registry: registry.clone(),
         layout: layout.clone(),
         started: Instant::now(),
+        // reads the real repository with the same hardened git as everything else, and its
+        // children are listed with the tracker, so the origin checks refuse them too
+        browser: RepoBrowser::new(Arc::new(
+            GitVcs::new(env.clone(), app.env.clone())
+                .with_tracker(tracker.clone())
+                .with_timeout(REPO_READ_TIMEOUT),
+        )),
     });
     let web = match &opts.web {
         Some(web_opts) => Some(WebServer::bind(
@@ -375,6 +385,9 @@ struct DaemonHandler {
     registry: SessionRegistry,
     layout: StateLayout,
     started: Instant,
+    /// Answers the questions about a task's repository (read from the real repository, on the
+    /// calling thread).
+    browser: RepoBrowser,
 }
 
 impl DaemonHandler {
@@ -454,6 +467,12 @@ impl DaemonHandler {
                     session: Box::new(PtyAttach { io }),
                 })
             }
+            Reply::Repo(req) => match self.browser.run(&req.target, &req.query)? {
+                RepoReply::Doc(v) => Ok(HandlerReply::Data(v)),
+                RepoReply::Image(_) => Err(FleetError::invalid(
+                    "images are served by the dashboard only; use repo.file for a description",
+                )),
+            },
         }
     }
 
@@ -544,12 +563,13 @@ impl RequestHandler for DaemonHandler {
 }
 
 impl DaemonHandler {
-    /// Validates and runs one command. The caller has already decided that its peer is admitted.
-    fn execute(&self, cmd: &str, args: Value) -> Result<HandlerReply> {
-        let command = parse_command(cmd, &args)?;
+    /// Validates one command and has the engine decide on it. The caller has already decided that
+    /// its peer is admitted.
+    fn dispatch(&self, cmd: &str, args: &Value) -> Result<(Reply, Option<(u16, u16)>)> {
+        let command = parse_command(cmd, args)?;
         self.check_repo(&command)?;
         let size = if matches!(command, Command::Attach { .. }) {
-            term_size(&args)
+            term_size(args)
         } else {
             None
         };
@@ -557,7 +577,30 @@ impl DaemonHandler {
             cmd: command,
             reply,
         })??;
+        Ok((reply, size))
+    }
+
+    /// Runs one command. A repository question is answered here, on the caller's thread, not on
+    /// the engine's: the engine only said which commits it may be about.
+    fn execute(&self, cmd: &str, args: Value) -> Result<HandlerReply> {
+        let (reply, size) = self.dispatch(cmd, &args)?;
         self.convert(reply, size)
+    }
+
+    /// `repo.blob`: the bytes of an image, for the dashboard. Any other command is refused.
+    fn execute_image(&self, args: Value) -> Result<RepoImage> {
+        let (reply, _) = self.dispatch("repo.blob", &args)?;
+        match reply {
+            Reply::Repo(req) => match self.browser.run(&req.target, &req.query)? {
+                RepoReply::Image(i) => Ok(i),
+                RepoReply::Doc(_) => Err(FleetError::internal(
+                    "the image request produced a document",
+                )),
+            },
+            _ => Err(FleetError::internal(
+                "the image request was not a repository request",
+            )),
+        }
     }
 }
 
@@ -577,6 +620,13 @@ pub const WEB_COMMANDS: &[&str] = &[
     "goal.show",
     "goal.remaining",
     "verify.status",
+    // the repository at the commits recorded for a task, read only: file names, contents and
+    // diffs are shown as text, and only images (by magic number) are ever sent as bytes
+    "repo.tree",
+    "repo.file",
+    "repo.blob",
+    "repo.markdown",
+    "repo.diff",
 ];
 
 /// The dashboard's view of the daemon: the same handler as the control socket, restricted to
@@ -606,6 +656,16 @@ impl WebBackend for DaemonWeb {
                 "the dashboard cannot attach to a terminal",
             )),
         }
+    }
+
+    fn image(&self, args: Value) -> Result<WebImage> {
+        let image = self.handler.execute_image(args)?;
+        Ok(WebImage {
+            content_type: image.kind.content_type(),
+            bytes: image.bytes,
+            width: image.width,
+            height: image.height,
+        })
     }
 
     fn process_alive(&self, pid: u32) -> bool {
@@ -754,9 +814,49 @@ mod tests {
                     *cmd,
                     "task.send" | "gate.resolve" | "approval.decide" | "merge"
                 ) || cmd.starts_with("goal.")
+                    || cmd.starts_with("repo.")
                     || matches!(*cmd, "status" | "events" | "task.tail" | "verify.status"),
                 "{cmd}"
             );
+        }
+    }
+
+    #[test]
+    fn the_dashboard_offers_the_repository_views_read_only_and_nothing_that_writes() {
+        let task = Value::object([("task", Value::str("r1/a"))]);
+        let repo_commands: Vec<&&str> = WEB_COMMANDS
+            .iter()
+            .filter(|c| c.starts_with("repo."))
+            .collect();
+        assert_eq!(
+            repo_commands,
+            [
+                &"repo.tree",
+                &"repo.file",
+                &"repo.blob",
+                &"repo.markdown",
+                &"repo.diff"
+            ]
+        );
+        for cmd in repo_commands {
+            let parsed = parse_command(cmd, &task).unwrap();
+            assert!(
+                fleet_app::api::is_read_only(&parsed),
+                "{cmd} must change nothing"
+            );
+        }
+        // there is no way to name a command that writes a file or starts a process in the repository
+        for cmd in [
+            "repo.write",
+            "repo.edit",
+            "repo.checkout",
+            "repo.commit",
+            "repo.exec",
+            "repo.target",
+            "repo.refs",
+        ] {
+            assert!(!WEB_COMMANDS.contains(&cmd), "{cmd}");
+            assert!(parse_command(cmd, &task).is_err(), "{cmd} must not parse");
         }
     }
 

@@ -2428,3 +2428,967 @@ fn a_verification_check_process_cannot_use_the_web_ui() {
     assert_eq!(jstr(&jarr(&list, "goals")[0], "status"), "verified");
     f.shutdown();
 }
+
+// ---- 14. the review workbench: the repository at recorded commits, read only ------------------------------------------
+
+const WORKBENCH_WORKER: &str = r##"#!/bin/bash
+set -e
+mkdir -p src docs img .fleet
+if [ "$FLEET_TASK" = a ]; then
+  mv src/lib.txt src/renamed.txt
+  printf 'one\ntwo\nthree\nfour\n' > src/renamed.txt
+  printf 'fn main() {}\n' > src/main.rs
+  printf '# Title\n\nSee [guide](docs/guide.md), [site](https://example.com/x) and [evil](javascript:alert(1)).\n\n![logo](img/logo.png) ![remote](https://tracker.example/p.png)\n\n<script>alert(1)</script>\n\n| a | b |\n|---|---|\n| 1 | 2 |\n' > README.md
+  printf '# Guide\n' > docs/guide.md
+  echo 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' | base64 -d > img/logo.png
+  printf 'a\r\nb\r\n' > crlf.txt
+  printf '\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x9c\x40\0\0\x9c\x40\x08\x02\0\0\0\0\0\0\0' > img/huge.png
+  printf 'GIF89a\xff\xff\xff\xff\0\0\0' > img/huge.gif
+  printf 'bare\rcr\n' > lone-cr.txt
+  printf 'back\\slash\\u{202e}\n' > 'lit\u{202e}eral\\name.txt'
+  printf 'caf\xe9\n' > latin1.txt
+  printf '\0\1\2\0' > bin.dat
+  printf '<svg xmlns="x" onload="alert(1)"><script>alert(2)</script></svg>\n' > evil.svg
+  ln -s ../../../../etc/passwd src/up
+  ln -s /etc/passwd abs
+  ln -s src dirlink
+  printf '#!/bin/sh\n' > run.sh; chmod +x run.sh
+  printf x > $'\xc3\xa9.txt'
+  : > $'we\nird\x1b[31mname.txt'
+  : > $'bidi\xe2\x80\xaetxt.exe'
+  : > 'sp ace.txt'
+  head -c 3000000 /dev/zero | tr '\0' x > big.txt
+else
+  printf 'other\n' > other.txt
+fi
+printf '{"version":1,"status":"done","summary":"wrote files"}' > .fleet/result.json
+"##;
+
+/// A daemon with the dashboard on and two finished tasks, `a` (many kinds of files) and `b`.
+fn workbench_fleet() -> (Fleet, Web) {
+    let mut f = Fleet::new();
+    let s = f.tmp.script("w.sh", WORKBENCH_WORKER);
+    f.write_cfg(&simple_cfg(&s, ""));
+    let info = f.start_web(&[]);
+    let web = Web::new(&info);
+    f.plan_and_start("r1", 2, &[t("a"), t("b")]);
+    web.wait_task("a", "completed");
+    web.wait_task("b", "completed");
+    (f, web)
+}
+
+fn enc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn repo_url(kind: &str, task: &str, commit: &str, path: &str) -> String {
+    format!(
+        "/api/repo/{kind}?task={}&commit={}&path={}",
+        enc(task),
+        enc(commit),
+        enc(path)
+    )
+}
+
+const CSP_PAGE: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
+/// Every response of the workbench carries the security headers; JSON is escaped.
+fn assert_workbench_response(r: &Resp, what: &str) {
+    assert_eq!(
+        r.header("x-content-type-options"),
+        Some("nosniff"),
+        "{what}"
+    );
+    assert_eq!(r.header("cache-control"), Some("no-store"), "{what}");
+    assert_eq!(r.header("referrer-policy"), Some("no-referrer"), "{what}");
+    assert_eq!(r.header("x-frame-options"), Some("DENY"), "{what}");
+    assert_eq!(
+        r.header("cross-origin-resource-policy"),
+        Some("same-origin"),
+        "{what}"
+    );
+    assert_eq!(r.all("content-security-policy").len(), 1, "{what}");
+    let csp = r.header("content-security-policy").unwrap();
+    if r.header("content-type").unwrap_or("").starts_with("image/") {
+        assert_eq!(csp, "default-src 'none'; sandbox", "{what}");
+    } else {
+        assert_eq!(csp, CSP_PAGE, "{what}");
+        for b in [b'<', b'>', b'&', 0x1b, 0x00, 0x07] {
+            assert!(
+                !r.body.contains(&b),
+                "{what}: raw byte {b:#x} in the document"
+            );
+        }
+        for bad in ["\u{202e}", "\u{2028}", "\u{200b}", "\u{feff}"] {
+            assert!(!has_bytes(&r.body, bad.as_bytes()), "{what}: raw {bad:?}");
+        }
+    }
+}
+
+fn get_ok(web: &Web, path: &str) -> Value {
+    let r = web.get(path);
+    assert_eq!(r.status, 200, "{path}: {}", r.text());
+    assert_workbench_response(&r, path);
+    r.json()
+}
+
+fn get_err(web: &Web, path: &str, status: u16, code: &str) {
+    let r = web.get(path);
+    assert_eq!(r.status, status, "{path}: {}", r.text());
+    assert_eq!(r.code(), code, "{path}: {}", r.text());
+    assert_workbench_response(&r, path);
+}
+
+fn ids(web: &Web, task: &str) -> (String, String) {
+    let st = web.status();
+    let run = jarr(&st, "runs")[0].clone();
+    let base = jstr(&run, "base_sha").to_string();
+    let head = jstr(find_task(&st, "r1", task).unwrap(), "head").to_string();
+    assert!(is_hex40(&base) && is_hex40(&head), "{base} {head}");
+    (base, head)
+}
+
+fn entry<'a>(doc: &'a Value, name: &str) -> &'a Value {
+    jarr(doc, "entries")
+        .iter()
+        .find(|e| jstr(e, "name") == name)
+        .unwrap_or_else(|| panic!("no entry {name:?} in {}", doc.canonical()))
+}
+
+fn file_of<'a>(doc: &'a Value, path: &str) -> &'a Value {
+    jarr(doc, "files")
+        .iter()
+        .find(|f| jstr(f, "path") == path)
+        .unwrap_or_else(|| panic!("no file {path:?} in the diff"))
+}
+
+#[test]
+fn the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository() {
+    let (_f, web) = workbench_fleet();
+    let (base, head) = ids(&web, "a");
+
+    // ---- the tree at the head commit, at the base commit and below a directory
+    let root = get_ok(&web, &repo_url("tree", "r1/a", "head", ""));
+    assert_eq!(jstr(&root, "schema"), "fleet.repo.tree/1");
+    assert_eq!(jstr(&root, "task"), "r1/a");
+    assert_eq!(jstr(&root, "at"), "head");
+    assert_eq!(jstr(&root, "commit"), head);
+    assert!(!jbool(&root, "truncated"));
+    assert_eq!(jstr(entry(&root, "src"), "kind"), "dir");
+    assert_eq!(jstr(entry(&root, "run.sh"), "mode"), "executable");
+    assert_eq!(jstr(entry(&root, "abs"), "kind"), "symlink");
+    assert_eq!(jstr(entry(&root, "dirlink"), "kind"), "symlink");
+    assert_eq!(jstr(entry(&root, "big.txt"), "kind"), "file");
+    assert_eq!(jnum(entry(&root, "big.txt"), "size"), 3_000_000);
+    // directories come first
+    assert_eq!(jstr(&jarr(&root, "entries")[0], "kind"), "dir");
+    // hostile names are listed, escaped, and cannot be requested back
+    let evil = jarr(&root, "entries")
+        .iter()
+        .find(|e| jstr(e, "name").contains("\\u{1b}"))
+        .expect("the name with an escape sequence is listed");
+    assert!(
+        jstr(evil, "name").contains("\\u{1b}") && jstr(evil, "name").contains("\\u{a}"),
+        "{}",
+        jstr(evil, "name")
+    );
+    assert!(evil.get("path").unwrap().is_null());
+    let bidi = jarr(&root, "entries")
+        .iter()
+        .find(|e| jstr(e, "name").contains("txt.exe"))
+        .unwrap();
+    assert!(jstr(bidi, "name").contains("\\u{202e}"));
+    assert!(bidi.get("path").unwrap().is_null());
+    assert_eq!(jstr(entry(&root, "sp ace.txt"), "path"), "sp ace.txt");
+
+    let at_base = get_ok(&web, &repo_url("tree", "r1/a", "base", ""));
+    assert_eq!(jstr(&at_base, "commit"), base);
+    let names: Vec<&str> = jarr(&at_base, "entries")
+        .iter()
+        .map(|e| jstr(e, "name"))
+        .collect();
+    assert_eq!(
+        names,
+        ["src", "README.md"],
+        "the base commit has the fixture's files only"
+    );
+    let by_sha = get_ok(&web, &repo_url("tree", "r1/a", &head, "src"));
+    assert_eq!(jstr(&by_sha, "at"), head);
+    let names: Vec<&str> = jarr(&by_sha, "entries")
+        .iter()
+        .map(|e| jstr(e, "name"))
+        .collect();
+    assert_eq!(names, ["main.rs", "renamed.txt", "up"]);
+    // the task may also be named by its bare id
+    assert_eq!(
+        jstr(&get_ok(&web, &repo_url("tree", "a", "head", "")), "task"),
+        "r1/a"
+    );
+
+    // ---- files
+    let readme = get_ok(&web, &repo_url("file", "r1/a", "head", "README.md"));
+    assert_eq!(jstr(&readme, "schema"), "fleet.repo.file/1");
+    assert_eq!(
+        (jstr(&readme, "view"), jstr(&readme, "class")),
+        ("text", "text")
+    );
+    assert!(jbool(&readme, "markdown"));
+    assert_eq!(jstr(&jarr(&readme, "lines")[0], ""), "");
+    let lines: Vec<&str> = jarr(&readme, "lines")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(lines[0], "# Title");
+    assert!(
+        lines.contains(&"<script>alert(1)</script>"),
+        "markup is text: {lines:?}"
+    );
+    let old = get_ok(&web, &repo_url("file", "r1/a", "base", "README.md"));
+    assert_eq!(jarr(&old, "lines")[0].as_str(), Some("# fixture"));
+    let crlf = get_ok(&web, &repo_url("file", "r1/a", "head", "crlf.txt"));
+    assert!(jbool(&crlf, "crlf"));
+    assert_eq!(jarr(&crlf, "lines")[0].as_str(), Some("a"));
+    let latin1 = get_ok(&web, &repo_url("file", "r1/a", "head", "latin1.txt"));
+    assert!(jbool(&latin1, "lossy"));
+    assert_eq!(jarr(&latin1, "lines")[0].as_str(), Some("caf\u{fffd}"));
+    let bin = get_ok(&web, &repo_url("file", "r1/a", "head", "bin.dat"));
+    assert_eq!(
+        (jstr(&bin, "view"), jstr(&bin, "class")),
+        ("binary", "binary")
+    );
+    assert_eq!(jnum(&bin, "size"), 4);
+    assert!(jarr(&bin, "lines").is_empty());
+    let big = get_ok(&web, &repo_url("file", "r1/a", "head", "big.txt"));
+    assert_eq!(jstr(&big, "view"), "too_large");
+    assert_eq!(jnum(&big, "size"), 3_000_000);
+    assert!(jarr(&big, "lines").is_empty());
+    let svg = get_ok(&web, &repo_url("file", "r1/a", "head", "evil.svg"));
+    assert_eq!(
+        jstr(&svg, "view"),
+        "text",
+        "an SVG is shown as source, never as an image"
+    );
+    assert!(
+        jstr(&jarr(&svg, "lines")[0], "").is_empty()
+            || jarr(&svg, "lines")[0].as_str().unwrap().contains("onload")
+    );
+    let png = get_ok(&web, &repo_url("file", "r1/a", "head", "img/logo.png"));
+    assert_eq!((jstr(&png, "view"), jstr(&png, "image")), ("image", "png"));
+    // links are described, not followed
+    let up = get_ok(&web, &repo_url("file", "r1/a", "head", "src/up"));
+    assert_eq!(jstr(&up, "view"), "symlink");
+    assert_eq!(jstr(&up, "target"), "../../../../etc/passwd");
+    assert!(up.get("target_path").unwrap().is_null());
+    let abs = get_ok(&web, &repo_url("file", "r1/a", "head", "abs"));
+    assert_eq!(jstr(&abs, "target"), "/etc/passwd");
+    assert!(abs.get("target_path").unwrap().is_null());
+    let dirlink = get_ok(&web, &repo_url("file", "r1/a", "head", "dirlink"));
+    assert_eq!(jstr(&dirlink, "target"), "src");
+    assert_eq!(jstr(&dirlink, "target_path"), "src");
+    get_err(
+        &web,
+        &repo_url("file", "r1/a", "head", "dirlink/main.rs"),
+        404,
+        "not_found",
+    );
+    get_err(
+        &web,
+        &repo_url("tree", "r1/a", "head", "dirlink"),
+        400,
+        "invalid",
+    );
+    get_err(
+        &web,
+        &repo_url("file", "r1/a", "head", "src"),
+        400,
+        "invalid",
+    );
+    get_err(
+        &web,
+        &repo_url("file", "r1/a", "head", "nope.txt"),
+        404,
+        "not_found",
+    );
+    // a name is exactly the bytes it has: composed and decomposed forms are different names
+    let composed = get_ok(&web, &repo_url("file", "r1/a", "head", "\u{e9}.txt"));
+    assert_eq!(jarr(&composed, "lines")[0].as_str(), Some("x"));
+    get_err(
+        &web,
+        &repo_url("file", "r1/a", "head", "e\u{301}.txt"),
+        404,
+        "not_found",
+    );
+
+    // ---- images: the bytes, with the headers that keep them inert
+    let img = web.get(&repo_url("blob", "r1/a", "head", "img/logo.png"));
+    assert_eq!(img.status, 200, "{}", img.text());
+    assert_workbench_response(&img, "blob");
+    assert_eq!(img.header("content-type"), Some("image/png"));
+    assert_eq!(img.header("content-disposition"), Some("inline"));
+    assert!(img.body.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(img.body.len(), 70);
+    assert_eq!(img.header("x-image-width"), Some("1"));
+    assert_eq!(img.header("x-image-height"), Some("1"));
+    // an image that declares a canvas of 40000 x 40000 pixels (a 33 byte file) is never served,
+    // and its file document is a placeholder with the size and the limits
+    for huge in ["img/huge.png", "img/huge.gif"] {
+        let r = web.get(&repo_url("blob", "r1/a", "head", huge));
+        assert_eq!(r.status, 413, "{huge}: {}", r.text());
+        assert_workbench_response(&r, huge);
+        assert!(r
+            .header("content-type")
+            .unwrap()
+            .starts_with("application/json"));
+        assert!(r.header("x-image-width").is_none());
+        let d = get_ok(&web, &repo_url("file", "r1/a", "head", huge));
+        assert_eq!(jstr(&d, "view"), "image_too_large", "{huge}");
+        assert_eq!(jnum(&d, "max_side"), 8192);
+        assert_eq!(jnum(&d, "max_pixels"), 32_000_000);
+        assert!(jnum(&d, "width") >= 40_000 || huge.ends_with("gif"));
+    }
+    // a bare carriage return stays in the text for the page to make visible; a literal
+    // backslash is doubled in names so it cannot pass for an escape
+    let cr = get_ok(&web, &repo_url("file", "r1/a", "head", "lone-cr.txt"));
+    assert_eq!(jarr(&cr, "lines")[0].as_str(), Some("bare\rcr"));
+    let root_names: Vec<String> = jarr(&root, "entries")
+        .iter()
+        .map(|e| jstr(e, "name").to_string())
+        .collect();
+    assert!(
+        root_names
+            .iter()
+            .any(|n| n.contains("\\\\u{202e}eral\\\\\\\\name")),
+        "{root_names:?}"
+    );
+    for (path, status) in [
+        ("evil.svg", 415),
+        ("README.md", 415),
+        ("bin.dat", 415),
+        ("abs", 415),
+        ("src", 400),
+        ("big.txt", 415),
+        ("nope.png", 404),
+    ] {
+        let r = web.get(&repo_url("blob", "r1/a", "head", path));
+        assert_eq!(r.status, status, "{path}: {}", r.text());
+        assert_workbench_response(&r, path);
+        assert!(
+            r.header("content-type")
+                .unwrap()
+                .starts_with("application/json"),
+            "{path}"
+        );
+    }
+
+    // ---- Markdown: a closed tree, links classified, nothing remote loaded
+    let md = get_ok(&web, &repo_url("markdown", "r1/a", "head", "README.md"));
+    assert_eq!(jstr(&md, "schema"), "fleet.repo.markdown/1");
+    let text = md.canonical();
+    assert!(text.contains("\"kind\":\"external\"") && text.contains("https://example.com/x"));
+    assert!(text.contains("\"path\":\"docs/guide.md\""));
+    assert!(text.contains("\"path\":\"img/logo.png\""));
+    assert!(text.contains("remote images are not loaded"));
+    assert!(!text.contains("\"url\":\"javascript:"), "{text}");
+    assert!(
+        text.contains("<script>alert(1)</script>"),
+        "raw markup is text: {text}"
+    );
+    assert!(text.contains("\"t\":\"table\""));
+    get_err(
+        &web,
+        &repo_url("markdown", "r1/a", "head", "crlf.txt"),
+        400,
+        "invalid",
+    );
+    get_err(
+        &web,
+        &repo_url("markdown", "r1/a", "head", "big.txt"),
+        400,
+        "invalid",
+    );
+
+    // ---- the diff of the task's branch against the run's base commit
+    let d = get_ok(&web, &format!("/api/repo/diff?task={}", enc("r1/a")));
+    assert_eq!(jstr(&d, "schema"), "fleet.repo.diff/1");
+    assert_eq!(
+        (jstr(&d, "base"), jstr(&d, "head")),
+        (base.as_str(), head.as_str())
+    );
+    assert!(!jbool(&d, "truncated"), "{:?}", d.get("notice"));
+    let readme = file_of(&d, "README.md");
+    assert_eq!(jstr(readme, "status"), "modified");
+    let renamed = file_of(&d, "src/renamed.txt");
+    assert_eq!(jstr(renamed, "status"), "renamed");
+    assert_eq!(jstr(renamed, "old_path"), "src/lib.txt");
+    assert!(jnum(renamed, "similarity") >= 50);
+    assert_eq!(jstr(file_of(&d, "src/main.rs"), "status"), "added");
+    let logo = file_of(&d, "img/logo.png");
+    assert!(jbool(logo, "binary") && jarr(logo, "hunks").is_empty());
+    assert!(jbool(file_of(&d, "bin.dat"), "binary"));
+    assert_eq!(jstr(file_of(&d, "run.sh"), "new_mode"), "100755");
+    assert_eq!(jstr(file_of(&d, "abs"), "new_mode"), "120000");
+    let crlf_file = file_of(&d, "crlf.txt");
+    let first = &jarr(&jarr(crlf_file, "hunks")[0], "lines")[0];
+    assert!(jbool(first, "cr"), "{}", first.canonical());
+    // the one very long line is clipped with a marker
+    let big_file = file_of(&d, "big.txt");
+    let big_line = jstr(&jarr(&jarr(big_file, "hunks")[0], "lines")[0], "t");
+    assert!(
+        big_line.contains("more characters]") && big_line.len() < 2100,
+        "{}",
+        big_line.len()
+    );
+    // hostile file names are shown escaped and are not offered to the viewer
+    let weird = jarr(&d, "files")
+        .iter()
+        .find(|f| jstr(f, "path").contains("\\u{1b}"))
+        .unwrap();
+    assert!(!jbool(weird, "path_ok") && jstr(weird, "path").contains("\\u{1b}"));
+    let stats = d.get("stats").unwrap();
+    assert_eq!(jnum(stats, "files"), jarr(&d, "files").len() as u64);
+    assert!(jnum(stats, "binary") >= 2 && jnum(stats, "additions") > 10);
+    // the other direction, an explicit context and a commit by id
+    let back = get_ok(
+        &web,
+        &format!(
+            "/api/repo/diff?task={}&base=head&head=base&context=0",
+            enc("r1/a")
+        ),
+    );
+    assert_eq!(jstr(file_of(&back, "src/main.rs"), "status"), "deleted");
+    assert_eq!(jnum(&back, "context"), 0);
+    let by_id = get_ok(
+        &web,
+        &format!(
+            "/api/repo/diff?task={}&base={base}&head={head}",
+            enc("r1/a")
+        ),
+    );
+    assert_eq!(jarr(&by_id, "files").len(), jarr(&d, "files").len());
+    // task b's diff is its own
+    let b = get_ok(&web, &format!("/api/repo/diff?task={}", enc("r1/b")));
+    assert_eq!(jarr(&b, "files").len(), 1);
+    assert_eq!(jstr(&jarr(&b, "files")[0], "path"), "other.txt");
+}
+
+#[test]
+fn the_workbench_reads_the_repository_never_the_worktree() {
+    let (f, web) = workbench_fleet();
+    let (_, head) = ids(&web, "a");
+    let wt = f.worktree("r1", "a");
+    // a worker (or anything else with write access to its worktree) changes what is there...
+    fs::write(wt.join("README.md"), "FORGED in the worktree\n").unwrap();
+    fs::write(wt.join("src/main.rs"), "forged\n").unwrap();
+    fs::write(wt.join("untracked-secret.txt"), "not committed\n").unwrap();
+    // ...and repoints the worktree's own `.git` file at a repository of its own
+    let forged = f.tmp.join("forged");
+    fs::create_dir_all(&forged).unwrap();
+    safe_git(&forged, &["init", "-q", "-b", "main"]);
+    fs::write(forged.join("README.md"), "FORGED repository\n").unwrap();
+    safe_git(&forged, &["add", "-A"]);
+    safe_git(&forged, &["commit", "-q", "-m", "forged"]);
+    fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", forged.join(".git").display()),
+    )
+    .unwrap();
+    // what is served is what the repository holds at the recorded commit
+    let readme = get_ok(&web, &repo_url("file", "r1/a", "head", "README.md"));
+    assert_eq!(jarr(&readme, "lines")[0].as_str(), Some("# Title"));
+    let main = get_ok(&web, &repo_url("file", "r1/a", "head", "src/main.rs"));
+    assert_eq!(jarr(&main, "lines")[0].as_str(), Some("fn main() {}"));
+    get_err(
+        &web,
+        &repo_url("file", "r1/a", "head", "untracked-secret.txt"),
+        404,
+        "not_found",
+    );
+    let root = get_ok(&web, &repo_url("tree", "r1/a", "head", ""));
+    assert_eq!(jstr(&root, "commit"), head);
+    assert!(jarr(&root, "entries")
+        .iter()
+        .all(|e| jstr(e, "name") != "untracked-secret.txt"));
+    // and the worktree may be gone altogether
+    fs::remove_dir_all(&wt).unwrap();
+    let again = get_ok(&web, &repo_url("file", "r1/a", "head", "docs/guide.md"));
+    assert_eq!(jarr(&again, "lines")[0].as_str(), Some("# Guide"));
+    let d = get_ok(&web, &format!("/api/repo/diff?task={}", enc("r1/a")));
+    assert_eq!(jstr(file_of(&d, "src/main.rs"), "status"), "added");
+}
+
+#[test]
+fn clients_cannot_name_paths_commits_or_tasks_the_daemon_did_not_record() {
+    let (f, web) = workbench_fleet();
+    let (base, head) = ids(&web, "a");
+    let (_, head_b) = ids(&web, "b");
+    let events_before = web.get("/api/events?limit=500").text();
+
+    // paths: every form of leaving the tree, or of naming something that is not a plain entry
+    for (path, status, code) in [
+        ("..", 400, "invalid"),
+        ("../README.md", 400, "invalid"),
+        ("src/../README.md", 400, "invalid"),
+        ("src/./main.rs", 400, "invalid"),
+        ("./README.md", 400, "invalid"),
+        ("/etc/passwd", 400, "invalid"),
+        ("/README.md", 400, "invalid"),
+        ("//", 400, "invalid"),
+        ("src//main.rs", 400, "invalid"),
+        ("src/", 400, "invalid"),
+        ("src\\main.rs", 400, "invalid"),
+        ("..\\README.md", 400, "invalid"),
+        (".git/config", 400, "invalid"),
+        (".GIT/HEAD", 400, "invalid"),
+        ("src/.git/x", 400, "invalid"),
+        ("a\nb", 400, "invalid"),
+        ("a\rb", 400, "invalid"),
+        ("a\tb", 400, "invalid"),
+        ("a\u{1b}[31mb", 400, "invalid"),
+        ("a\u{202e}b", 400, "invalid"),
+        ("a\u{200b}b", 400, "invalid"),
+        ("a\u{7f}", 400, "invalid"),
+        // spelled like traversal but just names (full-width dots, a division slash)
+        ("\u{ff0e}\u{ff0e}/README.md", 404, "not_found"),
+        ("src\u{2215}main.rs", 404, "not_found"),
+        // a double-encoded `..` is the literal text `%2e%2e`
+        ("%2e%2e/README.md", 404, "not_found"),
+        ("README.md ", 404, "not_found"),
+        ("readme.md", 404, "not_found"),
+    ] {
+        for kind in ["file", "tree", "markdown", "blob"] {
+            let url = repo_url(kind, "r1/a", "head", path);
+            let r = web.get(&url);
+            assert_eq!(r.status, status, "{kind} {path:?}: {}", r.text());
+            assert_eq!(r.code(), code, "{kind} {path:?}: {}", r.text());
+            assert!(r
+                .header("content-type")
+                .unwrap()
+                .starts_with("application/json"));
+            assert_workbench_response(&r, &format!("{kind} {path:?}"));
+        }
+    }
+    // raw (not percent-decoded by us) escapes in the target
+    for raw in [
+        "/api/repo/file?task=r1%2Fa&path=%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+        "/api/repo/file?task=r1%2Fa&path=%2E%2E",
+        "/api/repo/file?task=r1%2Fa&path=a%00b",
+        "/api/repo/file?task=r1%2Fa&path=%5c..%5c",
+        "/api/repo/file?task=r1%2Fa&path=%ff%fe",
+    ] {
+        let r = web.get(raw);
+        assert!(matches!(r.status, 400), "{raw}: {} {}", r.status, r.text());
+        assert_workbench_response(&r, raw);
+    }
+    // overlong: path, component and depth
+    for path in ["a".repeat(1025), "b/".repeat(40) + "c", "x".repeat(300)] {
+        get_err(
+            &web,
+            &repo_url("file", "r1/a", "head", &path),
+            400,
+            "invalid",
+        );
+    }
+
+    // commits: only `head`, `base` and ids the daemon recorded for this very task
+    for bad in [
+        "main",
+        "master",
+        "HEAD",
+        "refs/heads/main",
+        "fleet/r1/a",
+        "fleet/r1/integration",
+        "HEAD~1",
+        "head^",
+        "head~1",
+        "@{u}",
+        "--output=/tmp/x",
+        "-1",
+        "",
+        " ",
+        "HEAD:README.md",
+    ] {
+        get_err(
+            &web,
+            &repo_url("file", "r1/a", bad, "README.md"),
+            400,
+            "invalid",
+        );
+    }
+    for bad in [
+        &head[..7],
+        &head[..39],
+        &head.to_uppercase(),
+        &format!("{head}0"),
+    ] {
+        get_err(
+            &web,
+            &repo_url("file", "r1/a", bad, "README.md"),
+            400,
+            "invalid",
+        );
+    }
+    // a well-formed id nobody recorded, and the head of a different task
+    get_err(
+        &web,
+        &repo_url("file", "r1/a", &"1".repeat(40), "README.md"),
+        404,
+        "not_found",
+    );
+    get_err(
+        &web,
+        &repo_url("file", "r1/a", &head_b, "other.txt"),
+        404,
+        "not_found",
+    );
+    assert_eq!(
+        jstr(
+            &get_ok(&web, &repo_url("file", "r1/b", "head", "other.txt")),
+            "commit"
+        ),
+        head_b
+    );
+    get_err(
+        &web,
+        &repo_url("file", "r1/b", &head, "README.md"),
+        404,
+        "not_found",
+    );
+    // the base commit of the run belongs to every task of it
+    assert_eq!(
+        jstr(
+            &get_ok(&web, &repo_url("file", "r1/b", &base, "README.md")),
+            "at"
+        ),
+        base
+    );
+    get_err(
+        &web,
+        &format!("/api/repo/diff?task=r1%2Fa&head={}", "2".repeat(40)),
+        404,
+        "not_found",
+    );
+    get_err(&web, "/api/repo/diff?task=r1%2Fa&base=main", 400, "invalid");
+
+    // tasks and parameters
+    for task in ["nope", "r9/a", "r1/nope"] {
+        get_err(&web, &repo_url("tree", task, "head", ""), 404, "not_found");
+    }
+    for task in [
+        "../a",
+        "r1/a/../b",
+        "a b",
+        "r1//a",
+        "r1/",
+        "/a",
+        "A",
+        "a\nb",
+    ] {
+        let r = web.get(&repo_url("tree", task, "head", ""));
+        assert!(
+            matches!(r.status, 400 | 404),
+            "{task:?}: {} {}",
+            r.status,
+            r.text()
+        );
+        assert_workbench_response(&r, task);
+    }
+    for q in [
+        "/api/repo/tree?task=r1%2Fa&ref=main",
+        "/api/repo/tree?task=r1%2Fa&repo=%2Ftmp",
+        "/api/repo/tree?task=r1%2Fa&worktree=x",
+        "/api/repo/tree?task=r1%2Fa&path=a&path=b",
+        "/api/repo/tree?commit=head",
+        "/api/repo/diff?task=r1%2Fa&context=-1",
+        "/api/repo/diff?task=r1%2Fa&context=abc",
+    ] {
+        let r = web.get(q);
+        assert_eq!(r.status, 400, "{q}: {}", r.text());
+    }
+    // a large context is clamped, not an error
+    assert_eq!(
+        jnum(
+            &get_ok(
+                &web,
+                &format!("/api/repo/diff?task={}&context=99999", enc("r1/a"))
+            ),
+            "context"
+        ),
+        25
+    );
+
+    // the surface is read only
+    for path in [
+        "/api/repo/tree",
+        "/api/repo/file",
+        "/api/repo/diff",
+        "/api/repo/blob",
+        "/api/repo/markdown",
+    ] {
+        let r = web.post_raw(&format!("{path}?task=r1%2Fa"), "{}");
+        assert!(
+            matches!(r.status, 405 | 415 | 403),
+            "POST {path}: {}",
+            r.status
+        );
+        assert_ne!(r.status, 200);
+    }
+    for path in [
+        "/api/repo/write",
+        "/api/repo/checkout",
+        "/api/repo/exec",
+        "/api/repo/refs",
+        "/api/repo",
+    ] {
+        assert_eq!(web.get(path).status, 404, "{path}");
+    }
+    // none of this changed anything: no events, no new branches, no state
+    assert_eq!(web.get("/api/events?limit=500").text(), events_before);
+    assert!(!git_branches(&f).iter().any(|b| b == "fleet/r1/integration"));
+    assert_eq!(jarr(&web.status(), "approvals").len(), 0);
+}
+
+#[test]
+fn hostile_repository_content_is_inert_in_every_document() {
+    let (_f, web) = workbench_fleet();
+    let mut seen = 0usize;
+    for url in [
+        repo_url("tree", "r1/a", "head", ""),
+        repo_url("file", "r1/a", "head", "README.md"),
+        repo_url("file", "r1/a", "head", "evil.svg"),
+        repo_url("file", "r1/a", "head", "src/up"),
+        repo_url("markdown", "r1/a", "head", "README.md"),
+        format!("/api/repo/diff?task={}", enc("r1/a")),
+    ] {
+        let r = web.get(&url);
+        assert_eq!(r.status, 200, "{url}: {}", r.text());
+        assert_workbench_response(&r, &url);
+        assert_eq!(
+            r.header("content-type"),
+            Some("application/json; charset=utf-8")
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, 6);
+    // the SVG with script is only ever text
+    let svg = web.get(&repo_url("blob", "r1/a", "head", "evil.svg"));
+    assert_eq!(svg.status, 415);
+    assert!(
+        !svg.text().contains("onload"),
+        "the content is not echoed into an error"
+    );
+    // the dashboard's other commands are unaffected: nothing a repository holds can name one
+    let st = web.status();
+    assert_eq!(jstr(&st, "schema"), "fleet.status/1");
+}
+
+#[test]
+fn a_worker_cannot_read_the_repository_through_the_workbench() {
+    let mut f = Fleet::new();
+    let child = f.tmp.script(
+        "webreq.sh",
+        &format!("#!/bin/bash\n{BASH_REQ}\nPORT=$1\nTOKEN=$2\nreq \"$3\" \"$4\" \"$5\" \"$6\"\n"),
+    );
+    let worker = fill(
+        &format!(
+            r#"#!/bin/bash
+{BASH_REQ}
+if [ "$FLEET_TASK" = a ]; then echo a > a.txt; exit 0; fi
+PORT=; TOKEN=
+while IFS= read -r l; do
+  [[ $l =~ WEBPORT=([0-9]+) ]] && PORT=${{BASH_REMATCH[1]}}
+  [[ $l =~ WEBTOKEN=([0-9a-f]+) ]] && TOKEN=${{BASH_REMATCH[1]}}
+done < "$FLEET_BRIEF_FILE"
+n=0
+for p in "/api/repo/tree?task=r1%2Fa" "/api/repo/file?task=r1%2Fa&path=a.txt" "/api/repo/blob?task=r1%2Fa&path=a.txt" "/api/repo/markdown?task=r1%2Fa&path=a.txt" "/api/repo/diff?task=r1%2Fa"; do
+  n=$((n+1))
+  req GET "$p" "" repo-get-$n.txt
+  ( req GET "$p" "" repo-sub-$n.txt )
+  bash @CHILD@ "$PORT" "$TOKEN" GET "$p" "" repo-child-$n.txt
+done
+echo finished > b.txt
+"#
+        ),
+        &[("CHILD", &child)],
+    );
+    let s = f.tmp.script("w.sh", &worker);
+    f.write_cfg(&simple_cfg(&s, "timeout_secs = 90"));
+    let info = f.start_web(&[]);
+    let web = Web::new(&info);
+    let spec = format!("WEBPORT={} WEBTOKEN={}", info.port, info.token);
+    f.plan_and_start("r1", 2, &[t("a"), t("b").spec(&spec)]);
+    web.wait_task("a", "completed");
+    web.wait_task("b", "completed");
+    let dir = f.worktree("r1", "b");
+    assert!(
+        dir.join("b.txt").exists(),
+        "the worker script did not finish"
+    );
+    for n in 1..=5 {
+        for kind in ["get", "sub", "child"] {
+            let file = format!("repo-{kind}-{n}.txt");
+            let text =
+                fs::read_to_string(dir.join(&file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert!(
+                text.starts_with("HTTP/1.1 403"),
+                "{file}: the worker was not refused:\n{text}"
+            );
+            assert!(
+                text.contains("\"code\":\"forbidden\"") && text.contains("worker processes"),
+                "{file}: {text}"
+            );
+            for secret in [
+                "fleet.repo.",
+                "\"entries\"",
+                "\"lines\"",
+                "\"files\"",
+                "a.txt\"",
+            ] {
+                assert!(!text.contains(secret), "{file} got {secret}:\n{text}");
+            }
+        }
+    }
+    // the same request from this process is fine
+    let ok = web.get(&repo_url("file", "r1/a", "head", "a.txt"));
+    assert_eq!(ok.status, 200, "{}", ok.text());
+}
+
+#[test]
+fn many_large_diffs_and_files_keep_memory_flat_and_every_cap_holds() {
+    let mut f = Fleet::new();
+    let worker = f.script(
+        "w.sh",
+        r##"#!/bin/bash
+set -e
+mkdir -p .fleet many
+# one file of about 24 MiB with 600000 lines, 60 files of 2000 lines, a directory of 3000 files
+yes 'a line of ordinary text that is long enough to take some space in the diff' | head -n 400000 > huge.txt
+for i in $(seq 1 60); do yes "file $i line text" | head -n 2000 > many/f$i.txt; done
+mkdir -p wide
+for i in $(seq 1 3000); do : > wide/w$i.txt; done
+printf '{"version":1,"status":"done","summary":"big"}' > .fleet/result.json
+"##,
+    );
+    f.write_cfg(&simple_cfg(&worker, "timeout_secs = 120"));
+    let info = f.start_web(&[]);
+    let web = Web::new(&info);
+    f.plan_and_start("r1", 1, &[t("a")]);
+    web.wait_task("a", "completed");
+    let rss = |web: &Web| -> u64 {
+        let st = web.status();
+        st.get("daemon")
+            .and_then(|d| d.get("rss_kb"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let url = format!("/api/repo/diff?task={}", enc("r1/a"));
+    let first = web.get(&url);
+    assert_eq!(
+        first.status,
+        200,
+        "{}",
+        &first.text()[..first.text().len().min(300)]
+    );
+    assert!(
+        first.body.len() < 8 * 1024 * 1024,
+        "{} bytes",
+        first.body.len()
+    );
+    let d = first.json();
+    let shown: usize = jarr(&d, "files")
+        .iter()
+        .flat_map(|f| jarr(f, "hunks"))
+        .map(|h| jarr(h, "lines").len())
+        .sum();
+    assert!(shown <= 30_000, "{shown} lines");
+    assert!(
+        jarr(&d, "files").iter().any(|f| jbool(f, "truncated")),
+        "the caps must show"
+    );
+    assert!(jarr(&d, "files").len() <= 300);
+    let huge = file_of(&d, "huge.txt");
+    assert_eq!(jnum(huge, "additions"), 400_000, "totals are the real ones");
+    assert!(jbool(huge, "truncated"));
+    // the wide directory is cut at its cap and says so
+    let wide = get_ok(&web, &repo_url("tree", "r1/a", "head", "wide"));
+    assert_eq!(jarr(&wide, "entries").len(), 2000);
+    assert!(jbool(&wide, "truncated"));
+
+    // Two identical phases of reads, three at a time. A read builds a document of a few megabytes
+    // (bounded by the caps), so memory rises to a plateau during the first phase; the plateau is
+    // bounded and the second phase must not raise it: nothing grows with the number of reads.
+    let port = info.port;
+    let token = info.token.clone();
+    let paths: Vec<String> = vec![
+        url.clone(),
+        format!("{url}&context=25"),
+        format!("{url}&context=0"),
+        format!("{url}&base=head&head=base"),
+        repo_url("tree", "r1/a", "head", "wide"),
+        repo_url("tree", "r1/a", "head", "many"),
+        repo_url("file", "r1/a", "head", "huge.txt"),
+        repo_url("file", "r1/a", "head", "many/f7.txt"),
+    ];
+    let phase = |rounds: usize| -> usize {
+        let workers: Vec<_> = (0..4)
+            .map(|w| {
+                let paths = paths.clone();
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    let mut busy = 0;
+                    for round in 0..rounds {
+                        let p = &paths[(round + w) % paths.len()];
+                        let r = http(
+                            port,
+                            "GET",
+                            p,
+                            &[("Authorization", &format!("Bearer {token}"))],
+                            None,
+                        );
+                        match r.status {
+                            200 => assert!(r.body.len() < 8 * 1024 * 1024),
+                            // the number of reads that run at once is capped
+                            503 => busy += 1,
+                            other => {
+                                panic!("{p}: {other} {}", &r.text()[..r.text().len().min(200)])
+                            }
+                        }
+                    }
+                    busy
+                })
+            })
+            .collect();
+        workers.into_iter().map(|h| h.join().unwrap()).sum()
+    };
+    let start = Instant::now();
+    let baseline = rss(&web);
+    let busy1 = phase(48);
+    let plateau = rss(&web);
+    let busy2 = phase(48);
+    let after = rss(&web);
+    println!(
+        "workbench memory: baseline {baseline} kB, after the first phase {plateau} kB, after the second {after} kB ({} reads in {:?}, {} turned away)",
+        2 * 4 * 48,
+        start.elapsed(),
+        busy1 + busy2
+    );
+    assert!(busy1 + busy2 < 2 * 4 * 48, "every read was refused as busy");
+    assert!(
+        plateau < baseline + 256 * 1024,
+        "the first phase raised the daemon's memory from {baseline} kB to {plateau} kB"
+    );
+    assert!(
+        after < plateau + 32 * 1024,
+        "memory grew from {plateau} kB to {after} kB over a second identical phase ({:?}; {busy1} and {busy2} reads were turned away)",
+        start.elapsed()
+    );
+    // the daemon is still answering everything else
+    assert_eq!(web.get("/api/health").status, 200);
+}
