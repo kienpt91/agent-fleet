@@ -2,7 +2,8 @@
 # The tests start their own sshd as an ordinary user on a high port with keys generated at run time
 # (nothing is committed); the image only provides the binaries. /etc/passwd is made writable for the
 # test run only, so that scripts/ssh-env.sh can add the entry that sshd and ssh need for an arbitrary
-# uid. Never use this image for anything but tests.
+# uid. Never use this image for anything but tests, never run it as a service and never push it: a writable
+# /etc/passwd lets any process in a container built from it become root.
 #   docker build -f docker/Dockerfile.dev -t fleet-dev docker/
 #   docker build -f docker/Dockerfile.ssh -t fleet-ssh docker/
 FROM fleet-dev

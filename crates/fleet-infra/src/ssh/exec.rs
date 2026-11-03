@@ -352,9 +352,9 @@ pub fn run(spec: &Spec, tracker: &JobTracker) -> Done {
             stop(&mut child, pid);
             break Ending::TimedOut;
         }
-        let total_moved = sent.load(Ordering::SeqCst)
-            + out.seen.load(Ordering::SeqCst)
-            + err.seen.load(Ordering::SeqCst);
+        // Progress is what the call is for: bytes sent and bytes of its output. What a host prints
+        // on stderr is not progress (a hostile host could trickle it forever).
+        let total_moved = sent.load(Ordering::SeqCst) + out.seen.load(Ordering::SeqCst);
         if total_moved != moved {
             moved = total_moved;
             last_progress = now;
@@ -580,6 +580,23 @@ mod tests {
             &JobTracker::new(),
         );
         assert_eq!(done.ending, Ending::TimedOut);
+    }
+
+    #[test]
+    fn a_client_that_only_chatters_on_stderr_is_stalled_all_the_same() {
+        let t = std::time::Instant::now();
+        let done = run(
+            &sh(
+                "while :; do echo trickle >&2; sleep 0.1; done",
+                Input::None,
+                Output::Capture { max: 10 },
+                20_000,
+                600,
+            ),
+            &JobTracker::new(),
+        );
+        assert_eq!(done.ending, Ending::Stalled);
+        assert!(t.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

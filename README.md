@@ -865,16 +865,16 @@ How an attempt goes, and why each step is the way it is:
 2. **Run.** The worker starts through `ssh -tt` in a **local pty**: its output goes through the same sanitizer, ring buffer,
    redaction and limits as a local worker's, idle and total timeouts and TERM-then-KILL apply (the signal is also sent to the
    remote process group), and the ssh client is a live session, so the control socket and the dashboard refuse it and what it
-   starts. The remote command is `env -i <only the values written in [hosts.<name>.env]> ...`: nothing of your environment goes.
+   starts. The values written in `[hosts.<name>.env]` go to the host in a 0600 file that the launcher reads and deletes (not on a command line, where `ps` would show them); nothing of your environment goes.
 3. **Collect.** The host commits what the worker left and sends a bundle back; fleet fetches it into a quarantine ref,
-   runs `git fsck --strict` over it, requires that it builds on the commit that was sent, touches no `.git` or `.fleet` path and stays
+   checks it with `git fsck` in a scratch repository (so a refused bundle leaves nothing in yours), requires that it builds on the commit that was sent, touches no `.git` or `.fleet` path and stays
    within the commit, file and byte limits, and only then makes **one new local commit with the verified tree**, authored by fleet.
    The host's commit objects and messages never enter your history. The worker's `result.json` and `question.json` come back
    through bounded reads and are validated like local ones.
 4. **Clean up.** The remote process group is killed and the remote worktree removed (also after a failure; a host that was down
    keeps a marker and is cleaned at the next daemon start, which says so in the activity feed).
 
-The host key is **pinned by you**: `fleet host trust` is the only way a key is written to `<state>/hosts/<name>.known_hosts`
+The host key is **pinned by you**: `fleet host trust` is the only command that writes a key to `<state>/hosts/<name>.known_hosts`
 (0600), and every other connection is strict against that one file. An unpinned host is not connected to; a changed key is refused
 with a message that says why. There is no agent forwarding, no password login, no X11, no port forwarding, no multiplexing and
 no `ProxyJump`/`ProxyCommand` unless you name a `proxy_jump` host (whose hop uses that entry's own key and pin).
@@ -1109,7 +1109,7 @@ gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 6
   keep working); a local process that passes admission can still keep connection slots busy for short periods (see SECURITY.md).
 - SSH remote workers run with all rights of their remote account and are not sandboxed; the returned tree is verified for
   form, not content. Not verified: macOS, real accounts, real agents, other OpenSSH versions. Preparing a remote attempt
-  blocks the engine thread for as long as its connect and stall timeouts allow (a host that was down is skipped for 30 s);
+  blocks the engine thread for up to its 120 s budget (a host that timed out is skipped for 120 s);
   start-up clean-up of leftover remote worktrees is bounded by 20 s. See SECURITY.md, "Remote hosts".
 - macOS: the code type-checks for `aarch64-apple-darwin` but was **not run**; pty, peer-credential, `ps`-based
   process-identity and the `lsof`-based dashboard admission behaviour there is unverified. Windows is not supported.

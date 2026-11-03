@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long a host that could not be reached is not tried again.
-const DOWN_FOR: Duration = Duration::from_secs(30);
+const DOWN_FOR: Duration = Duration::from_secs(120);
 
 /// Time limits of one kind of call.
 #[derive(Clone, Copy, Debug)]
@@ -47,7 +47,7 @@ impl Default for Timeouts {
         };
         Timeouts {
             quick: t(60, 40),
-            prepare: t(300, 60),
+            prepare: t(120, 60),
             collect: t(600, 120),
             cleanup: t(60, 30),
         }

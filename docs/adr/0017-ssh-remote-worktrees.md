@@ -25,8 +25,7 @@ four steps through the `RemoteHost` port:
 3. *Collect* (after the local client ended; on a helper thread, the orchestrator never waits for a host). The host commits what
    the worker left (never `.fleet`) and sends a bundle of the new commits; the worker's `result.json`/`question.json` come through
    bounded reads into the local `.fleet/`. The bundle is **never trusted**: it must name exactly the one ref the protocol
-   uses; it is fetched into a quarantine ref; every object reachable from its tip passes `git fsck --strict` (git does not check
-   the objects of a bundle by itself); the tip must descend from the commit that was sent; no changed path may be `.git`-like or
+   uses; it is fetched into a **scratch bare repository** that holds only the commit that was sent and the incoming objects, where `git fsck` checks them (git does not check the objects of a bundle by itself; checking in the scratch repository means old malformed objects of your own repository cannot refuse an honest host and a refused bundle leaves nothing behind); only then is the verified tip fetched into the quarantine ref of the real repository; the tip must descend from the commit that was sent; no changed path may be `.git`-like or
    under `.fleet`; commits, changed paths, files and bytes are bounded; the local worktree must be clean and the task branch
    unchanged since the export. **Only the verified tree is used**: the task branch gets one new commit authored by fleet with that
    tree on top of the old head. Commit objects, messages and authors of the host never enter local history.
@@ -68,8 +67,8 @@ terminal client is a live session like any worker.
   part of a bundle that fleet can check by itself.
 - A bundle of a large repository's *tree* is the price of an attempt (bounded, `max_bundle_mib`, default 256 MiB). Nothing is cached
   between attempts.
-- Preparing runs synchronously on the engine thread, bounded by connect and stall timeouts (a host that cannot be reached is marked
-  down for 30 s so that the next attempts fail at once); collecting and signalling are asynchronous.
+- Preparing runs synchronously on the engine thread. It is bounded by one 120 s budget for the whole of sending (silence limit 60 s; stderr does not count as progress), and a host that timed out or could not be reached is skipped for 120 s. That is a bound, not a fix: a hostile host can still hold the daemon for 120 s per two minutes. Collecting and signalling are asynchronous. Moving the transfer to a helper thread (a `starting` state for the task) was considered and not done in this phase.
+- Variables of a remote worker travel in a 0600 file that the launcher reads and deletes, never on a command line.
 - A worker that writes a question and keeps running is noticed when it ends or is stopped by its limits, not while it runs (the
   question file is on the host until collected).
 - Quality gates and verification contracts run locally, on the verified commit, in the local worktree and in an export. A remote
