@@ -17,7 +17,7 @@ A human-only task is a **barrier**. fleet cannot mark a task completed by hand, 
 behind it. The procedure at a barrier:
 
 1. Let the run finish everything that does not depend on the barrier (`fleet status`).
-2. Review and merge what the run produced (RUNBOOK.md, "Review and merge"). Land it on the branch the next run
+2. Review and merge what the run produced (RUNBOOK.md, section 5). Land it on the branch the next run
    starts from.
 3. Do the human-only work **yourself, in your own clone**, as commits you author, and have it reviewed as the task
    says. Land it on the same branch.

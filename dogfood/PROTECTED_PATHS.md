@@ -130,6 +130,22 @@ scaffolded for the milestones: `crates/neo-knowledge/src/**`, `crates/neo-govern
 task can never add a dependency). Anything that needs a protected file, such as registering a new crate,
 wiring it into the daemon or adding an event, is a **human-only task** ([`human-only.md`](human-only.md)).
 
+## Reviewed exceptions: a test-only change in a protected source file
+
+The list is broad on purpose (`crates/fleet-infra/**` as a whole), and the work that was actually run on this repository before the
+list existed was a fix of a flaky test inside two files of it ([trials/](trials/README.md)). Forbidding that wholesale would make
+the list unusable for the commonest maintenance task, and loosening it would defeat it. The way out is the second route of the
+principle: **a human approves the exact diff**, with the machine narrowing what that diff can be.
+
+- The only such route is the contract template `contracts/flaky-test.json`, rendered by hand for **one named Rust file**
+  (`crates/<crate>/src/**.rs` or `crates/<crate>/tests/**.rs`; never a build script, a manifest or the architecture tests).
+- It replaces the glob deny check by `check-protected.sh --except <that file>` (exact path, printed as a REVIEWED EXCEPTION, symlinks and
+  odd paths still refused) and adds `check-test-only.sh` (everything above the file's first test module is byte-identical to the base),
+  a `kept` check (the test is still there) and a stress loop.
+- It does **not** make the file less protected for any other task, and it is never part of the roadmap's goal list: you render it, for
+  one task, on purpose. What it cannot see is production code placed after a test module: that is the diff you read before you approve
+  the merge, and for `crates/fleet-infra` the independent security review you owe the change anyway.
+
 ## How the list is enforced
 
 Four layers, each independent of the others:

@@ -4,14 +4,15 @@
 # THROWAWAY CLONE with `fleet daemon --config ~/.fleet-dogfood/fleet.toml`. fleet reads this file
 # once at start, from the daemon's side, never from a repository.
 #
-# What to fill in, and nothing else:
-#   - [workers.agent] command: the absolute path of your agent CLI (already `omp` below);
-#   - [[gates]] command: the absolute path of your container wrapper (dogfood/container-run.example.sh);
-#   - author_name / author_email if you want another identity on the commits fleet makes.
-# Paths below assume the directory ~/.fleet-dogfood that RUNBOOK.md creates; change them together.
+# What to check before you use it, and nothing else:
+#   - [workers.agent] command: the absolute path of the agent CLI on this machine (`omp` below);
+#   - [[gates]] command: the absolute path of your container wrapper (dogfood/container-run.example.sh,
+#     installed outside the repository). Paths below assume the directory ~/.fleet-dogfood that RUNBOOK.md
+#     creates (written out, because a TOML file does not expand `~`); change them together.
+# The commits fleet makes are authored `fleet <fleet@localhost>` (the default; no author_name or
+# author_email below). RUNBOOK.md, section 5, says how you re-author them when you take them in.
 #
-# Nothing in this file is a secret and none may become one: no key, no token. The agent's login
-# lives in the agent's own isolated profile (see [workers.agent]).
+# Nothing in this file is a secret and none may become one: no key, no token, no password.
 
 [daemon]
 max_sessions = 1              # one worker at a time. The hard cap of fleet is 64; do not raise this before RUNBOOK.md's checklist is true
@@ -22,15 +23,14 @@ approval_ttl_secs = 600       # an approval nobody used expires after 10 minutes
 sensitive = ["merge", "external-command"]   # BOTH stay: see "Why merge stays a human approval" below
 external_timeout_secs = 120   # an approved command the worker asked for may run this long
 question_grace_secs = 2
-author_name = "fleet-dogfood"
-author_email = "fleet-dogfood@localhost"
 ring_bytes = 262144
 
 [env]
 # Variables the worker, the gates and git receive from the daemon's environment. Nothing else is
-# inherited. NO secret variable is in this list: the agent's credential is in its own profile (below).
-# HOME is passed because the agent CLI keeps its profile, sessions and caches under it; this is the
-# same user and the same home as yours, so it is NOT a security boundary (see RUNBOOK.md, known gaps).
+# inherited. NO secret variable is in this list. HOME is passed because the agent CLI keeps its
+# configuration, login and sessions under it: this is the same user and the same home as yours, so it
+# is NOT a security boundary (RUNBOOK.md, known gaps). DOGFOOD_* variables of the container wrapper are
+# deliberately not passed: a check can never switch the wrapper to its online mode.
 allow = ["PATH", "HOME", "USER", "LANG", "TERM"]
 
 [redact]
@@ -53,28 +53,34 @@ charset = "token"
 min_len = 24
 
 # ---- the worker ---------------------------------------------------------------------------------------
-# The agent CLI of this machine, `omp` 18.6.1, run non-interactively. Flags (omp --help):
+# The agent CLI of this machine, `omp` 18.6.1, run non-interactively, with the arguments that were run for
+# real on the owner's macOS in trial runs of NEO (two tasks completed with every contract check passing):
 #   -p                    print mode: process the prompt and exit
 #   --no-session          keep no session file
 #   --no-extensions       do not discover extensions
 #   --no-skills           do not discover skills
 #   --no-rules            do not discover rules or context files of the project or of other tools
-#   --profile fleet-dogfood
-#                         an isolated profile for auth, sessions, settings and caches. Without it the
-#                         worker reads YOUR configuration through HOME: your global MCP servers, your
-#                         extensions, your rules, your login. In a dry run with the default profile
-#                         omp printed a warning that a globally configured MCP server failed to
-#                         connect: `--no-extensions` does not stop MCP servers.
-#   --max-time 20m        omp stops the session after 20 minutes (fleet's own timeout below is the backstop)
+#   --max-time 25m        omp stops the session after 25 minutes (fleet's own timeout below is the backstop)
 #   --cwd {worktree}      start in the task's worktree
-#   --approval-mode write approve reads and workspace writes, ask for anything that executes. Nobody
-#                         can answer a prompt in a headless run: see RUNBOOK.md ("Approval modes") for
-#                         what that means and what was and was not verified.
+#   --approval-mode write approve reads and workspace writes, refuse anything that executes (see below)
 #   @{brief_file}         the brief of the task, as the prompt
-# One-time login of the profile, by you, in a terminal (never through fleet), with a provider key that
-# has a HARD spending limit set in the provider's console: `omp --profile fleet-dogfood login <provider>`
-# or `/login` inside `omp --profile fleet-dogfood`. Check afterwards that the profile shows no warning
-# about MCP servers of your own. Because the profile holds its own login, `env_pass` stays EMPTY.
+#
+# WHAT `--approval-mode write` DOES HEADLESS, as observed in those runs: the agent could NOT run shell
+# commands (the approval it needs cannot be given with nobody there), so it edited files BLIND, without ever
+# running a build or a test; fleet's own verification of the committed result (the contract) did all the
+# proving, in a container. That is the safe default for an unattended worker: the agent can change files of
+# its worktree and nothing else, and what it claims is checked by something that is not the agent. Do not
+# "fix" it with `--auto-approve`, `--yolo` or `--approval-mode yolo`: that lets the agent run anything as you.
+#
+# WHAT THIS DOES NOT ISOLATE: the default profile reads YOUR omp configuration through HOME, among it
+# global MCP servers (their tools count as `write` and are approved automatically) and your login. The
+# trial runs used it. To keep your configuration out of the worker's way, give omp its own profile (isolated
+# auth, sessions, settings and caches under ~/.omp/profiles/fleet-dogfood) and log in once, in a terminal,
+# with a provider key that has a HARD spending limit set in the provider's console:
+#     omp --profile fleet-dogfood login <provider>
+# then add these two lines to `args` below, before "--cwd" (NOT exercised yet: see RUNBOOK.md, section 2):
+#     "--profile", "fleet-dogfood",
+# `env_pass` stays empty either way: the login lives in omp's own storage, not in a variable.
 [workers.agent]
 command = "/Users/kienpt/.local/bin/omp"
 args = [
@@ -83,17 +89,14 @@ args = [
   "--no-extensions",
   "--no-skills",
   "--no-rules",
-  "--profile", "fleet-dogfood",
-  "--max-time", "20m",
+  "--max-time", "25m",
   "--cwd", "{worktree}",
   "--approval-mode", "write",
   "@{brief_file}",
 ]
-env_pass = []                 # no secret variable. Only if the provider key MUST come from an environment variable
-                              # (the profile cannot hold it), name that ONE variable here, set it in the daemon's
-                              # environment only for this session, and read RUNBOOK.md "If the key must be a variable".
-timeout_secs = 1500           # 25 minutes in all; omp's own --max-time is 20
-idle_timeout_secs = 1200      # print mode may print nothing until the end, so this is long; --max-time is the real bound
+env_pass = []                 # no secret variable (RUNBOOK.md, "If the key must be a variable")
+timeout_secs = 1800           # 30 minutes in all; omp's own --max-time is 25
+idle_timeout_secs = 600       # print mode may print nothing until the end, so this is long; --max-time is the real bound
 
 # A worker for tasks that only a person may do (dogfood/human-only.md). It prints why and fails at
 # once, so such a task costs nothing and its dependents wait behind it; its contract can never pass either.
@@ -109,7 +112,7 @@ idle_timeout_secs = 30
 # proven and merged); this gate is a second, slower look at the worktree itself. It is optional:
 # delete it to halve the time of a task. The command is the wrapper OUTSIDE the repository, never a
 # script of the repository (a worker can edit those, see SECURITY.md "Quality gates").
-# Refcheck is not used: this is a Rust repository.
+# The wrapper mounts the worktree read-only and has no network. Refcheck is not used: this is a Rust repository.
 [[gates]]
 name = "tests"
 command = "/Users/kienpt/.fleet-dogfood/bin/container-run"

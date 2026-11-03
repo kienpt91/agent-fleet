@@ -5,13 +5,17 @@
 # and shows what happens. No real agent is started and nothing outside the temporary directory is
 # changed.
 #
-#   dryrun.sh --fleet <fleet binary> --source <repository to clone> --container-run <wrapper> [--keep]
+#   dryrun.sh --fleet <fleet binary> --source <repository to clone> [--container-run <wrapper>] [--keep]
 #
 # --source is cloned (its committed state: commit first) and everything runs on the clone.
-# --container-run is the wrapper the cargo checks of the contracts go through (RUNBOOK.md, step 2).
+# --container-run is the wrapper the cargo checks of the contracts go through (RUNBOOK.md, section 2);
+# without it the dry run uses container-run.inside.sh, a copy of which is made OUTSIDE the clone: run
+# the dry run inside the development container, where no docker client exists.
 # The stage: the three starter tasks (one of which first touches a protected path, so its contract
 # fails and the retry fixes it), a human-only task behind them and an agent task behind that, which
-# therefore never starts. The output is the transcript RUNBOOK.md quotes.
+# therefore never starts. Then the reviewer's steps: the checkers by hand, the merge approval and taking a
+# task's commits into another branch under another identity with the conflict-marker check. The output
+# is the transcript RUNBOOK.md quotes.
 set -eu
 
 fail() { printf 'dryrun: %s\n' "$1" >&2; exit 2; }
@@ -24,10 +28,11 @@ while [ $# -gt 0 ]; do
     *) fail "unknown argument $1" ;;
   esac
 done
-[ -n "$fleet" ] && [ -n "$source" ] && [ -n "$crun" ] || fail "usage: dryrun.sh --fleet F --source REPO --container-run W [--keep]"
+[ -n "$fleet" ] && [ -n "$source" ] || fail "usage: dryrun.sh --fleet F --source REPO [--container-run W] [--keep]"
 case $fleet in /*) ;; *) fail "--fleet must be an absolute path" ;; esac
-case $crun in /*) ;; *) fail "--container-run must be an absolute path" ;; esac
-[ -x "$fleet" ] && [ -x "$crun" ] || fail "the fleet binary or the wrapper is not executable"
+[ -z "$crun" ] || case $crun in /*) ;; *) fail "--container-run must be an absolute path" ;; esac
+[ -x "$fleet" ] || fail "the fleet binary is not executable"
+[ -z "$crun" ] || [ -x "$crun" ] || fail "the wrapper is not executable"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/dogfood-dryrun.XXXXXX")
 export HOME="$work/home"
@@ -54,6 +59,11 @@ base=$(git -C "$clone" rev-parse HEAD)
 echo "base commit $base"
 
 run sh "$clone/dogfood/install-tools.sh" --repo "$clone" --ref HEAD --dest "$tools"
+if [ -z "$crun" ]; then
+  crun=$work/container-run
+  cp "$clone/dogfood/container-run.inside.sh" "$crun" && chmod 755 "$crun"
+  say "container-run = a copy of dogfood/container-run.inside.sh outside the clone ($crun)"
+fi
 
 # The dry-run configuration is the template with the real agent replaced by the fake one and the
 # optional gate dropped; everything else is the template as it is.
@@ -115,7 +125,7 @@ say "the worker that costs nothing: fleet tail n3-scaffold"
 
 say "fleet verify r/task: run the contract again, by hand, on the task's current commit"
 "$fleet" verify neo-roadmap/starter-docs-glossary || echo "exit $?"
-say "fleet verify g-n3-scaffold: the human-only contract can not pass"
+say "fleet verify g-n3-scaffold: a human-only task never gets a worktree, so there is nothing to verify and nothing can pass"
 "$fleet" verify g-n3-scaffold --task neo-roadmap/n3-scaffold || echo "exit $?"
 
 # ---- the person reviews and merges ---------------------------------------------------------------------
@@ -135,3 +145,15 @@ run "$fleet" verify-log
 say "git status --short   # the clone's own branch and working tree were never touched"
 git -C "$clone" status --short
 git -C "$clone" branch --show-current
+
+# ---- taking the work into the branch you keep (fleet's commits carry the identity fleet <fleet@localhost>) ----
+say "git log --format='%h %an <%ae> %s' $base..fleet/neo-roadmap/starter-docs-glossary   # who fleet says made the commits"
+git -C "$clone" log --format='%h %an <%ae> %s' "$base..fleet/neo-roadmap/starter-docs-glossary"
+run git -C "$clone" switch -q -c owner-branch "$base"
+say "git cherry-pick -n $base..fleet/neo-roadmap/starter-docs-glossary   # applied to the index and the files, not committed"
+git -C "$clone" cherry-pick -n "$base..fleet/neo-roadmap/starter-docs-glossary"
+run sh "$tools/check-conflict-markers.sh" --git "$clone"
+say "git commit as the owner (the commit message is the owner's own)"
+git -C "$clone" -c user.name="Owner Name" -c user.email=owner@example.invalid commit -q -m "Add the self-development terms to the glossary"
+git -C "$clone" log --format='%h %an <%ae> %s' -2
+git -C "$clone" switch -q main
