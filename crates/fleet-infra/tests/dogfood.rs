@@ -1215,6 +1215,19 @@ fn no_contract_runs_the_remote_layer_and_the_documents_say_why() {
     let text = read(wrapper);
     assert!(text.contains("image=fleet-dev"), "{wrapper}");
     assert!(!text.contains("image=fleet-ssh"), "{wrapper}");
+    // a check never writes to a target that another check reuses: the wrapper copies a read-only warm target
+    // into a volume of its own, and the documents name the channel and the housekeeping script
+    assert!(
+        text.contains(":/warm-target:ro"),
+        "{wrapper}: the warm target must be mounted read-only"
+    );
+    assert!(
+        text.contains("volume create") && text.contains("volume rm -f"),
+        "{wrapper}: a scratch target is created and removed"
+    );
+    let contracts_readme = read("dogfood/contracts/README.md");
+    assert!(contracts_readme.contains("fresh volume") && contracts_readme.contains("poisoning"));
+    assert!(read("SECURITY.md").contains("poison the artifacts"));
     let readme = read("dogfood/contracts/README.md");
     assert!(
         readme.contains("The `remote` layer is not part of the contract"),
@@ -1285,6 +1298,7 @@ fn the_documents_name_every_part_and_every_protected_path() {
         "gen-contracts.sh",
         "container-run.example.sh",
         "container-run.inside.sh",
+        "reset-cache.sh",
         "fleet.dogfood.example.toml",
         "plan.neo-roadmap.toml",
         "goals.neo-roadmap.tsv",

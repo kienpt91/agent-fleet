@@ -202,7 +202,12 @@ What the design tries to guarantee, and where it is tested:
   task forbids the protected paths (a `deny` list in the `diff` check, plus a stricter script run from a copy outside the
   repository), but the worker is the same user as the operator: it can edit the main checkout, the shared `.git` directory,
   the agent's own profile and anything else the operator can, none of which a contract looks at. Run it on a throwaway clone and
-  in a container, a VM or under another OS user. The protected list is only as complete as its author made it. A weak
+  in a container, a VM or under another OS user. The checks of a contract build and run the task's own tests (a hostile test is not stopped
+  by the container: README, Limitations), so they must not share anything that outlives them: the wrapper gives each check a fresh cargo target
+  directory, copied from a warm one that the check sees read-only and removed afterwards. A writable target shared by all checks would let a
+  hostile test of one task poison the artifacts that the next task's checks reuse and report as a pass; what remains is the warm target
+  itself, which only the operator writes and is only as trustworthy as the commit it was built from (`dogfood/reset-cache.sh` empties it).
+  The protected list is only as complete as its author made it. A weak
   check passes a weak result, and no token governor exists: spend is limited only by the limit set in the provider's console. The
   scaffold has not been run with a real agent (earlier trials with hand-written contracts, made by the owner on macOS, reported and not re-verified here, were: two tasks completed, the agent could not run
   commands headless in write mode, and the contract did the proving). A test-only change in one protected Rust file is the one explicit,

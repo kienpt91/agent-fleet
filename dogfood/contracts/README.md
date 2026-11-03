@@ -126,11 +126,16 @@ The `command` checks run **programs**, never a shell: absolute path, not inside 
 export or the scratch area. So the cargo checks go through your **container wrapper**, one program that takes a
 command string: `@CONTAINER_RUN@ 'cargo fmt --all -- --check'`. The wrapper is yours, outside the repository
 (`../container-run.example.sh` is the template, modelled on the wrapper of the trial runs). You set two things in it: the
-absolute path of your docker client and the image (`fleet-dev`, built from `docker/Dockerfile.dev`); the cargo registry and target
-directory are two docker volumes it names (`fleet-dogfood-cargo`, `fleet-dogfood-target`), the registry filled once by
-`DOGFOOD_MODE=online container-run 'cargo fetch --locked'`. Every check then runs in a throwaway container with **no network,
-no capabilities, your uid, the export mounted read-only at `/work`, the registry read-only and nothing of yours mounted**; only the
-target volume is writable, so every export builds on a warm cache. Checks start with an environment of `PATH HOME USER LANG TERM`
+absolute path of your docker client and the image (`fleet-dev`, built from `docker/Dockerfile.dev`); the cargo registry and the warm
+target directory are two docker volumes it names (`fleet-dogfood-cargo`, `fleet-dogfood-target`), the registry filled once by
+`DOGFOOD_MODE=online container-run 'cargo fetch --locked'` and the warm target by `DOGFOOD_MODE=warm` from a commit you reviewed. Every check
+then runs in a throwaway container with **no network, no capabilities, your uid, the export mounted read-only at `/work`, the registry and
+the warm target read-only and nothing of yours mounted**; its own `/target` is a **fresh volume, copied from the warm target and removed when
+the check ends**, so every export builds on a warm cache and no check can leave anything for another task's checks (a shared writable target
+would be a channel for poisoning: a hostile test of one task rewriting build artifacts that the next task's `cargo test` reuses and reports
+as a pass). Costs and limits, plainly: a copy of the warm target (a few GB) per check, a scratch volume that a SIGKILLed wrapper leaves
+behind (`reset-cache.sh --scratch`), and the warm target is only as trustworthy as the commit you warmed it from (`reset-cache.sh --warm` empties it).
+Checks start with an environment of `PATH HOME USER LANG TERM`
 only (`fleet.dogfood.example.toml`), so `DOGFOOD_MODE` can never reach one. Use absolute paths in the wrapper and never rely on your
 shell setup: checks run with a `PATH` of absolute directories and a home of their own.
 

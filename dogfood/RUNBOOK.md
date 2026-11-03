@@ -24,7 +24,8 @@ The files of this directory:
 | `render-contract.sh` | fills a template's placeholders (accepts only values of a safe shape) |
 | `install-tools.sh` | copies the check scripts from a reviewed commit to a directory outside the repository |
 | `check-protected.sh`, `check-docs-claims.sh`, `check-secret-tree.sh`, `check-conflict-markers.sh`, `check-test-only.sh` | the checks of a contract that are scripts; `check-protected.sh` and `check-conflict-markers.sh` are also your review tools |
-| `container-run.example.sh` | template of the container wrapper the cargo checks go through (yours, outside the repository): offline, read-only tree, fixed cache volumes |
+| `container-run.example.sh` | template of the container wrapper the cargo checks go through (yours, outside the repository): offline, read-only tree, a fresh scratch target per check copied from a read-only warm one |
+| `reset-cache.sh` | removes scratch volumes a killed check left behind, and empties the warm target volume when you no longer trust it (a person runs it) |
 | `container-run.inside.sh` | the same job for when everything already runs inside the development container (the dry run) |
 | `plan.neo-roadmap.toml`, `goals.neo-roadmap.tsv` | the roadmap: tasks (the DAG) and the goal and contract of each |
 | `apply-goals.sh`, `plan-without.sh` | add the goals to the ledger; cut a plan to the tasks that are still to do and give it its repository |
@@ -72,7 +73,7 @@ Five rules: (1) one task, one file; (2) protected paths are human-only; (3) the 
   layers. The `remote` layer is deliberately not part of any self-development contract (the code it tests is protected, so no task can change what
   it proves; [contracts/README.md](contracts/README.md)). Run it yourself after you have changed such code: `IMAGE=fleet-ssh`, README, Development.
 - Disk and time: the first run of the contract's `layers` check builds the whole workspace in the container (minutes, and a
-  few GB in the volumes); later runs reuse the target volume. Two verification jobs may run at once, one worker at a time.
+  few GB in the volumes); later runs start from the warm target volume (copied into a fresh scratch target for each check, a few GB and some seconds per check). Two verification jobs may run at once, one worker at a time.
 - macOS note: the trial runs were made on macOS and worked there (as reported). The README still says that fleet's macOS code
   paths were type-checked and not run by its author; that statement predates the trials and was not re-verified here.
   The scripts of this directory are POSIX `sh` and use only tools found on macOS and Linux; the shell tests were run on Linux only.
@@ -96,7 +97,8 @@ install -m 755 dogfood/container-run.example.sh ~/.fleet-dogfood/bin/container-r
 #    edit THE TWO THINGS the file says: `docker=` (the absolute path of your docker client, `command -v docker`)
 #    and `image=` (only if you use another image, never the sshd one). It must not be writable by group or others.
 #    It starts the container with no network, no capabilities, your uid, the checked tree read-only at /work,
-#    the cargo registry read-only and nothing of yours mounted.
+#    the cargo registry read-only and nothing of yours mounted. Its target directory is a fresh volume per check, copied from the
+#    warm target (read-only to the check) and removed afterwards, so no check can leave artifacts for another task's checks.
 
 # 4. the image and the two volumes (README, Development), then the cargo cache, filled online ONCE by you
 docker build -f docker/Dockerfile.dev -t fleet-dev docker/
@@ -105,6 +107,10 @@ docker run --rm -u 0 -v fleet-dogfood-cargo:/cargo -v fleet-dogfood-target:/targ
 cd ~/work/fleet-dogfood && DOGFOOD_MODE=online ~/.fleet-dogfood/bin/container-run 'cargo fetch --locked'
 #    online mode: network on, cargo registry and the directory writable. Only you run it; a check starts with PATH, HOME,
 #    USER, LANG and TERM only, so DOGFOOD_MODE never reaches one. Repeat it after every change of Cargo.lock.
+#    then warm the target volume that every check starts from, in a clone at a commit YOU reviewed (never in a task's export):
+cd ~/work/fleet-dogfood && DOGFOOD_MODE=warm ~/.fleet-dogfood/bin/container-run 'cargo clippy --workspace --all-targets --locked --offline && cargo test --workspace --no-run --locked --offline'
+#    repeat it after you merged work into the branch the runs start from, so checks recompile less; if you ever distrust the cache, empty it:
+#    sh dogfood/reset-cache.sh --warm    (and `sh dogfood/reset-cache.sh --scratch` removes volumes a killed check left behind)
 
 # 5. the base must be green BEFORE any task: every check of every contract on the untouched commit
 cd ~/work/fleet-dogfood
