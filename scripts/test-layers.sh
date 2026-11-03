@@ -47,7 +47,7 @@ shell_layer() {
 
 layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals -p neo-context -p fleet-forge -p fleet-fanout
 layer application  cargo test $OPTS -p fleet-app --features testing
-layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test git_diff --test web_http --test origin --test golden_pack --test forge_gh --test forge_push --test dogfood
+layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test git_diff --test web_http --test origin --test golden_pack --test forge_gh --test forge_push --test dogfood --test repo_hygiene
 layer soak         cargo test $OPTS -p fleet-infra --test soak
 shell_layer dogfood sh dogfood/tests/run.sh
 if [ -n "$RUN" ]; then
