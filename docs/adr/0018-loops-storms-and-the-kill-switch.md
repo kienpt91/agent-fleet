@@ -57,7 +57,8 @@ per-task and per-channel totals, per-channel and per-task-per-minute rates, appr
 A legitimate long exchange needs an operator to unmute or higher limits. A determined pair can still burn the budget
 before it is noticed; the budget bounds the cost. Limits are per daemon lifetime of the log (counters are rebuilt by
 replay). A loop is blamed on the sender that crossed the limit, which may be the honest side of an exchange the other
-side started: the gate says which pair and the operator unmutes. Not covered: collusion through a channel that is
+side started: the gate says which pair and the operator unmutes. The loop rules look at pairs: a ring of three or more
+tasks (A to B, B to C, C to A) is no pair and is bounded only by the quotas, the rates and the cap per run. Not covered: collusion through a channel that is
 allowed (the limits and the audit trail make it visible and bounded, they do not make it impossible), and anything two
 agents do outside the daemon.
 
