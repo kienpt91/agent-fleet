@@ -322,6 +322,7 @@ pub fn config_checks(
     explicit: Option<&Path>,
     layout: &StateLayout,
     env: &[(String, String)],
+    tracker: &JobTracker,
 ) -> Vec<Check> {
     let path = explicit.unwrap_or(&layout.default_config);
     if std::fs::symlink_metadata(path).is_err() {
@@ -350,7 +351,7 @@ pub fn config_checks(
         ssh,
         loaded.app.hosts.clone(),
         layout.root.clone(),
-        JobTracker::new(),
+        tracker.clone(),
     );
     for host in loaded.app.hosts.values() {
         out.extend(offline_checks(&client, host, false));

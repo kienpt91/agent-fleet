@@ -7,6 +7,7 @@ use crate::client::Client;
 use crate::config_file::load_config;
 use crate::eventlog::verify_file;
 use crate::git::check_git_version;
+use crate::jobs::JobTracker;
 use crate::server::verify_socket_permissions;
 use crate::statedir::{verify_token_file, StateLayout};
 use crate::undo::AgentUndo;
@@ -73,6 +74,10 @@ impl Check {
 
 pub struct DoctorInput {
     pub layout: StateLayout,
+    /// Where the children of the checks (`git --version`) are listed. The daemon passes its shared tracker, so that
+    /// the health panel's probes are refused as origin like every other child it starts; `fleet doctor`, a process
+    /// of its own, passes a fresh one.
+    pub tracker: JobTracker,
     /// `--config`; when absent the default config file is used if it exists.
     pub config: Option<PathBuf>,
     pub env: Vec<(String, String)>,
@@ -82,7 +87,7 @@ pub struct DoctorInput {
 pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
     let mut checks = vec![
         check_platform(std::env::consts::OS),
-        check_git(&input.env),
+        check_git(&input.env, &input.tracker),
         check_state_dir(&input.layout.root, current_uid()),
         check_socket(&input.layout.socket),
         check_token(&input.layout.token, &input.layout.socket),
@@ -98,6 +103,7 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
         input.config.as_deref(),
         &input.layout,
         &input.env,
+        &input.tracker,
     ));
     checks.push(check_undo(&input.env));
     checks.push(check_peer_credentials());
@@ -156,8 +162,12 @@ pub fn check_platform(os: &str) -> Check {
     }
 }
 
-fn check_git(env: &[(String, String)]) -> Check {
-    match check_git_version(env, &fleet_domain::env::EnvPolicy::default_policy()) {
+fn check_git(env: &[(String, String)], tracker: &JobTracker) -> Check {
+    match check_git_version(
+        env,
+        &fleet_domain::env::EnvPolicy::default_policy(),
+        tracker,
+    ) {
         Ok(v) => Check::new("git", Status::Ok, v),
         Err(e) => Check::new("git", Status::Fail, e.message),
     }
@@ -414,6 +424,27 @@ mod tests {
 
     fn chmod(p: &Path, mode: u32) {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn the_git_probe_of_the_health_checks_is_listed_in_the_shared_tracker() {
+        // the daemon's health panel runs the doctor's checks on a web thread: the `git --version` child must
+        // be registered like every other child the daemon starts, so that it is refused as origin
+        let t = TempDir::new("doc-tracker");
+        let bin = t.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        t.script("bin/git", "#!/bin/sh\nsleep 1\necho 'git version 2.50.0'\n");
+        let env = vec![("PATH".to_string(), bin.to_str().unwrap().to_string())];
+        let tracker = JobTracker::new();
+        let seen = tracker.clone();
+        let probe = std::thread::spawn(move || check_git(&env, &tracker));
+        assert!(
+            crate::testutil::wait_until(3_000, || !seen.live().is_empty()),
+            "the git child was never listed in the tracker"
+        );
+        let check = probe.join().unwrap();
+        assert_eq!(check.status, Status::Ok, "{}", check.detail);
+        assert!(seen.live().is_empty(), "the entry goes with the child");
     }
 
     #[test]

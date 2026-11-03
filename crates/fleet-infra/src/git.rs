@@ -1909,10 +1909,16 @@ impl Vcs for GitVcs {
     }
 }
 
-/// The installed git's version line (used by `fleet doctor`); an error when git is missing or
-/// older than 2.39.
-pub fn check_git_version(parent_env: &[(String, String)], policy: &EnvPolicy) -> Result<String> {
-    GitVcs::new(parent_env.to_vec(), policy.clone()).version()
+/// The installed git's version line (used by `fleet doctor` and the dashboard's health panel; the child is
+/// listed in `tracker`); an error when git is missing or older than 2.39.
+pub fn check_git_version(
+    parent_env: &[(String, String)],
+    policy: &EnvPolicy,
+    tracker: &JobTracker,
+) -> Result<String> {
+    GitVcs::new(parent_env.to_vec(), policy.clone())
+        .with_tracker(tracker.clone())
+        .version()
 }
 
 #[cfg(test)]
@@ -3699,9 +3705,11 @@ mod tests {
                 "PATH".to_string(),
                 std::env::var("PATH").unwrap_or_default(),
             )];
-            assert!(check_git_version(&env, &EnvPolicy::default_policy())
-                .unwrap()
-                .starts_with("git version"));
+            assert!(
+                check_git_version(&env, &EnvPolicy::default_policy(), &JobTracker::new())
+                    .unwrap()
+                    .starts_with("git version")
+            );
         }
     }
 

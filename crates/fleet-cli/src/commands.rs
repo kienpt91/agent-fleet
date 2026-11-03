@@ -1554,6 +1554,7 @@ fn run_doctor(
 ) -> Result<i32> {
     let checks = doctor::run_checks(&DoctorInput {
         layout,
+        tracker: fleet_infra::jobs::JobTracker::new(),
         config,
         env: ctx.env.clone(),
     });

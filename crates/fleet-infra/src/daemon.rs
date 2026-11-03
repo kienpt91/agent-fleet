@@ -260,6 +260,7 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
             web_opts,
             Arc::new(DaemonWeb {
                 handler: Arc::clone(&handler),
+                tracker: tracker.clone(),
                 layout: layout.clone(),
                 config: opts.config_path.clone(),
                 env: env.clone(),
@@ -721,6 +722,8 @@ pub const WEB_COMMANDS: &[&str] = &[
 /// [`WEB_COMMANDS`].
 struct DaemonWeb {
     handler: Arc<DaemonHandler>,
+    /// The shared tracker of every child the daemon starts: the health checks' probes are listed in it.
+    tracker: JobTracker,
     layout: StateLayout,
     config: Option<PathBuf>,
     env: Vec<(String, String)>,
@@ -767,6 +770,7 @@ impl WebBackend for DaemonWeb {
     fn health(&self) -> Value {
         let checks = crate::doctor::run_checks(&crate::doctor::DoctorInput {
             layout: self.layout.clone(),
+            tracker: self.tracker.clone(),
             config: self.config.clone(),
             env: self.env.clone(),
         });

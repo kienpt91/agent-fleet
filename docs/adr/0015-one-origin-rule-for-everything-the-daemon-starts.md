@@ -15,7 +15,8 @@ descendants that leave their group.
 ## Decision
 **One registry and one rule, used by every entry point.**
 - `jobs::JobTracker` is the only registry. The daemon creates one and hands a clone to every adapter that starts a child:
-  `ThreadJobRunner` (gates, approved commands, verification checks), `GitVcs` (both instances) and `AgentUndo`. Each
+  `ThreadJobRunner` (gates, approved commands, verification checks), `GitVcs` (both instances, `git push` and the `git --version`
+  probe of the dashboard's health checks), `AgentUndo`, the forge adapter (`gh`) and the ssh client. Each
   registers the process group of the child it starts for as long as the child and its group exist, and follows the
   child's descendants with the `Sweeper` (sampled every 200 ms while the child runs, the first sample 200 ms after it
   started, and once more before a timed-out child is stopped; registered by pid, killed with start-token verification when
