@@ -87,6 +87,8 @@ string_enum!(
         Merge => "merge",
         ExternalCommand => "external-command",
         Manual => "manual",
+        /// Publishing a task's branch and opening a pull request on a forge.
+        PullRequest => "pull-request",
     }
 );
 

@@ -36,7 +36,9 @@ use neo_verify::limits::MAX_CHANGED_PATHS;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 
+mod push;
 mod read;
+pub use push::GitPublisher;
 
 /// Hard cap per captured stream of one git call.
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;

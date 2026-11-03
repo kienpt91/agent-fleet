@@ -419,6 +419,105 @@ fails the diff constraint; secrets in check output are redacted before they reac
 file of its worktree to point at a repository of its own (alternates, a replace ref) gets a failed review, no evidence and no merge**
 (the commit and tree come from the real repository, ADR 16); nothing above a check's working directory is the state directory.
 
+## GitHub: issues, pull requests and an approval for each
+
+Off unless `[github] enabled = true`. fleet reads issues and pull requests, turns an issue into a task and opens a pull
+request for a task's branch. Its only transport is the `gh` program you already signed in with (`gh auth login`); **fleet
+never sees, stores or passes a token** (ADR 20). Commands: `fleet github status`, `issue list|show|to-task`,
+`pr list|show|status|create` (`pr comment` is not implemented).
+
+```toml
+[github]
+enabled = true
+repo = "owner/name"            # or leave it out: read from the remote of a run's repository
+remote = "origin"              # the git remote branches are pushed to
+base = "main"                  # base of a new pull request unless --base is given
+# allowed_hosts = ["github.com"]; host = "ghe.example.org" for GitHub Enterprise Server
+# rate_budget_per_hour = 300; rate_reserve = 10; rate_backoff_secs = 30; rate_backoff_max_secs = 900
+# gh = "/opt/homebrew/bin/gh"  # else the first absolute PATH entry with a gh, resolved once at start
+# env_pass = ["DBUS_SESSION_BUS_ADDRESS"]   # non-secret variables gh may need (a keyring session, say)
+# push_credentials = "none" | "gh" | "helper"   # see below; push_credential_helper = "/abs/path" for "helper"
+# push_url = "https://github.com/owner/name.git"; allow_local_remote = false; timeout_secs = 30; push_timeout_secs = 120
+```
+
+- **How `gh` runs.** Absolute canonical path resolved once (relative `PATH` entries skipped; refused while inside any run's
+  repository or worktree), fixed argv (`gh api --hostname … --include --method GET|POST … <endpoint>`), no shell, working directory
+  `/`, environment `HOME`, `PATH`, `GH_PROMPT_DISABLED`, `GH_NO_UPDATE_NOTIFIER` (and `GH_HOST`, `env_pass`), a hard timeout, output
+  capped at 2 MiB, the process group listed in the job tracker so that it and its descendants are refused on the control socket and the
+  dashboard. Answers are parsed as JSON under strict schemas (required typed fields, size caps, terminal control and secret shapes
+  removed) before anything else sees them. The daemon never waits for GitHub: a command answers with a ticket and the CLI asks for the outcome.
+- **Rate limits and being offline.** A 403/429 answer or a nearly empty window closes a gate with a doubling, jittered back-off; while it
+  is closed no process is started and the error says for how long. A missing, signed-out or unreachable `gh` fails the command with a clear
+  message before any state is touched; the rest of fleet is unaffected (`fleet github status` shows the state).
+- **Issue text is untrusted** (ADR 22): `issue to-task` makes a task whose spec is fleet's own sentences plus the issue's text, cleaned,
+  redacted, quoted line by line and introduced by `from GitHub issue #n (untrusted)`; it never becomes a contract, a goal or an approval.
+- **A pull request needs an approval of exactly that pull request** (ADR 21): repository, base, head branch, head commit, title, body and
+  draft flag are in the digest; change any of them (or move the branch) and the old approval does not apply; an approval is used once and is
+  spent only after a preflight read succeeded. The push is `<sha>:refs/heads/<branch>` through the hardened git runner: no force, tags or extra
+  refs; the remote URL is re-read, compared with the approved repository and rebuilt; ssh remotes and configuration that rewrites URLs or steers
+  HTTP are refused.
+- **Push credentials, honestly.** The hardened runner reads none of your git configuration, so your own credential helper is *not* used. For
+  an https remote choose `push_credentials = "gh"` (git runs `gh auth git-credential` for that one push) or `"helper"` with the absolute path of
+  one helper (for example the macOS keychain helper). `"none"` works for remotes that need no credential, and for local repositories (tests,
+  mirrors; needs `allow_local_remote`). The token, if any, lives in `gh`'s or the helper's store and in git's memory during the push; fleet's
+  environment for the child holds only `PATH` and `HOME`.
+- **Views.** The dashboard and the terminal dashboard show the last fetched issues and pull requests and the links between tasks, issues and
+  pull requests, read only (`forge.snapshot`, `forge.links`, `forge.status`; text nodes only). They never contact GitHub; `fleet issue list`
+  and `pr list` fill them.
+
+The demo (`scripts/github-demo.sh`; `gh` is a stand-in script that replays canned answers from `examples/github`, the remote is a local bare
+repository, nothing touches a network). Real output of the final run, paths shortened:
+
+```text
+$ fleet github status
+GitHub integration: ready (host github.com, repository o/r, remote origin, base main)
+  gh at /tmp/demo/bin/gh
+  rate: ok (0 of 300 requests used this hour)
+  push credentials: none; a local remote is allowed
+  linked: 0 issue(s) became tasks, 0 pull request publication(s)
+
+$ fleet issue list
+issues of github.com/o/r (page 1; the last page); text below is from GitHub and untrusted
+  number  state  comments  title                 labels  author
+  #7      open   3         Crash on start        bug     octocat
+  #8      open   0         Docs are out of date  -       hubot
+
+$ fleet issue to-task 7 --run r1 --id fix
+task r1/fix was created from issue #7 of github.com/o/r; its text is quoted and labelled untrusted in the brief
+
+$ fleet pr create --task r1/fix        # exits 5: nothing is pushed before a human approves exactly this
+fleet: opening a pull request for r1/fix on github.com/o/r needs approval a1 (digest b1c35a82c1a6); read what it covers with `fleet approval list`, approve it with `fleet approve a1` and run the same `fleet pr create` again
+
+$ fleet approval list
+approval a1 [pull-request] r1/fix pending digest b1c35a82c1a6
+  forge: "pull-request.create" "github.com/o/r" "main" "fleet/r1/fix" "a343c53ea8ac412000984060afd72374a5a63465" "Work on issue #7" "Opened by fleet for task r1/fix at commit a343c53ea8ac.\n\nRefs #7" …
+
+$ fleet approve a1 && fleet pr create --task r1/fix --title 'A different title'   # any change needs a new approval
+fleet: opening a pull request for r1/fix on github.com/o/r needs approval a2 (digest 3c7d2edf2733); …
+
+$ fleet pr create --task r1/fix
+pull request #12 opened for r1/fix on github.com/o/r: https://github.com/o/r/pull/12
+
+$ git -C remote.git for-each-ref       # exactly the approved commit on exactly one ref
+a343c53ea8ac412000984060afd72374a5a63465 commit	refs/heads/fleet/r1/fix
+
+$ fleet pr create --task r1/fix        # the same commit is never published twice
+fleet: pull request #12 was already opened for the commit a343c53ea8ac of r1/fix
+
+$ fleet pr status 12
+pull request #12 of github.com/o/r: open (text is from GitHub and untrusted)
+  title:   Work on issue #7
+  checks:  failing (1 passed, 1 failed, 1 pending of 3)
+  reviews: changes_requested (ann changes_requested, bob approved)
+```
+
+**What was not verified.** A real `gh` and a real GitHub account were never used; the canned answers and test fixtures were written by hand from the
+REST documentation. Checked against the help text of `gh` 2.79.0 (read only, nothing run against a network): `gh api` flags `--include`, `--hostname`,
+`--method`, `-f` (literal strings) and `-F` (typed; a leading `@` reads a file, so text is only ever passed with `-f`), `-H`; exit code 4 for
+"authentication required"; `GH_HOST`, `GH_PROMPT_DISABLED`, `GH_NO_UPDATE_NOTIFIER`. *Not* verifiable offline: the bytes of the `--include` block, what
+`gh api` prints for a 4xx/5xx, the exact stderr wording, the JSON shapes of GitHub's objects, whether the Linux Secret Service is reachable with the minimal
+environment, a real HTTPS push with the `gh` or `helper` credential modes, and macOS. These are owner-verified until you confirm them.
+
 ## Concepts
 
 | Term | Meaning |
@@ -1179,11 +1278,6 @@ application          3132     2959    94.5%
 infrastructure       5974     5494    92.0%
 cli                  2705     2433    89.9%
 overall             19245    18165    94.4%
-domain               6853     6700    97.8%
-application          3783     3519    93.0%
-infrastructure       6128     5677    92.6%
-cli                  3013     2732    90.7%
-overall             19777    18628    94.2%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard

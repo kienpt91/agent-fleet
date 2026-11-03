@@ -219,6 +219,11 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
         None => None,
     };
 
+    // The forge integration (off by default): `gh` is resolved once, here. Its children are listed
+    // in the same tracker as every other child the daemon starts.
+    let forge_jobs = app.forge.enabled.then(|| {
+        crate::forge_jobs::build(&app.forge, &env, Arc::clone(&redactor), tracker.clone())
+    });
     let ports = Ports {
         clock: Box::new(SystemClock),
         store: Box::new(FileEventStore::open(
@@ -256,6 +261,9 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     let mut app = app;
     app.redactor = Arc::clone(&redactor);
     let mut orch = Orchestrator::new(app, ports)?;
+    if let Some(jobs) = forge_jobs {
+        orch.attach_forge(jobs);
+    }
     orch.startup(u64::from(std::process::id()), VERSION)?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -637,6 +645,11 @@ pub const WEB_COMMANDS: &[&str] = &[
     "repo.blob",
     "repo.markdown",
     "repo.diff",
+    // what the operator's `github`, `issue` and `pr` commands fetched and linked, from memory:
+    // nothing that starts `gh`, reads a ticket, makes a task or a pull request is offered
+    "forge.status",
+    "forge.snapshot",
+    "forge.links",
 ];
 
 /// The dashboard's view of the daemon: the same handler as the control socket, restricted to
@@ -825,7 +838,16 @@ mod tests {
                     "task.send" | "gate.resolve" | "approval.decide" | "merge"
                 ) || cmd.starts_with("goal.")
                     || cmd.starts_with("repo.")
-                    || matches!(*cmd, "status" | "events" | "task.tail" | "verify.status"),
+                    || matches!(
+                        *cmd,
+                        "status"
+                            | "events"
+                            | "task.tail"
+                            | "verify.status"
+                            | "forge.status"
+                            | "forge.snapshot"
+                            | "forge.links"
+                    ),
                 "{cmd}"
             );
         }
@@ -867,6 +889,30 @@ mod tests {
         ] {
             assert!(!WEB_COMMANDS.contains(&cmd), "{cmd}");
             assert!(parse_command(cmd, &task).is_err(), "{cmd} must not parse");
+        }
+    }
+
+    #[test]
+    fn the_dashboard_offers_the_forge_views_read_only_and_nothing_that_reaches_github() {
+        for cmd in ["forge.status", "forge.snapshot", "forge.links"] {
+            assert!(WEB_COMMANDS.contains(&cmd), "{cmd}");
+            let parsed = parse_command(cmd, &Value::Null).unwrap();
+            assert!(
+                fleet_app::api::is_read_only(&parsed),
+                "{cmd} changes nothing"
+            );
+        }
+        for cmd in [
+            "issue.list",
+            "issue.show",
+            "issue.to-task",
+            "pr.list",
+            "pr.show",
+            "pr.status",
+            "pr.create",
+            "forge.result",
+        ] {
+            assert!(!WEB_COMMANDS.contains(&cmd), "{cmd} must not be offered");
         }
     }
 

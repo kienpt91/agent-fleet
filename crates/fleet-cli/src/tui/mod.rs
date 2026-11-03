@@ -230,6 +230,15 @@ impl App {
                     .set_message(&format!("daemon unreachable: {} (retrying)", e.message));
             }
         }
+        // Read only and answered from the daemon's memory; a daemon without them (or with the
+        // integration off) simply leaves the pane out.
+        if self.model.connected {
+            let snapshot = self.link.call("forge.snapshot", Value::Null);
+            let links = self.link.call("forge.links", Value::Null);
+            if let (Ok(snapshot), Ok(links)) = (snapshot, links) {
+                self.model.update_forge(&snapshot, &links);
+            }
+        }
     }
 
     fn poll_tail(&mut self) {

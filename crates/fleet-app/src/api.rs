@@ -162,6 +162,8 @@ pub enum Command {
     Handoff {
         task: String,
     },
+    /// The forge integration: issues, pull requests and their links to tasks.
+    Forge(crate::forge::api::ForgeCommand),
     Shutdown,
 }
 
@@ -515,17 +517,23 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
         },
         "handoff" => Command::Handoff { task: task()? },
         "shutdown" => Command::Shutdown,
-        other => {
-            return Err(FleetError::invalid(format!(
-                "unknown command {}",
-                fleet_domain::ids::show(other)
-            )))
-        }
+        other => match crate::forge::api::parse(other, args)? {
+            Some(forge) => Command::Forge(forge),
+            None => {
+                return Err(FleetError::invalid(format!(
+                    "unknown command {}",
+                    fleet_domain::ids::show(other)
+                )))
+            }
+        },
     })
 }
 
 /// Commands that change nothing and are always safe to run.
 pub fn is_read_only(cmd: &Command) -> bool {
+    if let Command::Forge(f) = cmd {
+        return crate::forge::api::is_read_only(f);
+    }
     matches!(
         cmd,
         Command::Ping

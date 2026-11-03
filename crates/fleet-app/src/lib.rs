@@ -1,6 +1,6 @@
 //! Application layer: the use cases of the fleet orchestrator.
 //!
-//! Depends on the domain crates (`fleet-domain`, `neo-goals`, `neo-verify`) only. Everything that
+//! Depends on the domain crates (`fleet-domain`, `fleet-forge`, `neo-goals`, `neo-verify`) only. Everything that
 //! touches the outside world (files, git, ptys, processes, the clock) is a trait in [`ports`];
 //! adapters live in `fleet-infra`.
 
@@ -13,6 +13,7 @@
 pub mod api;
 pub mod browse;
 pub mod config;
+pub mod forge;
 pub mod neo;
 pub mod orchestrator;
 pub mod ports;

@@ -24,6 +24,7 @@ impl Orchestrator {
         self.reconcile_orphans();
         self.reconcile_commands();
         self.reconcile_handoffs();
+        self.reconcile_publications();
         // Whatever the replayed history leaves unsettled in the goal ledger (a verification that
         // no longer matches the commit of its task) is settled before anything runs.
         let settle = self.ledger.resettle();

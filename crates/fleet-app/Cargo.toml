@@ -18,6 +18,7 @@ testing = ["neo-context/testing"]
 
 [dependencies]
 fleet-domain = { path = "../fleet-domain" }
+fleet-forge = { path = "../fleet-forge" }
 neo-goals = { path = "../neo-goals" }
 neo-verify = { path = "../neo-verify" }
 neo-context = { path = "../neo-context" }

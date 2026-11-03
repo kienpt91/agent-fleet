@@ -127,6 +127,7 @@ impl Orchestrator {
                 self.context_explain(task.as_deref(), profile.as_deref())
             }
             Command::Handoff { task } => self.handoff_command(&task),
+            Command::Forge(forge) => self.handle_forge(forge),
             Command::Shutdown => {
                 self.shutdown_requested = true;
                 self.begin_shutdown();

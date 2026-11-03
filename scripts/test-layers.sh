@@ -4,12 +4,14 @@
 #
 #   domain       pure unit and property tests of entities, aggregates, events, sanitizer, redactor, hash chain
 #                (fleet-domain) and of the NEO crates: verification contracts, glob matcher, judging,
-#                evidence (neo-verify) and the goal ledger with its status machine (neo-goals)
+#                evidence (neo-verify), the goal ledger with its status machine (neo-goals) and the forge model:
+#                strict schemas, untrusted issue text, the pull request digest, the rate gate (fleet-forge)
 #   application  the orchestrator driven through commands with in-memory fakes for every port,
 #                and the port contract suites against those fakes
 #   adapters     unit tests of every real adapter, the same contract suites against the real
 #                file adapters in temp dirs, the web adapter over real loopback sockets and the origin rule
-#                with real child processes
+#                with real child processes, the `gh` adapter against a fake `gh` and the git push against a
+#                local bare repository
 #   soak         bounded memory with chatty workers (FLEET_SOAK_SECS, default 20)
 #   end-to-end   the real `fleet` binary and daemon (also with --web), CLI, TUI rendering and architecture rules
 set -eu
@@ -24,8 +26,8 @@ layer() {
   printf '%s\n' "$out" | grep -E '^test result' | awk -v n="$name" '{p+=$4; f+=$6} END {printf "%s: %d passed, %d failed\n", n, p, f}'
 }
 
-layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals -p neo-context
+layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals -p neo-context -p fleet-forge
 layer application  cargo test $OPTS -p fleet-app --features testing
-layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test web_http --test origin --test golden_pack
+layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test web_http --test origin --test golden_pack --test forge_gh --test forge_push
 layer soak         cargo test $OPTS -p fleet-infra --test soak
 layer end-to-end   cargo test $OPTS -p fleet-cli

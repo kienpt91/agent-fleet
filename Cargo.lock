@@ -278,6 +278,7 @@ dependencies = [
  "fleet-app",
  "fleet-domain",
  "neo-context",
+ "fleet-forge",
  "neo-goals",
  "neo-verify",
 ]
@@ -289,6 +290,7 @@ dependencies = [
  "crossterm",
  "fleet-app",
  "fleet-domain",
+ "fleet-forge",
  "fleet-infra",
  "nix 0.31.3",
  "ratatui",
@@ -299,12 +301,20 @@ name = "fleet-domain"
 version = "0.1.0"
 
 [[package]]
+name = "fleet-forge"
+version = "0.1.0"
+dependencies = [
+ "fleet-domain",
+]
+
+[[package]]
 name = "fleet-infra"
 version = "0.1.0"
 dependencies = [
  "fleet-app",
  "fleet-domain",
  "neo-context",
+ "fleet-forge",
  "neo-verify",
  "nix 0.31.3",
  "portable-pty",

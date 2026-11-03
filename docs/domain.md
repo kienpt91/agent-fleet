@@ -48,6 +48,11 @@ line and the README. When a word is used in one of those places with another mea
 | **Job origin** | The process groups of the children the daemon runs on behalf of workers (gates, approved commands, checks, the undo tool, git) and their detached descendants, listed in the one shared job tracker: refused by the origin check on the control socket and on the web port, like workers. |
 | **Task verification** | How a task stands with regard to its contracts: `none`, `pending` (the worker is not done), `unverified` (the worker reported or the task is in review, and fleet has no passing evidence), `failed`, `verified`. |
 | **Remaining** | What is left: open leaves (goals with nothing but their own criteria between them and `verified`), blockers (blocked goals, blocked or failed tasks of unfinished goals) and the tasks that can start next. |
+| **Forge** | A code host and issue tracker (GitHub). The application layer sees it only through neutral ports: `IssueTracker` (issues), `CodeHost` (pull requests) and `BranchPublisher` (pushing one branch); `fleet-forge` holds the pure model. A later tracker implements `IssueTracker` and changes no use case. |
+| **Forge ticket** | The handle of a forge request in flight: commands that need GitHub answer at once with a ticket, the engine thread never waits for `gh`, and `forge.result` reports the outcome. |
+| **Untrusted issue text** | Text written by whoever opened or edited an issue. Cleaned, redacted, quoted line by line and introduced by `from GitHub issue #n (untrusted)` when it becomes a task; never placed in a contract, goal or approval. |
+| **Publication** | Opening a pull request for a task: an approval bound to the digest of (repository, base, head branch, head commit, title, body, draft flag), a preflight, a one-ref push of exactly that commit, and the creation. Recorded as `pull_request_started` / `pull_request_opened` / `pull_request_failed`. |
+| **Rate gate** | The local state that decides whether `gh` is started at all: fleet's hourly budget, the limit the forge reported, and a back-off that doubles with jitter. While it is closed no process is started. |
 
 ## Layers and the dependency rule
 

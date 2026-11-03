@@ -125,10 +125,24 @@ pub fn render(frame: &mut Frame, model: &Model) {
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(body);
     render_tasks(frame, model, left);
     render_output(frame, model, right);
-    let [approvals, gates] =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(panels);
-    render_approvals(frame, model, approvals);
-    render_gates(frame, model, gates);
+    let github = model.forge_enabled || !model.forge.is_empty();
+    if github {
+        let [approvals, gates, forge] = Layout::horizontal([
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ])
+        .areas(panels);
+        render_approvals(frame, model, approvals);
+        render_gates(frame, model, gates);
+        render_forge(frame, model, forge);
+    } else {
+        let [approvals, gates] =
+            Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .areas(panels);
+        render_approvals(frame, model, approvals);
+        render_gates(frame, model, gates);
+    }
     render_footer(frame, model, footer);
     if model.show_help {
         render_help(frame, area);
@@ -390,6 +404,31 @@ fn render_gates(frame: &mut Frame, model: &Model, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Issue links, pull request links and the cached lists, read only.
+fn render_forge(frame: &mut Frame, model: &Model, area: Rect) {
+    let block = panel(format!("GitHub ({})", model.forge.len()), false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if model.forge.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "nothing fetched yet",
+                Style::new().fg(Color::DarkGray),
+            )),
+            inner,
+        );
+        return;
+    }
+    let width = usize::from(inner.width);
+    let lines: Vec<Line> = model
+        .forge
+        .iter()
+        .take(usize::from(inner.height))
+        .map(|l| Line::from(fit(l, width)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_footer(frame: &mut Frame, model: &Model, area: Rect) {
     let width = usize::from(area.width);
     let second = match &model.input {
@@ -556,6 +595,67 @@ mod tests {
         assert!(text.contains("No runs or tasks yet"), "{text}");
         assert!(text.contains("No task selected"));
         assert!(text.contains("none pending") && text.contains("none open"));
+    }
+
+    #[test]
+    fn the_github_pane_shows_links_and_the_cache_and_hostile_text_is_neutralised() {
+        let evil = "x\x1b]52;c;AAAA\x07\x1b[2J\u{202e}y\x00";
+        let mut m = sample();
+        assert!(!screen(&m, 120, 30).contains("GitHub"), "hidden while off");
+        let page = |items: Vec<Value>| {
+            Value::object([("data", Value::object([("items", Value::array(items))]))])
+        };
+        let snapshot = Value::object([
+            ("enabled", Value::Bool(true)),
+            (
+                "issues",
+                page(vec![Value::object([
+                    ("number", Value::int(12)),
+                    ("state", Value::str("open")),
+                    ("title", Value::str(evil)),
+                ])]),
+            ),
+            ("pulls", Value::Null),
+        ]);
+        let links = Value::object([
+            (
+                "issues",
+                Value::array([Value::object([
+                    ("run", Value::str("r1")),
+                    ("task", Value::str("t1")),
+                    ("number", Value::int(12)),
+                ])]),
+            ),
+            (
+                "pulls",
+                Value::array([Value::object([
+                    ("run", Value::str("r1")),
+                    ("task", Value::str("t2")),
+                    ("state", Value::str("opened")),
+                    ("number", Value::int(34)),
+                ])]),
+            ),
+        ]);
+        m.update_forge(&snapshot, &links);
+        let text = screen(&m, 140, 30);
+        assert!(text.contains("GitHub (3)"), "{text}");
+        assert!(text.contains("r1/t1 <- issue #12"), "{text}");
+        assert!(text.contains("r1/t2 -> PR #34 opened"), "{text}");
+        assert!(text.contains("cached issue #12 open"), "{text}");
+        for cell in draw(&m, 140, 30).content() {
+            for c in cell.symbol().chars() {
+                assert!(
+                    !c.is_control() && !fleet_domain::ids::is_invisible(c),
+                    "control or invisible char {c:?} in buffer"
+                );
+            }
+        }
+        // on but nothing fetched yet
+        m.update_forge(
+            &Value::object([("enabled", Value::Bool(true))]),
+            &Value::Null,
+        );
+        assert!(screen(&m, 140, 30).contains("nothing fetched yet"));
     }
 
     #[test]

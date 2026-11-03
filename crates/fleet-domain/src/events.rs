@@ -173,6 +173,19 @@ define_events! {
     HandoffCreated = "handoff_created" {
         run: RunId, task: TaskId, attempt: u32, trigger: String, digest: String, packet: Document,
     },
+    /// A task was made from an issue of a forge (`repo` is `host/owner/name`).
+    IssueLinked = "issue_linked" { run: RunId, task: TaskId, repo: String, number: u64 },
+    /// A pull request is being opened for an approved action; its approval was consumed at this
+    /// moment, so the publication is never started a second time, whatever happens afterwards.
+    PullRequestStarted = "pull_request_started" {
+        id: ApprovalId, run: RunId, task: TaskId, repo: String, base: String, branch: String, head: Sha,
+    },
+    /// The branch was pushed and the forge created the pull request.
+    PullRequestOpened = "pull_request_opened" {
+        id: ApprovalId, run: RunId, task: TaskId, repo: String, number: u64, url: String, head: Sha,
+    },
+    /// The publication did not complete, or its outcome is unknown (the daemon stopped meanwhile).
+    PullRequestFailed = "pull_request_failed" { id: ApprovalId, run: RunId, task: TaskId, reason: String },
 }
 
 impl DomainEvent {
@@ -206,7 +219,11 @@ impl DomainEvent {
             | WorktreeRemoved { run, .. }
             | EvidenceRecorded { run, .. }
             | ContextCompiled { run, .. }
-            | HandoffCreated { run, .. } => Some(run),
+            | HandoffCreated { run, .. }
+            | IssueLinked { run, .. }
+            | PullRequestStarted { run, .. }
+            | PullRequestOpened { run, .. }
+            | PullRequestFailed { run, .. } => Some(run),
             DaemonStarted { .. }
             | DecisionResolved { .. }
             | ApprovalDecided { .. }
@@ -248,7 +265,11 @@ impl DomainEvent {
             | WorktreeRemoved { task, .. }
             | EvidenceRecorded { task, .. }
             | ContextCompiled { task, .. }
-            | HandoffCreated { task, .. } => Some(task),
+            | HandoffCreated { task, .. }
+            | IssueLinked { task, .. }
+            | PullRequestStarted { task, .. }
+            | PullRequestOpened { task, .. }
+            | PullRequestFailed { task, .. } => Some(task),
             DaemonStarted { .. }
             | RunCreated { .. }
             | RunStarted { .. }
@@ -370,6 +391,16 @@ impl DomainEvent {
                 "{run}/{task} handoff made ({})",
                 digest.get(..12).unwrap_or(digest)
             ),
+            IssueLinked {
+                run, task, number, ..
+            } => format!("{run}/{task} linked to issue #{number}"),
+            PullRequestStarted { run, task, .. } => format!("{run}/{task} pull request started"),
+            PullRequestOpened {
+                run, task, number, ..
+            } => {
+                format!("{run}/{task} pull request #{number} opened")
+            }
+            PullRequestFailed { run, task, .. } => format!("{run}/{task} pull request failed"),
         }
     }
 }

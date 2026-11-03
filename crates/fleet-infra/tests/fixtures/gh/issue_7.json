@@ -1,0 +1,13 @@
+{
+  "id": 1001,
+  "number": 7,
+  "title": "Crash on start",
+  "state": "open",
+  "labels": [{"name": "bug"}, {"name": "p1"}],
+  "user": {"login": "octocat"},
+  "comments": 3,
+  "updated_at": "2026-10-30T10:00:00Z",
+  "html_url": "https://github.com/o/r/issues/7",
+  "body": "It crashes.\n\nSteps:\n1. run it",
+  "reactions": {"total_count": 0}
+}

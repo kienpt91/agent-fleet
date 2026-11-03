@@ -13,6 +13,7 @@ use fleet_domain::limits::{
 use fleet_domain::quality::GateFormat;
 use fleet_domain::redact::Redactor;
 use fleet_domain::repo::view::ImageLimits;
+use fleet_forge::config::ForgeConfig;
 use neo_context::estimate::Profile;
 use neo_context::input::GlossaryEntry;
 use neo_context::layer::UnverifiedPolicy;
@@ -149,6 +150,8 @@ pub struct AppConfig {
     pub images: ImageLimits,
     /// Redacts every piece of text a context pack is made of (the daemon sets its own).
     pub redactor: Arc<Redactor>,
+    /// The `[github]` section: the forge integration (off by default).
+    pub forge: ForgeConfig,
 }
 
 impl AppConfig {
@@ -176,6 +179,7 @@ impl AppConfig {
             context: ContextConfig::default(),
             images: ImageLimits::default(),
             redactor: Arc::new(redactor),
+            forge: ForgeConfig::disabled(),
         }
     }
 
@@ -282,6 +286,7 @@ impl AppConfig {
                 )));
             }
         }
+        self.forge.validate()?;
         Ok(())
     }
 

@@ -503,7 +503,7 @@
     if (parts[0] === 'goal' && parts[1]) {
       return { name: 'goal', id: parts[1] };
     }
-    if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health' || parts[0] === 'goals') {
+    if (parts[0] === 'decisions' || parts[0] === 'events' || parts[0] === 'health' || parts[0] === 'goals' || parts[0] === 'github') {
       return { name: parts[0] };
     }
     if (parts[0].split('?')[0] === 'work') {
@@ -532,7 +532,7 @@
 
   function setNav(name) {
     const section = name === 'run' || name === 'task' ? 'runs' : name === 'goal' ? 'goals' : name;
-    ['runs', 'work', 'goals', 'decisions', 'events', 'health'].forEach(function (id) {
+    ['runs', 'work', 'goals', 'github', 'decisions', 'events', 'health'].forEach(function (id) {
       const a = document.getElementById('nav-' + id);
       if (a) {
         a.classList.toggle('active', id === section);
@@ -560,6 +560,8 @@
       v = healthView();
     } else if (r.name === 'goals') {
       v = goalsView();
+    } else if (r.name === 'github') {
+      v = githubView();
     } else if (r.name === 'goal') {
       v = goalView(r.id);
     } else if (r.name === 'work') {
@@ -2136,6 +2138,175 @@
         paintTree();
         loadRemaining();
       },
+      stop: function () {
+        active = false;
+      }
+    };
+  }
+
+  // ------------------------------------------------------------ the GitHub view
+  // Read only: what the operator's commands fetched and the links made from it, from the
+  // daemon's memory. Nothing here starts a request to GitHub; urls are shown as plain text.
+
+  const MAX_FORGE_ROWS = 100;
+
+  function forgeItems(entry) {
+    const page = entry && entry.data;
+    return page && Array.isArray(page.items) ? page.items.filter(Boolean) : [];
+  }
+
+  function forgeUrl(v) {
+    return typeof v === 'string' && /^https:\/\/[^\s\u0000-\u001f\u007f-\u009f]{1,500}$/.test(v) ? v : '';
+  }
+
+  function forgeFetched(entry, what) {
+    const p = el('p', 'muted small');
+    if (!entry) {
+      p.textContent = 'No ' + what + ' have been fetched. Run `fleet ' + (what === 'issues' ? 'issue' : 'pr') + ' list` on the command line.';
+    } else {
+      p.textContent = clean('Fetched by the operator at ' + fmtTime(entry.fetched_ms) + ' from ' + clean(entry.repo, { max: 200 }) +
+        '; the dashboard never contacts GitHub.', { max: 600 });
+    }
+    return p;
+  }
+
+  function forgeTable(title, entry, what, headers, build) {
+    const box = el('div', 'remsection');
+    const items = forgeItems(entry);
+    box.appendChild(el('h4', '', title + ' (' + items.length + ')'));
+    box.appendChild(forgeFetched(entry, what));
+    if (!items.length) {
+      if (entry) {
+        box.appendChild(el('p', 'muted', 'none'));
+      }
+      return box;
+    }
+    const table = makeTable(headers, 'auto');
+    items.slice(0, MAX_FORGE_ROWS).forEach(function (x) {
+      const tr = el('tr');
+      build(x).forEach(function (c) {
+        tr.appendChild(c);
+      });
+      table.appendChild(tr);
+    });
+    box.appendChild(scrollBox(table));
+    if (items.length > MAX_FORGE_ROWS) {
+      box.appendChild(el('p', 'muted small', (items.length - MAX_FORGE_ROWS) + ' more are not shown.'));
+    }
+    return box;
+  }
+
+  function forgeLabels(v) {
+    return (Array.isArray(v) ? v.slice(0, 20) : []).map(function (l) {
+      return clean(l, { max: 60 });
+    }).join(', ');
+  }
+
+  function githubView() {
+    const root = el('section', 'page');
+    root.appendChild(el('h2', '', 'GitHub'));
+    root.appendChild(el('p', 'muted small', 'Read only. Issues and pull requests appear here after the operator fetched them on the command line; the dashboard never contacts GitHub and cannot create tasks or pull requests.'));
+    const note = el('p', 'goalsum', 'Loading.');
+    const body = el('div', 'forgebody');
+    root.appendChild(note);
+    root.appendChild(body);
+    let sig = null;
+    let busy = false;
+    let active = true;
+
+    function paint(d) {
+      const snap = d.snapshot || {};
+      const links = d.links || {};
+      note.textContent = snap.enabled === false
+        ? 'The GitHub integration is off in this daemon; nothing has been fetched.'
+        : 'The integration is on.';
+      const issueLinks = Array.isArray(links.issues) ? links.issues.filter(Boolean) : [];
+      const pulls = Array.isArray(links.pulls) ? links.pulls.filter(Boolean) : [];
+      const linkBox = el('div', 'remsection');
+      linkBox.appendChild(el('h4', '', 'Tasks made from issues (' + issueLinks.length + ')'));
+      if (!issueLinks.length) {
+        linkBox.appendChild(el('p', 'muted', 'none'));
+      } else {
+        const t = makeTable(['Task', 'Issue', 'Repository'], 'auto');
+        issueLinks.slice(0, MAX_FORGE_ROWS).forEach(function (l) {
+          const ref = clean(l.run, { max: 80 }) + '/' + clean(l.task, { max: 80 });
+          const tr = el('tr');
+          tr.appendChild(cell(taskLink(ref)));
+          tr.appendChild(cell('\u2190 issue #' + num(l.number)));
+          tr.appendChild(cell(l.repo));
+          t.appendChild(tr);
+        });
+        linkBox.appendChild(scrollBox(t));
+      }
+      const pubBox = el('div', 'remsection');
+      pubBox.appendChild(el('h4', '', 'Pull requests published from tasks (' + pulls.length + ')'));
+      if (!pulls.length) {
+        pubBox.appendChild(el('p', 'muted', 'none'));
+      } else {
+        const t = makeTable(['Task', 'Pull request', 'State', 'Branch', 'Detail'], 'auto');
+        pulls.slice(0, MAX_FORGE_ROWS).forEach(function (p) {
+          const ref = clean(p.run, { max: 80 }) + '/' + clean(p.task, { max: 80 });
+          const tr = el('tr');
+          tr.appendChild(cell(taskLink(ref)));
+          tr.appendChild(cell(typeof p.number === 'number' ? '\u2192 PR #' + num(p.number) : '\u2192 PR (not opened)'));
+          tr.appendChild(cell(el('span', 'badge st-unknown', p.state)));
+          tr.appendChild(cell(clean(p.branch, { max: 200 }) + ' \u2192 ' + clean(p.base, { max: 100 })));
+          const url = forgeUrl(p.url);
+          tr.appendChild(cell(p.reason ? clean(p.reason, { max: 400 }) : url));
+          t.appendChild(tr);
+        });
+        pubBox.appendChild(scrollBox(t));
+      }
+      body.replaceChildren(
+        linkBox,
+        pubBox,
+        forgeTable('Issues', snap.issues, 'issues', ['#', 'State', 'Title', 'Labels', 'Author', 'Comments', 'Updated'], function (i) {
+          return [cell('#' + num(i.number)), cell(i.state), cell(i.title), cell(forgeLabels(i.labels)), cell(i.author),
+            cell(num(i.comments)), cell(i.updated)];
+        }),
+        forgeTable('Pull requests', snap.pulls, 'pull requests', ['#', 'State', 'Title', 'Labels', 'Author', 'Comments', 'Branch', 'Updated'], function (p) {
+          return [cell('#' + num(p.number)), cell(p.draft === true ? clean(p.state, { max: 20 }) + ' (draft)' : p.state), cell(p.title),
+            cell(forgeLabels(p.labels)), cell(p.author), cell(num(p.comments)),
+            cell(clean(p.head_branch, { max: 200 }) + ' \u2192 ' + clean(p.base_branch, { max: 100 })), cell(p.updated)];
+        })
+      );
+    }
+
+    async function load() {
+      if (busy || !active) {
+        return;
+      }
+      busy = true;
+      try {
+        const res = await api('GET', '/api/forge');
+        if (!active) {
+          return;
+        }
+        if (res.status === 401) {
+          showLoggedOut(NOT_LOGGED_IN);
+          return;
+        }
+        if (!res.ok || !res.data) {
+          sig = null;
+          note.textContent = clean('The GitHub information is not available: ' + errText(res), { max: 400 });
+          body.replaceChildren();
+          return;
+        }
+        const s = JSON.stringify(res.data);
+        if (s !== sig) {
+          sig = s;
+          paint(res.data);
+        }
+      } finally {
+        busy = false;
+      }
+    }
+
+    return {
+      node: root,
+      start: load,
+      update: load,
+      resume: load,
       stop: function () {
         active = false;
       }

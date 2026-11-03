@@ -454,7 +454,7 @@ impl FleetState {
         let decided = approval.decide(approve, seen_digest, now_ms, hasher)?;
         let mut events = vec![decided];
         let needs_unblock = match approval.purpose {
-            Purpose::Merge => false,
+            Purpose::Merge | Purpose::PullRequest => false,
             Purpose::Manual => true,
             Purpose::ExternalCommand => !approve,
         };
@@ -486,7 +486,7 @@ impl FleetState {
                 continue;
             };
             events.push(expired);
-            if a.purpose == Purpose::Merge {
+            if matches!(a.purpose, Purpose::Merge | Purpose::PullRequest) {
                 continue;
             }
             let Ok(run) = self.run(&a.run) else { continue };
@@ -639,6 +639,71 @@ impl FleetState {
             task_id.clone(),
             Purpose::Merge,
             &action,
+            Window {
+                now_ms,
+                ttl_ms: policy.approval_ttl_ms,
+            },
+            hasher,
+        )?;
+        Ok(MergeGate::Pending {
+            approval: id,
+            events: vec![requested],
+        })
+    }
+
+    /// First step of publishing a task's work on a forge: finds an approved, unexpired, unused
+    /// approval for exactly `action` of this task (same digest) and consumes it, or asks for one.
+    /// Unlike a merge, a publication always needs an approval. Any difference in what is about to
+    /// be sent (repository, base, head branch or commit, title, body, draft flag) is a different
+    /// digest, so an approval given for another action is never used.
+    pub fn request_publication(
+        &self,
+        run_id: &RunId,
+        task_id: &TaskId,
+        action: &Action,
+        policy: &Policy,
+        now_ms: u64,
+        hasher: &dyn Digest,
+    ) -> Result<MergeGate> {
+        let run = self.run(run_id)?;
+        run.task(task_id)
+            .ok_or_else(|| FleetError::not_found(format!("task {task_id} does not exist")))?;
+        let digest = action.digest(task_id, hasher);
+        let mut pending: Option<ApprovalId> = None;
+        for a in self.approvals.values() {
+            if a.run != *run_id
+                || a.task != *task_id
+                || a.purpose != Purpose::PullRequest
+                || a.digest != digest
+            {
+                continue;
+            }
+            match a.status_at(now_ms) {
+                ApprovalStatus::Approved => {
+                    return Ok(MergeGate::Proceed(vec![a.consume(action, now_ms, hasher)?]));
+                }
+                ApprovalStatus::Pending => pending = Some(a.id.clone()),
+                _ => {}
+            }
+        }
+        if let Some(id) = pending {
+            return Ok(MergeGate::Pending {
+                approval: id,
+                events: Vec::new(),
+            });
+        }
+        if self.open_decision_count() >= MAX_OPEN_DECISIONS {
+            return Err(FleetError::limit(
+                "too many unanswered questions and approvals",
+            ));
+        }
+        let id = ApprovalId::from_seq(self.approval_seq.saturating_add(1));
+        let requested = Approval::request(
+            id.clone(),
+            run_id.clone(),
+            task_id.clone(),
+            Purpose::PullRequest,
+            action,
             Window {
                 now_ms,
                 ttl_ms: policy.approval_ttl_ms,

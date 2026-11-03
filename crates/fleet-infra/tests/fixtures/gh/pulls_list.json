@@ -1,0 +1,30 @@
+[
+  {
+    "number": 9,
+    "title": "Fix it",
+    "state": "open",
+    "draft": false,
+    "labels": [],
+    "user": {"login": "octocat"},
+    "head": {"ref": "fleet/r1/a", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "repo": {"full_name": "o/r"}},
+    "base": {"ref": "main", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    "merged_at": null,
+    "updated_at": "2026-10-30T10:00:00Z",
+    "html_url": "https://github.com/o/r/pull/9",
+    "body": "Fixes the crash."
+  },
+  {
+    "number": 10,
+    "title": "Merged work",
+    "state": "closed",
+    "draft": false,
+    "labels": [{"name": "done"}],
+    "user": {"login": "octocat"},
+    "head": {"ref": "feature/x", "sha": "cccccccccccccccccccccccccccccccccccccccc"},
+    "base": {"ref": "main"},
+    "merged_at": "2026-10-29T10:00:00Z",
+    "updated_at": "2026-10-29T10:00:00Z",
+    "html_url": "https://github.com/o/r/pull/10",
+    "body": null
+  }
+]

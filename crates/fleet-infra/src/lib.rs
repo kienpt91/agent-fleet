@@ -16,6 +16,8 @@ pub mod daemon;
 pub mod digest;
 pub mod doctor;
 pub mod eventlog;
+pub mod forge_gh;
+pub mod forge_jobs;
 pub mod fsx;
 pub mod git;
 pub mod jobs;

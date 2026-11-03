@@ -1,0 +1,2 @@
+{"number": 12, "state": "open", "title": "Work on issue #7", "draft": false, "html_url": "https://github.com/o/r/pull/12",
+ "labels": [], "user": {"login": "octocat"}, "head": {"ref": "fleet/r1/fix", "sha": "@@HEAD@@"}, "base": {"ref": "main"}, "updated_at": "2026-10-31T10:00:00Z", "comments": 0, "body": "Opened by fleet"}
