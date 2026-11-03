@@ -203,7 +203,8 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
             GitVcs::new(env.clone(), app.env.clone())
                 .with_tracker(tracker.clone())
                 .with_timeout(REPO_READ_TIMEOUT),
-        )),
+        ))
+        .with_image_limits(app.images),
     });
     let web = match &opts.web {
         Some(web_opts) => Some(WebServer::bind(

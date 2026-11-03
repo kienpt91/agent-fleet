@@ -18,6 +18,7 @@ use fleet_domain::limits::{
 };
 use fleet_domain::quality::GateFormat;
 use fleet_domain::redact::{Charset, Redactor, Rule};
+use fleet_domain::repo::view::ImageLimits;
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::value::Value;
 use neo_context::estimate::Profile;
@@ -53,7 +54,28 @@ struct FileConfig {
     workers: BTreeMap<String, WorkerSection>,
     /// `[context]`, read by hand so that every error names the key.
     context: toml::Table,
+    web: WebSection,
     gates: Vec<GateSection>,
+}
+
+/// `[web]`. The values are read as TOML values so that every error names the key.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct WebSection {
+    image_max_side: Option<toml::Value>,
+    image_max_megapixels: Option<toml::Value>,
+}
+
+/// An integer in `1..=max`, or an error naming `web.<key>`.
+fn web_limit(key: &str, v: &Option<toml::Value>, max: u64) -> Result<Option<u64>> {
+    let Some(v) = v else { return Ok(None) };
+    let n = v
+        .as_integer()
+        .ok_or_else(|| invalid(format!("web.{key} must be an integer")))?;
+    match u64::try_from(n) {
+        Ok(n) if (1..=max).contains(&n) => Ok(Some(n)),
+        _ => Err(invalid(format!("web.{key} must be between 1 and {max}"))),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -323,6 +345,21 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
     }
 
     app.context = build_context(file.context)?;
+
+    let side = web_limit(
+        "image_max_side",
+        &file.web.image_max_side,
+        u64::from(ImageLimits::HARD_MAX_SIDE),
+    )?;
+    let megapixels = web_limit(
+        "image_max_megapixels",
+        &file.web.image_max_megapixels,
+        ImageLimits::HARD_MAX_PIXELS / 1_000_000,
+    )?;
+    app.images = ImageLimits::new(
+        side.map_or(ImageLimits::DEFAULT_MAX_SIDE, |n| n as u32),
+        megapixels.map_or(ImageLimits::DEFAULT_MAX_PIXELS, |n| n * 1_000_000),
+    );
 
     app.validate()?;
 
@@ -963,6 +1000,42 @@ format = "refcheck-json"
                 .unwrap_or_else(|| panic!("accepted: {text}"));
             assert_eq!(err.code, ErrorCode::Invalid, "{text}: {}", err.message);
         }
+    }
+
+    #[test]
+    fn web_image_limits_are_optional_and_bounded_by_the_hard_caps() {
+        let dflt = parse("").unwrap().app.images;
+        assert_eq!((dflt.max_side(), dflt.max_pixels()), (8192, 32_000_000));
+        let l = parse("[web]\nimage_max_side = 4096\nimage_max_megapixels = 16")
+            .unwrap()
+            .app
+            .images;
+        assert_eq!((l.max_side(), l.max_pixels()), (4096, 16_000_000));
+        let top = parse("[web]\nimage_max_side = 16384\nimage_max_megapixels = 64")
+            .unwrap()
+            .app
+            .images;
+        assert_eq!((top.max_side(), top.max_pixels()), (16_384, 64_000_000));
+        // one key alone leaves the other at its default
+        let one = parse("[web]\nimage_max_megapixels = 1").unwrap().app.images;
+        assert_eq!((one.max_side(), one.max_pixels()), (8192, 1_000_000));
+
+        for (text, key) in [
+            ("[web]\nimage_max_side = 0", "image_max_side"),
+            ("[web]\nimage_max_side = 16385", "image_max_side"),
+            ("[web]\nimage_max_side = -1", "image_max_side"),
+            ("[web]\nimage_max_side = 4096.5", "image_max_side"),
+            ("[web]\nimage_max_side = \"big\"", "image_max_side"),
+            ("[web]\nimage_max_megapixels = 0", "image_max_megapixels"),
+            ("[web]\nimage_max_megapixels = 65", "image_max_megapixels"),
+            ("[web]\nimage_max_megapixels = 1.5", "image_max_megapixels"),
+            ("[web]\nimage_max_megapixels = true", "image_max_megapixels"),
+        ] {
+            let err = parse(text).err().unwrap_or_else(|| panic!("{text}"));
+            assert_eq!(err.code, ErrorCode::Invalid, "{text}");
+            assert!(err.message.contains(key), "{text}: {}", err.message);
+        }
+        assert!(parse("[web]\nimage_max_pixels = 4").is_err());
     }
 
     #[test]

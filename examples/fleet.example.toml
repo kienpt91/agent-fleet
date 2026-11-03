@@ -13,6 +13,13 @@ sensitive = ["merge", "external-command"]   # actions that always need an approv
 # Variables workers, gates and git receive from the daemon's own environment. Nothing else is inherited.
 allow = ["PATH", "HOME", "USER", "LANG", "TERM"]
 
+# [web]
+# Limits of the images the read-only workbench shows (checked against the size the file declares).
+# Values may lower the defaults or raise them up to the hard caps; zero, more than a cap or a
+# non-integer stops the daemon at start.
+# image_max_side = 8192          # pixels per side; default 8192, hard cap 16384
+# image_max_megapixels = 32      # millions of pixels in all; default 32, hard cap 64
+
 [redact]
 # Extra patterns removed from stored output, besides the built-in key shapes.
 literals = []

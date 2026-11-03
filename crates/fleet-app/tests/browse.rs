@@ -944,6 +944,24 @@ fn the_image_limits_can_be_changed_but_never_past_the_hard_caps() {
 }
 
 #[test]
+fn configured_image_limits_decide_what_the_browser_shows() {
+    let (spy, _, t) = browser();
+    // wide.png is 9000 x 10: over the default side limit, within a raised one
+    let raised =
+        RepoBrowser::new(spy.clone()).with_image_limits(ImageLimits::new(10_000, 32_000_000));
+    assert!(ask(&raised, &t, "repo.blob", vec![("path", s("wide.png"))]).is_ok());
+    // with a one-pixel limit a 1 x 1 image passes and the wide one is refused
+    let lowered = RepoBrowser::new(spy).with_image_limits(ImageLimits::new(8192, 1));
+    assert!(ask(&lowered, &t, "repo.blob", vec![("path", s("pic.png"))]).is_ok());
+    assert_eq!(
+        ask(&lowered, &t, "repo.blob", vec![("path", s("wide.png"))])
+            .unwrap_err()
+            .code,
+        ErrorCode::Limit
+    );
+}
+
+#[test]
 fn a_cached_document_names_the_selector_of_the_request_it_answers() {
     let (_, b, t) = browser();
     let head = "2".repeat(40);

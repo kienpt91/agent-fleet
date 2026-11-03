@@ -12,6 +12,7 @@ use fleet_domain::limits::{
 };
 use fleet_domain::quality::GateFormat;
 use fleet_domain::redact::Redactor;
+use fleet_domain::repo::view::ImageLimits;
 use neo_context::estimate::Profile;
 use neo_context::input::GlossaryEntry;
 use neo_context::layer::UnverifiedPolicy;
@@ -144,6 +145,8 @@ pub struct AppConfig {
     /// Silence after which a question file makes the supervisor stop the worker.
     pub question_grace_ms: u64,
     pub context: ContextConfig,
+    /// Largest images the read-only workbench shows (`[web]` of the configuration file).
+    pub images: ImageLimits,
     /// Redacts every piece of text a context pack is made of (the daemon sets its own).
     pub redactor: Arc<Redactor>,
 }
@@ -171,6 +174,7 @@ impl AppConfig {
             gates: Vec::new(),
             question_grace_ms: 2000,
             context: ContextConfig::default(),
+            images: ImageLimits::default(),
             redactor: Arc::new(redactor),
         }
     }

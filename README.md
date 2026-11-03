@@ -568,6 +568,7 @@ the status, error and doctor documents are pinned by end-to-end tests
 | `author_name`, `author_email` | identity of commits fleet makes | `fleet` / `fleet@localhost` |
 | `ring_bytes` | output kept per session (hard cap 4 MiB) | 262144 |
 | `[env] allow` | variables copied from the daemon's environment to workers, gates, git and approved commands | `PATH HOME USER LOGNAME LANG LC_ALL LC_CTYPE TERM TZ TMPDIR` |
+| `[web] image_max_side`, `image_max_megapixels` | largest image the workbench shows, per side and in millions of pixels; may be lowered, or raised up to the hard caps 16384 and 64; zero or more than a cap stops the daemon | 8192, 32 |
 | `[redact] literals, env_values, [[redact.rules]]` | extra redaction: literal strings, values of secret-looking daemon variables, `prefix` + `charset` (`alnum|hex|base64|token`) + `min_len` rules | built-in key shapes + env values |
 | `[workers.<name>]` | `command`, `args`, `env_pass`, `env_set`, `timeout_secs`, `idle_timeout_secs` | |
 | `[[gates]]` | `name`, `command`, `args`, `env_pass`, `env_set`, `format` (`exit` or `refcheck-json`), `timeout_secs` | exit, 600 s |
