@@ -1,9 +1,11 @@
 #!/bin/sh
 # Regenerates the contract templates of contracts/ from protected-paths.json. The templates share
-# their first nine checks (the reusable fragment, also written to contracts/common-checks.json) and
-# differ in the last, the scope of the task. Run it after every change of protected-paths.json or of
-# the fragment below, and commit the result: crates/fleet-infra/tests/dogfood.rs fails when a
-# template and the list disagree.
+# their first ten checks (the reusable fragment, also written to contracts/common-checks.json) and
+# differ in what follows: the scope of the task. One template, flaky-test.json, is a REVIEWED
+# EXCEPTION: it replaces the glob deny list by the script check with `--except <file>` and adds the
+# checks that make a test-only change in a protected file credible (see contracts/README.md).
+# Run it after every change of protected-paths.json or of the fragment below, and commit the result:
+# crates/fleet-infra/tests/dogfood.rs fails when a template and the list disagree.
 #
 #   sh dogfood/gen-contracts.sh
 set -eu
@@ -12,8 +14,11 @@ cd "$here"
 deny=$(sed -n 's/.*"path": *"\([^"]*\)".*/        "\1"/p' protected-paths.json | sed '$!s/$/,/')
 [ -n "$deny" ] || { echo "gen-contracts: no entries in protected-paths.json" >&2; exit 2; }
 
+# The shared checks, as JSON objects separated by commas (no brackets). With the argument
+# `exception` the glob deny check is left out and the script check gets `--except @FILE_PATH@`.
 common() {
-  cat <<EOC
+  if [ "${1:-}" != exception ]; then
+    cat <<EOC
     {
       "id": "protected-diff",
       "kind": "diff",
@@ -21,11 +26,17 @@ common() {
 $deny
       ]
     },
+EOC
+    protected_args='["--repo", "@REPO@", "@BASE@..fleet/@RUN@/@TASK@"]'
+  else
+    protected_args='["--repo", "@REPO@", "--except", "@FILE_PATH@", "@BASE@..fleet/@RUN@/@TASK@"]'
+  fi
+  cat <<EOC
     {
       "id": "protected-script",
       "kind": "command",
       "program": "@TOOLS@/check-protected.sh",
-      "args": ["--repo", "@REPO@", "@BASE@..fleet/@RUN@/@TASK@"],
+      "args": $protected_args,
       "timeout_ms": 60000
     },
     {
@@ -43,6 +54,13 @@ $deny
       "timeout_ms": 60000
     },
     {
+      "id": "conflict-markers",
+      "kind": "command",
+      "program": "@TOOLS@/check-conflict-markers.sh",
+      "args": ["--tree"],
+      "timeout_ms": 60000
+    },
+    {
       "id": "secret-scan",
       "kind": "command",
       "program": "@TOOLS@/check-secret-tree.sh",
@@ -53,33 +71,33 @@ $deny
       "kind": "command",
       "program": "@CONTAINER_RUN@",
       "args": ["cargo fmt --all -- --check"],
-      "timeout_ms": 120000
+      "timeout_ms": 300000
     },
     {
       "id": "clippy",
       "kind": "command",
       "program": "@CONTAINER_RUN@",
       "args": ["cargo clippy --workspace --all-targets --locked --offline -- -D warnings"],
-      "timeout_ms": 900000
+      "timeout_ms": 1200000
     },
     {
       "id": "architecture",
       "kind": "command",
       "program": "@CONTAINER_RUN@",
       "args": ["cargo test --locked --offline -p fleet-cli --test architecture"],
-      "timeout_ms": 900000
+      "timeout_ms": 1200000
     },
     {
       "id": "layers",
       "kind": "command",
       "program": "@CONTAINER_RUN@",
       "args": ["sh scripts/test-layers.sh"],
-      "timeout_ms": 1500000
+      "timeout_ms": 1800000
     }
 EOC
 }
 
-template() { # name, the scope check (JSON text)
+template() { # name, the checks that follow the fragment (JSON objects, comma separated)
   {
     printf '{\n  "version": 1,\n  "checks": [\n'
     common
@@ -102,6 +120,47 @@ template crate-src '    {
       "kind": "diff",
       "allow": ["crates/@CRATE@/src/**", "crates/@CRATE@/tests/**"]
     }'
+
+# The reviewed exception for a flaky test inside one protected Rust file: the file is the only thing
+# that may change, only below its test module (check-test-only.sh), and the named test must still be
+# there and survive a loop under CPU load (the stress check: eight busy loops, the test 25 times in a
+# row, a failure of any one fails the check). `--lib` means a unit test of the crate's library.
+{
+  printf '{\n  "version": 1,\n  "checks": [\n'
+  common exception
+  cat <<'EOT'
+,
+    {
+      "id": "scope",
+      "kind": "diff",
+      "allow": ["@FILE_PATH@"]
+    },
+    {
+      "id": "kept",
+      "kind": "file",
+      "path": "@FILE_PATH@",
+      "assert": "contains",
+      "value": "fn @TEST_NAME@"
+    },
+    {
+      "id": "test-only",
+      "kind": "command",
+      "program": "@TOOLS@/check-test-only.sh",
+      "args": ["--repo", "@REPO@", "--file", "@FILE_PATH@", "@BASE@..fleet/@RUN@/@TASK@"],
+      "timeout_ms": 60000
+    },
+    {
+      "id": "stress",
+      "kind": "command",
+      "program": "@CONTAINER_RUN@",
+      "args": ["cargo test -p @PACKAGE@ --lib --no-run --offline --locked -q && for j in 1 2 3 4 5 6 7 8; do (timeout 280 sh -c \"while :; do :; done\" &) ; done; i=0; while [ $i -lt 25 ]; do cargo test -p @PACKAGE@ --lib @TEST_FILTER@ --offline --locked -q 2>&1 | grep -E \"test result\" | grep -q \"1 passed\" || { echo FAILED-AT-$i; exit 1; }; i=$((i+1)); done; echo stress-ok"],
+      "timeout_ms": 900000
+    }
+  ]
+}
+EOT
+} > contracts/flaky-test.json
+
 { printf '[\n'; common; printf '\n]\n'; } > contracts/common-checks.json
 cat > contracts/human-only.json <<'EOF'
 {
@@ -121,4 +180,4 @@ cat > contracts/human-only.json <<'EOF'
   ]
 }
 EOF
-echo "gen-contracts: wrote single-file, docs-only, crate-src, human-only and common-checks in $here/contracts"
+echo "gen-contracts: wrote single-file, docs-only, crate-src, flaky-test, human-only and common-checks in $here/contracts"

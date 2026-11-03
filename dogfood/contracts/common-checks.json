@@ -77,6 +77,13 @@
       "timeout_ms": 60000
     },
     {
+      "id": "conflict-markers",
+      "kind": "command",
+      "program": "@TOOLS@/check-conflict-markers.sh",
+      "args": ["--tree"],
+      "timeout_ms": 60000
+    },
+    {
       "id": "secret-scan",
       "kind": "command",
       "program": "@TOOLS@/check-secret-tree.sh",
@@ -87,28 +94,28 @@
       "kind": "command",
       "program": "@CONTAINER_RUN@",
       "args": ["cargo fmt --all -- --check"],
-      "timeout_ms": 120000
+      "timeout_ms": 300000
     },
     {
       "id": "clippy",
       "kind": "command",
       "program": "@CONTAINER_RUN@",
       "args": ["cargo clippy --workspace --all-targets --locked --offline -- -D warnings"],
-      "timeout_ms": 900000
+      "timeout_ms": 1200000
     },
     {
       "id": "architecture",
       "kind": "command",
       "program": "@CONTAINER_RUN@",
       "args": ["cargo test --locked --offline -p fleet-cli --test architecture"],
-      "timeout_ms": 900000
+      "timeout_ms": 1200000
     },
     {
       "id": "layers",
       "kind": "command",
       "program": "@CONTAINER_RUN@",
       "args": ["sh scripts/test-layers.sh"],
-      "timeout_ms": 1500000
+      "timeout_ms": 1800000
     }
 
 ]

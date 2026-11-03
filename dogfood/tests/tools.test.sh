@@ -62,17 +62,35 @@ expect_exit 2 "LOCK_SHA256 cannot be worked out without a base that has Cargo.lo
 expect_exit 0 "the human-only contract has no placeholder and is copied as it is" "$rc" "$dogfood/contracts/human-only.json" "$work/h.json"
 cmp -s "$dogfood/contracts/human-only.json" "$work/h.json" && ok || bad "the copy differs"
 
+# ---- the flaky-test template (a reviewed exception) -----------------------------------------------------------
+ftpl=$dogfood/contracts/flaky-test.json
+fgood="TOOLS=/opt/dogfood/bin CONTAINER_RUN=/opt/dogfood/container-run REPO=$repo BASE=$base RUN=neo-roadmap TASK=flaky-x FILE_PATH=crates/fleet-infra/src/server.rs PACKAGE=fleet-infra TEST_NAME=a_reply_is_delivered TEST_FILTER=server::tests::a_reply_is_delivered"
+# shellcheck disable=SC2086
+expect_exit 0 "the flaky-test template renders" "$rc" "$ftpl" "$work/f.json" $fgood
+grep -q '"args": \["--repo", "'"$repo"'", "--except", "crates/fleet-infra/src/server.rs", "'"$base"'..fleet/neo-roadmap/flaky-x"\]' "$work/f.json" && ok || bad "the exception was not named in the protected script check"
+grep -q '"value": "fn a_reply_is_delivered"' "$work/f.json" && ok || bad "the kept check does not name the test"
+grep -q 'cargo test -p fleet-infra --lib server::tests::a_reply_is_delivered --offline --locked -q' "$work/f.json" && ok || bad "the stress check does not run the test"
+grep -q '"id": "protected-diff"' "$work/f.json" && bad "the exception template still has the glob deny check" || ok
+grep -q '"id": "test-only"' "$work/f.json" && ok || bad "no test-only check"
+for bad_arg in 'FILE_PATH=crates/fleet-infra/Cargo.toml' 'FILE_PATH=crates/fleet-infra/build.rs' 'FILE_PATH=crates/fleet-cli/tests/architecture.rs' 'FILE_PATH=SECURITY.md' 'FILE_PATH=dogfood/check-protected.sh' 'FILE_PATH=crates/a/src/x.md' 'TEST_FILTER=a b' 'TEST_FILTER=a;b' 'TEST_FILTER=Server::t' 'TEST_FILTER=-x' 'TEST_NAME=A' 'TEST_NAME=a:b' 'PACKAGE=Fleet' 'PACKAGE=-x' 'PACKAGE=a/b'; do
+  key=${bad_arg%%=*}
+  # shellcheck disable=SC2046
+  expect_exit 2 "flaky-test: refused $bad_arg" "$rc" "$ftpl" "$work/x.json" $(printf '%s\n' "$fgood" | tr ' ' '\n' | grep -v "^$key=" | tr '\n' ' ') "$bad_arg"
+done
+# shellcheck disable=SC2086
+expect_exit 2 "a template without TEST_NAME takes no PACKAGE" "$rc" "$tpl" "$work/x.json" $good PACKAGE=fleet-infra
+
 # ---- install-tools -----------------------------------------------------------------------------------
 src=$work/src-repo
 mkdir -p "$src/dogfood"
 git -C "$src" init -q -b main
-for f in check-protected.sh check-docs-claims.sh check-secret-tree.sh protected-paths.json; do cp "$dogfood/$f" "$src/dogfood/$f"; done
+for f in check-protected.sh check-docs-claims.sh check-secret-tree.sh check-conflict-markers.sh check-test-only.sh protected-paths.json; do cp "$dogfood/$f" "$src/dogfood/$f"; done
 git -C "$src" add -A; git -C "$src" commit -q -m tools
 echo '# edited but not committed' >> "$src/dogfood/check-protected.sh"
 dest=$work/tools
 expect_exit 0 "install from a commit" "$it" --repo "$src" --ref main --dest "$dest"
 expect_out "it names the commit it read" "reading dogfood/ at $(git -C "$src" rev-parse main)"
-for f in check-protected.sh check-docs-claims.sh check-secret-tree.sh protected-paths.json; do
+for f in check-protected.sh check-docs-claims.sh check-secret-tree.sh check-conflict-markers.sh check-test-only.sh protected-paths.json; do
   committed=$(git -C "$src" cat-file blob "main:dogfood/$f" | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | cut -d' ' -f1)
   expect_eq "$f is the committed file" "$committed" "$(sha "$dest/$f")"
   expect_out "its hash is printed" "$committed"

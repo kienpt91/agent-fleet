@@ -14,16 +14,17 @@ program path), so a forgotten substitution cannot turn into a contract that chec
 | `single-file.json` | the default: one named file | exactly `@FILE_PATH@` |
 | `docs-only.json` | a task that edits several documents | `README.md` and `docs/**` |
 | `crate-src.json` | a task that builds one crate a person scaffolded | `crates/@CRATE@/src/**` and `crates/@CRATE@/tests/**` |
+| `flaky-test.json` | a flaky unit test, **a reviewed exception** (see below) | exactly `@FILE_PATH@`, and only below its test module |
 | `human-only.json` | a task that touches a protected path | nothing: it can never pass (see below) |
-| `common-checks.json` | not a contract: the shared fragment, the first nine checks of the three above | |
+| `common-checks.json` | not a contract: the shared fragment, the first ten checks of the three templates above | |
 
 How a task picks one: **start from `single-file`**. Use `docs-only` only when the task really is several
 documents, `crate-src` only for the one task per module that must add a test file next to its source, and
-`human-only` for every task that touches a protected path ([PROTECTED_PATHS.md](../PROTECTED_PATHS.md)). Never
+`flaky-test` only for a flaky test (see "Reviewed exceptions"), and `human-only` for every other task that touches a protected path ([PROTECTED_PATHS.md](../PROTECTED_PATHS.md)). Never
 widen a scope to make a task pass; if the work needs another file, that is a different task. The choice for each
 task of the roadmap is a row of [`goals.neo-roadmap.tsv`](../goals.neo-roadmap.tsv); `apply-goals.sh` renders and adds them.
 
-## The reusable fragment (every contract except `human-only` starts with it)
+## The reusable fragment (every contract except `human-only` and, in part, `flaky-test` starts with it)
 
 All checks are mandatory. They run in order in a private export of the commit, with no network wish of their own.
 
@@ -33,6 +34,7 @@ All checks are mandatory. They run in order in a private export of the commit, w
 | `protected-script` | `check-protected.sh --repo <repo> <base>..fleet/<run>/<task>`: case-insensitive, refuses symlinks, submodules and unusual paths | the same, stricter, from a checker outside the repository |
 | `lock-unchanged` | `file` `sha256` of `Cargo.lock` equals the hash at the run's base commit (and `Cargo.lock` is in the deny list too) | no dependency change without a person |
 | `docs-claims` | `check-docs-claims.sh`: no changed line of README.md or docs/ states a measured number (test counts, coverage, check counts, crate counts, soak figures) | those numbers come from the human-run verification |
+| `conflict-markers` | `check-conflict-markers.sh --tree`: no file of the export has a line starting with `<<<<<<<` or `>>>>>>>` | a task that commits an unresolved merge |
 | `secret-scan` | `check-secret-tree.sh`: the repository's `scripts/secret-scan.sh --tree` on the export | no secret enters the tree |
 | `fmt` | `cargo fmt --all -- --check` in the container | formatting |
 | `clippy` | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | lints (workspace denies `unwrap`, `expect`, indexing; `unsafe` is forbidden) |
@@ -45,6 +47,28 @@ then the task's own `scope` check: a `diff` with `allow` (the table above).
 what a glob cannot (case folding, links, odd names) and run from copies installed outside the repository.
 `secret-scan` covers the tree of the commit; run `sh scripts/secret-scan.sh --history` yourself before you
 merge, it needs the whole history.
+
+## Reviewed exceptions: `flaky-test.json`
+
+A flaky test fails once in a while and passes when run alone, so a task that fixes one needs a check that runs it
+many times under load, and the tests that are worth fixing often live in a protected file (`crates/fleet-infra/src/server.rs`,
+`jobs.rs`). The template is the one case where the protected list is **not** forbidden wholesale, on purpose and for one file:
+
+| What changes against the fragment | Why |
+| --- | --- |
+| no `protected-diff` (the glob deny list cannot say "all of the list but this file") | the file would be denied by its directory |
+| `protected-script` gets `--except <file>`: that exact path, a Rust source or test file of a crate, never a build script, a manifest or the architecture tests; printed as a REVIEWED EXCEPTION; symlinks, submodules and odd paths are still refused | the one allowed protected path |
+| `scope`: allow only `<file>` | nothing else may change |
+| `kept`: the file still contains `fn <test name>` | the test is not deleted |
+| `test-only`: `check-test-only.sh`: everything above the file's first test module (`#[cfg(test)]` + `mod ... {`) is byte-identical to the base | the production code of the file cannot have changed behind the diff |
+| `stress`: build the test once, start 8 busy loops, run exactly that test 25 times (`cargo test -p <package> --lib <filter>`), one failure fails the check | the proof that the flakiness is gone (the pattern of the trial runs, `../trials/`) |
+
+Limits, stated plainly: `test-only` proves nothing about what is *after* the first test module (tests are by convention the last
+items; a person reading the diff is the guard), a file whose first `#[cfg(test)]` is on an import is refused as "cannot judge", and
+the principle of [PROTECTED_PATHS.md](../PROTECTED_PATHS.md) is met by option 2: **a human approves the exact diff** (the merge
+approval) **plus** the independent security review you owe to any change in `crates/fleet-infra`. The placeholders `PACKAGE`, `TEST_NAME`
+and `TEST_FILTER` (`server::tests::a_reply...`) are checked by `render-contract.sh`; there is no goal for this template in the roadmap
+because the two flaky tests of the trials are fixed on `main`: render it by hand for the next one (RUNBOOK.md, section 9).
 
 ## What `human-only.json` is
 
@@ -63,8 +87,9 @@ something changed. A test (`crates/fleet-infra/tests/dogfood.rs`) proves it with
 | `@RUN@`, `@TASK@` | the run id and the task id | the task's branch is `fleet/<run>/<task>` |
 | `@LOCK_SHA256@` | derived by `render-contract.sh` from `Cargo.lock` at `@BASE@` | never typed |
 | `@FILE_PATH@`, `@CRATE@` | a relative path without wildcards; a crate name | from the `params` column of the goal list |
+| `@PACKAGE@`, `@TEST_NAME@`, `@TEST_FILTER@` | a cargo package; a test function name; the filter that selects it (`module::tests::name`) | `flaky-test.json` only; its `@FILE_PATH@` must be `crates/<crate>/src/**.rs` or `crates/<crate>/tests/**.rs` |
 
-Values may contain only letters, digits and `. _ / -` (a base may also contain `^ ~`): nothing that could add a
+Values may contain only letters, digits and `. _ / -` (a base may also contain `^ ~`, a test filter `:`): nothing that could add a
 field to the JSON. No value is a secret and none may be.
 
 ```sh
@@ -81,11 +106,14 @@ fleet goals add --id g-x --title "..." --task neo-roadmap/starter-error-tests --
 The `command` checks run **programs**, never a shell: absolute path, not inside the repository, its worktree, the
 export or the scratch area. So the cargo checks go through your **container wrapper**, one program that takes a
 command string: `@CONTAINER_RUN@ 'cargo fmt --all -- --check'`. The wrapper is yours, outside the repository
-(`../container-run.example.sh` is the template): it starts the development container of the README
-(`fleet-dev`, volumes `fleet-cargo` and `fleet-target`, filled once by `cargo fetch --locked`), with the current
-directory (the export) mounted, **no network** and no environment of yours; no secret is passed in. Checks run with
-a PATH of absolute directories and a home of their own, so the wrapper uses absolute paths and never relies on your
-shell setup.
+(`../container-run.example.sh` is the template, modelled on the wrapper of the trial runs). You set two things in it: the
+absolute path of your docker client and the image (`fleet-dev`, built from `docker/Dockerfile.dev`); the cargo registry and target
+directory are two docker volumes it names (`fleet-dogfood-cargo`, `fleet-dogfood-target`), the registry filled once by
+`DOGFOOD_MODE=online container-run 'cargo fetch --locked'`. Every check then runs in a throwaway container with **no network,
+no capabilities, your uid, the export mounted read-only at `/work`, the registry read-only and nothing of yours mounted**; only the
+target volume is writable, so every export builds on a warm cache. Checks start with an environment of `PATH HOME USER LANG TERM`
+only (`fleet.dogfood.example.toml`), so `DOGFOOD_MODE` can never reach one. Use absolute paths in the wrapper and never rely on your
+shell setup: checks run with a `PATH` of absolute directories and a home of their own.
 
 To change the fragment or the protected list: edit `protected-paths.json` and/or `gen-contracts.sh`, run
 `sh dogfood/gen-contracts.sh`, commit; a human does this, these files are protected.

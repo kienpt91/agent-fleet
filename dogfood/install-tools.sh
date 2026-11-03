@@ -74,5 +74,7 @@ install_one() { # name mode
 install_one check-protected.sh 0555
 install_one check-docs-claims.sh 0555
 install_one check-secret-tree.sh 0555
+install_one check-conflict-markers.sh 0555
+install_one check-test-only.sh 0555
 install_one protected-paths.json 0444
 printf 'install-tools: installed into %s\n' "$dest_real"

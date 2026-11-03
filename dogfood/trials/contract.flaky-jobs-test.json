@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "checks": [
+    {"id": "scope", "kind": "diff", "allow": ["crates/fleet-infra/src/jobs.rs"]},
+    {"id": "kept", "kind": "file", "path": "crates/fleet-infra/src/jobs.rs", "assert": "contains", "value": "fn the_children_of_running_jobs_are_listed_until_their_group_is_gone"},
+    {"id": "fmt", "kind": "command", "program": "/bin/sh",
+     "args": ["-c", "/ABSOLUTE/PATH/TO/container-run 'cargo fmt --all -- --check'"], "timeout_ms": 300000},
+    {"id": "clippy", "kind": "command", "program": "/bin/sh",
+     "args": ["-c", "/ABSOLUTE/PATH/TO/container-run 'cargo clippy -p fleet-infra --all-targets --offline --locked -- -D warnings'"], "timeout_ms": 1200000},
+    {"id": "stress", "kind": "command", "program": "/bin/sh",
+     "args": ["-c", "/ABSOLUTE/PATH/TO/container-run 'cargo test -p fleet-infra --lib --no-run --offline --locked -q && for j in 1 2 3 4 5 6 7 8; do (timeout 280 sh -c \"while :; do :; done\" &) ; done; i=0; while [ $i -lt 25 ]; do cargo test -p fleet-infra --lib jobs::tests::the_children_of_running_jobs_are_listed --offline --locked -q 2>&1 | grep -E \"test result\" | grep -q \"1 passed\" || { echo FAILED-AT-$i; exit 1; }; i=$((i+1)); done; echo stress-ok'"], "timeout_ms": 900000},
+    {"id": "tests", "kind": "command", "program": "/bin/sh",
+     "args": ["-c", "/ABSOLUTE/PATH/TO/container-run 'cargo test -p fleet-infra --lib --offline --locked'"], "timeout_ms": 1200000}
+  ]
+}

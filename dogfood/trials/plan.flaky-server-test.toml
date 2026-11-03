@@ -1,0 +1,17 @@
+[run]
+objective = "Remove a timing race from one server test"
+repo = "/ABSOLUTE/PATH/OF/THE/THROWAWAY/CLONE"   # give the real one with plan-without.sh --repo
+id = "r1"
+
+[[tasks]]
+id = "flaky-test"
+title = "Fix the race in a_reply_that_is_being_produced_when_the_server_stops_is_still_delivered"
+spec = """
+In crates/fleet-infra/src/server.rs the test `a_reply_that_is_being_produced_when_the_server_stops_is_still_delivered` failed once in a real verification run (513 passed, 1 failed, the suite took 32 s under load) and passes when the machine is idle.
+
+Suspected cause (verify it by reading the server code and the test helpers before you change anything): the test sleeps 30 ms and then sets the server's stop flag, assuming the server has already read the `slow` request and started its handler. Under load the request may not have been read yet, so the server stops first and the reply never arrives. The product rule being tested is: a request the server has ACCEPTED and is answering must still get its reply when the stop flag is set. A request that was not yet read when the server stops may be dropped; that is not what this test checks.
+
+Fix the test so it no longer depends on timing: make the test handler signal when it has started (for example through a channel or an atomic that the `slow` handler sets), and have the test wait for that signal, with a generous timeout that fails with a clear message, before it sets the stop flag. Do not weaken the assertion (the reply must arrive and carry the schema `fleet.slow/1`). Do not remove the test, do not add a sleep to fix it, do not ignore it. If after reading the server code you find that the server itself can lose an accepted request's reply, say so in the commit-less summary file and fix the server in the smallest possible way; any such change must keep every other test passing.
+
+Only crates/fleet-infra/src/server.rs may change. No new dependencies. Commit nothing yourself: fleet commits your work.
+"""
