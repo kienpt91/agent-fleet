@@ -888,68 +888,68 @@ after; in the `fleet-ssh` image, see [Development](#development)); the paths are
 
 ```text
 The operator compares this fingerprint with the one on the host's console:
-256 SHA256:UnsbG9WQyO4RX9eFUAhSPgRKJN1pDPMbL98DyJ1i0Z4 demo (ED25519)
+256 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms demo (ED25519)
 
-$ /target/release/fleet host add build --config /tmp/tmp.wfsCCGwIFs/fleet.toml --address 127.0.0.1 --port 23641 --user fleetssh --identity /tmp/tmp.wfsCCGwIFs/sshd/client_key --base-dir /tmp/tmp.wfsCCGwIFs/remote-work --worker sh
-host build added to /tmp/tmp.wfsCCGwIFs/fleet.toml
+$ /target/release/fleet host add build --config /tmp/tmp.AIJNF2xrgc/fleet.toml --address 127.0.0.1 --port 23642 --user fleetssh --identity /tmp/tmp.AIJNF2xrgc/sshd/client_key --base-dir /tmp/tmp.AIJNF2xrgc/remote-work --worker sh
+host build added to /tmp/tmp.AIJNF2xrgc/fleet.toml
 next: compare the host's key and pin it with `fleet host trust build`, then check it with `fleet host doctor build`
 
-$ /target/release/fleet host list --config /tmp/tmp.wfsCCGwIFs/fleet.toml
+$ /target/release/fleet host list --config /tmp/tmp.AIJNF2xrgc/fleet.toml
 NAME   ADDRESS          USER      BASE DIRECTORY                   WORKERS  PINNED KEY
-build  127.0.0.1:23641  fleetssh  /tmp/tmp.wfsCCGwIFs/remote-work  sh       not pinned
+build  127.0.0.1:23642  fleetssh  /tmp/tmp.AIJNF2xrgc/remote-work  sh       not pinned
 
-$ /target/release/fleet host doctor build --config /tmp/tmp.wfsCCGwIFs/fleet.toml   # nothing is trusted yet: no connection is made
+$ /target/release/fleet host doctor build --config /tmp/tmp.AIJNF2xrgc/fleet.toml   # nothing is trusted yet: no connection is made
 [ok  ] ssh program: /usr/bin/ssh (OpenSSH 9.2)
-[ok  ] host build: identity file: /tmp/tmp.wfsCCGwIFs/sshd/client_key
+[ok  ] host build: identity file: /tmp/tmp.AIJNF2xrgc/sshd/client_key
 [FAIL] host build: pinned key: not pinned yet: run `fleet host trust build`
 [info] host build: connection: not tried: fix the checks above first
 unhealthy: 1 check(s) failed
 (exit code 13)
 
-$ /target/release/fleet host trust build --config /tmp/tmp.wfsCCGwIFs/fleet.toml   # needs a terminal; here one is made with script(1) and "yes" is typed
+$ /target/release/fleet host trust build --config /tmp/tmp.AIJNF2xrgc/fleet.toml   # needs a terminal; here one is made with script(1) and "yes" is typed
 yes
-host build (127.0.0.1:23641) presented this key:
+host build (127.0.0.1:23642) presented this key:
   type:        ssh-ed25519
-  fingerprint: SHA256:UnsbG9WQyO4RX9eFUAhSPgRKJN1pDPMbL98DyJ1i0Z4
+  fingerprint: SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
 nothing is pinned for this host yet.
 Compare the fingerprint with one you know to be the host's own, over another channel (for example on its console: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
-Type yes to pin this key for host build: pinned SHA256:UnsbG9WQyO4RX9eFUAhSPgRKJN1pDPMbL98DyJ1i0Z4 for host build; check the host with `fleet host doctor build`
+Type yes to pin this key for host build: pinned SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms for host build; check the host with `fleet host doctor build`
 
-$ /target/release/fleet host list --config /tmp/tmp.wfsCCGwIFs/fleet.toml
+$ /target/release/fleet host list --config /tmp/tmp.AIJNF2xrgc/fleet.toml
 NAME   ADDRESS          USER      BASE DIRECTORY                   WORKERS  PINNED KEY
-build  127.0.0.1:23641  fleetssh  /tmp/tmp.wfsCCGwIFs/remote-work  sh       ssh-ed25519 SHA256:UnsbG9WQyO4RX9eFUAhSPgRKJN1pDPMbL98DyJ1i0Z4
+build  127.0.0.1:23642  fleetssh  /tmp/tmp.AIJNF2xrgc/remote-work  sh       ssh-ed25519 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
 
-$ /target/release/fleet host doctor build --config /tmp/tmp.wfsCCGwIFs/fleet.toml
+$ /target/release/fleet host doctor build --config /tmp/tmp.AIJNF2xrgc/fleet.toml
 [ok  ] ssh program: /usr/bin/ssh (OpenSSH 9.2)
-[ok  ] host build: identity file: /tmp/tmp.wfsCCGwIFs/sshd/client_key
-[ok  ] host build: pinned key: ssh-ed25519 SHA256:UnsbG9WQyO4RX9eFUAhSPgRKJN1pDPMbL98DyJ1i0Z4
-[ok  ] host build: connection: 208 ms, pinned key accepted, key file accepted
+[ok  ] host build: identity file: /tmp/tmp.AIJNF2xrgc/sshd/client_key
+[ok  ] host build: pinned key: ssh-ed25519 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+[ok  ] host build: connection: 591 ms, pinned key accepted, key file accepted
 [ok  ] host build: quoting: the login shell reads quoted text unchanged
 [ok  ] host build: system: Linux
 [ok  ] host build: remote user: uid 501
 [ok  ] host build: git: git version 2.39.5
-[ok  ] host build: base directory: /tmp/tmp.wfsCCGwIFs/remote-work is writable
+[ok  ] host build: base directory: /tmp/tmp.AIJNF2xrgc/remote-work is writable
 healthy
 
-$ /target/release/fleet plan /tmp/tmp.wfsCCGwIFs/plan.toml
+$ /target/release/fleet plan /tmp/tmp.AIJNF2xrgc/plan.toml
 plan loaded into run r1 (1 tasks)
 
 $ /target/release/fleet start --run r1
 run r1 started
 
 $ /target/release/fleet status
-daemon pid 3722 | v0.1.0 | up 2s | sessions 0/4 | undo unavailable | rss 4752 kB
+daemon pid 3728 | v0.1.0 | up 17s | sessions 0/4 | undo unavailable | rss 4672 kB
 
 run r1 [finished] max-parallel 2
   objective  Try a worker on another machine
-  repo       /tmp/tmp.wfsCCGwIFs/repo (base HEAD @ 4ff21e87)
+  repo       /tmp/tmp.AIJNF2xrgc/repo (base HEAD @ 2c5a6876)
   branch     fleet/r1/integration
   tasks      pending 0, ready 0, running 0, review 0, completed 1, failed 0, blocked 0
   ID      STATUS     DEPS  TRY  WORKER        NOTE
   remote  completed  -     1    - host:build  wrote a file on the host
 
 recent
-  #1 daemon started (pid 3722)
+  #1 daemon started (pid 3728)
   #2 run r1 created
   #3 r1/remote added
   #4 r1/remote ready
@@ -961,7 +961,7 @@ recent
   #10 r1/remote completed
 
 $ git -C $REPO show fleet/r1/remote:from-the-host.txt   # the file was written on the host and came back as a commit of the local repository
-hello from Linux, written for task remote in /tmp/tmp.wfsCCGwIFs/remote-work/r1/remote
+hello from Linux, written for task remote in /tmp/tmp.AIJNF2xrgc/remote-work/r1/remote
 
 $ git -C $REPO log --format='%an <%ae>: %s' fleet/r1/remote   # one commit of fleet's own on top of the base
 fleet <fleet@localhost>: fleet: changes made on host build
@@ -971,11 +971,11 @@ $ ls $WORK/remote-work/r1   # nothing is left on the host
 0
 
 $ fleet tail remote   # what fleet recorded about the attempt
-fleet: remote: host build returned 1 commit(s) changing 1 path(s); verified and applied as 1b807a63141a
+fleet: remote: host build returned 1 commit(s) changing 1 path(s); verified and applied as 7c17a4146e4a
 fleet: remote: the worktree on host build was removed
 
 --- the host is reinstalled: its key changes ---
-256 SHA256:cCXxrMm2k8m3joYQr/bTyx9hq0XewqaO+OFU+UI9l1E demo (ED25519)
+256 SHA256:1dI8Jw3XjIWqk/fVln9olas4cE4DLO1Sbm3x6dNGGV0 demo (ED25519)
 
 $ /target/release/fleet task add --run r1 --title Another file --id again --host build
 task added to run r1
@@ -1024,16 +1024,16 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-The counts in the table below are from before phase 3c (1385 tests); phase 3c added the remote rows and tests in every layer (the domain quoting and host tests, the remote session host and its contract, the ssh adapter units, the architecture rules). All passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1523 tests, all passing in the final run (328 + 323 + 563 + 1 + 27 + 281 across the layers below) (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 317 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 298 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | 509 |
-| Remote (OpenSSH) | `crates/fleet-infra/tests/ssh_remote.rs` (a real sshd started by the test: pinning, changed key, wrong key, forwarding and environment, quoting through the real login shell, hostile bundles, kill escalation, keepalive on a frozen server, a jump host, origin refusal, the `RemoteHost` contract suite) and `crates/fleet-cli/tests/e2e_remote.rs` (the real binary and daemon, 11 tests); skipped when the image has no sshd (`docker/Dockerfile.ssh`, `scripts/ssh-env.sh`) | 25 + 11 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay) | 328 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs) | 323 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started | 563 |
+| Remote (OpenSSH) | `crates/fleet-infra/tests/ssh_remote.rs` (a real sshd started by the test: pinning, changed key, wrong key, forwarding and environment, quoting through the real login shell, hostile bundles, kill escalation, keepalive on a frozen server, a jump host, origin refusal, the `RemoteHost` contract suite) and `crates/fleet-cli/tests/e2e_remote.rs` (the real binary and daemon, 11 tests); skipped when the image has no sshd (`docker/Dockerfile.ssh`, `scripts/ssh-env.sh`) | 27 (and 11 more in the end-to-end layer) |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | 260 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views | 281 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -1048,11 +1048,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               5209     5081    97.5%
-application          3015     2846    94.4%
-infrastructure       7781     7148    91.9%
+domain               5231     5100    97.5%
+application          3035     2862    94.3%
+infrastructure       7877     7242    91.9%
 cli                  3128     2781    88.9%
-overall             19133    17856    93.3%
+overall             19271    17985    93.3%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -1148,10 +1148,10 @@ remove it from the tree and rewrite the history if it was not published.
 What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, the test suites above, the release build, the 120 second soak (with the dashboard and an event stream),
-`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
+`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/ssh-demo.sh` (OpenSSH client and server in the `docker/Dockerfile.ssh` image), `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
 `node scripts/web-smoke.mjs` (334 checks) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
-found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
+found no keys or secrets (the sshd tests generate their keys at run time in temporary directories; none is committed): the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
 
 ## Development
 
