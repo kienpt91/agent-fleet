@@ -1814,6 +1814,8 @@ whose formula is printed. The criteria and their order come from `[compare] rank
 ranking. `fleet pick <group> <task>` is the only way a member's work reaches the integration branch: it asks for the normal
 merge approval, bound to the digest of the exact action (group, branch, commit and the evidence statement), and after the merge
 the other members are `superseded`; their worktrees and branches stay until `fleet cleanup [--branches]` (or `--remove-others`).
+Likewise a task cannot be added after a member that was not picked (`task add`, a plan, `issue to-task --after`), and `fleet pr create` publishes
+only the winner of a group, so a member's work leaves through the pick and its approval, not around it.
 `--allow-unverified` is the one opt-in for what fleet could not check: it applies to a member that no contract guards
 (unverified evidence) and to a member whose **scope is not known** (no mandatory `diff` check in its contract, or a diff
 that was listed only in part, over 500 files); the approval then says `UNVERIFIED` and/or `scope: UNKNOWN`. A member that a
