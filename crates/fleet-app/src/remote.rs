@@ -401,8 +401,9 @@ impl SessionHost for RemoteSessions {
     }
 
     fn notify(&mut self, id: SessionId, line: &str) -> Result<()> {
-        // A line typed into the local ssh client's terminal would reach the remote worker's
-        // terminal: that is not offered for a remote session.
+        // Messages are not available to remote tasks (they are refused when a plan or a task is
+        // added), so this is never reached for a remote session; a line typed into the local ssh
+        // client's terminal would not be a mediated notice, so it is refused all the same.
         if self.active.contains_key(&id) {
             return Err(FleetError::unavailable(
                 "messages are not available to tasks that run on a remote host",
@@ -728,6 +729,28 @@ mod tests {
         assert_eq!(r.sessions.poll(s.id), SessionState::Running);
         r.sessions.release(s.id);
         assert_eq!(r.remote.abandoned().len(), 1);
+    }
+
+    #[test]
+    fn the_notice_that_types_into_a_terminal_is_refused_for_a_remote_session_only() {
+        let mut r = rig(2);
+        let local = r.sessions.spawn(&spec("a", "run-agent", None)).unwrap();
+        let remote = r
+            .sessions
+            .spawn(&spec("b", "agent", Some("build")))
+            .unwrap();
+        assert!(r.sessions.notify(local.id, "one fixed line").is_ok());
+        let err = r.sessions.notify(remote.id, "one fixed line").unwrap_err();
+        assert!(
+            err.message
+                .contains("not available to tasks that run on a remote host"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            r.world.notices(),
+            vec![(local.id, "one fixed line".to_string())]
+        );
     }
 
     #[test]

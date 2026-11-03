@@ -14,7 +14,7 @@ use crate::msg::{list_value, show_value, status_of, ListFilter};
 use crate::ports::{InboxReport, OutboxItem, OutboxRead};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{ChannelName, MessageId, RunId, TaskId};
+use fleet_domain::ids::{ChannelName, HostName, MessageId, RunId, TaskId, WorkerName};
 use fleet_domain::msg::board::{
     Accepted, Context, Due, Refused, Submission, TripInfo, Verdict, GATE_KEEP, GATE_UNMUTE,
 };
@@ -22,6 +22,7 @@ use fleet_domain::msg::channel::{ChannelDef, Member, RosterEntry};
 use fleet_domain::msg::inbox::{notice_line, render_item};
 use fleet_domain::msg::limits::MAX_OUTBOX_PER_SCAN;
 use fleet_domain::msg::message::{OutboxMessage, Sender};
+use fleet_domain::run::NewTask;
 use fleet_domain::status::{ApprovalStatus, BlockReason, MessageKind, MuteReason};
 use fleet_domain::value::Value;
 use std::collections::BTreeSet;
@@ -39,6 +40,12 @@ fn data(schema: &str, pairs: Vec<(&str, Value)>) -> Reply {
 enum Target {
     Channel(RunId, ChannelName),
     Task(RunId, TaskId),
+}
+
+fn refuse_remote_channel(channel: &ChannelName, task: &TaskId, host: &HostName) -> FleetError {
+    FleetError::invalid(format!(
+        "channel {channel}: task {task} runs on host {host}, and messages are not available to tasks on a remote host (a mailbox is a set of files in the worktree, which is on another machine while the worker runs)"
+    ))
 }
 
 impl Orchestrator {
@@ -753,6 +760,76 @@ impl Orchestrator {
             }
         }
         self.board.open_channels(run, channels).map(|_| ())
+    }
+
+    /// The tasks of a run, and the ones a plan adds, that run on a remote host, with the worker
+    /// each runs. `added` are the new tasks and the ids they get.
+    pub(crate) fn remote_tasks(
+        &self,
+        run: &RunId,
+        added: &[NewTask],
+        ids: &[TaskId],
+    ) -> Vec<(TaskId, Option<WorkerName>, HostName)> {
+        let default = self.cfg.default_worker.clone();
+        let mut out: Vec<(TaskId, Option<WorkerName>, HostName)> = self
+            .state
+            .run(run)
+            .map(|r| r.tasks().to_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| {
+                let host = t.host?;
+                Some((t.id, t.worker.or_else(|| default.clone()), host))
+            })
+            .collect();
+        for (task, id) in added.iter().zip(ids) {
+            if let Some(host) = &task.host {
+                out.push((
+                    id.clone(),
+                    task.worker.clone().or_else(|| default.clone()),
+                    host.clone(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Messages are files in a task's worktree that the daemon reads and writes while the worker
+    /// runs. The worktree of a task on a remote host is on another machine and comes back only
+    /// when the attempt ends, so such a task cannot belong to a channel: a channel that names it
+    /// (as a task, or through its worker) is refused when it is declared.
+    pub(crate) fn refuse_remote_members(
+        &self,
+        remote: &[(TaskId, Option<WorkerName>, HostName)],
+        channels: &[ChannelDef],
+    ) -> Result<()> {
+        for c in channels {
+            for (task, worker, host) in remote {
+                if c.is_member(task, worker.as_ref()) {
+                    return Err(refuse_remote_channel(&c.name, task, host));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The same for tasks added to a run that already has channels.
+    pub(crate) fn refuse_remote_joining(
+        &self,
+        run: &RunId,
+        remote: &[(TaskId, Option<WorkerName>, HostName)],
+    ) -> Result<()> {
+        for (task, worker, host) in remote {
+            if let Some(c) = self
+                .board
+                .channels_of(run, task, worker.as_ref())
+                .into_iter()
+                .next()
+            {
+                return Err(refuse_remote_channel(&c.def.name, task, host));
+            }
+        }
+        Ok(())
     }
 
     /// The events that open the channels of a plan.

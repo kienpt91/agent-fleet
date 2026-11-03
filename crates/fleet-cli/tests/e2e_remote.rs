@@ -741,3 +741,43 @@ printf '{{\"version\":1,\"status\":\"done\",\"summary\":\"done remotely\"}}' > .
     let _ = fs::remove_dir_all(&out);
     r.f.shutdown();
 }
+
+#[test]
+fn a_channel_that_names_a_task_on_a_host_is_refused_with_a_clear_error_and_nothing_is_created() {
+    let Some(mut r) = rig(WRITE_FILE, "", |c| c) else {
+        return;
+    };
+    start_with_host(&mut r);
+    r.f.start();
+    for members in [
+        "[\"task:a\", \"task:b\"]",
+        // through its worker: every task that runs `remote-sh` would be a member
+        "[\"role:remote-sh\", \"task:b\"]",
+    ] {
+        let mut text = plan_toml(
+            &r.f.repo,
+            "r1",
+            1,
+            &[t("a").worker("remote-sh").host("build"), t("b")],
+        );
+        text.push_str(&format!(
+            "\n[[channels]]\nname = \"talk\"\nmembers = {members}\nmode = \"direct\"\n"
+        ));
+        let file = r.f.tmp.write("plan-channel.toml", &text);
+        let out = r.f.cli(&["plan", file.to_str().unwrap()]);
+        assert_eq!(out.code, 7, "{out:?}");
+        assert!(
+            out.stderr
+                .contains("messages are not available to tasks on a remote host"),
+            "{}",
+            out.stderr
+        );
+        assert!(out.stderr.contains("runs on host build"), "{}", out.stderr);
+        let status = r.f.json(&["status", "--json"]);
+        assert!(
+            jarr(&status, "runs").is_empty(),
+            "a refused plan creates nothing: {status:?}"
+        );
+    }
+    r.f.shutdown();
+}

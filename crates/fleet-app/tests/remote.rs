@@ -369,3 +369,209 @@ fn a_remote_task_of_a_compiled_run_gets_the_pack_and_the_pointer_brief_before_th
     // and the worker's own paths are the host's
     assert_eq!(remote.launched()[0].args[3], "/remote/build/r1/a");
 }
+
+fn plan_with(channel_members: &[&str], remote_task: &str) -> Value {
+    let task = |id: &str| {
+        let mut pairs = vec![("id", s(id)), ("title", s(id)), ("spec", s("x"))];
+        if id == remote_task {
+            pairs.push(("host", s("build")));
+        }
+        obj(pairs)
+    };
+    obj(vec![
+        (
+            "new_run",
+            obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+        ),
+        ("tasks", Value::array([task("a"), task("b")])),
+        (
+            "channels",
+            Value::array([obj(vec![
+                ("name", s("talk")),
+                (
+                    "members",
+                    Value::array(channel_members.iter().map(|m| s(m))),
+                ),
+            ])]),
+        ),
+    ])
+}
+
+fn run_count(h: &mut Harness) -> usize {
+    h.call("status", Value::Null)
+        .unwrap()
+        .data()
+        .get("runs")
+        .and_then(Value::as_array)
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn a_channel_that_names_a_remote_task_or_its_worker_is_refused_and_nothing_is_created() {
+    for members in [&["task:a", "task:b"][..], &["role:agent", "task:b"][..]] {
+        let remote = FakeRemote::new();
+        let mut h = remote_harness(config(), &remote);
+        let err = h
+            .call("plan.load", plan_with(members, "a"))
+            .expect_err("messages are not available to remote tasks");
+        assert!(
+            err.message
+                .contains("messages are not available to tasks on a remote host")
+                && err.message.contains("runs on host build"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            run_count(&mut h),
+            0,
+            "{members:?}: no run, no task, no channel"
+        );
+    }
+}
+
+#[test]
+fn local_tasks_keep_their_channels_next_to_a_remote_task() {
+    let remote = FakeRemote::new();
+    let mut h = remote_harness(config(), &remote);
+    // a and b talk; the third task is remote and is not a member (and its worker is not named).
+    let task = |id: &str, host: Option<&str>| {
+        let mut pairs = vec![("id", s(id)), ("title", s(id)), ("spec", s("x"))];
+        if let Some(host) = host {
+            pairs.push(("host", s(host)));
+        }
+        obj(pairs)
+    };
+    h.call(
+        "plan.load",
+        obj(vec![
+            (
+                "new_run",
+                obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+            ),
+            (
+                "tasks",
+                Value::array([task("a", None), task("b", None), task("c", Some("build"))]),
+            ),
+            (
+                "channels",
+                Value::array([obj(vec![
+                    ("name", s("talk")),
+                    ("members", Value::array([s("task:a"), s("task:b")])),
+                ])]),
+            ),
+        ]),
+    )
+    .unwrap();
+    start(&mut h);
+    assert_eq!(task_status(&mut h, "a"), "running");
+    assert_eq!(task_status(&mut h, "c"), "running");
+    assert_eq!(remote.prepared().len(), 1);
+}
+
+#[test]
+fn a_remote_task_cannot_be_added_to_a_run_whose_channel_would_include_it() {
+    let remote = FakeRemote::new();
+    let mut h = remote_harness(config(), &remote);
+    // The channel names the default worker, so every task that runs it is a member.
+    h.call(
+        "plan.load",
+        obj(vec![
+            (
+                "new_run",
+                obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+            ),
+            (
+                "tasks",
+                Value::array([obj(vec![
+                    ("id", s("a")),
+                    ("title", s("a")),
+                    ("spec", s("x")),
+                ])]),
+            ),
+            (
+                "channels",
+                Value::array([obj(vec![
+                    ("name", s("talk")),
+                    ("members", Value::array([s("role:agent"), s("task:a")])),
+                ])]),
+            ),
+        ]),
+    )
+    .unwrap();
+    let err = h
+        .call(
+            "task.add",
+            obj(vec![
+                ("run", s("r1")),
+                ("id", s("far")),
+                ("title", s("far")),
+                ("host", s("build")),
+            ]),
+        )
+        .expect_err("a member of a channel cannot run remotely");
+    assert!(
+        err.message
+            .contains("messages are not available to tasks on a remote host"),
+        "{}",
+        err.message
+    );
+    // the same task without a host is fine
+    h.call(
+        "task.add",
+        obj(vec![
+            ("run", s("r1")),
+            ("id", s("near")),
+            ("title", s("near")),
+        ]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_channel_added_to_a_run_that_already_has_the_remote_task_is_refused() {
+    let remote = FakeRemote::new();
+    let (mut h, _) = {
+        let mut h = remote_harness(config(), &remote);
+        h.call(
+            "run.create",
+            obj(vec![("objective", s("o")), ("repo", s("/repo"))]),
+        )
+        .unwrap();
+        (h, ())
+    };
+    add_remote(&mut h, "far", Some("build"));
+    add_remote(&mut h, "near", None);
+    let err = h
+        .call(
+            "plan.load",
+            obj(vec![
+                ("run", s("r1")),
+                (
+                    "tasks",
+                    Value::array([obj(vec![("id", s("more")), ("title", s("more"))])]),
+                ),
+                (
+                    "channels",
+                    Value::array([obj(vec![
+                        ("name", s("talk")),
+                        ("members", Value::array([s("task:near"), s("task:far")])),
+                    ])]),
+                ),
+            ]),
+        )
+        .expect_err("task far is remote");
+    assert!(
+        err.message.contains("runs on host build"),
+        "{}",
+        err.message
+    );
+    // nothing of the plan was added
+    let st = h.call("status", Value::Null).unwrap().data().clone();
+    let tasks = st.get("runs").and_then(Value::as_array).unwrap()[0]
+        .get("tasks")
+        .and_then(Value::as_array)
+        .unwrap()
+        .len();
+    assert_eq!(tasks, 2);
+}

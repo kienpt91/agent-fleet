@@ -299,7 +299,9 @@ impl Orchestrator {
     fn add_tasks(&mut self, run: &RunId, tasks: Vec<NewTask>, schema: &str) -> Result<Reply> {
         self.check_hosts(&tasks)?;
         self.refuse_group_dependencies(run, &tasks)?;
-        let (ids, events) = self.state.add_tasks(run, tasks)?;
+        let (ids, events) = self.state.add_tasks(run, tasks.clone())?;
+        let remote = self.remote_tasks(run, &tasks, &ids);
+        self.refuse_remote_joining(run, &remote)?;
         self.commit(events)?;
         self.promote()?;
         Ok(data(
@@ -362,8 +364,10 @@ impl Orchestrator {
                     .iter()
                     .map(|t| t.id.clone())
                     .collect();
+                let remote = self.remote_tasks(&r, &tasks, &ids);
                 known.extend(ids);
                 self.check_channels(&r, &known, &channels)?;
+                self.refuse_remote_members(&remote, &channels)?;
                 (r, None)
             }
             (None, Some(args)) => {
@@ -373,7 +377,9 @@ impl Orchestrator {
                 let mut scratch = fleet_domain::fleet::FleetState::new();
                 scratch.apply(&event);
                 let (ids, _) = scratch.add_tasks(&id, tasks.clone())?;
+                let remote = self.remote_tasks(&id, &tasks, &ids);
                 self.check_channels(&id, &ids.into_iter().collect(), &channels)?;
+                self.refuse_remote_members(&remote, &channels)?;
                 (id, Some(event))
             }
         };
