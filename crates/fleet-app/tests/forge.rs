@@ -1437,3 +1437,28 @@ fn an_issue_cannot_become_a_task_that_builds_on_a_member_that_was_not_picked() {
         .unwrap_err();
     assert_eq!(plain.code, ErrorCode::Conflict);
 }
+
+#[test]
+fn a_pull_request_is_made_only_of_the_winner_of_a_group_and_a_pick_comes_first() {
+    let mut h = Harness::with_config(fanout_config());
+    h.forge.set_remote("/repo", "https://github.com/o/r.git");
+    finished_group(&mut h);
+    let pr = |h: &mut Harness, task: &str| h.call("pr.create", obj(vec![("task", s(task))]));
+    // before the pick nobody has won
+    for member in ["fan1-1", "fan1-2"] {
+        let err = pr(&mut h, member).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict, "{member}: {}", err.message);
+        assert!(err.message.contains("fleet pick"), "{}", err.message);
+    }
+    assert!(approvals(&mut h).is_empty(), "no approval was asked for");
+    pick(&mut h, "fan1-1");
+    // the loser stays out, like for `fleet merge`
+    let err = pr(&mut h, "fan1-2").unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{}", err.message);
+    assert!(err.message.contains("not its winner"), "{}", err.message);
+    assert!(approvals(&mut h).is_empty());
+    assert!(h.forge.pushes().is_empty());
+    // the winner is asked for like any other task
+    let err = pr(&mut h, "fan1-1").unwrap_err();
+    assert_eq!(err.code, ErrorCode::ApprovalRequired, "{}", err.message);
+}

@@ -667,6 +667,42 @@ impl Orchestrator {
         }
     }
 
+    /// A fan-out member's work leaves the machine only after its group's pick, like it reaches the
+    /// integration branch only through the pick (`fleet merge` refuses members): the pick's approval
+    /// states the member's evidence and scope, which a pull request's does not. Only the winner may be
+    /// published. A group that was forgotten no longer says who won; a member that was merged is the
+    /// winner, because nothing but a pick merges a member.
+    fn refuse_unpicked_member(&self, key: &Key) -> Result<()> {
+        let name = qualified(key);
+        if let Some(g) = self.fanout.groups.group_of(&key.0, &key.1) {
+            return match &g.winner {
+                Some(w) if *w == key.1 => Ok(()),
+                Some(_) => Err(FleetError::conflict(format!(
+                    "{name} is a member of fan-out group {} and is not its winner: only the winner can be published",
+                    g.id
+                ))),
+                None => Err(FleetError::conflict(format!(
+                    "{name} is a member of fan-out group {} that has no winner yet: pick one with `fleet pick {} <task>`, then publish the winner",
+                    g.id, g.id
+                ))),
+            };
+        }
+        if self.fanout.groups.was_member(&key.0, &key.1) {
+            let picked = self
+                .state
+                .run(&key.0)
+                .ok()
+                .and_then(|r| r.task(&key.1).map(|t| t.merged.is_some()))
+                .unwrap_or(false);
+            if !picked {
+                return Err(FleetError::conflict(format!(
+                    "{name} was a member of a fan-out group that was forgotten and is not its winner: only the winner can be published"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Everything a publication is made of, from the repository and the arguments as they are
     /// now. Used twice (before the preflight and after it) so that nothing can change in between
     /// without a different digest.
@@ -691,6 +727,7 @@ impl Orchestrator {
                 qualified(&key)
             )));
         }
+        self.refuse_unpicked_member(&key)?;
         let head = self.ports.vcs.branch_head(&repo_path, &branch)?;
         // Work that a verification contract guards leaves the machine only as the commit that was
         // proven, like a merge.
