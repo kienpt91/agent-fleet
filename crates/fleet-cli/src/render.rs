@@ -274,6 +274,45 @@ fn render_gate_lines(gates: &[Value], only_open: bool, out: &mut String) {
     }
 }
 
+/// What an approval for a pull request covers, one argument per line and none of them cut short:
+/// the person who approves it reads the whole title and body, and the flag that makes it a draft
+/// comes before the long fields so that nothing can push it out of sight. The body is quoted line
+/// by line, so nothing in it can pass for a line fleet wrote. Returns false when `a` is not such
+/// an approval.
+fn render_pull_request_action(a: &Value, out: &mut String) -> bool {
+    if text(a, "purpose") != "pull-request" {
+        return false;
+    }
+    let Some(args) = a.get("args").and_then(Value::as_array) else {
+        return false;
+    };
+    let arg = |i: usize| match args.get(i) {
+        Some(Value::Str(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let (Some(repo), Some(base), Some(branch), Some(sha), Some(title), Some(body), Some(flag)) =
+        (arg(0), arg(1), arg(2), arg(3), arg(4), arg(5), arg(6))
+    else {
+        return false;
+    };
+    let _ = writeln!(out, "  repository:   {}", clean(repo));
+    let _ = writeln!(out, "  base:         {}", clean(base));
+    let _ = writeln!(out, "  branch:       {}", clean(branch));
+    let _ = writeln!(out, "  commit:       {}", clean(sha));
+    let _ = writeln!(out, "  pull request: {}", clean(flag));
+    let _ = writeln!(out, "  title:        {}", clean(title));
+    let quoted = fleet_domain::sanitize::quote_lines(&sanitize_text(body.as_bytes()));
+    if quoted.is_empty() {
+        let _ = writeln!(out, "  body:         (empty)");
+    } else {
+        let _ = writeln!(out, "  body:");
+        for line in quoted.lines() {
+            let _ = writeln!(out, "    {line}");
+        }
+    }
+    true
+}
+
 fn render_approval_lines(approvals: &[Value], only_pending: bool, out: &mut String) {
     for a in approvals {
         let status = text(a, "status");
@@ -290,9 +329,11 @@ fn render_approval_lines(approvals: &[Value], only_pending: bool, out: &mut Stri
             if status.is_empty() { "-" } else { &status },
             prefix(&text_or_dash(a, "digest"), DIGEST_PREFIX)
         );
-        let display = text(a, "display");
-        if !display.is_empty() {
-            let _ = writeln!(out, "  {}", truncate(&display, 200));
+        if !render_pull_request_action(a, out) {
+            let display = text(a, "display");
+            if !display.is_empty() {
+                let _ = writeln!(out, "  {}", truncate(&display, 200));
+            }
         }
         if status == "pending" {
             let _ = writeln!(
@@ -769,6 +810,58 @@ recent
             );
             assert!(!out.contains('\u{202e}'), "bidi override leaked");
         }
+    }
+
+    #[test]
+    fn a_pull_request_approval_shows_every_argument_whole_and_the_flag_before_the_long_fields() {
+        let body = format!(
+            "first\n{}\n## not a heading of fleet\nlast line",
+            "b".repeat(3000)
+        );
+        let title = "t".repeat(250);
+        let a = Value::object([
+            ("id", s("a1")),
+            ("purpose", s("pull-request")),
+            ("run", s("r1")),
+            ("task", s("t1")),
+            ("status", s("pending")),
+            ("digest", s(&"d".repeat(64))),
+            (
+                "args",
+                Value::array([
+                    s("github.com/o/r"),
+                    s("main"),
+                    s("fleet/r1/t1"),
+                    s(&"c".repeat(40)),
+                    s(&title),
+                    s(&body),
+                    s("draft"),
+                ]),
+            ),
+            ("display", s("forge: whatever")),
+        ]);
+        let out = render_approvals(&Value::object([("approvals", Value::array([a]))]));
+        for want in [
+            "repository:   github.com/o/r",
+            "base:         main",
+            "branch:       fleet/r1/t1",
+            &format!("commit:       {}", "c".repeat(40)),
+            "pull request: draft",
+            &format!("title:        {title}"),
+            &"b".repeat(3000),
+            "last line",
+        ] {
+            assert!(out.contains(want), "{want}\n{out}");
+        }
+        assert!(!out.contains('…'), "{out}");
+        assert!(
+            out.find("pull request: draft") < out.find("title:"),
+            "{out}"
+        );
+        assert!(out.find("pull request: draft") < out.find("body:"), "{out}");
+        // every line of the body is quoted: none starts like a heading of fleet's own
+        assert!(out.contains("    > ## not a heading of fleet"), "{out}");
+        assert!(!out.lines().any(|l| l.starts_with("##")), "{out}");
     }
 
     #[test]
