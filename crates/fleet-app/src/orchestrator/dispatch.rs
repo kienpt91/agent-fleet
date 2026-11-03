@@ -154,6 +154,11 @@ impl Orchestrator {
             // a summary left from an earlier attempt must not be attached to a later handoff
             self.handoff_summaries.remove(&key);
         }
+        let task_worker = task
+            .worker
+            .clone()
+            .or_else(|| self.cfg.default_worker.clone());
+        let notes = self.board.notes_for(run_id, task_id, task_worker.as_ref());
         // A run that chose compiled context gets a pack compiled by NEO from fleet's own state
         // (and a short brief that points at it); every other run gets the plain brief it always did.
         let pack = if self.uses_compiled_context(&key) {
@@ -173,13 +178,14 @@ impl Orchestrator {
             None
         };
         let brief = match &pack {
-            Some(p) => build_pointer_brief(task_id, &task.title, attempt, p.digest()),
+            Some(p) => build_pointer_brief(task_id, &task.title, attempt, p.digest(), Some(&notes)),
             None => build_brief(&BriefInput {
                 run: run_id,
                 objective: &objective,
                 task: &task,
                 dependencies,
                 attempt,
+                messages: Some(&notes),
             }),
         };
         if let Err(e) = self.ports.contract.prepare(&worktree, &brief) {
@@ -201,6 +207,15 @@ impl Orchestrator {
                 );
                 return;
             }
+        }
+        if let Err(e) = self.prepare_messages(run_id, task_id, &worktree) {
+            self.start_failed(
+                &key,
+                attempt,
+                &worktree,
+                &format!("could not prepare the message directories: {}", e.message),
+            );
+            return;
         }
         if self.ports.undo.available() {
             self.checkpoint(&key, &worktree, "before");

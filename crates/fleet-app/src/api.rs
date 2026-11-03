@@ -4,13 +4,17 @@
 //! them) and are parsed here, so every adapter shares one definition of what a request is.
 
 use crate::browse::{CommitSel, RepoQuery, RepoRequest};
+use crate::msg::{DEFAULT_LIST_LIMIT, LIST_LIMIT};
 use crate::ports::SessionId;
 use fleet_domain::error::{FleetError, Result};
-use fleet_domain::ids::{ApprovalId, DecisionId, GoalId, GroupId, RunId, TaskId, WorkerName};
+use fleet_domain::ids::{
+    ApprovalId, DecisionId, GoalId, GroupId, MessageId, RunId, TaskId, WorkerName,
+};
 use fleet_domain::limits::MAX_SEND_BYTES;
+use fleet_domain::msg::channel::ChannelDef;
 use fleet_domain::repo::RepoPath;
 use fleet_domain::run::NewTask;
-use fleet_domain::status::{ContextMode, GoalStatus};
+use fleet_domain::status::{ContextMode, GoalStatus, MessageKind};
 use fleet_domain::value::{Document, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +74,8 @@ pub enum Command {
         run: Option<RunId>,
         new_run: Option<NewRunArgs>,
         tasks: Vec<NewTask>,
+        /// Message channels the plan declares for the run.
+        channels: Vec<ChannelDef>,
     },
     StartRun {
         run: RunId,
@@ -200,6 +206,32 @@ pub enum Command {
         allow_unverified: bool,
         /// Remove the worktrees and branches of the superseded members now.
         remove_others: bool,
+    },
+    /// Channels and the newest messages, newest first; `channel` and `task` narrow them.
+    MsgList {
+        channel: Option<String>,
+        task: Option<String>,
+        limit: usize,
+    },
+    MsgShow {
+        id: MessageId,
+    },
+    /// Mutes a channel or a task: nothing is accepted from or delivered to it. `target` is a
+    /// channel (`<run>/<name>`, `channel:<ref>`) or a task (`<run>/<task>`, `task:<ref>`).
+    MsgMute {
+        target: String,
+    },
+    MsgUnmute {
+        target: String,
+    },
+    /// A message from the operator into a channel. Labelled `from operator`.
+    MsgSend {
+        channel: String,
+        to: Option<String>,
+        kind: MessageKind,
+        subject: String,
+        body: String,
+        in_reply_to: Option<MessageId>,
     },
     Shutdown,
 }
@@ -429,6 +461,15 @@ fn parse_repo_query(name: &str, a: &Args<'_>) -> Result<RepoQuery> {
         },
     })
 }
+/// The channels of a plan: `channels` is a list of tables, validated by the domain.
+fn parse_channels(v: &Value) -> Result<Vec<ChannelDef>> {
+    match v.get("channels") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items.iter().map(ChannelDef::from_value).collect(),
+        Some(_) => Err(FleetError::invalid("`channels` must be a list")),
+    }
+}
+
 /// Parses a request: its command name and its arguments object.
 pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
     let empty = Value::Object(Default::default());
@@ -465,6 +506,7 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
                     .map(parse_new_run)
                     .transpose()?,
                 tasks,
+                channels: parse_channels(args)?,
             }
         }
         "run.start" => Command::StartRun {
@@ -555,6 +597,41 @@ pub fn parse_command(name: &str, args: &Value) -> Result<Command> {
             task: a.opt_str("task")?.map(str::to_string),
             ticket: a.opt_u64("ticket")?,
         },
+        "msg.list" => Command::MsgList {
+            channel: a.opt_str("channel")?.map(str::to_string),
+            task: a.opt_str("task")?.map(str::to_string),
+            limit: a
+                .opt_u64("limit")?
+                .map_or(DEFAULT_LIST_LIMIT, |n| {
+                    usize::try_from(n).unwrap_or(usize::MAX)
+                })
+                .clamp(1, LIST_LIMIT),
+        },
+        "msg.show" => Command::MsgShow {
+            id: MessageId::parse(a.req_str("id")?)?,
+        },
+        "msg.mute" => Command::MsgMute {
+            target: a.req_str("target")?.to_string(),
+        },
+        "msg.unmute" => Command::MsgUnmute {
+            target: a.req_str("target")?.to_string(),
+        },
+        "msg.send" => Command::MsgSend {
+            channel: a.req_str("channel")?.to_string(),
+            to: a.opt_str("to")?.map(str::to_string),
+            kind: match a.opt_str("kind")? {
+                None => MessageKind::Info,
+                Some(k) => MessageKind::parse(k).ok_or_else(|| {
+                    FleetError::invalid("`kind` must be info, question, result or request")
+                })?,
+            },
+            subject: a.req_str("subject")?.to_string(),
+            body: a.req_str("body")?.to_string(),
+            in_reply_to: a
+                .opt_str("in_reply_to")?
+                .map(MessageId::parse)
+                .transpose()?,
+        },
         "repo.tree" | "repo.file" | "repo.blob" | "repo.markdown" | "repo.diff" => {
             Command::Repo(parse_repo_query(name, &a)?)
         }
@@ -635,6 +712,8 @@ pub fn is_read_only(cmd: &Command) -> bool {
             | Command::GroupList
             | Command::GroupShow { .. }
             | Command::GroupCompare { .. }
+            | Command::MsgList { .. }
+            | Command::MsgShow { .. }
     )
 }
 
@@ -713,10 +792,12 @@ mod tests {
             run,
             new_run,
             tasks,
+            channels,
         } = cmd
         else {
             panic!("wrong command")
         };
+        assert!(channels.is_empty());
         assert!(run.is_none());
         assert_eq!(new_run.unwrap().repo, "/r");
         assert_eq!(tasks.len(), 1);

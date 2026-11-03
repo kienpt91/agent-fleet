@@ -26,6 +26,7 @@ pub mod json;
 pub mod knowledge;
 pub mod logs;
 pub mod memory;
+pub mod msgfs;
 pub mod procid;
 pub mod protocol;
 pub mod pty;

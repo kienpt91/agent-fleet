@@ -116,13 +116,27 @@ pub fn render(frame: &mut Frame, model: &Model) {
         return;
     }
     let bottom = (area.height / 4).clamp(4, 8);
-    let [header, body, panels, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(bottom),
-        Constraint::Length(2),
-    ])
-    .areas(area);
+    let (header, body, messages, panels, footer) = if model.has_messages_pane() {
+        let msg_height = (area.height / 5).clamp(4, 8);
+        let [header, body, messages, panels, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(msg_height),
+            Constraint::Length(bottom),
+            Constraint::Length(2),
+        ])
+        .areas(area);
+        (header, body, Some(messages), panels, footer)
+    } else {
+        let [header, body, panels, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(bottom),
+            Constraint::Length(2),
+        ])
+        .areas(area);
+        (header, body, None, panels, footer)
+    };
 
     render_header(frame, model, header);
     let [left, right] =
@@ -146,6 +160,9 @@ pub fn render(frame: &mut Frame, model: &Model) {
                 .areas(panels);
         render_approvals(frame, model, approvals);
         render_gates(frame, model, gates);
+    }
+    if let Some(messages) = messages {
+        render_messages(frame, model, messages);
     }
     render_footer(frame, model, footer);
     if model.show_help {
@@ -534,6 +551,119 @@ fn render_forge(frame: &mut Frame, model: &Model, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// A line of `text` with a badge that survives truncation: the text gives way, the badge does not.
+fn badge_line(
+    text: &str,
+    badge: Option<(String, Style)>,
+    style: Style,
+    width: usize,
+) -> Line<'static> {
+    let Some((badge_text, badge_style)) = badge else {
+        return Line::from(Span::styled(fit(text, width), style));
+    };
+    let badge_text = fit(&format!(" {badge_text}"), width);
+    let room = width.saturating_sub(badge_text.chars().count());
+    Line::from(vec![
+        Span::styled(fit(text, room), style),
+        Span::styled(badge_text, badge_style),
+    ])
+}
+
+fn muted_badge(reason: &str) -> (String, Style) {
+    let text = if reason.is_empty() {
+        "MUTED".to_string()
+    } else {
+        format!("MUTED ({reason})")
+    };
+    (
+        text,
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn blocked_badge(reason: &str) -> (String, Style) {
+    let text = if reason.is_empty() {
+        "BLOCKED".to_string()
+    } else {
+        format!("BLOCKED ({reason})")
+    };
+    (
+        text,
+        Style::new()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Read-only view of mediated messaging: channels, muted tasks and the newest messages. Every
+/// string is unverified peer content, drawn only as plain text next to its label.
+fn render_messages(frame: &mut Frame, model: &Model, area: Rect) {
+    let focused = model.focus == Focus::Messages;
+    let block = panel(
+        format!(
+            "Messages ({} channels, {} messages)",
+            model.msg_channels.len(),
+            model.msg_rows.len()
+        ),
+        focused,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = usize::from(inner.width);
+
+    let mut items: Vec<(String, Option<(String, Style)>)> = Vec::new();
+    for c in &model.msg_channels {
+        let text = format!(
+            "{}/{} [{}] queued {} approval {} delivered {} expired {} blocked {}",
+            c.run, c.name, c.mode, c.queued, c.awaiting_approval, c.delivered, c.expired, c.blocked
+        );
+        items.push((text, c.muted.then(|| muted_badge(&c.mute_reason))));
+    }
+    for t in &model.msg_muted_tasks {
+        let on = if t.channel.is_empty() {
+            String::new()
+        } else {
+            format!(" on {}", t.channel)
+        };
+        items.push((
+            format!("task {}/{}{on}", t.run, t.task),
+            Some(muted_badge(&t.reason)),
+        ));
+    }
+    for r in &model.msg_rows {
+        let text = format!("{} {} [{}] {}", r.id, r.label, r.kind, r.subject);
+        let badge = match r.status.as_str() {
+            "blocked" => Some(blocked_badge(&r.reason)),
+            "delivered" | "" => None,
+            other => Some((other.to_string(), Style::new().fg(Color::DarkGray))),
+        };
+        items.push((text, badge));
+    }
+
+    let head = Line::from(Span::styled(
+        fit("unverified peer content (read-only)", width),
+        Style::new().fg(Color::Yellow),
+    ));
+    let visible = usize::from(inner.height.saturating_sub(1));
+    let start = window_start(model.msg_selected, visible);
+    let mut lines = vec![head];
+    for (i, (text, badge)) in items.into_iter().enumerate().skip(start).take(visible) {
+        let selected = i == model.msg_selected;
+        let style = if selected {
+            selection_style(focused)
+        } else {
+            Style::new()
+        };
+        let text = format!("{} {text}", if selected { ">" } else { " " });
+        lines.push(badge_line(&text, badge, style, width));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_footer(frame: &mut Frame, model: &Model, area: Rect) {
     let width = usize::from(area.width);
     let second = match &model.input {
@@ -583,6 +713,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let lines = [
         "j / k, Up / Down   move selection",
         "Tab                cycle panels",
+        "                   (a read-only Messages panel joins the cycle",
+        "                   when channels exist; peer text is unverified)",
         "o                  focus output pane",
         "Enter              attach to a live task",
         "                   (Ctrl-] detaches)",
@@ -893,5 +1025,168 @@ mod tests {
         assert_eq!(window_start(4, 5), 0);
         assert_eq!(window_start(5, 5), 1);
         assert_eq!(window_start(9, 0), 9);
+    }
+
+    fn sample_with_messages(subject: &str) -> Model {
+        let mut m = sample();
+        m.update_messages(&msg_list(
+            vec![
+                msg_channel("review", true, "operator froze it"),
+                msg_channel("docs", false, ""),
+            ],
+            vec![
+                msg_message("m2", subject, "blocked", "contains a secret"),
+                msg_message("m1", "all good", "delivered", ""),
+            ],
+        ));
+        m
+    }
+
+    #[test]
+    fn messages_pane_is_absent_without_channels() {
+        let m = sample();
+        let text = screen(&m, 100, 40);
+        assert!(
+            !text.contains("Messages") && !text.contains("unverified"),
+            "{text}"
+        );
+        let mut gone = sample_with_messages("x");
+        gone.clear_messages();
+        assert_eq!(screen(&gone, 100, 40), text);
+    }
+
+    #[test]
+    fn messages_pane_draws_channels_messages_and_badges() {
+        let m = sample_with_messages("hello there");
+        let text = screen(&m, 100, 40);
+        assert!(text.contains("Messages (2 channels, 2 messages)"), "{text}");
+        assert!(text.contains("unverified peer content"), "{text}");
+        assert!(text.contains("r1/review [lead]"), "{text}");
+        assert!(text.contains("MUTED (operator froze it)"), "{text}");
+        assert!(
+            text.contains(
+                "m2 from task t2 (unverified peer message) [note] hello there BLOCKED (contains a secret)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("m1 from task t2 (unverified peer message) [note] all good"),
+            "{text}"
+        );
+        // The docs channel is not muted: exactly one MUTED badge.
+        assert_eq!(text.matches("MUTED").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn muted_tasks_get_a_muted_badge() {
+        let mut m = sample_with_messages("x");
+        let mut doc = msg_list(vec![msg_channel("review", false, "")], vec![]);
+        if let Value::Object(map) = &mut doc {
+            map.insert(
+                "muted_tasks".into(),
+                Value::array([Value::object([
+                    ("run", Value::str("r1")),
+                    ("task", Value::str("t9")),
+                    ("reason", Value::str("noisy")),
+                ])]),
+            );
+        }
+        m.update_messages(&doc);
+        let text = screen(&m, 100, 40);
+        assert!(text.contains("task r1/t9 MUTED (noisy)"), "{text}");
+    }
+
+    #[test]
+    fn a_task_muted_on_one_channel_names_the_channel() {
+        let mut m = sample_with_messages("x");
+        let mut doc = msg_list(vec![msg_channel("review", false, "")], vec![]);
+        if let Value::Object(map) = &mut doc {
+            map.insert(
+                "muted_tasks".into(),
+                Value::array([Value::object([
+                    ("run", Value::str("r1")),
+                    ("task", Value::str("t9")),
+                    ("channel", Value::str("review")),
+                    ("reason", Value::str("reply-depth")),
+                ])]),
+            );
+        }
+        m.update_messages(&doc);
+        let text = screen(&m, 100, 40);
+        assert!(
+            text.contains("task r1/t9 on review MUTED (reply-depth)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn long_message_subjects_are_truncated_and_keep_the_badge() {
+        let m = sample_with_messages(&"z".repeat(3000));
+        let text = screen(&m, 100, 40);
+        let longest = text.split(|c| c != 'z').map(str::len).max().unwrap_or(0);
+        assert!(longest <= 100, "{longest}");
+        assert!(text.contains("BLOCKED (contains a secret)"), "{text}");
+    }
+
+    #[test]
+    fn hostile_message_text_never_reaches_the_buffer_as_control_characters() {
+        let evil = "t\x1b]52;c;AAAA\x07\x1b[2J\u{202e}evil\u{2066}\n\r\x00\x07";
+        let mut row = msg_message(evil, evil, "blocked", evil);
+        if let Value::Object(map) = &mut row {
+            map.insert("label".into(), Value::str(evil));
+            map.insert("kind".into(), Value::str(evil));
+        }
+        let mut m = sample();
+        m.update_messages(&msg_list(vec![msg_channel(evil, true, evil)], vec![row]));
+        m.message = evil.to_string();
+        for focus in [Focus::Tasks, Focus::Messages] {
+            m.focus = focus;
+            let buf = draw(&m, 120, 40);
+            for cell in buf.content() {
+                for c in cell.symbol().chars() {
+                    assert!(
+                        !c.is_control() && !fleet_domain::ids::is_invisible(c),
+                        "control or invisible char {c:?} in buffer"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn messages_pane_scrolls_to_keep_the_selection_visible() {
+        let many: Vec<Value> = (0..30)
+            .map(|i| msg_message(&format!("m{i:02}"), "s", "queued", ""))
+            .collect();
+        let mut m = sample();
+        m.update_messages(&msg_list(vec![msg_channel("review", false, "")], many));
+        m.focus = Focus::Messages;
+        m.move_selection(25);
+        let text = screen(&m, 100, 40);
+        assert!(text.contains("> m24 "), "{text}");
+        assert!(!text.contains("m00 "), "{text}");
+    }
+
+    #[test]
+    fn messages_pane_renders_at_small_sizes_without_panicking() {
+        let mut m = sample_with_messages("subject");
+        for (w, h) in [
+            (0, 0),
+            (1, 1),
+            (40, 10),
+            (41, 11),
+            (45, 12),
+            (60, 14),
+            (100, 9),
+            (120, 20),
+        ] {
+            let _ = screen(&m, w, h);
+        }
+        m.focus = Focus::Messages;
+        m.show_help = true;
+        m.input = Some("typing".into());
+        for (w, h) in [(40, 10), (45, 12), (60, 10), (80, 24)] {
+            let _ = screen(&m, w, h);
+        }
     }
 }

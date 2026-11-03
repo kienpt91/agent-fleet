@@ -10,6 +10,7 @@ use fleet_domain::limits::{
     MAX_ENV_ALLOW, MAX_GATES_CONFIGURED, MAX_RETRIES_CEILING, MAX_SESSIONS_HARD,
     MAX_WORKERS_CONFIGURED,
 };
+use fleet_domain::msg::limits::MessagingLimits;
 use fleet_domain::quality::GateFormat;
 use fleet_domain::redact::Redactor;
 use fleet_domain::repo::view::ImageLimits;
@@ -154,6 +155,8 @@ pub struct AppConfig {
     pub forge: ForgeConfig,
     /// The criteria `fleet compare` ranks fan-out members by when the request names none.
     pub compare_rank: fleet_fanout::rank::RankRule,
+    /// Limits and switches of the message channels (`[messages]`).
+    pub messaging: MessagingLimits,
 }
 
 impl AppConfig {
@@ -183,6 +186,7 @@ impl AppConfig {
             redactor: Arc::new(redactor),
             forge: ForgeConfig::disabled(),
             compare_rank: fleet_fanout::rank::RankRule::default(),
+            messaging: MessagingLimits::default(),
         }
     }
 
@@ -290,6 +294,7 @@ impl AppConfig {
             }
         }
         self.forge.validate()?;
+        self.messaging.validate()?;
         Ok(())
     }
 

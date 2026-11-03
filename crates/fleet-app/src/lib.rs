@@ -15,6 +15,7 @@ pub mod browse;
 pub mod config;
 mod fanout;
 pub mod forge;
+pub mod msg;
 pub mod neo;
 pub mod orchestrator;
 pub mod ports;

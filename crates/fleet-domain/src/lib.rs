@@ -22,6 +22,7 @@ pub mod events;
 pub mod fleet;
 pub mod ids;
 pub mod limits;
+pub mod msg;
 pub mod output;
 pub mod quality;
 pub mod redact;

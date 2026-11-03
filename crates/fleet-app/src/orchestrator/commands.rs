@@ -10,6 +10,7 @@ use fleet_domain::error::{ErrorCode, FleetError, Result};
 use fleet_domain::events::DomainEvent;
 use fleet_domain::fleet::{MergeGate, NewRun};
 use fleet_domain::ids::{RunId, TaskId};
+use fleet_domain::msg::channel::ChannelDef;
 use fleet_domain::run::NewTask;
 use fleet_domain::sanitize::sanitize_text;
 use fleet_domain::status::{ContextMode, EndKind, TaskStatus};
@@ -42,7 +43,8 @@ impl Orchestrator {
                 run,
                 new_run,
                 tasks,
-            } => self.load_plan(run, new_run, tasks),
+                channels,
+            } => self.load_plan(run, new_run, tasks, channels),
             Command::StartRun { run, max_parallel } => self.start_run(&run, max_parallel),
             Command::Stop { task } => self.stop(&task),
             Command::Retry { task } => self.retry(&task),
@@ -57,7 +59,9 @@ impl Orchestrator {
             Command::Attach { task } => self.attach(&task),
             Command::GateList => Ok(self.gate_list()),
             Command::ResolveGate { id, answer } => {
-                let events = self.state.resolve_decision(&id, &answer)?;
+                let mut events = self.state.resolve_decision(&id, &answer)?;
+                // an answer to the gate of an automatic mute may unmute what was muted
+                events.extend(self.board.answer_gate(&id, answer.trim(), self.now()));
                 let task = self
                     .state
                     .decision(&id)
@@ -139,6 +143,29 @@ impl Orchestrator {
                 allow_unverified,
                 remove_others,
             } => self.group_pick(&group, &task, allow_unverified, remove_others),
+            Command::MsgList {
+                channel,
+                task,
+                limit,
+            } => self.msg_list(channel.as_deref(), task.as_deref(), limit),
+            Command::MsgShow { id } => self.msg_show(&id),
+            Command::MsgMute { target } => self.msg_mute(&target, true),
+            Command::MsgUnmute { target } => self.msg_mute(&target, false),
+            Command::MsgSend {
+                channel,
+                to,
+                kind,
+                subject,
+                body,
+                in_reply_to,
+            } => self.msg_send(
+                &channel,
+                to.as_deref(),
+                kind,
+                &subject,
+                &body,
+                in_reply_to.as_ref(),
+            ),
             Command::Shutdown => {
                 self.shutdown_requested = true;
                 self.begin_shutdown();
@@ -295,8 +322,9 @@ impl Orchestrator {
         run: Option<RunId>,
         new_run: Option<NewRunArgs>,
         tasks: Vec<NewTask>,
+        channels: Vec<ChannelDef>,
     ) -> Result<Reply> {
-        let run_id = match (run, new_run) {
+        let (run_id, new_event) = match (run, new_run) {
             (Some(_), Some(_)) => {
                 return Err(FleetError::invalid(
                     "a plan names an existing run or describes a new one, not both",
@@ -309,9 +337,18 @@ impl Orchestrator {
             }
             (Some(r), None) => {
                 self.refuse_group_dependencies(&r, &tasks)?;
-                // Validate the tasks against the run before changing anything.
-                self.state.add_tasks(&r, tasks.clone())?;
-                r
+                // Validate the tasks and channels against the run before changing anything.
+                let (ids, _) = self.state.add_tasks(&r, tasks.clone())?;
+                let mut known: BTreeSet<TaskId> = self
+                    .state
+                    .run(&r)?
+                    .tasks()
+                    .iter()
+                    .map(|t| t.id.clone())
+                    .collect();
+                known.extend(ids);
+                self.check_channels(&r, &known, &channels)?;
+                (r, None)
             }
             (None, Some(args)) => {
                 let (id, event) = self.create_run_event(args)?;
@@ -319,13 +356,29 @@ impl Orchestrator {
                 // scratch copy of the state so an invalid plan creates nothing.
                 let mut scratch = fleet_domain::fleet::FleetState::new();
                 scratch.apply(&event);
-                scratch.add_tasks(&id, tasks.clone())?;
-                self.commit(vec![event])?;
-                self.record_forge_repo(&id);
-                id
+                let (ids, _) = scratch.add_tasks(&id, tasks.clone())?;
+                self.check_channels(&id, &ids.into_iter().collect(), &channels)?;
+                (id, Some(event))
             }
         };
-        self.add_tasks(&run_id, tasks, "fleet.plan/1")
+        if let Some(event) = new_event {
+            self.commit(vec![event])?;
+            self.record_forge_repo(&run_id);
+        }
+        // the channels exist before the first task can start, so its brief and its directories know them
+        let opened = self.channel_events(&run_id, &channels)?;
+        self.commit(opened)?;
+        let reply = self.add_tasks(&run_id, tasks, "fleet.plan/1")?;
+        match reply {
+            Reply::Data(Value::Object(mut map)) if !channels.is_empty() => {
+                map.insert(
+                    "channels".to_string(),
+                    Value::array(channels.iter().map(|c| Value::str(c.name.as_str()))),
+                );
+                Ok(Reply::Data(Value::Object(map)))
+            }
+            other => Ok(other),
+        }
     }
 
     fn start_run(&mut self, run: &RunId, max_parallel: Option<u32>) -> Result<Reply> {

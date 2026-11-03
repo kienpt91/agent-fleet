@@ -263,3 +263,13 @@ What exists after N2, how it is checked, and what does not exist.
 
 N2 as built: everything above, the crash-safe handoff of ADR 18, the end-to-end tests in
 `crates/fleet-cli/tests/e2e_context.rs` and the demo `scripts/neo-n2-demo.sh` (its output is in the README).
+
+## Agent messages and the context compiler
+
+Agent-to-agent messages (ADR 24 to 26) are not part of a context pack: the compiler reads fleet's own state (plan, goal
+ledger, results of fleet's own checks, recorded events) and no message text enters layers 1 to 8, a verification contract,
+an approval or any field a check or a status is computed from. What a worker is told about its channels and about the few
+messages waiting for it is the `## Messages` section of the brief, built by the same code for a plain brief and for the
+short brief that points at a compiled pack: every sender is labelled `from task <id> (unverified peer message)` (or
+`from operator`), each subject is one flattened, quoted, bounded line, and the words of a message are read from
+`.fleet/inbox/` only. Message ids and digests may be cited as provenance; their words are never evidence.

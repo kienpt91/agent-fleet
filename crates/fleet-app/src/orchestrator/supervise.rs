@@ -120,6 +120,8 @@ impl Orchestrator {
             ));
         }
         self.stash_worker_summary(key, &live.worktree);
+        // a message written just before the worker exited is still a message
+        self.read_outbox_of(key, &live.worktree, live.attempt);
         let end = self.worker_end(
             &live.worktree,
             live.attempt,

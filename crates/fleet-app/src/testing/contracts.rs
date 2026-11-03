@@ -61,11 +61,12 @@ use fleet_domain::contract::{
 use fleet_domain::error::{ErrorCode, FleetError};
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::{
-    ApprovalId, DecisionId, EvidenceId, GoalId, GroupId, RunId, Sha, TaskId, WorkerName,
+    ApprovalId, ChannelName, DecisionId, EvidenceId, GoalId, GroupId, MessageId, RunId, Sha,
+    TaskId, WorkerName,
 };
 use fleet_domain::status::{
-    BlockKind, CloseReason, ContextMode, DecisionKind, EndKind, GoalStatus, MemberOutcome, Purpose,
-    Verdict,
+    BlockKind, BlockReason, ChannelDirection, ChannelMode, CloseReason, ContextMode, DecisionKind,
+    EndKind, ExpireReason, GoalStatus, MemberOutcome, MessageKind, MuteReason, Purpose, Verdict,
 };
 use fleet_domain::value::{Document, Value};
 use std::fmt::Debug;
@@ -416,6 +417,75 @@ fn sample_events() -> Vec<DomainEvent> {
             run: RunId::parse("r1").unwrap(),
             task: TaskId::parse("t1").unwrap(),
             reason: tricky.into(),
+        },
+        DomainEvent::ChannelOpened {
+            run: run_id(),
+            channel: ChannelName::parse("review").unwrap(),
+            members: vec!["task:t1".into(), "role:agent".into()],
+            lead: None,
+            mode: ChannelMode::Direct,
+            direction: ChannelDirection::Both,
+            max_message_bytes: 2048,
+            max_messages_per_task: 20,
+            max_messages_per_minute: 10,
+            ttl_secs: 900,
+            requires_approval: false,
+        },
+        DomainEvent::MessageSubmitted {
+            id: MessageId::from_seq(1),
+            run: run_id(),
+            channel: ChannelName::parse("review").unwrap(),
+            from: "task:t1".into(),
+            to: vec![TaskId::parse("t2").unwrap()],
+            kind: MessageKind::Question,
+            subject: tricky.into(),
+            body: tricky.into(),
+            in_reply_to: None,
+            depth: 0,
+            digest: "ab".repeat(32),
+            at_ms: 1,
+            expires_ms: 4_294_967_296,
+            approval: None,
+            source: Some("outbox:1:1.json".into()),
+        },
+        DomainEvent::MessageDelivered {
+            id: MessageId::from_seq(1),
+            to: TaskId::parse("t2").unwrap(),
+            at_ms: 2,
+        },
+        DomainEvent::MessageBlocked {
+            id: MessageId::from_seq(2),
+            run: run_id(),
+            channel: "review".into(),
+            from: "task:t1".into(),
+            reason: BlockReason::SecretShape,
+            detail: "github-token".into(),
+            digest: "cd".repeat(32),
+            bytes: 40,
+            at_ms: 3,
+            source: None,
+        },
+        DomainEvent::MessageExpired {
+            id: MessageId::from_seq(1),
+            to: TaskId::parse("t3").unwrap(),
+            reason: ExpireReason::Ttl,
+            at_ms: 4,
+        },
+        DomainEvent::ChannelMuted {
+            run: run_id(),
+            channel: Some(ChannelName::parse("review").unwrap()),
+            task: None,
+            reason: MuteReason::PairBudget,
+            by: "auto".into(),
+            gate: Some(DecisionId::from_seq(1)),
+            at_ms: 5,
+        },
+        DomainEvent::ChannelUnmuted {
+            run: run_id(),
+            channel: Some(ChannelName::parse("review").unwrap()),
+            task: None,
+            by: "operator".into(),
+            at_ms: 6,
         },
     ]
 }

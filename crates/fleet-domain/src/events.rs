@@ -2,11 +2,12 @@
 //! the audit log is their serialized form, so the field names here are a stable format.
 
 use crate::ids::{
-    ApprovalId, DecisionId, EvidenceId, GoalId, GroupId, RunId, Sha, TaskId, WorkerName,
+    ApprovalId, ChannelName, DecisionId, EvidenceId, GoalId, GroupId, MessageId, RunId, Sha,
+    TaskId, WorkerName,
 };
 use crate::status::{
-    BlockKind, CloseReason, ContextMode, DecisionKind, EndKind, GoalStatus, MemberOutcome, Purpose,
-    Verdict,
+    BlockKind, BlockReason, ChannelDirection, ChannelMode, CloseReason, ContextMode, DecisionKind,
+    EndKind, ExpireReason, GoalStatus, MemberOutcome, MessageKind, MuteReason, Purpose, Verdict,
 };
 use crate::value::{Document, Field, Value};
 use std::collections::BTreeMap;
@@ -211,6 +212,44 @@ define_events! {
         group: GroupId, task: TaskId, merge_sha: Sha, verification: String, superseded: Vec<TaskId>,
     },
     GroupClosed = "group_closed" { group: GroupId, reason: CloseReason },
+    /// An operator declared a channel for the tasks of a run. `members` are `task:<id>` and
+    /// `role:<worker>` entries; `lead` is one of them.
+    ChannelOpened = "channel_opened" {
+        run: RunId, channel: ChannelName, members: Vec<String>, lead: Option<String>,
+        mode: ChannelMode, direction: ChannelDirection, max_message_bytes: u64,
+        max_messages_per_task: u64, max_messages_per_minute: u64, ttl_secs: u64,
+        requires_approval: bool,
+    },
+    /// A message was accepted: sanitized, redacted, within its channel's limits. `to` are the
+    /// tasks it is for; `from` is `task:<id>` or `operator`; `approval` is the approval a person
+    /// must give first, when the channel requires one. The content is untrusted peer content.
+    MessageSubmitted = "message_submitted" {
+        id: MessageId, run: RunId, channel: ChannelName, from: String, to: Vec<TaskId>,
+        kind: MessageKind, subject: String, body: String, in_reply_to: Option<MessageId>,
+        depth: u32, digest: String, at_ms: u64, expires_ms: u64, approval: Option<ApprovalId>,
+        source: Option<String>,
+    },
+    /// A message was written to the inbox of a running task.
+    MessageDelivered = "message_delivered" { id: MessageId, to: TaskId, at_ms: u64 },
+    /// A message was refused. Its text is not recorded, only its size and a digest; a message
+    /// that was already accepted and then denied by a person is refused with the same event.
+    MessageBlocked = "message_blocked" {
+        id: MessageId, run: RunId, channel: String, from: String, reason: BlockReason,
+        detail: String, digest: String, bytes: u64, at_ms: u64, source: Option<String>,
+    },
+    /// A message was not delivered to one recipient and will not be.
+    MessageExpired = "message_expired" {
+        id: MessageId, to: TaskId, reason: ExpireReason, at_ms: u64,
+    },
+    /// A channel (or, with `task`, one task on every channel) was muted: nothing is accepted or
+    /// delivered until it is unmuted. `by` is `operator`, `auto` or the gate that did it.
+    ChannelMuted = "channel_muted" {
+        run: RunId, channel: Option<ChannelName>, task: Option<TaskId>, reason: MuteReason,
+        by: String, gate: Option<DecisionId>, at_ms: u64,
+    },
+    ChannelUnmuted = "channel_unmuted" {
+        run: RunId, channel: Option<ChannelName>, task: Option<TaskId>, by: String, at_ms: u64,
+    },
 }
 
 impl DomainEvent {
@@ -249,7 +288,12 @@ impl DomainEvent {
             | ForgeRepoRecorded { run, .. }
             | PullRequestStarted { run, .. }
             | PullRequestOpened { run, .. }
-            | PullRequestFailed { run, .. } => Some(run),
+            | PullRequestFailed { run, .. }
+            | ChannelOpened { run, .. }
+            | MessageSubmitted { run, .. }
+            | MessageBlocked { run, .. }
+            | ChannelMuted { run, .. }
+            | ChannelUnmuted { run, .. } => Some(run),
             DaemonStarted { .. }
             | DecisionResolved { .. }
             | ApprovalDecided { .. }
@@ -264,6 +308,8 @@ impl DomainEvent {
             | MemberFinished { .. }
             | WinnerPicked { .. }
             | GroupClosed { .. }
+            | MessageDelivered { .. }
+            | MessageExpired { .. }
             | Warning { .. } => None,
         }
     }
@@ -301,7 +347,10 @@ impl DomainEvent {
             | PullRequestOpened { task, .. }
             | PullRequestFailed { task, .. }
             | MemberFinished { task, .. }
-            | WinnerPicked { task, .. } => Some(task),
+            | WinnerPicked { task, .. }
+            | MessageDelivered { to: task, .. }
+            | MessageExpired { to: task, .. } => Some(task),
+            ChannelMuted { task, .. } | ChannelUnmuted { task, .. } => task.as_ref(),
             DaemonStarted { .. }
             | RunCreated { .. }
             | RunStarted { .. }
@@ -318,6 +367,9 @@ impl DomainEvent {
             | ForgeRepoRecorded { .. }
             | GroupCreated { .. }
             | GroupClosed { .. }
+            | ChannelOpened { .. }
+            | MessageSubmitted { .. }
+            | MessageBlocked { .. }
             | Warning { .. } => None,
         }
     }
@@ -445,6 +497,34 @@ impl DomainEvent {
             } => format!("fan-out {group}: {task} {outcome}"),
             WinnerPicked { group, task, .. } => format!("fan-out {group}: {task} picked"),
             GroupClosed { group, reason } => format!("fan-out {group} closed ({reason})"),
+            ChannelOpened { run, channel, .. } => format!("channel {channel} opened in run {run}"),
+            MessageSubmitted {
+                id,
+                channel,
+                from,
+                to,
+                ..
+            } => format!("message {id} from {from} to {} on {channel}", to.len()),
+            MessageDelivered { id, to, .. } => format!("message {id} delivered to {to}"),
+            MessageBlocked { id, reason, .. } => format!("message {id} blocked ({reason})"),
+            MessageExpired { id, to, reason, .. } => {
+                format!("message {id} expired for {to} ({reason})")
+            }
+            ChannelMuted {
+                channel,
+                task,
+                reason,
+                ..
+            } => match (channel, task) {
+                (Some(c), _) => format!("channel {c} muted ({reason})"),
+                (None, Some(t)) => format!("task {t} muted ({reason})"),
+                (None, None) => format!("muted ({reason})"),
+            },
+            ChannelUnmuted { channel, task, .. } => match (channel, task) {
+                (Some(c), _) => format!("channel {c} unmuted"),
+                (None, Some(t)) => format!("task {t} unmuted"),
+                (None, None) => "unmuted".to_string(),
+            },
         }
     }
 }
@@ -820,5 +900,130 @@ mod tests {
             message: "\u{1b}]0;x".into(),
         };
         assert_eq!(w.headline(), "warning");
+    }
+
+    fn message_events() -> Vec<DomainEvent> {
+        let m = MessageId::from_seq(3);
+        vec![
+            DomainEvent::ChannelOpened {
+                run: run(),
+                channel: ChannelName::parse("review").unwrap(),
+                members: vec!["task:a".into(), "role:agent".into()],
+                lead: Some("task:a".into()),
+                mode: ChannelMode::Broadcast,
+                direction: ChannelDirection::ToLead,
+                max_message_bytes: 2048,
+                max_messages_per_task: 20,
+                max_messages_per_minute: 10,
+                ttl_secs: 900,
+                requires_approval: true,
+            },
+            DomainEvent::MessageSubmitted {
+                id: m.clone(),
+                run: run(),
+                channel: ChannelName::parse("review").unwrap(),
+                from: "task:t1".into(),
+                to: vec![TaskId::parse("t2").unwrap()],
+                kind: MessageKind::Question,
+                subject: "s".into(),
+                body: "line\nline".into(),
+                in_reply_to: Some(MessageId::from_seq(1)),
+                depth: 2,
+                digest: "d".into(),
+                at_ms: 5,
+                expires_ms: 905,
+                approval: Some(ApprovalId::from_seq(2)),
+                source: Some("outbox:1:1.json".into()),
+            },
+            DomainEvent::MessageDelivered {
+                id: m.clone(),
+                to: TaskId::parse("t2").unwrap(),
+                at_ms: 6,
+            },
+            DomainEvent::MessageBlocked {
+                id: MessageId::from_seq(4),
+                run: run(),
+                channel: "review".into(),
+                from: "task:t1".into(),
+                reason: BlockReason::SecretShape,
+                detail: "github-token".into(),
+                digest: "d".into(),
+                bytes: 41,
+                at_ms: 7,
+                source: None,
+            },
+            DomainEvent::MessageExpired {
+                id: m,
+                to: TaskId::parse("t2").unwrap(),
+                reason: ExpireReason::Ttl,
+                at_ms: 8,
+            },
+            DomainEvent::ChannelMuted {
+                run: run(),
+                channel: Some(ChannelName::parse("review").unwrap()),
+                task: None,
+                reason: MuteReason::ReplyDepth,
+                by: "auto".into(),
+                gate: Some(DecisionId::from_seq(1)),
+                at_ms: 9,
+            },
+            DomainEvent::ChannelUnmuted {
+                run: run(),
+                channel: None,
+                task: Some(task()),
+                by: "operator".into(),
+                at_ms: 10,
+            },
+        ]
+    }
+
+    #[test]
+    fn message_events_round_trip_through_the_log_encoding() {
+        for ev in message_events() {
+            let decoded = DomainEvent::from_value(&ev.to_value()).unwrap();
+            assert_eq!(decoded, ev, "{}", ev.kind());
+        }
+        for kind in [
+            "channel_opened",
+            "message_submitted",
+            "message_delivered",
+            "message_blocked",
+            "message_expired",
+            "channel_muted",
+            "channel_unmuted",
+        ] {
+            assert!(DomainEvent::KINDS.contains(&kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_damaged_message_event_is_rejected_not_half_decoded() {
+        let ev = &message_events()[1];
+        let Value::Object(mut map) = ev.to_value() else {
+            panic!()
+        };
+        map.insert("kind".into(), Value::str("approval"));
+        assert!(DomainEvent::from_value(&Value::Object(map.clone())).is_err());
+        map.insert("kind".into(), Value::str("info"));
+        map.insert("id".into(), Value::str("g3"));
+        assert!(DomainEvent::from_value(&Value::Object(map)).is_err());
+    }
+
+    #[test]
+    fn message_headlines_carry_ids_and_reasons_but_never_text() {
+        let heads: Vec<String> = message_events().iter().map(DomainEvent::headline).collect();
+        assert_eq!(heads[0], "channel review opened in run r1");
+        assert_eq!(heads[1], "message m3 from task:t1 to 1 on review");
+        assert_eq!(heads[2], "message m3 delivered to t2");
+        assert_eq!(heads[3], "message m4 blocked (secret-shape)");
+        assert_eq!(heads[4], "message m3 expired for t2 (ttl)");
+        assert_eq!(heads[5], "channel review muted (reply-depth)");
+        assert_eq!(heads[6], "task t1 unmuted");
+        for h in &heads {
+            assert!(!h.contains("line"), "{h}");
+        }
+        let events = message_events();
+        assert_eq!(events[1].run(), Some(&run()));
+        assert_eq!(events[2].run(), None);
     }
 }

@@ -8,6 +8,7 @@
 
 pub mod contracts;
 pub mod forge;
+pub mod mail_contracts;
 pub mod repo;
 
 use crate::config::{AppConfig, WorkerDef};
@@ -17,9 +18,12 @@ use fleet_domain::approval::Digest;
 use fleet_domain::contract::{ContractRead, WorkerHandoff, WorkerQuestion, WorkerResult};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{ApprovalId, RunId, Sha, TaskId, WorkerName};
+use fleet_domain::ids::{ApprovalId, ChannelName, MessageId, RunId, Sha, TaskId, WorkerName};
+use fleet_domain::msg::inbox::InboxItem;
+use fleet_domain::msg::message::OutboxMessage;
 use fleet_domain::output::Chunk;
 use fleet_domain::quality::GateOutcome;
+use fleet_domain::status::MessageKind;
 use fleet_domain::status::Verdict;
 use fleet_domain::supervision::{LiveSession, ProcessIdentity};
 use fleet_domain::value::Value;
@@ -135,6 +139,18 @@ struct Inner {
     undo_available: bool,
     undo_calls: Vec<String>,
     undo_fails: bool,
+
+    outboxes: BTreeMap<String, BTreeMap<String, OutboxRead>>,
+    outbox_refused: BTreeMap<String, String>,
+    settled: Vec<(String, String, bool)>,
+    fail_settle: bool,
+    inboxes: BTreeMap<String, Vec<InboxItem>>,
+    inbox_strays: BTreeMap<String, Vec<String>>,
+    fail_inbox: bool,
+    fail_prepare_mail: bool,
+    mail_prepared: Vec<String>,
+    notices: Vec<(SessionId, String)>,
+    redact_literals: Vec<String>,
 }
 
 /// Shared handle to the state behind all fakes.
@@ -168,6 +184,9 @@ impl World {
             vcs: Box::new(FakeVcs(self.clone())),
             sessions: Box::new(FakeSessions(self.clone())),
             contract: Box::new(FakeContract(self.clone())),
+            outbox: Box::new(FakeOutbox(self.clone())),
+            inbox: Box::new(FakeInbox(self.clone())),
+            redact: Box::new(FakeRedact(self.clone())),
             jobs: Box::new(FakeJobs(self.clone())),
             logs: Box::new(MemoryLogs(self.clone())),
             undo: Box::new(FakeUndo(self.clone())),
@@ -270,6 +289,15 @@ impl World {
             .rev()
             .find(|(_, s)| s.spec.task.as_str() == task && !s.released)
             .map(|(k, _)| SessionId(*k))
+    }
+    /// The live sessions of one run, by task id.
+    pub fn sessions_of_run(&self, run: &str) -> Vec<(String, SessionId)> {
+        self.lock()
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.spec.run.as_str() == run && !s.released)
+            .map(|(k, s)| (s.spec.task.to_string(), SessionId(*k)))
+            .collect()
     }
     pub fn exit(&self, id: SessionId, code: i64) {
         if let Some(s) = self.lock().sessions.get_mut(&id.0) {
@@ -538,6 +566,111 @@ impl World {
     }
     pub fn undo_calls(&self) -> Vec<String> {
         self.lock().undo_calls.clone()
+    }
+    // ---- messages ----
+    /// Plants a message in the outbox of a worktree as the reader would return it.
+    pub fn write_outbox(&self, worktree: &str, name: &str, read: OutboxRead) {
+        self.lock()
+            .outboxes
+            .entry(worktree.to_string())
+            .or_default()
+            .insert(name.to_string(), read);
+    }
+
+    /// A well-formed message file `name` written by the worker in `worktree`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_message(
+        &self,
+        worktree: &str,
+        name: &str,
+        channel: &str,
+        to: Option<&str>,
+        kind: MessageKind,
+        subject: &str,
+        body: &str,
+    ) {
+        self.write_outbox(
+            worktree,
+            name,
+            OutboxRead::Valid(OutboxMessage {
+                channel: ChannelName::parse(channel).unwrap(),
+                to: to.map(|t| TaskId::parse(t).unwrap()),
+                kind,
+                subject: subject.to_string(),
+                body: body.to_string(),
+                in_reply_to: None,
+            }),
+        );
+    }
+
+    /// Makes the outbox of a worktree unreadable (a link, say).
+    pub fn refuse_outbox(&self, worktree: &str, why: &str) {
+        self.lock()
+            .outbox_refused
+            .insert(worktree.to_string(), why.to_string());
+    }
+
+    /// The names still in the outbox of a worktree.
+    pub fn outbox_names(&self, worktree: &str) -> Vec<String> {
+        let g = self.lock();
+        let mut names: Vec<String> = g
+            .outboxes
+            .get(worktree)
+            .map(|f| f.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort_by_key(|n| outbox_order(n));
+        names
+    }
+
+    /// Every `(worktree, file, accepted)` the daemon settled.
+    pub fn settled_files(&self) -> Vec<(String, String, bool)> {
+        self.lock().settled.clone()
+    }
+
+    pub fn fail_settle(&self, fail: bool) {
+        self.lock().fail_settle = fail;
+    }
+
+    /// What the daemon put in the inbox of a worktree.
+    pub fn inbox(&self, worktree: &str) -> Vec<InboxItem> {
+        self.lock()
+            .inboxes
+            .get(worktree)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A file the worker made in its inbox; the next write reports and removes it.
+    pub fn plant_inbox_stray(&self, worktree: &str, name: &str) {
+        self.lock()
+            .inbox_strays
+            .entry(worktree.to_string())
+            .or_default()
+            .push(name.to_string());
+    }
+
+    /// Makes writing an inbox fail as it does when the worker replaced `inbox` by a link.
+    pub fn fail_inbox(&self, fail: bool) {
+        self.lock().fail_inbox = fail;
+    }
+
+    pub fn fail_prepare_mail(&self, fail: bool) {
+        self.lock().fail_prepare_mail = fail;
+    }
+
+    /// The worktrees whose message directories were prepared.
+    pub fn mail_prepared(&self) -> Vec<String> {
+        self.lock().mail_prepared.clone()
+    }
+
+    /// The lines typed into terminals by `notify_input`.
+    pub fn notices(&self) -> Vec<(SessionId, String)> {
+        self.lock().notices.clone()
+    }
+
+    /// Text the fake redactor masks.
+    pub fn redact_literal(&self, literal: &str) {
+        self.lock().redact_literals.push(literal.to_string());
     }
 }
 
@@ -1032,6 +1165,16 @@ impl SessionHost for FakeSessions {
         g.terminated.push(identity.clone());
         SignalOutcome::Sent
     }
+
+    fn notify(&mut self, id: SessionId, line: &str) -> Result<()> {
+        let mut g = self.0.lock();
+        match g.sessions.get(&id.0) {
+            Some(s) if s.state == SessionState::Running => {}
+            _ => return Err(FleetError::conflict("the session is not running")),
+        }
+        g.notices.push((id, line.to_string()));
+        Ok(())
+    }
 }
 
 // ---- worker files --------------------------------------------------------------------------
@@ -1226,6 +1369,123 @@ impl KnowledgeSource for FakeKnowledge {
             Some(message) => Err(FleetError::invalid(message.clone())),
             None => Ok(g.knowledge.clone()),
         }
+    }
+}
+
+// ---- messages between agents ----------------------------------------------------------------------
+
+pub struct FakeOutbox(World);
+
+fn outbox_order(name: &str) -> (u64, String) {
+    let n = name
+        .strip_suffix(".json")
+        .and_then(|d| d.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    (n, name.to_string())
+}
+
+impl OutboxReader for FakeOutbox {
+    fn scan(&self, worktree: &str, max: usize) -> OutboxScan {
+        let g = self.0.lock();
+        if let Some(why) = g.outbox_refused.get(worktree) {
+            return OutboxScan {
+                items: Vec::new(),
+                refused: Some(why.clone()),
+            };
+        }
+        let mut items: Vec<OutboxItem> = g
+            .outboxes
+            .get(worktree)
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|(name, read)| OutboxItem {
+                        name: name.clone(),
+                        read: read.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        items.sort_by_key(|i| outbox_order(&i.name));
+        items.truncate(max);
+        OutboxScan {
+            items,
+            refused: None,
+        }
+    }
+
+    fn settle(&self, worktree: &str, name: &str, accepted: bool) -> Result<()> {
+        if outbox_order(name).0 == u64::MAX {
+            return Err(FleetError::invalid("not an outbox file name"));
+        }
+        let mut g = self.0.lock();
+        if g.fail_settle {
+            return Err(FleetError::internal("the outbox is not writable"));
+        }
+        if let Some(files) = g.outboxes.get_mut(worktree) {
+            files.remove(name);
+        }
+        g.settled
+            .push((worktree.to_string(), name.to_string(), accepted));
+        Ok(())
+    }
+}
+
+pub struct FakeInbox(World);
+
+impl InboxWriter for FakeInbox {
+    fn prepare(&self, worktree: &str, items: &[InboxItem]) -> Result<InboxReport> {
+        let mut g = self.0.lock();
+        if g.fail_prepare_mail {
+            return Err(FleetError::internal(
+                "the message directories are not writable",
+            ));
+        }
+        g.mail_prepared.push(worktree.to_string());
+        g.outboxes.remove(worktree);
+        let report = InboxReport {
+            written: items.iter().map(|i| i.id.clone()).collect(),
+            removed: g.inbox_strays.remove(worktree).unwrap_or_default(),
+        };
+        g.inboxes.insert(worktree.to_string(), items.to_vec());
+        Ok(report)
+    }
+
+    fn sync(&self, worktree: &str, items: &[InboxItem]) -> Result<InboxReport> {
+        let mut g = self.0.lock();
+        if g.fail_inbox {
+            return Err(FleetError::forbidden(
+                "the inbox is a link; refusing to write",
+            ));
+        }
+        let before: Vec<MessageId> = g
+            .inboxes
+            .get(worktree)
+            .map(|v| v.iter().map(|i| i.id.clone()).collect())
+            .unwrap_or_default();
+        let report = InboxReport {
+            written: items
+                .iter()
+                .filter(|i| !before.contains(&i.id))
+                .map(|i| i.id.clone())
+                .collect(),
+            removed: g.inbox_strays.remove(worktree).unwrap_or_default(),
+        };
+        g.inboxes.insert(worktree.to_string(), items.to_vec());
+        Ok(report)
+    }
+}
+
+pub struct FakeRedact(World);
+
+impl TextRedactor for FakeRedact {
+    fn redact(&self, text: &str) -> String {
+        let g = self.0.lock();
+        let mut out = text.to_string();
+        for lit in &g.redact_literals {
+            out = out.replace(lit.as_str(), "[REDACTED]");
+        }
+        out
     }
 }
 

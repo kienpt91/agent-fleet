@@ -2130,6 +2130,100 @@ fn goal_documents_cannot_be_changed_over_http() {
     assert_eq!(web.get("/api/goals").status, 200);
 }
 
+// ---- 13b. the agent messages are read only over HTTP ------------------------------------------------------------------
+
+#[test]
+fn agent_messages_are_served_read_only_and_cannot_be_sent_or_muted_over_http() {
+    let (f, info) = goal_fleet("exit 0");
+    let web = Web::new(&info);
+    load_plan_a(&f);
+    let events_before = f.events_raw();
+    let status_before = f.status();
+
+    let list = web.get("/api/messages");
+    assert_eq!(list.status, 200, "{}", list.text());
+    let doc = list.json();
+    assert_eq!(jstr(&doc, "schema"), "fleet.msg.list/1");
+    assert_eq!(jnum(&doc, "total"), 0);
+    assert!(jarr(&doc, "messages").is_empty());
+    // a filter on a task of the run is fine; one on a channel that does not exist is a 404
+    assert_eq!(web.get("/api/messages?limit=5&task=r1%2Fa").status, 200);
+    assert_eq!(web.get("/api/messages?channel=nosuch").status, 404);
+    let none = web.get("/api/message?id=m1");
+    assert_eq!(none.status, 404, "{}", none.text());
+    assert_eq!(web.get("/api/message").status, 400);
+    assert_eq!(
+        http(web.port, "GET", "/api/messages", &[], None).status,
+        401
+    );
+
+    let body = Value::object([
+        ("channel", Value::str("c")),
+        ("text", Value::str("injected")),
+        ("target", Value::str("c")),
+        ("id", Value::str("m1")),
+    ])
+    .canonical();
+    // the two documents have a GET and nothing else
+    for path in ["/api/messages", "/api/message"] {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let r = http(
+                web.port,
+                method,
+                path,
+                &[("Authorization", &web.bearer())],
+                (method != "DELETE").then_some(body.as_str()),
+            );
+            assert!(
+                r.status == 405 || r.status == 404,
+                "{method} {path} -> {} {}",
+                r.status,
+                r.text()
+            );
+            if method == "POST" {
+                assert_eq!(r.status, 405, "{path}: {}", r.text());
+                assert_eq!(r.header("allow"), Some("GET"), "{path}");
+            }
+        }
+    }
+    // and no route sends, mutes or unmutes anything, whatever it is called
+    for path in [
+        "/api/msg/send",
+        "/api/msg/mute",
+        "/api/msg/unmute",
+        "/api/msg",
+        "/api/messages/send",
+        "/api/messages/mute",
+        "/api/messages/unmute",
+        "/api/message/send",
+        "/api/msg.send",
+        "/api/msg.mute",
+        "/api/msg.unmute",
+    ] {
+        let r = web.post_raw(path, &body);
+        assert_eq!(r.status, 404, "POST {path}: {}", r.text());
+        let r = web.get(path);
+        assert_eq!(r.status, 404, "GET {path}: {}", r.text());
+    }
+    // a command name in the query is refused rather than ignored
+    for path in [
+        "/api/messages?cmd=msg.send&text=injected",
+        "/api/messages?command=msg.mute",
+        "/api/message?id=m1&cmd=msg.unmute",
+    ] {
+        let r = web.get(path);
+        assert_eq!(r.status, 400, "{path}: {}", r.text());
+        assert_eq!(r.code(), "invalid", "{path}");
+    }
+    // nothing was recorded and the daemon is still there
+    assert_eq!(f.events_raw(), events_before, "something was recorded");
+    assert_eq!(
+        jarr(&f.status(), "runs")[0].canonical(),
+        jarr(&status_before, "runs")[0].canonical()
+    );
+    assert_eq!(web.get("/api/messages").status, 200);
+}
+
 // ---- 14. hostile goal text and evidence --------------------------------------------------------------------------------
 
 #[test]

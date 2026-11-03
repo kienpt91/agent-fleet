@@ -7,6 +7,7 @@ use fleet_app::testing::contracts::{
     context_store_contract, contract_files_contract, event_store_contract, output_logs_contract,
     verify_jobs_contract, MemoryContractHarness, MemoryVerifyHarness,
 };
+use fleet_app::testing::mail_contracts::{inbox_contract, outbox_contract, MemoryMailHarness};
 use fleet_app::testing::World;
 
 #[test]
@@ -44,4 +45,16 @@ fn memory_repo_reader_satisfies_the_contract() {
     fleet_app::testing::repo::repo_reader_contract(
         &mut fleet_app::testing::repo::MemoryRepoHarness,
     );
+}
+
+#[test]
+fn memory_outbox_satisfies_the_contract() {
+    let mut harness = MemoryMailHarness::new(World::new());
+    outbox_contract(&mut harness);
+}
+
+#[test]
+fn memory_inbox_satisfies_the_contract() {
+    let mut harness = MemoryMailHarness::new(World::new());
+    inbox_contract(&mut harness);
 }

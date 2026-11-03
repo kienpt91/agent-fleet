@@ -10,6 +10,7 @@
 mod commands;
 mod dispatch;
 mod forge;
+mod messaging;
 mod reconcile;
 mod supervise;
 
@@ -22,6 +23,7 @@ use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
 use fleet_domain::fleet::{FleetState, Policy};
 use fleet_domain::ids::{ApprovalId, RunId, TaskId};
+use fleet_domain::msg::board::MessageBoard;
 use fleet_domain::run::{RetryPolicy, WorkerEnd};
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::supervision::{KillEscalation, SupervisionPolicy};
@@ -64,6 +66,8 @@ pub struct Orchestrator {
     pub(crate) handoff_waits: BTreeMap<Key, u32>,
     /// Fan-out groups, a projection of the same event log.
     pub(crate) fanout: FanoutState,
+    /// The message channels and messages, a projection of the same event log.
+    pub(crate) board: MessageBoard,
     pub(crate) policy: Policy,
     pub(crate) live: BTreeMap<Key, Live>,
     /// Quality-gate jobs in flight: (run, task, attempt).
@@ -82,6 +86,9 @@ pub struct Orchestrator {
     /// Session ends that could not be recorded yet (the store failed); retried every tick so a
     /// task never stays `running` without a session.
     pub(crate) pending_ends: BTreeMap<Key, WorkerEnd>,
+    /// Invalid outbox files rejected without an event since the last one that was recorded, per
+    /// task (not persisted: it only enriches the next record).
+    pub(crate) skipped_files: BTreeMap<Key, u32>,
     pub(crate) recent: VecDeque<Recent>,
     pub(crate) started_ms: u64,
     pub(crate) pid: u64,
@@ -101,6 +108,7 @@ impl Orchestrator {
         let mut ledger = Ledger::new();
         let mut context = ContextState::default();
         let mut fanout = FanoutState::default();
+        let mut board = MessageBoard::new();
         let mut recent: VecDeque<Recent> = VecDeque::new();
         let mut forge = forge::ForgeRuntime::default();
         ports.store.replay(&mut |s: StoredEvent| {
@@ -110,6 +118,7 @@ impl Orchestrator {
             context.apply(s.seq, &s.event, ports.digest.as_ref());
             forge.ledger.apply(&s.event);
             fanout.groups.apply(s.ts_ms, &s.event);
+            board.apply(&s.event);
             Ok(())
         })?;
         let policy = Policy {
@@ -130,6 +139,7 @@ impl Orchestrator {
             handoff_summaries: BTreeMap::new(),
             handoff_waits: BTreeMap::new(),
             fanout,
+            board,
             policy,
             live: BTreeMap::new(),
             gate_jobs: BTreeSet::new(),
@@ -140,6 +150,7 @@ impl Orchestrator {
             verify_outcomes: VecDeque::new(),
             verified: BTreeSet::new(),
             pending_ends: BTreeMap::new(),
+            skipped_files: BTreeMap::new(),
             recent,
             started_ms,
             pid: 0,
@@ -220,6 +231,7 @@ impl Orchestrator {
             self.context.apply(seq, &event, self.ports.digest.as_ref());
             self.forge.ledger.apply(&event);
             self.fanout.groups.apply(ts, &event);
+            self.board.apply(&event);
             committed_task |= matches!(event, DomainEvent::TaskCommitted { .. });
             if is_group_relevant(&event) {
                 group_relevant.push(event.clone());
@@ -269,7 +281,7 @@ impl Orchestrator {
     /// Advances time-driven work: approval expiry, supervision, jobs, readiness, scheduling.
     pub fn tick(&mut self) {
         type Step = fn(&mut Orchestrator) -> Result<()>;
-        let steps: [Step; 8] = [
+        let steps: [Step; 9] = [
             Orchestrator::expire_approvals,
             Orchestrator::supervise,
             Orchestrator::collect_jobs,
@@ -278,6 +290,7 @@ impl Orchestrator {
             Orchestrator::review_scan,
             Orchestrator::promote,
             Orchestrator::schedule,
+            Orchestrator::messages,
         ];
         for step in steps {
             if let Err(e) = step(self) {

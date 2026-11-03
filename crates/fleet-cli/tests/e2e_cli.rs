@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-const ALL_SUBCOMMANDS: [&str; 50] = [
+const ALL_SUBCOMMANDS: [&str; 55] = [
     "daemon",
     "run create",
     "task add",
@@ -66,6 +66,11 @@ const ALL_SUBCOMMANDS: [&str; 50] = [
     "pick",
     "groups list",
     "groups show",
+    "msg list",
+    "msg show",
+    "msg mute",
+    "msg unmute",
+    "msg send",
 ];
 
 /// `PATH` without any directory that holds `tool`.

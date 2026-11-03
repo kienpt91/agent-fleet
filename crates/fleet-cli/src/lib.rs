@@ -16,6 +16,7 @@ pub mod forge_cli;
 pub mod render;
 pub mod render_context;
 pub mod render_fanout;
+pub mod render_msg;
 pub mod render_neo;
 pub mod tui;
 

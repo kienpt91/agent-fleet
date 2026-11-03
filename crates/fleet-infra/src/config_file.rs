@@ -60,6 +60,7 @@ struct FileConfig {
     gates: Vec<GateSection>,
     github: GithubSection,
     compare: CompareSection,
+    messages: MessagesSection,
 }
 
 /// `[web]`. The values are read as TOML values so that every error names the key.
@@ -87,6 +88,21 @@ fn web_limit(key: &str, v: &Option<toml::Value>, max: u64) -> Result<Option<u64>
 #[serde(deny_unknown_fields, default)]
 struct CompareSection {
     rank: Option<Vec<String>>,
+}
+
+/// `[messages]`: limits and switches of the channels. The channels themselves are declared in
+/// plans, by the operator, never here and never by a worker.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct MessagesSection {
+    max_total_messages: Option<u64>,
+    max_fan_out: Option<u64>,
+    max_reply_depth: Option<u64>,
+    max_pair_exchanges: Option<u64>,
+    max_messages_per_task_per_minute: Option<u64>,
+    max_refused_per_task: Option<u64>,
+    /// Type a one-line notice into a worker's terminal when a message arrives. Off by default.
+    notify_input: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -484,6 +500,36 @@ fn build_config(file: FileConfig, parent_env: Vec<(String, String)>) -> Result<L
     );
 
     apply_github(&mut app.forge, file.github)?;
+    let m = file.messages;
+    let limits = &mut app.messaging;
+    let whole = |what: &str, n: u64| {
+        usize::try_from(n).map_err(|_| invalid(format!("[messages] {what} is too large")))
+    };
+    let small = |what: &str, n: u64| {
+        u32::try_from(n).map_err(|_| invalid(format!("[messages] {what} is too large")))
+    };
+    if let Some(n) = m.max_total_messages {
+        limits.max_total_messages = whole("max_total_messages", n)?;
+    }
+    if let Some(n) = m.max_fan_out {
+        limits.max_fan_out = whole("max_fan_out", n)?;
+    }
+    if let Some(n) = m.max_reply_depth {
+        limits.max_reply_depth = small("max_reply_depth", n)?;
+    }
+    if let Some(n) = m.max_pair_exchanges {
+        limits.max_pair_exchanges = small("max_pair_exchanges", n)?;
+    }
+    if let Some(n) = m.max_messages_per_task_per_minute {
+        limits.max_per_task_per_minute = small("max_messages_per_task_per_minute", n)?;
+    }
+    if let Some(n) = m.max_refused_per_task {
+        limits.max_refused_per_task = small("max_refused_per_task", n)?;
+    }
+    if let Some(b) = m.notify_input {
+        limits.notify_input = b;
+    }
+
     app.validate()?;
 
     if file.redact.rules.len() > MAX_REDACT_RULES {
@@ -826,12 +872,45 @@ fn check_task(index: usize, task: &Value) -> Result<()> {
     }
 }
 
+/// The keys of a `[[channels]]` table; the values are validated by the domain when the plan is
+/// loaded (`ChannelDef::from_value`).
+const CHANNEL_KEYS: [&str; 10] = [
+    "name",
+    "members",
+    "lead",
+    "mode",
+    "direction",
+    "max_message_bytes",
+    "max_messages_per_task",
+    "max_messages_per_minute",
+    "ttl_secs",
+    "requires_approval",
+];
+
+fn check_channel(index: usize, channel: &Value) -> Result<()> {
+    let what = format!("channel #{}", index.saturating_add(1));
+    let obj = channel
+        .as_object()
+        .ok_or_else(|| invalid(format!("{what} must be a table")))?;
+    check_keys(&what, obj, &CHANNEL_KEYS)?;
+    check_string(&what, obj, "name", true)?;
+    match obj.get("members") {
+        Some(Value::Array(items)) if items.iter().all(|i| matches!(i, Value::Str(_))) => Ok(()),
+        _ => Err(invalid(format!(
+            "{what}: members must be a list of strings"
+        ))),
+    }
+}
+
+/// Channels a plan may declare (the domain caps them per run and in all as well).
+const MAX_PLAN_CHANNELS: usize = fleet_domain::msg::limits::MAX_CHANNELS_PER_RUN;
+
 /// Checks the shape of a parsed plan and builds the `plan.load` arguments.
 fn plan_args(doc: &Value) -> Result<Value> {
     let top = doc
         .as_object()
         .ok_or_else(|| invalid("a plan must be a table"))?;
-    check_keys("plan", top, &["run", "tasks"])?;
+    check_keys("plan", top, &["run", "tasks", "channels"])?;
     let tasks = match top.get("tasks") {
         Some(Value::Array(tasks)) => tasks,
         Some(_) => return Err(invalid("tasks must be a list of tables")),
@@ -851,6 +930,20 @@ fn plan_args(doc: &Value) -> Result<Value> {
         out.insert("new_run".to_string(), run.clone());
     }
     out.insert("tasks".to_string(), Value::Array(tasks.clone()));
+    if let Some(channels) = top.get("channels") {
+        let Value::Array(list) = channels else {
+            return Err(invalid("channels must be a list of tables"));
+        };
+        if list.len() > MAX_PLAN_CHANNELS {
+            return Err(FleetError::limit(format!(
+                "a plan can have at most {MAX_PLAN_CHANNELS} channels"
+            )));
+        }
+        for (i, c) in list.iter().enumerate() {
+            check_channel(i, c)?;
+        }
+        out.insert("channels".to_string(), channels.clone());
+    }
     Ok(Value::Object(out))
 }
 
@@ -1080,6 +1173,40 @@ format = "refcheck-json"
         assert!(dflt.app.workers.is_empty());
         let key = format!("ghp_{}", "a1B2".repeat(10));
         assert!(!dflt.redactor.redact(&format!("token {key}")).contains(&key));
+    }
+
+    #[test]
+    fn the_messages_section_sets_every_limit_and_is_validated() {
+        let loaded = parse(
+            "[messages]\nmax_total_messages = 40\nmax_fan_out = 3\nmax_reply_depth = 4\nmax_pair_exchanges = 9\nmax_messages_per_task_per_minute = 12\nmax_refused_per_task = 55\nnotify_input = true\n",
+        )
+        .unwrap();
+        let m = loaded.app.messaging;
+        assert_eq!(
+            (
+                m.max_total_messages,
+                m.max_fan_out,
+                m.max_reply_depth,
+                m.max_pair_exchanges,
+                m.max_per_task_per_minute,
+                m.max_refused_per_task,
+                m.notify_input
+            ),
+            (40, 3, 4, 9, 12, 55, true)
+        );
+        let defaults = parse("").unwrap().app.messaging;
+        assert_eq!(defaults.max_refused_per_task, 100);
+        assert!(!defaults.notify_input, "off unless the operator says so");
+        for bad in [
+            "max_refused_per_task = 0",
+            "max_refused_per_task = 100000",
+            "max_refused_per_task = 99999999999999",
+            "max_refused_per_task = -1",
+            "max_refused_per_task = \"many\"",
+            "max_reply_depth = 0",
+        ] {
+            assert!(parse(&format!("[messages]\n{bad}\n")).is_err(), "{bad}");
+        }
     }
 
     #[test]

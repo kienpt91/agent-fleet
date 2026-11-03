@@ -78,6 +78,9 @@ string_enum!(
     DecisionKind {
         Question => "question",
         Conflict => "conflict",
+        /// A message channel was muted automatically (a loop, a storm); a person decides whether
+        /// it may speak again. Blocks no task.
+        Channel => "channel",
     }
 );
 
@@ -89,6 +92,8 @@ string_enum!(
         Manual => "manual",
         /// Publishing a task's branch and opening a pull request on a forge.
         PullRequest => "pull-request",
+        /// Delivery of one message on a channel that requires approval. Blocks no task.
+        Message => "message",
     }
 );
 
@@ -152,10 +157,29 @@ string_enum!(
 );
 
 string_enum!(
+    /// How the members of a message channel reach each other.
+    ChannelMode {
+        /// A message without `to` goes to every other member.
+        Broadcast => "broadcast",
+        /// Every message names exactly one recipient.
+        Direct => "direct",
+    }
+);
+
+string_enum!(
     /// How the task of a fan-out member ended.
     MemberOutcome {
         Completed => "completed",
         Failed => "failed",
+    }
+);
+
+string_enum!(
+    /// Who may send on a message channel.
+    ChannelDirection {
+        Both => "both",
+        /// Members send to the channel's lead only.
+        ToLead => "to_lead",
     }
 );
 
@@ -166,6 +190,84 @@ string_enum!(
         Resolved => "resolved",
         /// Every member ended and none completed: there is nothing to pick.
         NoCompletion => "no_completion",
+    }
+);
+
+string_enum!(
+    /// What a message says it is. A label only: no kind carries any authority.
+    MessageKind {
+        Info => "info",
+        Question => "question",
+        Result => "result",
+        Request => "request",
+    }
+);
+
+string_enum!(
+    /// Why a message was refused. Recorded in the log; the body of a refused message never is.
+    BlockReason {
+        /// The file or its fields did not pass validation.
+        Invalid => "invalid",
+        UnknownChannel => "unknown-channel",
+        NotMember => "not-a-member",
+        BadRecipient => "bad-recipient",
+        /// The channel's direction does not let this sender send.
+        Direction => "direction",
+        TooLarge => "too-large",
+        /// The text matches the shape of a key, token or password.
+        SecretShape => "secret-shape",
+        Duplicate => "duplicate",
+        TaskMuted => "task-muted",
+        ChannelMuted => "channel-muted",
+        /// Too many messages in the last minute.
+        Rate => "rate-limit",
+        /// The sender's or the channel's total was used up.
+        Quota => "quota",
+        FanOut => "fan-out",
+        ReplyDepth => "reply-depth",
+        PairBudget => "pair-budget",
+        GlobalCap => "global-cap",
+        UnknownReply => "unknown-reply",
+        /// A person denied the approval the channel requires.
+        Denied => "denied",
+    }
+);
+
+string_enum!(
+    /// Why a message was not delivered to one recipient.
+    ExpireReason {
+        Ttl => "ttl",
+        RecipientEnded => "recipient-ended",
+        ApprovalExpired => "approval-expired",
+        InboxFull => "inbox-full",
+    }
+);
+
+string_enum!(
+    /// Why a channel or a task was muted.
+    MuteReason {
+        /// `fleet msg mute`.
+        Operator => "operator",
+        ReplyDepth => "reply-depth",
+        PairBudget => "pair-budget",
+        /// A task kept sending messages that were refused.
+        Flood => "flood",
+        /// A task used up the total number of refusals it may cause (until a person looks).
+        RefusalBudget => "refusal-budget",
+        /// Fewer than two members can still take part, or the lead is gone.
+        EndpointEnded => "endpoint-ended",
+    }
+);
+
+string_enum!(
+    /// Where a message stands, as shown to people.
+    MessageStatus {
+        AwaitingApproval => "awaiting-approval",
+        /// Accepted; waiting for a recipient that is running.
+        Queued => "queued",
+        Delivered => "delivered",
+        Expired => "expired",
+        Blocked => "blocked",
     }
 );
 
@@ -230,5 +332,43 @@ mod tests {
             assert_eq!(CloseReason::parse(r.as_str()), Some(*r));
         }
         assert_eq!(MemberOutcome::parse("superseded"), None);
+    }
+
+    #[test]
+    fn messaging_vocabularies_round_trip() {
+        for s in ChannelMode::ALL {
+            assert_eq!(ChannelMode::parse(s.as_str()), Some(*s));
+        }
+        for s in ChannelDirection::ALL {
+            assert_eq!(ChannelDirection::from_value(&s.to_value()), Some(*s));
+        }
+        for s in MessageKind::ALL {
+            assert_eq!(MessageKind::parse(s.as_str()), Some(*s));
+        }
+        for s in BlockReason::ALL {
+            assert_eq!(BlockReason::parse(s.as_str()), Some(*s));
+        }
+        for s in ExpireReason::ALL {
+            assert_eq!(ExpireReason::parse(s.as_str()), Some(*s));
+        }
+        for s in MuteReason::ALL {
+            assert_eq!(MuteReason::parse(s.as_str()), Some(*s));
+        }
+        for s in MessageStatus::ALL {
+            assert_eq!(s.to_string(), s.as_str());
+        }
+        assert_eq!(DecisionKind::parse("channel"), Some(DecisionKind::Channel));
+        assert_eq!(Purpose::parse("message"), Some(Purpose::Message));
+        // no kind looks like an approval or a gate answer: the vocabulary is closed
+        for bad in [
+            "approval",
+            "approve",
+            "gate",
+            "gate_answer",
+            "command",
+            "exec",
+        ] {
+            assert_eq!(MessageKind::parse(bad), None, "{bad}");
+        }
     }
 }

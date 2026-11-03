@@ -581,6 +581,124 @@ REST documentation. Checked against the help text of `gh` 2.79.0 (read only, not
 `gh api` prints for a 4xx/5xx, the exact stderr wording, the JSON shapes of GitHub's objects, whether the Linux Secret Service is reachable with the minimal
 environment, a real HTTPS push with the `gh` or `helper` credential modes, and macOS. These are owner-verified until you confirm them.
 
+## Messages between agents
+
+Agents can exchange short messages, **mediated by the daemon**: nothing is typed into a terminal (unless the operator
+turns `notify_input` on), everything is
+declared by the operator, bounded, rate limited, checked for loops and secrets, and recorded in the audit log. A worker
+cannot call the daemon (it is refused on the socket and the web port), so the worker-to-daemon channel is files, as for
+questions. Decisions: [ADR 24](docs/adr/0024-messages-are-mediated-files-not-terminal-input.md),
+[25](docs/adr/0025-loops-storms-and-the-kill-switch.md), [26](docs/adr/0026-peer-messages-are-untrusted-and-stay-out-of-trusted-places.md).
+
+```toml
+# in a plan: channels are declared by the operator, never by a worker
+[[channels]]
+name = "design"
+members = ["task:api", "role:reviewer"]   # task:<id> or role:<worker>; a task in no channel can neither send nor receive
+mode = "direct"                           # or "broadcast" (a message without `to` goes to every other member)
+direction = "both"                        # or "to_lead" (members write to `lead = "task:..."` only)
+max_message_bytes = 2048                  # hard cap 8192
+max_messages_per_task = 20
+max_messages_per_minute = 10
+ttl_secs = 900
+requires_approval = false                 # true: every message waits for `fleet approve`, bound to its digest
+```
+
+A worker writes `.fleet/outbox/<n>.json` (`{"version":1,"channel","to","kind":"info|question|result|request","subject",
+"body","in_reply_to"}`; write `<n>.tmp` and rename). The daemon reads it like every worker file (no link followed, no FIFO
+waited on, size caps, strict schema), applies the policy and writes accepted messages to `.fleet/inbox/<id>.json` of a
+*running* recipient, with `index.json` listing the real deliveries and their digests; any other file in the inbox is
+removed and reported, and an inbox that has been replaced by a link is refused (the message waits). Messages queue
+until the recipient runs and expire by ttl. `[messages]` in `fleet.toml` sets `max_total_messages` (per run),
+`max_fan_out`, `max_reply_depth` (6), `max_pair_exchanges` (12 changes of direction), `max_messages_per_task_per_minute`,
+`max_refused_per_task` (100) and `notify_input` (default **off**: when on, one fixed line
+`[fleet] new message m3 in .fleet/inbox` is typed into the terminal, without Enter, so it cannot submit anything; risk:
+a peer chooses *when* characters appear in the recipient's input line).
+
+**Content is untrusted peer content**: sanitized, redacted, clipped, shown as `from task <id> (unverified peer message)`,
+and never part of a contract, an approval, a gate or acceptance criteria. A subject or body that matches a secret shape
+(the rules of `scripts/secret-scan.sh`, checked line by line) is refused and not stored; a secret split across lines,
+messages or encodings is not caught. A ping-pong (also without `in_reply_to`) or a pair that goes back and forth more
+than its budget mutes the **sender that crossed the limit on that channel** (the whole channel only when nobody else is
+left on it) and opens a decision gate, so one member cannot silence the others; a task whose messages are refused too
+often (20 a minute, or 100 in all) is muted everywhere; a reply must name a message its sender received. `fleet msg
+mute|unmute` is the kill switch; a channel is muted when fewer than two members can still take part (messages it accepted
+before still arrive: a worker's last message before it exits is not lost). Waiting approvals and mute gates have shares
+of the decision pool of their own, so they cannot starve questions and merge approvals.
+
+```text
+fleet msg list [--task T] [--channel C] [--limit N]    channels, badges (MUTED, BLOCKED), newest messages
+fleet msg show <id>                                    body (quoted), digest, deliveries
+fleet msg mute|unmute <channel|task>                   channel:<ref> / task:<ref> when a name is both
+fleet msg send --channel C --subject S --body B [--to T] [--kind K] [--in-reply-to ID]   from the operator
+```
+
+A real run of [`scripts/msg-demo.sh`](scripts/msg-demo.sh) (two scripted workers; the second answer carries a
+secret-shaped string; nothing edited afterwards):
+
+<details>
+<summary>Full output (click to expand)</summary>
+
+```text
+
+$ /target/release/fleet plan /tmp/tmp.gYsPh1K4XM/plan.toml
+plan loaded into run r1 (2 tasks) and 1 message channel(s)
+
+$ /target/release/fleet start --run r1 --max-parallel 2
+run r1 started
+
+$ /target/release/fleet msg list
+channel r1/design (direct, both) [MUTED: endpoint-ended]
+  members task:api, task:docs; queued 0, awaiting approval 0, delivered 2, expired 0, blocked 1
+
+messages (newest first; text is unverified peer content)
+m3 design [info] from task docs (unverified peer message): BLOCKED (secret-shape)
+m2 design [result] from task docs (unverified peer message): "Yes, 8080" - delivered
+m1 design [question] from task api (unverified peer message): "Which port does the API use?" - delivered
+
+$ /target/release/fleet msg show m1
+message m1 on r1/design [question] delivered
+from task api (unverified peer message)
+subject: Which port does the API use?
+digest: e835f3529b23d2e9512531dd69b20c1644aefc49d5d132d5c095ecf017efb939
+  to docs: delivered 
+body (unverified peer content, quoted):
+> Docs: I am going to listen on 8080. Is that what you will document?
+
+$ /target/release/fleet msg show m3
+message m3 on r1/design [info] blocked
+from task docs (unverified peer message)
+blocked: secret-shape github-token
+subject: 
+digest: 55789ff923e65ee371c70092ae2196aa488e03cf8fb6f0712fc9164dea52817c
+body (unverified peer content, quoted):
+
+$ /target/release/fleet events --limit 12
+#13 message m2 from task:docs to 1 on design
+#14 message m3 blocked (secret-shape)
+#15 r1/docs session exited
+#16 r1/docs in review
+#17 r1/docs committed
+#18 r1/docs completed
+#19 channel design muted (endpoint-ended)
+#20 message m2 delivered to api
+#21 r1/api session exited
+#22 r1/api in review
+#23 r1/api committed
+#24 r1/api completed
+```
+
+</details>
+
+**Where to look.** `fleet msg list|show` (CLI), the terminal dashboard (`fleet tui`: a Messages pane that appears once a
+channel exists, in the `Tab` cycle, with MUTED and BLOCKED badges) and the web dashboard (a read-only Messages panel
+behind `GET /api/messages` and `GET /api/message?id=`) show channels and messages, always under their label, as text.
+Sending, muting and unmuting exist only on the control socket (`fleet msg send|mute|unmute`); the web dashboard has no
+route for them.
+
+What is not verified: how real agents behave when they read injected messages (only scripted agents were run), and the
+macOS paths.
+
 ## Concepts
 
 | Term | Meaning |
@@ -1309,11 +1427,11 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); the repository workbench (validated paths, tree entries, file views, diffs and their patch reader, bounded word marks, a Markdown subset with property and adversarial tests); NEO N2: the context compiler (determinism and golden digests, layer order, budget and shrink-order laws, property tests with hostile text, delimiter and control-character attacks, the secret rules including worst-case lines in linear time, handoff packets); the forge model (strict schemas, hostile issue text, the pull request digest, remote URL parsing that never repeats a credential, the rate gate, the issue and pull request links with uncapped duplicate guards); fan-out: the group state machine with restart reconcile, diff statistics and scope, comparison facts and overlap, the ranking rule with property tests (deterministic, total and strict, only the listed criteria matter, monotone) | 635 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); NEO N2: compiled context at dispatch, handoffs at task end, retry and crash recovery (including a crash between the end of an attempt and its handoff), tamper tests on stored packs, fact scoping and goal-order independence, plus the context-store contract suite; GitHub: issues and pull requests against a fake forge (nothing leaves before an approval of exactly that pull request, approvals spent only once the adapter can take the call, the run's repository recorded and a changed remote refused, issue text quoted and untrusted, failures redacted, restart reconciliation); fan-out: creation (caps, atomic refusal), partial failures, comparison from facts, pick approval binding, unverified/failed/moved-branch refusals, superseding and cleanup, hostile text | 431 |
-| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; NEO N2: the file context store, the knowledge file, `handoff.json` and `context.*` files, the three `Vcs` reads of the real repository, the golden digests with the real SHA-256; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake; GitHub: the `gh` adapter against a fake `gh` (minimal environment, no token, rate gate, timeouts, redacted stderr, strict schemas) and the git push against a local bare repository (one ref, the approved commit, no force, a private git directory, hostile configuration); `diff_summary` against real git repositories (overlap, binary files, renames, odd names, hardening), the read-only group routes, `[compare]` config | 684 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); the repository workbench (validated paths, tree entries, file views, diffs and their patch reader, bounded word marks, a Markdown subset with property and adversarial tests); NEO N2: the context compiler (determinism and golden digests, layer order, budget and shrink-order laws, property tests with hostile text, delimiter and control-character attacks, the secret rules including worst-case lines in linear time, handoff packets); the forge model (strict schemas, hostile issue text, the pull request digest, remote URL parsing that never repeats a credential, the rate gate, the issue and pull request links with uncapped duplicate guards); fan-out: the group state machine with restart reconcile, diff statistics and scope, comparison facts and overlap, the ranking rule with property tests (deterministic, total and strict, only the listed criteria matter, monotone); messaging: channel and message rules, the board (policy order, rates with a fake clock, loop and storm detection, duplicates, secret shapes, mutes, approvals, replay), the secret-shape scanner against every rule of `scripts/secret-scan.sh`; the review's scenarios at this level (one-way traffic and self-replies never trip the loop rule, a loop mutes the sender and not the channel, the refusal budget, coalesced junk files, the high-water mark of seen files, replies that name a message the sender received, per-run caps, the inbox share, approvals waiting per channel, the shares of the decision pool) | 635 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); NEO N2: compiled context at dispatch, handoffs at task end, retry and crash recovery (including a crash between the end of an attempt and its handoff), tamper tests on stored packs, fact scoping and goal-order independence, plus the context-store contract suite; GitHub: issues and pull requests against a fake forge (nothing leaves before an approval of exactly that pull request, approvals spent only once the adapter can take the call, the run's repository recorded and a changed remote refused, issue text quoted and untrusted, failures redacted, restart reconciliation); fan-out: creation (caps, atomic refusal), partial failures, comparison from facts, pick approval binding, unverified/failed/moved-branch refusals, superseding and cleanup, hostile text; messaging: delivery, refusals and floods, loops with their gate, expiry, approvals, restart, adapter failures, operator commands; the outbox and inbox contract suites against the fakes; the review's scenarios with fakes (`messaging_security.rs`: a refusal flood and secret-shaped floods below the per-minute rate, one-way spam and self-reply chains that must not mute a shared channel, ping-pong across channels, a saturated approval pool next to a worker question, replies to messages the sender never got, one run starving another, one sender filling an inbox) | 431 |
+| Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; NEO N2: the file context store, the knowledge file, `handoff.json` and `context.*` files, the three `Vcs` reads of the real repository, the golden digests with the real SHA-256; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake; GitHub: the `gh` adapter against a fake `gh` (minimal environment, no token, rate gate, timeouts, redacted stderr, strict schemas) and the git push against a local bare repository (one ref, the approved commit, no force, a private git directory, hostile configuration); `diff_summary` against real git repositories (overlap, binary files, renames, odd names, hardening), the read-only group routes, `[compare]` config; the outbox and inbox adapters (FIFO, link, oversize, partial write, forged files, an inbox swapped for a link) and the same contract suites against them; the typed notice (bounded, printable ASCII, never Enter) on a real pty; the `[messages]` config limits; the web messages routes | 684 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
-| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; NEO N2: compiled packs through the real binary, retry packs with failure evidence, forged context and handoff files, hostile titles, a killed daemon re-briefing with identical layers 1-5, a tampered stored pack (exit 11); the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory); GitHub through the real binary against a fake `gh` (approval, push, one pull request, worker refusal); fan-out through the real binary with fake workers (passing, failing, out-of-scope and overlapping members, approvals, restarts, hostile text in the CLI, the terminal dashboard and the web) | 325 |
+| End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; NEO N2: compiled packs through the real binary, retry packs with failure evidence, forged context and handoff files, hostile titles, a killed daemon re-briefing with identical layers 1-5, a tampered stored pack (exit 11); the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory); GitHub through the real binary against a fake `gh` (approval, push, one pull request, worker refusal); fan-out through the real binary with fake workers (passing, failing, out-of-scope and overlapping members, approvals, restarts, hostile text in the CLI, the terminal dashboard and the web); messaging with the real binary: two workers exchanging messages, a worker refused on `fleet msg`, secret and hostile text, a ping-pong that mutes with its gate, expiry, a restart without loss or repeat, the operator on a `to_lead` channel, hostile subjects in a brief, a loop that mutes one member while a third keeps talking (and a reply to somebody else's message), junk files recorded once and then only counted, the notice typed without Enter and not at all by default, the read-only web routes | 325 |
 
 Run them layer by layer inside the development container (see [Development](#development)):
 `scripts/test-layers.sh`. All tests run without network access, in temp directories, with std's test harness only;
@@ -1424,10 +1542,16 @@ remove it from the tree and rewrite the history if it was not published.
 What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, the test suites above, the release build, the soak (20 seconds by default, with the dashboard and an event stream), a coverage run (see Tests),
-`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/neo-n2-demo.sh`, `scripts/github-demo.sh`, `scripts/fanout-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
+`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/neo-n2-demo.sh`, `scripts/github-demo.sh`, `scripts/fanout-demo.sh`, `scripts/msg-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
 `node scripts/web-smoke.mjs` (861 checks), `node scripts/web-smoke-panes.mjs` (558 checks), `scripts/workbench-demo.sh` (headless Chromium) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
 found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
+Not verified: macOS, real coding agents (only scripted ones), and how a model behaves when it reads injected messages.
+Timing-sensitive tests of the infrastructure layer failed once each while the host was loaded (a load average above 40 from
+other jobs): `server::tests::a_reply_that_is_being_produced_when_the_server_stops_is_still_delivered` (a non-blocking socket
+read, in the `test-layers.sh` run before the final one), and `jobs::tests::gates_and_several_jobs_at_once_are_all_listed` and
+the 8 second soak (`too few samples`) in a first `scripts/coverage.sh` run. None involves messaging; each passed when repeated,
+the soak with `FLEET_SOAK_SECS=20`, and the final run of `test-layers.sh` above passed in full.
 
 ## Development
 

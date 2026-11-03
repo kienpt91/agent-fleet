@@ -1224,6 +1224,135 @@ fn goal_and_verification_queries_are_validated() {
 }
 
 #[test]
+fn agent_messages_are_served_read_only_through_msg_list_and_msg_show() {
+    let r = Running::start();
+    let resp = r.get_bearer("/api/messages");
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert_eq!(
+        r.get_bearer("/api/messages?channel=dev&task=r1%2Fa&limit=20")
+            .status,
+        200
+    );
+    assert_eq!(r.get_bearer("/api/message?id=m1").status, 200);
+    let calls = r.fake.calls();
+    let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["msg.list", "msg.list", "msg.show"]);
+    assert!(calls[0].1.get("channel").is_none() && calls[0].1.get("limit").is_none());
+    let v = &calls[1].1;
+    assert_eq!(v.get("channel").and_then(Value::as_str), Some("dev"));
+    assert_eq!(v.get("task").and_then(Value::as_str), Some("r1/a"));
+    assert_eq!(v.get("limit").and_then(Value::as_u64), Some(20));
+    assert_eq!(calls[2].1.get("id").and_then(Value::as_str), Some("m1"));
+    // they need credentials like everything else
+    for path in ["/api/messages", "/api/message?id=m1"] {
+        assert_eq!(r.get(path, &[]).status, 401, "{path}");
+    }
+    assert_eq!(r.fake.calls().len(), 3);
+}
+
+#[test]
+fn message_queries_are_validated() {
+    let r = Running::start();
+    for q in [
+        "/api/message",
+        "/api/message?id=",
+        "/api/message?id=a&id=b",
+        "/api/message?id=a&x=1",
+        "/api/message?id=%ZZ",
+        "/api/messages?x=1",
+        "/api/messages?limit=-1",
+        "/api/messages?limit=x",
+        "/api/messages?channel=a&channel=b",
+    ] {
+        let resp = r.get_bearer(q);
+        assert_eq!(resp.status, 400, "{q}: {}", resp.body);
+    }
+    assert!(r.fake.calls().is_empty());
+}
+
+#[test]
+fn sending_muting_and_unmuting_messages_has_no_web_route() {
+    let r = Running::start();
+    let paths = [
+        "/api/messages",
+        "/api/message",
+        "/api/msg/send",
+        "/api/msg/mute",
+        "/api/msg/unmute",
+        "/api/msg",
+        "/api/messages/send",
+        "/api/message/send",
+    ];
+    for path in paths {
+        let resp = r.request("POST", path, &[], Some("{}"));
+        assert!(
+            matches!(resp.status, 404 | 405 | 401),
+            "POST {path} -> {}",
+            resp.status
+        );
+        let resp = r.post_bearer(path, "{\"id\":\"m1\",\"task\":\"r1/a\",\"text\":\"x\"}");
+        assert!(
+            matches!(resp.status, 404 | 405),
+            "authenticated POST {path} -> {}",
+            resp.status
+        );
+    }
+    let (session, csrf) = r.login();
+    for path in paths {
+        let resp = r.post_session(path, &session, &csrf, "{}");
+        assert!(
+            matches!(resp.status, 404 | 405),
+            "session POST {path} -> {}",
+            resp.status
+        );
+    }
+    // a command name in a query or a body is never run either
+    for q in [
+        "/api/messages?cmd=msg.send",
+        "/api/message?id=m&cmd=msg.mute",
+    ] {
+        assert_eq!(r.get_bearer(q).status, 400, "{q}");
+    }
+    for name in r.fake.call_names() {
+        assert!(
+            !matches!(name.as_str(), "msg.send" | "msg.mute" | "msg.unmute"),
+            "{name} reached the daemon"
+        );
+    }
+    assert!(r.fake.calls().is_empty(), "no write reached the daemon");
+}
+
+#[test]
+fn hostile_message_text_stays_inert_in_the_served_documents() {
+    let r = Running::start();
+    let nasty = "<img src=x onerror=alert(1)>\u{1b}]8;;http://evil\u{7}x\u{202e}y";
+    let expected = nasty.to_string();
+    r.fake.on(move |cmd, _| {
+        Ok(Value::object([
+            ("schema", Value::str(format!("fleet.{cmd}/1"))),
+            ("subject", Value::str(nasty)),
+            ("body", Value::str(nasty)),
+            (
+                "label",
+                Value::str("from task r1/a (unverified peer message)"),
+            ),
+        ]))
+    });
+    for path in ["/api/messages", "/api/message?id=m1"] {
+        let resp = r.get_bearer(path);
+        assert_eq!(resp.status, 200, "{path}");
+        for c in ['<', '>', '&', '\u{1b}', '\u{202e}', '\u{7}'] {
+            assert!(!resp.body.contains(c), "{path}: raw {c:?}");
+        }
+        let doc = parse(&resp.body);
+        assert_eq!(
+            doc.get("subject").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+    }
+}
+
+#[test]
 fn hostile_goal_text_and_evidence_output_stay_inert_in_the_served_documents() {
     let r = Running::start();
     let nasty = "<img src=x onerror=alert(1)>\u{1b}]8;;http://evil\u{7}x\u{202e}y";

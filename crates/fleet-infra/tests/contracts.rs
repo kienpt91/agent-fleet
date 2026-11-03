@@ -11,6 +11,9 @@ use fleet_app::testing::contracts::{
     verify_jobs_contract, ContractFile, ContractHarness, Plant, VerifyHarness, PLANT_MARKER,
     VALID_HANDOFF_JSON, VALID_QUESTION_JSON, VALID_RESULT_JSON,
 };
+use fleet_app::testing::mail_contracts::{
+    inbox_contract, outbox_contract, MailHarness, OutboxPlant,
+};
 use fleet_domain::env::EnvPolicy;
 use fleet_domain::ids::{RunId, Sha, TaskId};
 use fleet_domain::redact::Redactor;
@@ -400,4 +403,111 @@ impl VerifyHarness for FsVerifyHarness {
 #[test]
 fn thread_job_runner_satisfies_the_verify_jobs_contract() {
     verify_jobs_contract(&mut FsVerifyHarness::new());
+}
+
+// ---- messages between agents ----------------------------------------------------------------
+
+/// The outbox reader and the inbox writer on real directories.
+struct FsMailHarness {
+    wt: TempDir,
+    elsewhere: TempDir,
+    outbox: fleet_infra::msgfs::FsOutbox,
+    inbox: fleet_infra::msgfs::FsInbox,
+}
+
+impl FsMailHarness {
+    fn new() -> FsMailHarness {
+        let wt = TempDir::new("contract-mail");
+        fs::create_dir_all(wt.join(".fleet")).unwrap();
+        FsMailHarness {
+            wt,
+            elsewhere: TempDir::new("contract-mail-elsewhere"),
+            outbox: fleet_infra::msgfs::FsOutbox::new().with_settle(std::time::Duration::ZERO),
+            inbox: fleet_infra::msgfs::FsInbox::new(),
+        }
+    }
+}
+
+const VALID_MESSAGE: &str =
+    r#"{"version":1,"channel":"talk","to":"b","kind":"info","subject":"s","body":"b"}"#;
+
+impl MailHarness for FsMailHarness {
+    fn outbox(&self) -> &dyn fleet_app::ports::OutboxReader {
+        &self.outbox
+    }
+    fn inbox(&self) -> &dyn fleet_app::ports::InboxWriter {
+        &self.inbox
+    }
+    fn worktree(&self) -> String {
+        self.wt.path().to_str().unwrap().to_string()
+    }
+    fn plant_outbox(&mut self, name: &str, what: OutboxPlant) {
+        let dir = self.wt.join(".fleet/outbox");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let _ = fs::remove_file(&path);
+        match what {
+            OutboxPlant::Valid => fs::write(&path, VALID_MESSAGE).unwrap(),
+            OutboxPlant::Malformed => fs::write(&path, format!("{{{PLANT_MARKER}")).unwrap(),
+            OutboxPlant::Oversized => fs::write(
+                &path,
+                format!(r#"{{"version":1,"body":"{}"}}"#, "x".repeat(40_000)),
+            )
+            .unwrap(),
+            OutboxPlant::Link => {
+                let target = self.elsewhere.write("secret.json", VALID_MESSAGE);
+                symlink(target, &path).unwrap();
+            }
+            OutboxPlant::Fifo => nix::unistd::mkfifo(&path, Mode::S_IRWXU).unwrap(),
+            OutboxPlant::Directory => fs::create_dir(&path).unwrap(),
+        }
+    }
+    fn outbox_names(&self) -> Vec<String> {
+        fs::read_dir(self.wt.join(".fleet/outbox"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.ends_with(".json"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn replace_outbox_with_link(&mut self) {
+        let _ = fs::remove_dir_all(self.wt.join(".fleet/outbox"));
+        symlink(self.elsewhere.path(), self.wt.join(".fleet/outbox")).unwrap();
+    }
+    fn inbox_files(&self) -> std::collections::BTreeMap<String, String> {
+        fs::read_dir(self.wt.join(".fleet/inbox"))
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                let name = e.file_name().into_string().unwrap();
+                let text = fs::read_to_string(e.path()).unwrap();
+                (name, text)
+            })
+            .collect()
+    }
+    fn plant_inbox_stray(&mut self, name: &str) {
+        fs::write(self.wt.join(".fleet/inbox").join(name), "forged\n").unwrap();
+    }
+    fn replace_inbox_with_link(&mut self) {
+        let _ = fs::remove_dir_all(self.wt.join(".fleet/inbox"));
+        symlink(self.elsewhere.path(), self.wt.join(".fleet/inbox")).unwrap();
+    }
+    fn link_target_untouched(&self) -> bool {
+        fs::read_dir(self.elsewhere.path())
+            .unwrap()
+            .next()
+            .is_none()
+    }
+}
+
+#[test]
+fn file_outbox_satisfies_the_contract() {
+    outbox_contract(&mut FsMailHarness::new());
+}
+
+#[test]
+fn file_inbox_satisfies_the_contract() {
+    inbox_contract(&mut FsMailHarness::new());
 }
