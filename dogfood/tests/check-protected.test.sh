@@ -253,4 +253,47 @@ done
 commit_all "$r"
 expect_exit 0 "the paths the roadmap lets tasks change are not protected" run_range "$r"
 
+# ---- reviewed exceptions (--except) -----------------------------------------------------------------------
+X=crates/fleet-infra/src/server.rs
+r=$(new_repo except $X docs/a.md)
+tag_base "$r"
+echo y >> "$r/$X"; commit_all "$r"
+expect_exit 1 "without the exception the file is protected" run_range "$r"
+expect_exit 0 "with the exact path as an exception it passes" "$cp_" --repo "$r" --except "$X" base..HEAD
+expect_out "and the exception is printed, not hidden" "REVIEWED EXCEPTION: $X"
+expect_out "and named at the end" "exceptions: $X"
+echo y >> "$r/crates/fleet-infra/src/git.rs" 2>/dev/null || { mkdir -p "$r/crates/fleet-infra/src"; echo y > "$r/crates/fleet-infra/src/git.rs"; }
+commit_all "$r"
+expect_exit 1 "a second protected file is still refused" "$cp_" --repo "$r" --except "$X" base..HEAD
+expect_exit 0 "unless it is excepted too" "$cp_" --repo "$r" --except "$X" --except crates/fleet-infra/src/git.rs base..HEAD
+
+r=$(new_repo except-case $X)
+tag_base "$r"
+mkdir -p "$r/crates/fleet-infra/src"; echo y > "$r/crates/fleet-infra/src/SERVER.rs"; commit_all "$r"
+expect_exit 1 "a path that differs in case is not excepted" "$cp_" --repo "$r" --except "$X" base..HEAD
+r=$(new_repo except-other $X)
+tag_base "$r"
+echo y >> "$r/SECURITY.md"; commit_all "$r"
+expect_exit 1 "an exception for one file does not excuse another" "$cp_" --repo "$r" --except "$X" base..HEAD
+r=$(new_repo except-link $X)
+tag_base "$r"
+rm "$r/$X"; ln -s /etc/passwd "$r/$X"; commit_all "$r"
+expect_exit 1 "a symlink in place of the excepted file is still refused" "$cp_" --repo "$r" --except "$X" base..HEAD
+expect_out "as a symlink" "SYMLINK"
+r=$(new_repo except-dir $X)
+tag_base "$r"
+mkdir -p "$r/crates/fleet-infra/src/extra"; echo y > "$r/crates/fleet-infra/src/extra/new.rs"; commit_all "$r"
+expect_exit 1 "an exception is one file, not the directory around it" "$cp_" --repo "$r" --except "$X" base..HEAD
+
+for bad in Cargo.toml Cargo.lock crates/fleet-infra/Cargo.toml crates/fleet-infra/build.rs crates/fleet-cli/tests/architecture.rs \
+           'crates/fleet-infra/src/*.rs' 'crates/**' crates/fleet-infra/src/ crates/fleet-infra/src/../../x.rs /crates/a/src/x.rs \
+           dogfood/check-protected.sh scripts/secret-scan.sh SECURITY.md .github/workflows/ci.yml 'crates/a/src/x y.rs' crates/a/src/x.md ''; do
+  expect_exit 2 "no exception can be made for: '$bad'" "$cp_" --repo "$r" --except "$bad" base..HEAD
+done
+expect_exit 2 "--except needs a value" "$cp_" --repo "$r" --except
+r=$(new_repo except-ok docs/a.md)
+tag_base "$r"
+echo y >> "$r/docs/a.md"; commit_all "$r"
+expect_exit 0 "an exception that is not needed does no harm" "$cp_" --repo "$r" --except "$X" base..HEAD
+
 finish

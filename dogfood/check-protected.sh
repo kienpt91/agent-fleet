@@ -1,9 +1,9 @@
 #!/bin/sh
 # Fails when a range of commits changes a path that NEO may never change by itself.
 #
-#   check-protected.sh [--repo DIR] [--list FILE] <base>..<head>
-#   check-protected.sh [--repo DIR] [--list FILE] <base>...<head>   (relative to their merge base)
-#   check-protected.sh [--repo DIR] [--list FILE] <base> <head>
+#   check-protected.sh [--repo DIR] [--list FILE] [--except FILE]... <base>..<head>
+#   check-protected.sh [--repo DIR] [--list FILE] [--except FILE]... <base>...<head>   (relative to their merge base)
+#   check-protected.sh [--repo DIR] [--list FILE] [--except FILE]... <base> <head>
 #
 # The protected list is dogfood/protected-paths.json next to this script (or --list). Every
 # `"path": "<glob>"` line of it is one entry, in the glob dialect of the neo-verify diff check
@@ -22,6 +22,14 @@
 #   - git runs with no global or system configuration and without renames, external diff
 #     drivers or text conversion.
 #
+# --except FILE is a REVIEWED EXCEPTION for one task (a flaky test that lives in a protected source
+# file, see contracts/README.md): that exact path, and only it, is not reported as protected. It must
+# be a Rust source or test file of a crate (`crates/<crate>/src/**.rs` or `crates/<crate>/tests/**.rs`), written
+# without wildcards; a build script, the architecture tests, a manifest and anything else is refused. It
+# does not excuse a symlink, a submodule or an odd path, and a path that differs from it in case is not
+# excepted. Every exception is printed. The exception only means "a person reviews this diff": pair it with
+# check-test-only.sh, which proves that nothing before the test module changed.
+#
 # Exit status: 0 nothing protected was touched, 1 something was, 2 usage or environment error
 # (an unreadable list, a bad ref, git failing: never a pass).
 set -u
@@ -33,10 +41,24 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || fail_usage "cannot fi
 repo=.
 list="$script_dir/protected-paths.json"
 range=
+excepts=
+nl='
+'
 while [ $# -gt 0 ]; do
   case $1 in
     --repo) [ $# -ge 2 ] || fail_usage "--repo needs a directory"; repo=$2; shift 2 ;;
     --list) [ $# -ge 2 ] || fail_usage "--list needs a file"; list=$2; shift 2 ;;
+    --except)
+      [ $# -ge 2 ] || fail_usage "--except needs a path"
+      case $2 in
+        ""|*[!A-Za-z0-9._/-]*|/*|*//*|*/|*..*) fail_usage "--except: a plain relative path without wildcards is needed" ;;
+      esac
+      case $2 in
+        */build.rs|crates/fleet-cli/tests/architecture.rs) fail_usage "--except: $2 can never be excepted" ;;
+        crates/*/src/*.rs|crates/*/tests/*.rs) ;;
+        *) fail_usage "--except: only a Rust source or test file of a crate can be excepted (crates/<crate>/src/**.rs or crates/<crate>/tests/**.rs)" ;;
+      esac
+      excepts="$excepts$2$nl"; shift 2 ;;
     --) shift; break ;;
     -*) fail_usage "unknown option $1" ;;
     *) break ;;
@@ -45,7 +67,7 @@ done
 case $# in
   1) range=$1 ;;
   2) range="$1..$2" ;;
-  *) fail_usage "usage: check-protected.sh [--repo DIR] [--list FILE] <base>..<head> | <base> <head>" ;;
+  *) fail_usage "usage: check-protected.sh [--repo DIR] [--list FILE] [--except FILE]... <base>..<head> | <base> <head>" ;;
 esac
 [ -d "$repo" ] || fail_usage "not a directory: $repo"
 [ -f "$list" ] && [ -r "$list" ] || fail_usage "cannot read the protected list $list"
@@ -142,7 +164,18 @@ while IFS= read -r line; do
     .git|.git/*|*/.git|*/.git/*) report "UNUSUAL PATH, a .git segment: $path"; continue ;;
   esac
   if hit=$(protected_by "$lp"); then
-    report "PROTECTED: $path (matches $hit)"
+    excepted=0
+    # a reviewed exception is an exact, case-sensitive match of the whole path
+    if [ -n "$excepts" ]; then
+      oldifs=$IFS; IFS=$nl
+      for e in $excepts; do [ "$path" = "$e" ] && excepted=1; done
+      IFS=$oldifs
+    fi
+    if [ "$excepted" -eq 1 ]; then
+      printf 'check-protected: REVIEWED EXCEPTION: %s is protected (matches %s) and is changed here; a person reads this diff\n' "$path" "$hit" >&2
+    else
+      report "PROTECTED: $path (matches $hit)"
+    fi
   fi
 done < "$tmp"
 
@@ -151,5 +184,5 @@ if [ "$violations" -gt 0 ]; then
     "$violations" "$total" "$range" >&2
   exit 1
 fi
-printf 'check-protected: %s changed path(s) in %s, none protected (%s entries)\n' "$total" "$range" "$entries"
+printf 'check-protected: %s changed path(s) in %s, none protected (%s entries)%s\n' "$total" "$range" "$entries" "$([ -n "$excepts" ] && printf ', exceptions: %s' "$(printf '%s' "$excepts" | tr '\n' ' ')")"
 exit 0
