@@ -253,7 +253,7 @@ pub trait SessionHost: Send {
     /// Terminates the process group of a process recorded by an earlier daemon run. Verifies
     /// `identity` first; waits up to `grace_ms` between TERM and KILL.
     fn terminate_orphan(&mut self, identity: &ProcessIdentity, grace_ms: u64) -> SignalOutcome;
-    /// Types one line (and a newline) into the session's terminal, for the optional
+    /// Types one line, *without* Enter, into the session's terminal, for the optional
     /// `notify_input` notice. Never blocks: when the worker does not read its input the line is
     /// dropped and the answer is an error. The caller passes a fixed sentence and an id, never
     /// text a peer wrote.

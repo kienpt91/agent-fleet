@@ -597,14 +597,14 @@ impl SessionHost for PtySessionHost {
             .get(id)
             .ok_or_else(|| FleetError::conflict("the session is not running"))?;
         // Only printable ASCII, bounded: whatever the caller passed, no escape sequence, control
-        // character or invisible character reaches the terminal; then one carriage return, as
-        // `fleet send` types.
-        let mut bytes: Vec<u8> = line
+        // character or invisible character reaches the terminal. No Enter either: the notice only
+        // sits in the input line, so a message a peer timed for a confirmation prompt or a
+        // half-typed command can never submit or confirm anything.
+        let bytes: Vec<u8> = line
             .bytes()
             .filter(|b| (0x20..0x7f).contains(b))
             .take(MAX_NOTICE_BYTES)
             .collect();
-        bytes.push(b'\r');
         io.write_input(&bytes).map_err(|e| match e.kind() {
             std::io::ErrorKind::WouldBlock => {
                 FleetError::unavailable("the worker is not reading its input")
@@ -677,6 +677,48 @@ mod tests {
         assert!(out.text.contains("hello red"), "{:?}", out.text);
         assert!(!out.text.contains('\u{1b}'));
         assert!(out.stripped >= 2);
+    }
+
+    #[test]
+    fn a_notice_is_printable_ascii_bounded_and_never_presses_enter() {
+        let dir = TempDir::new("pty");
+        let mut h = host();
+        // raw mode, so what arrives is exactly what was typed (a line discipline would hold a
+        // line back until Enter, and echo it)
+        let s = h
+            .spawn(&spec(
+                &dir,
+                "stty raw -echo min 0 time 10; touch ready; sleep 1; dd bs=1 count=400 of=got.txt 2>/dev/null",
+            ))
+            .unwrap();
+        assert!(wait_until(5000, || dir.exists("ready")));
+        let hostile = format!(
+            "[fleet] new message m1 \u{1b}]52;c;AAAA\u{7}\u{1b}[2J\r\n\u{202e}in .fleet/inbox {}",
+            "x".repeat(400)
+        );
+        h.notify(s.id, &hostile).unwrap();
+        wait_exit(&mut h, s.id);
+        let typed = dir.read("got.txt");
+        assert!(
+            typed.starts_with("[fleet] new message m1 ]52;c;AAAA[2Jin .fleet/inbox x"),
+            "{typed:?}"
+        );
+        assert_eq!(typed.len(), MAX_NOTICE_BYTES, "bounded: {typed:?}");
+        assert!(
+            typed.bytes().all(|b| (0x20..0x7f).contains(&b)),
+            "no control character, no Enter: {typed:?}"
+        );
+        h.release(s.id);
+    }
+
+    #[test]
+    fn a_notice_for_a_session_that_is_gone_is_an_error() {
+        let dir = TempDir::new("pty");
+        let mut h = host();
+        let s = h.spawn(&spec(&dir, "exit 0")).unwrap();
+        wait_exit(&mut h, s.id);
+        h.release(s.id);
+        assert!(h.notify(s.id, "[fleet] hi").is_err());
     }
 
     #[test]

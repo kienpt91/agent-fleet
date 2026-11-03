@@ -15,8 +15,12 @@ the daemon to send anything. The only worker-to-daemon channel is files, as for 
   count caps, descriptors checked), decides under the operator's policy, records the decision as an event and, for an
   accepted message, writes `.fleet/inbox/<message id>.json` and `index.json` into the worktree of a *running* recipient.
   Nothing is typed into a terminal. The optional `[messages] notify_input = true` types one fixed line
-  (`[fleet] new message m3 in .fleet/inbox`, printable ASCII, no peer text) and a carriage return; it is off by default
-  and its risk is documented: an unsolicited line of keystrokes in a terminal program.
+  (`[fleet] new message m3 in .fleet/inbox`, printable ASCII, no peer text) **without Enter**; it is off by default.
+  Its risk, which is why it stays off: the *timing* of those keystrokes is a peer's to choose (the line appears when
+  the peer's message is delivered), so a sender can make characters land in a prompt the recipient is looking at or in a
+  half-typed command. Without a carriage return they can never submit a line or confirm a prompt by themselves, and they
+  carry no peer text; they can still garble what the agent was typing. An earlier version ended the line with a carriage
+  return, which let a peer time a confirmation (a security review found it); the Enter was removed.
 - **Channels are declared by the operator**, in a plan (`[[channels]]`), never by a worker: members (`task:<id>` or
   `role:<worker>`, never a bare word), mode, direction, a lead, size/rate/total limits, ttl, `requires_approval`. A task
   that is a member of no channel is never read and never written to. Unknown keys are errors.
@@ -43,6 +47,8 @@ the design limits what *the daemon* does on its behalf and what the daemon recor
 process can do to files.
 
 ## Decisions that were open when this was written
+- **The notice has no Enter** (see above): a nudge that cannot press a key that matters is the only kind this design
+  accepts. An agent that needs the nudge to *act* has to read its inbox on its own.
 - **A `lead` key.** `direction = "to_lead"` has to say who receives, and the plan format had no way to. A channel
   therefore takes an optional `lead` (one of its members), required for `to_lead` and refused for `both`. Naming the
   first member instead would have made a security-relevant fact implicit.
