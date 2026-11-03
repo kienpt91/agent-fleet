@@ -848,12 +848,12 @@ later phases, see [docs/parity.md](docs/parity.md).
 
 ## Tests
 
-1513 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
+1524 tests, all passing in the final run (fresh cargo volumes, offline after one `cargo fetch --locked`):
 
 | Layer | What is tested | Tests |
 | --- | --- | --- |
-| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); fan-out: the group state machine with restart reconcile, diff statistics and scope, comparison facts and overlap, the ranking rule with property tests (deterministic, total and strict, only the listed criteria matter, monotone) | 368 |
-| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); fan-out: creation (caps, atomic refusal), partial failures, comparison from facts, pick approval binding, unverified/failed/moved-branch refusals, superseding and cleanup, hostile text | 330 |
+| Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); fan-out: the group state machine with restart reconcile, diff statistics and scope, comparison facts and overlap, the ranking rule with property tests (deterministic, total and strict, only the listed criteria matter, monotone) | 372 |
+| Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); fan-out: creation (caps, atomic refusal), partial failures, comparison from facts, pick approval binding, unverified/failed/moved-branch refusals, superseding and cleanup, hostile text | 337 |
 | Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; `diff_summary` against real git repositories (overlap, binary files, renames, odd names, hardening), the read-only group routes, `[compare]` config | 533 |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
 | End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; fan-out through the real binary with fake workers (passing, failing, out-of-scope and overlapping members, approvals, restarts, hostile text in the CLI, the terminal dashboard and the web) | 281 |
@@ -871,11 +871,11 @@ helpers:
 
 ```text
 layer               lines  covered  percent
-domain               5591     5443    97.4%
-application          3468     3293    95.0%
-infrastructure       5524     5105    92.4%
-cli                  3296     3145    95.4%
-overall             17879    16986    95.0%
+domain               5637     5491    97.4%
+application          3569     3387    94.9%
+infrastructure       5524     5101    92.3%
+cli                  3301     3146    95.3%
+overall             18031    17125    95.0%
 ```
 
 Targets were domain ≥ 95 %, application ≥ 90 %, overall ≥ 85 %. Honest gaps: the event loop of the terminal dashboard
@@ -1029,7 +1029,6 @@ members get the same prompt; one passes, one fails the contract while claiming s
 allowed `src/**`, one passes with a bigger change. Real output, in the release container (the temporary directory is shortened):
 
 ```text
-    Finished `release` profile [optimized] target(s) in 6.39s
 
 $ /target/release/fleet run create --id r1 --objective parser work --repo /tmp/demo/repo
 run r1 created
@@ -1057,8 +1056,8 @@ winner: not picked
 ranking (advisory only): sort by (completed, verified, in-scope, diff, time), then by task id a-z; advisory only, nothing is merged or picked from it
   1. completed: members whose task completed before those whose did not
   2. verified: members whose mandatory checks all passed in fleet's own run for the branch's current commit and tree before …
-  3. in-scope: members that touched no path outside the allow globs of the contract's mandatory diff checks before those tha…
-  4. diff: smaller diff (lines inserted plus deleted) first; unknown size last
+  3. in-scope: members whose paths are known to be inside the allow globs of the contract's mandatory diff checks, then thos…
+  4. diff: smaller diff first (lines inserted plus deleted, a binary file counts 100, a mode or type change 10); unknown…
   5. time: shorter time from first dispatch to the end first; unknown time last
 
 RANK  TASK    WORKER  STATE      EVIDENCE  IN SCOPE  FILES    GATES   TRIES  TIME
@@ -1069,7 +1068,7 @@ RANK  TASK    WORKER  STATE      EVIDENCE  IN SCOPE  FILES    GATES   TRIES  TIM
 
 fan1-1 (rank 1, completed; first)
   worker fake, 1 attempts, 0s, task completed
-  commit 3e4870b7bdd5 tree 04a13e7c64b2
+  commit 2eae33dc50c4 tree 04a13e7c64b2
   diff against the base: 2 files, +2 -0
     src/answer.txt added +1 -0
     src/parser.txt added +1 -0
@@ -1084,7 +1083,7 @@ fan1-1 (rank 1, completed; first)
 
 fan1-4 (rank 2, completed; placed below the member above by: diff)
   worker fake, 1 attempts, 0s, task completed
-  commit 90c6948486c3 tree 6d38778ab6d5
+  commit af52f583ed35 tree 6d38778ab6d5
   diff against the base: 3 files, +8 -0
     src/answer.txt added +1 -0
     src/notes.txt added +6 -0
@@ -1100,7 +1099,7 @@ fan1-4 (rank 2, completed; placed below the member above by: diff)
 
 fan1-2 (rank 3, failed; placed below the member above by: completed)
   worker fake, 1 attempts, 0s, task failed
-  commit b544c8e51d8b tree a989f5a5264d
+  commit 947a16495608 tree a989f5a5264d
   diff against the base: 2 files, +2 -0
     src/answer.txt added +1 -0
     src/parser.txt added +1 -0
@@ -1116,7 +1115,7 @@ fan1-2 (rank 3, failed; placed below the member above by: completed)
 
 fan1-3 (rank 4, failed; placed below the member above by: in-scope)
   worker fake, 1 attempts, 0s, task failed
-  commit a20f3f3d6cdf tree dda27756389f
+  commit e04240e324b4 tree dda27756389f
   diff against the base: 3 files, +3 -0
     README.md modified +1 -0
     src/answer.txt added +1 -0
@@ -1152,26 +1151,26 @@ fleet: r1/fan1-1 is a member of fan-out group fan1; its result reaches the integ
 (exit 6)
 
 $ /target/release/fleet pick fan1 fan1-1   (asks for the approval)
-fleet: picking fan1-1 for group fan1 needs approval a1 (digest b8d01eb0d9a3; the evidence is verified); approve it with `fleet approve a1` and run `fleet pick fan1 fan1-1` again
+fleet: picking fan1-1 for group fan1 needs approval a1 (digest 20e0110240a5; the evidence is verified); approve it with `fleet approve a1` and run `fleet pick fan1 fan1-1` again
 run: fleet approve a1
 (exit 5)
 
 $ /target/release/fleet approval list
-approval a1 [merge] r1/fan1-1 pending digest b8d01eb0d9a3
-  git: "merge" "fleet/r1/integration" "fleet/r1/fan1-1" "3e4870b7bdd5c1101a1b005f2229415bfc159775" "fan-out pick of group fan1" "evidence: verified (every mandatory check passed in fleet's own run for …
+approval a1 [merge] r1/fan1-1 pending digest 20e0110240a5
+  git: "merge" "fleet/r1/integration" "fleet/r1/fan1-1" "2eae33dc50c4893ec3f77e8e8608cd3cad35260a" "fan-out pick of group fan1" "evidence: verified (every mandatory check passed in fleet's own run for …
   decide: fleet approve a1 | fleet deny a1
 
 $ /target/release/fleet approve a1
 approval a1 approved
 
 $ /target/release/fleet pick fan1 fan1-1
-picked r1/fan1-1 for group fan1: merged fleet/r1/fan1-1 into fleet/r1/integration at 28dd71302ca7 (evidence verified)
+picked r1/fan1-1 for group fan1: merged fleet/r1/fan1-1 into fleet/r1/integration at 2784fdbd919e (evidence verified)
 superseded: fan1-2, fan1-3, fan1-4
 their worktrees and branches are kept until `fleet cleanup` (`--branches` removes the branches too)
 
 $ /target/release/fleet groups show fan1
 group fan1 [decided] in run r1: Reject trailing commas
-winner: fan1-1, merged as 28dd71302ca7 (evidence verified)
+winner: fan1-1, merged as 2784fdbd919e (evidence verified)
   TASK    WORKER  STATE       TASK STATUS  TRIES  TIME  TITLE
   fan1-1  fake    winner      completed    1      0s    Reject trailing commas [fake #1]
   fan1-2  fake    superseded  failed       1      0s    Reject trailing commas [fake #2]
@@ -1195,7 +1194,7 @@ cleanup finished, removed 4, branches_deleted 4
 
 $ /target/release/fleet groups show fan1
 group fan1 [closed] in run r1: Reject trailing commas
-winner: fan1-1, merged as 28dd71302ca7 (evidence verified)
+winner: fan1-1, merged as 2784fdbd919e (evidence verified)
 closed: resolved
   TASK    WORKER  STATE       TASK STATUS  TRIES  TIME  TITLE
   fan1-1  fake    winner      completed    1      0s    Reject trailing commas [fake #1]
@@ -1207,10 +1206,10 @@ $ git -C /tmp/demo/repo branch --list fleet/*
 + fleet/r1/integration
 
 $ /target/release/fleet verify-log
-event log ok: 62 records, head 84695ce816b0625ee6070af137d2d614f23c28f586568591f6652b7b3fdc37de
+event log ok: 62 records, head 9b814f51a268ec524105ab09953e796f974ae128ccb9723f718eed75fe3fb2b8
 ```
 
-What was not verified: no real coding agent was used (only scripted fakes), nothing ran on macOS, and the web page was only
+Two flaky timing checks showed up under the instrumented coverage runs (`jobs::tests::gates_and_several_jobs_at_once_are_all_listed` once, the soak test twice at 5 s) and passed on rerun; they are existing tests, not fan-out code. What was not verified: no real coding agent was used (only scripted fakes), nothing ran on macOS, and the web page was only
 checked through its JSON routes and the static-asset scans, not drawn in a browser for this feature.
 
 ## License
