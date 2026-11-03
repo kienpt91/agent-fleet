@@ -66,7 +66,11 @@ Five rules: (1) one task, one file; (2) protected paths are human-only; (3) the 
   limits spend, and the 25 minute `--max-time` of one attempt is a time limit, not a money limit. Know where the provider's
   usage page is and look at it (section 7).
 - A throwaway clone of the repository (section 2) and a directory for what must live outside it (`~/.fleet-dogfood`).
-- The development container of the README (`docker/Dockerfile.dev`, image `fleet-dev`) and two docker volumes for it.
+- The development container of the README (`docker/Dockerfile.dev`, image `fleet-dev`) and two docker volumes for it. **Not** the
+  `fleet-ssh` image (`docker/Dockerfile.ssh`): the `remote` layer of `scripts/test-layers.sh`, the tests of the SSH remote worktrees against a
+  real sshd, runs only where an sshd exists, so inside `fleet-dev` it prints `skipped` and a contract's `layers` check judges the other five
+  layers. The `remote` layer is deliberately not part of any self-development contract (the code it tests is protected, so no task can change what
+  it proves; [contracts/README.md](contracts/README.md)). Run it yourself after you have changed such code: `IMAGE=fleet-ssh`, README, Development.
 - Disk and time: the first run of the contract's `layers` check builds the whole workspace in the container (minutes, and a
   few GB in the volumes); later runs reuse the target volume. Two verification jobs may run at once, one worker at a time.
 - macOS note: the trial runs were made on macOS and worked there (as reported). The README still says that fleet's macOS code
@@ -90,7 +94,7 @@ sh dogfood/install-tools.sh --repo ~/work/fleet-dogfood --ref <the commit you re
 # 3. the container wrapper (yours; checks run programs, never a shell, so cargo goes through one program)
 install -m 755 dogfood/container-run.example.sh ~/.fleet-dogfood/bin/container-run
 #    edit THE TWO THINGS the file says: `docker=` (the absolute path of your docker client, `command -v docker`)
-#    and `image=` (only if you use another image). It must not be writable by group or others.
+#    and `image=` (only if you use another image, never the sshd one). It must not be writable by group or others.
 #    It starts the container with no network, no capabilities, your uid, the checked tree read-only at /work,
 #    the cargo registry read-only and nothing of yours mounted.
 
@@ -218,12 +222,13 @@ then does the reviewer's steps. **What you must see** (the appendix is the real 
    `check-conflict-markers.sh --git` and a commit of your own re-authors them.
 
 If any of these differs on your machine, stop: that is a finding, not noise. One thing that **does** vary, and is not a finding about the
-scaffold: the `layers` check runs the whole `fleet-infra` suite, and at the base this branch was cut from a few of its tests are flaky
-under load (the ones of [trials/](trials/README.md) and others). Two earlier dry runs of this scaffold each lost one task attempt to one of
-them (`jobs::tests::the_tracker_lists_a_running_group_leader_until_the_job_has_ended` and `jobs::tests::gates_and_several_jobs_at_once_are_all_listed`),
-and one of two coverage runs lost a test of the same suite. `dryrun.sh` therefore retries a task that ended `failed` with `fleet retry`, up to
-three rounds, and says so in its output (the run in the appendix needed none); do the same by hand in a real run, and treat a task that fails
-the same check twice as a real failure.
+scaffold: the `layers` check runs every suite of `scripts/test-layers.sh` except the `remote` layer (no sshd in the image), and the
+debug-profile timing tests (the wall-clock bounds of a few domain tests are meant for an idle machine, README) and a few flaky tests of earlier
+bases (the ones of [trials/](trials/README.md) and others; several have been fixed since) can fail under load. Earlier dry runs of this scaffold
+each lost one task attempt to one of them (`jobs::tests::the_tracker_lists_a_running_group_leader_until_the_job_has_ended` and
+`jobs::tests::gates_and_several_jobs_at_once_are_all_listed`). `dryrun.sh` therefore retries a task that ended `failed` with `fleet retry`, up to
+three rounds, and says so in its output; do the same by hand in a real run, and treat a task that fails the same check twice as a real
+failure. A test that fails under load and passes alone is not a reason to weaken it.
 
 ## 4. The first real run: ONE starter task, one worker
 
@@ -403,9 +408,11 @@ mode is used for `cargo update` only). It puts `Cargo.lock` back if any locked v
 ## 10. Known gaps
 
 - **No token governor (N4).** Spend is limited only by the provider's console. `max_retries` and the timeouts bound time, not money.
-- **No context compiler in this branch** (N2 is being built elsewhere). The agent receives the task's spec as its brief and does not
-  see the contract; it can learn what is checked only from a failed attempt's quoted checks. Nothing assembles a context pack or
-  hands over verified knowledge.
+- **The context compiler (N2) exists, and the plan does not use it.** It is an opt-in of a run (`context = "compiled"` in `[run]`, README,
+  docs/neo.md); this scaffold was never run with it. The plan's tasks are briefed with the task's spec and the agent does not see the contract;
+  it can learn what is checked only from a failed attempt's quoted checks. Whether a compiled pack helps these tasks is for the first real run to find out.
+- **The `remote` layer is not run by a contract** (section 1): the tests of the SSH remote worktrees need a real sshd and an image the wrapper does not use.
+  The code they test is protected; run them yourself after a person changed it.
 - **The agent cannot run anything in `write` mode**: it edits blind, so a small task passes and a task that needs a build to get
   right fails twice and ends `failed`. Prefer specs that name the file, the functions and the tests; keep tasks to one file.
 - **The worker is the same user as you; that is not a security boundary** (README and SECURITY.md, Limitations). `HOME` is passed,
@@ -422,8 +429,9 @@ mode is used for `cargo update` only). It puts `Cargo.lock` back if any locked v
 - **Not verified with the real agent** (section 11).
 - **fleet cannot mark a task completed by hand**: human-only tasks are barriers, handled by cutting the plan
   (`plan-without.sh`) and starting a new run; goals of finished barriers are abandoned by hand with a reason.
-- ADR numbers: this branch's ADR is numbered 20 because `main` already holds 17 to 19 (context compiler, handoffs, workbench);
-  README, SECURITY.md and docs/neo.md of this branch will conflict with `main`'s in the lines they both edit.
+- **The protected list was written before the later features and was extended when they landed** (ADR 28): the SSH, forge, messaging, fan-out,
+  context compiler and web workbench guardrails were added by name, and `crates/fleet-infra/tests/dogfood.rs` checks that every listed path exists. A
+  guardrail file that a later feature adds is not on the list until a person adds it and runs `gen-contracts.sh`.
 
 ## 11. What was not verified
 
@@ -431,7 +439,8 @@ By the preparation of this runbook: **no run of the scaffold with `omp`**; the i
 tried) and what `omp` prints, retries or stops on when a shell command is refused beyond what the trials showed; whether writes
 outside the worktree are refused in write mode; the docker wrapper `container-run.example.sh` itself (it follows the wrapper of the
 trials, which was run on macOS, but this file was not run: the dry run used `container-run.inside.sh` inside the development
-container, with a soak of 2 seconds instead of 20 and without the network and read-only isolation of the real wrapper); the real
+container, with a soak of 2 seconds instead of 20 and without the network and read-only isolation of the real wrapper, and in an image without
+an sshd, so the `remote` layer was skipped); the real
 dependency refresh (`deps-refresh.sh` was tested with stand-ins for the container and the age check, never against crates.io);
 anything on macOS (the shell tests and the dry run ran on Linux with GNU tools; the scripts use `sha256sum` or `shasum`, `mktemp`,
 `sed`, `awk`, `find`, `xargs -0` as found on macOS but were not run there); `flock` is used only by `container-run.inside.sh`, which is not

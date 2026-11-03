@@ -39,7 +39,7 @@ All checks are mandatory. They run in order in a private export of the commit, w
 | `fmt` | `cargo fmt --all -- --check` in the container | formatting |
 | `clippy` | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | lints (workspace denies `unwrap`, `expect`, indexing; `unsafe` is forbidden) |
 | `architecture` | `cargo test --locked --offline -p fleet-cli --test architecture` | layering, no I/O in the domain, no new kind of dependency |
-| `layers` | `sh scripts/test-layers.sh`: domain, application, adapters, soak and end-to-end layers | the tests, including the new ones |
+| `layers` | `sh scripts/test-layers.sh`: the domain, application, adapters (with the consistency tests of `dogfood/`), soak and end-to-end layers; the `remote` layer is skipped in the development image (see "The `remote` layer is not part of the contract") | the tests, including the new ones |
 
 then the task's own `scope` check: a `diff` with `allow` (the table above).
 
@@ -47,6 +47,24 @@ then the task's own `scope` check: a `diff` with `allow` (the table above).
 what a glob cannot (case folding, links, odd names) and run from copies installed outside the repository.
 `secret-scan` covers the tree of the commit; run `sh scripts/secret-scan.sh --history` yourself before you
 merge, it needs the whole history.
+
+## The `remote` layer is not part of the contract
+
+`scripts/test-layers.sh` has a sixth layer, `remote`: the tests of the SSH remote worktrees against a **real sshd**
+(`crates/fleet-infra/tests/ssh_remote.rs`, and the remote tests of the end-to-end layer, `crates/fleet-cli/tests/e2e_remote.rs`).
+It runs only when the image has `/usr/sbin/sshd` (`docker/Dockerfile.ssh`, the `fleet-ssh` image, started through
+`scripts/ssh-env.sh`). The development image `fleet-dev` that the container wrapper runs has none, so in every contract the
+`layers` check prints `skipped: no OpenSSH server in this image` for that layer and still passes or fails on the other five. That is
+deliberate and stays so:
+
+- the tests start an sshd of their own and need a passwd entry for the container's uid, which `scripts/ssh-env.sh` appends to the image's `/etc/passwd`; the wrapper's container is a different thing (its tree is read-only, no capabilities, no network), and a check should not depend on such a server;
+- it is no judge of a task's change: `crates/fleet-infra/src/ssh/**`, the remote host code, the host key pinning, `docker/Dockerfile.ssh`,
+  `scripts/ssh-env.sh` and the sshd tests are protected paths that no task may change ([PROTECTED_PATHS.md](../PROTECTED_PATHS.md)), so no
+  task of the roadmap can alter what the remote layer proves.
+
+Do not point the wrapper at the `fleet-ssh` image for these contracts: the layer would then start servers inside a check. The remote layer
+is run by a person, and by CI (the `ssh-tests` job): after a person changes one of those protected paths, run it yourself as the README
+shows (`IMAGE=fleet-ssh`, section Development). Through `scripts/ssh-env.sh` (`FLEET_SSH_TESTS=1`) a missing server is a failure, not a skip.
 
 ## Reviewed exceptions: `flaky-test.json`
 

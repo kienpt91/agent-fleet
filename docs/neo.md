@@ -238,6 +238,9 @@ decision is [ADR 28](adr/0028-neo-may-not-modify-its-own-guardrails.md). Exactly
 - No token governor (N4): nothing limits spend but the provider's own console. The context compiler (N2, above) exists but is an
   opt-in of a run (`context = "compiled"`) that the roadmap plan does not switch on and that has not been tried with the scaffold,
   so the agent sees a task's spec as its brief, not its contract.
+- The tests of the SSH remote worktrees (the `remote` layer of `scripts/test-layers.sh`) need an image with an OpenSSH server and are
+  not part of any self-development contract: the contracts run in the development image, where that layer is skipped. The code
+  they test is protected, so no task can change what they prove.
 - A weak check passes a weak result, and a person still reads every diff. `merge` stays a human approval.
 
 See the decisions in [docs/adr/0011](adr/0011-neo-domain-crates-and-application-module.md),

@@ -719,7 +719,8 @@ admission and the read-only workbench allowlist) are [protected
 paths](dogfood/PROTECTED_PATHS.md): no task may change them, and a change needs a commit authored by a person or a human approval of
 the exact diff plus an independent security review. Every task's contract (the `diff` check now takes a `deny` list) forbids them and
 also runs formatting, clippy with `-D warnings`, the architecture tests, the layered tests, the secret scanner, an unchanged
-`Cargo.lock` and a check that no measured number of the documentation changed; a roadmap plan for N3 to N5 lists the tasks, and the
+`Cargo.lock` and a check that no measured number of the documentation changed (the `remote` layer of the tests, which needs an sshd,
+is not part of a contract and is run by a person and by CI); a roadmap plan for N3 to N5 lists the tasks, and the
 ones that touch protected paths are marked human-only with a contract that can never pass.
 
 What is and is not safe today, exactly: the machinery is tested (shell tests of the checkers, consistency tests of the data, a dry run with the

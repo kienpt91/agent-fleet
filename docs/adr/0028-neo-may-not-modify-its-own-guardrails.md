@@ -65,4 +65,6 @@ task may edit finds only what the task allows. The worker is also the same user 
   agent**; only the scripted dry run, the shell tests and the consistency tests exist.
 - The list was written before those features landed and was extended when they did; a guardrail file that a later feature adds is
   on it only after a person adds it, and the consistency test (`crates/fleet-infra/tests/dogfood.rs`) only checks that what is listed exists.
+- The `remote` layer of the tests (a real sshd, `scripts/test-layers.sh`) is not part of any contract: it needs another image, and the
+  code it tests is on the list, so no task can change what it proves.
 - The ADR number is 28 because `main` took 17 to 27 (context compiler, workbench, GitHub, fan-out, messages, SSH) while this was written.

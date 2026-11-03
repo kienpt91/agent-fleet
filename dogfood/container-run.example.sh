@@ -31,7 +31,7 @@
 set -eu
 [ $# -eq 1 ] || { echo "usage: container-run.sh '<shell command>'" >&2; exit 2; }
 docker=/usr/local/bin/docker                  # EDIT: the absolute path of your docker client
-image=fleet-dev                               # EDIT only if you use another derived image
+image=fleet-dev                               # EDIT only if you use another derived image; NOT fleet-ssh (RUNBOOK.md, section 1: the `remote` layer is not part of a contract)
 cargo_volume=fleet-dogfood-cargo
 target_volume=fleet-dogfood-target
 repo=$(pwd)

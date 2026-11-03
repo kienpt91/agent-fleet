@@ -1161,6 +1161,68 @@ fn the_daemon_template_is_accepted_by_the_real_reader_and_is_strict() {
 // ---- the documents -----------------------------------------------------------------------------------
 
 #[test]
+fn no_contract_runs_the_remote_layer_and_the_documents_say_why() {
+    // the tests against a real sshd need the fleet-ssh image: a contract runs in fleet-dev, where
+    // scripts/test-layers.sh skips that layer, and none of them may ask for the sshd tests by name
+    for name in [
+        "single-file",
+        "docs-only",
+        "crate-src",
+        "flaky-test",
+        "human-only",
+        "common-checks",
+    ] {
+        let doc: serde_json::Value =
+            serde_json::from_str(&rendered(&read(&format!("dogfood/contracts/{name}.json"))))
+                .unwrap();
+        let checks = match &doc {
+            serde_json::Value::Array(a) => a.clone(),
+            other => other["checks"].as_array().unwrap().clone(),
+        };
+        for c in checks.iter().filter(|c| c["kind"] == "command") {
+            let line = format!("{} {}", c["program"], c["args"]);
+            for banned in [
+                "ssh-env",
+                "fleet-ssh",
+                "ssh_remote",
+                "e2e_remote",
+                "FLEET_SSH_TESTS",
+            ] {
+                assert!(
+                    !line.contains(banned),
+                    "{name}: {line} runs the remote layer"
+                );
+            }
+        }
+    }
+    let layers = read("scripts/test-layers.sh");
+    assert!(
+        layers.contains("layer remote"),
+        "the remote layer moved: update the documents"
+    );
+    assert!(
+        layers.contains("/usr/sbin/sshd"),
+        "the remote layer no longer depends on sshd"
+    );
+    // the wrapper's image has no sshd, so the layer is skipped inside a check
+    for wrapper in ["dogfood/container-run.example.sh"] {
+        let text = read(wrapper);
+        assert!(text.contains("image=fleet-dev"), "{wrapper}");
+        assert!(!text.contains("image=fleet-ssh"), "{wrapper}");
+    }
+    let readme = read("dogfood/contracts/README.md");
+    assert!(
+        readme.contains("The `remote` layer is not part of the contract"),
+        "contracts/README.md must document the remote layer"
+    );
+    let runbook = read("dogfood/RUNBOOK.md");
+    assert!(
+        runbook.contains("`remote` layer"),
+        "RUNBOOK.md must say that the remote layer is not part of a contract"
+    );
+}
+
+#[test]
 fn the_documents_name_every_part_and_every_protected_path() {
     let entries = protected();
     let doc = read("dogfood/PROTECTED_PATHS.md");
