@@ -447,17 +447,22 @@ A worker writes `.fleet/outbox/<n>.json` (`{"version":1,"channel","to","kind":"i
 waited on, size caps, strict schema), applies the policy and writes accepted messages to `.fleet/inbox/<id>.json` of a
 *running* recipient, with `index.json` listing the real deliveries and their digests; any other file in the inbox is
 removed and reported, and an inbox that has been replaced by a link is refused (the message waits). Messages queue
-until the recipient runs and expire by ttl. `[messages]` in `fleet.toml` sets `max_total_messages`, `max_fan_out`,
-`max_reply_depth` (6), `max_pair_exchanges` (12), `max_messages_per_task_per_minute` and `notify_input` (default **off**:
-when on, one fixed line `[fleet] new message m3 in .fleet/inbox` is typed into the terminal; risk: unsolicited
-keystrokes in a terminal program).
+until the recipient runs and expire by ttl. `[messages]` in `fleet.toml` sets `max_total_messages` (per run),
+`max_fan_out`, `max_reply_depth` (6), `max_pair_exchanges` (12 changes of direction), `max_messages_per_task_per_minute`,
+`max_refused_per_task` (100) and `notify_input` (default **off**: when on, one fixed line
+`[fleet] new message m3 in .fleet/inbox` is typed into the terminal, without Enter, so it cannot submit anything; risk:
+a peer chooses *when* characters appear in the recipient's input line).
 
 **Content is untrusted peer content**: sanitized, redacted, clipped, shown as `from task <id> (unverified peer message)`,
-and never part of a contract, an approval, a gate or acceptance criteria. A body that matches a secret shape (the rules
-of `scripts/secret-scan.sh`) is refused and not stored. A ping-pong (also without `in_reply_to`), a pair that exceeds its
-budget or a task that floods mutes the channel (or the task) and opens a decision gate; `fleet msg mute|unmute` is the
-kill switch; a channel is muted when fewer than two members can still take part (messages it accepted before still
-arrive: a worker's last message before it exits is not lost).
+and never part of a contract, an approval, a gate or acceptance criteria. A subject or body that matches a secret shape
+(the rules of `scripts/secret-scan.sh`, checked line by line) is refused and not stored; a secret split across lines,
+messages or encodings is not caught. A ping-pong (also without `in_reply_to`) or a pair that goes back and forth more
+than its budget mutes the **sender that crossed the limit on that channel** (the whole channel only when nobody else is
+left on it) and opens a decision gate, so one member cannot silence the others; a task whose messages are refused too
+often (20 a minute, or 100 in all) is muted everywhere; a reply must name a message its sender received. `fleet msg
+mute|unmute` is the kill switch; a channel is muted when fewer than two members can still take part (messages it accepted
+before still arrive: a worker's last message before it exits is not lost). Waiting approvals and mute gates have shares
+of the decision pool of their own, so they cannot starve questions and merge approvals.
 
 ```text
 fleet msg list [--task T] [--channel C] [--limit N]    channels, badges (MUTED, BLOCKED), newest messages

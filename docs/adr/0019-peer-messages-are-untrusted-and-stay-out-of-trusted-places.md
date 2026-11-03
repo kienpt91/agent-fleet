@@ -22,7 +22,14 @@ influenced by it; nothing in this repository can prevent that.
   and it cannot change the recipient's spec or contract (the brief is built from the task record only).
 - **In briefs:** a worker's brief names its channels and says what waits for it. Of the waiting messages only the
   sender label and the *subject*, flattened to one quoted line of at most 80 characters (three at most), appear; the body
-  never does. The same rule as a dependency's summary.
+  never does. The same rule as a dependency's summary. Be clear about what that is: up to three lines of peer text inside
+  the document a worker reads as its instructions. They are labelled, quoted, bounded and stripped of control and bidi
+  characters, they are not removed; an operator who does not want any peer text in a brief should not let messages wait
+  for a task that has not started (a short `ttl_secs`).
+- **What the secret check is.** A shape check on the subject and the body, line by line, ASCII based, the rules of
+  `scripts/secret-scan.sh`. A credential split across lines, across the subject and the body or across several
+  messages, an encoded one, or one written with look-alike characters passes it; a pattern that matches no rule passes
+  it. It stops the accidental paste, not a deliberate exfiltration, and the docs say so.
 
 ## Consequences
 A model that reads its inbox can still be talked into things; the blast radius is what that agent could do anyway,
