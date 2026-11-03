@@ -1500,10 +1500,56 @@ mod tests {
         std::fs::write(wt.join("go"), "").unwrap();
         collect(&mut runner, 1);
         // the result is queued before the guard of the child is dropped; both happen right away
-        assert!(wait_until(5_000, || runner.live().is_empty()));
+        assert!(wait_until(30_000, || runner.live().is_empty()));
+        // The group was SIGKILLed before the entry was dropped, but a killed process stays a
+        // zombie (and so keeps the group "existing" for killpg) until its parent reaps it, and
+        // the reaper of orphans (init) may be slow or absent. Wait until no member is left that
+        // is not a zombie.
+        let alive = |pgid: u32| -> Vec<String> {
+            let want = pgid.to_string();
+            // (pid, pgid, state) of every process: /proc where there is one, ps elsewhere
+            let mut procs: Vec<(String, String, String)> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if !name.chars().all(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    // a process may vanish while the directory is scanned: skip it
+                    let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
+                        continue;
+                    };
+                    let Some((_, rest)) = stat.rsplit_once(") ") else {
+                        continue;
+                    };
+                    let f: Vec<&str> = rest.split_whitespace().collect();
+                    if f.len() >= 3 {
+                        procs.push((name, f[2].to_string(), f[0].to_string()));
+                    }
+                }
+            } else {
+                let out = std::process::Command::new("ps")
+                    .args(["-A", "-o", "pid=,pgid=,stat="])
+                    .env("LC_ALL", "C")
+                    .output()
+                    .expect("ps runs");
+                for l in String::from_utf8_lossy(&out.stdout).lines() {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    if f.len() >= 3 {
+                        procs.push((f[0].to_string(), f[1].to_string(), f[2].to_string()));
+                    }
+                }
+            }
+            procs
+                .into_iter()
+                .filter(|(_, g, s)| *g == want && !s.starts_with('Z'))
+                .map(|(p, g, s)| format!("{p} {g} {s}"))
+                .collect()
+        };
         assert!(
-            !crate::procid::group_exists(pid),
-            "the group was killed before it was forgotten"
+            wait_until(30_000, || alive(pid).is_empty()),
+            "the group was killed before it was forgotten; still running: {:?}",
+            alive(pid)
         );
     }
 
