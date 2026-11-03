@@ -162,9 +162,81 @@ impl GitVcs {
         }
         self.require_clean(&w)?;
 
-        let path = path_str(bundle)?;
+        // Everything untrusted is looked at in a scratch repository first: it holds the commit
+        // that was sent and what the bundle brings, nothing else, so the checks cover exactly the
+        // incoming objects (not the whole history of the real repository) and a refused bundle
+        // leaves no object behind in the real one.
+        let scratch = bundle.with_file_name(format!(
+            "scratch-{}-{}-{}",
+            std::process::id(),
+            run.as_str(),
+            task.as_str()
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+        self.delete_ref(&w.repo, &return_ref)?;
+        let outcome = self
+            .stage_in_scratch(&w, &scratch, &sent_ref, bundle)
+            .and_then(|claimed| {
+                self.verify_and_apply(
+                    &w,
+                    &branch,
+                    &old,
+                    &old_tree,
+                    sent,
+                    &claimed,
+                    path_str(&scratch)?,
+                    &return_ref,
+                    identity,
+                    host,
+                )
+            });
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = self.delete_ref(&w.repo, &return_ref);
+        // The commit that was sent stays under its quarantine ref after a refusal (the same
+        // attempt may be collected again); a success or the end of the attempt drops it.
+        if outcome.is_ok() {
+            let _ = self.delete_ref(&w.repo, &sent_ref);
+        }
+        outcome
+    }
+
+    /// Fetches the bundle into a fresh bare repository that already holds the commit that was
+    /// sent, checks its header and its objects there and returns the commit it names.
+    fn stage_in_scratch(
+        &self,
+        w: &Worktree,
+        scratch: &Path,
+        sent_ref: &str,
+        bundle: &Path,
+    ) -> Result<Sha> {
+        let parent = bundle.parent().unwrap_or(Path::new("/"));
+        let scratch_text = path_str(scratch)?;
+        let bundle_text = path_str(bundle)?;
+        self.run_ok(parent, None, &["init", "--bare", "-q", scratch_text])?;
+        let refused = |e: FleetError| {
+            FleetError::forbidden(format!(
+                "the remote's bundle was refused by git: {}",
+                e.message
+            ))
+        };
+        self.run_ok(
+            scratch,
+            None,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                path_str(&w.repo)?,
+                &format!("+{sent_ref}:refs/heads/sent"),
+            ],
+        )?;
         // The bundle names exactly one ref, the one the protocol uses.
-        let heads = self.run_ok(&w.repo, None, &["bundle", "list-heads", path])?;
+        let heads = self
+            .run_ok(scratch, None, &["bundle", "list-heads", bundle_text])
+            .map_err(refused)?;
         let text = heads.text();
         let mut lines = text.lines();
         let (Some(line), None) = (lines.next(), lines.next()) else {
@@ -186,23 +258,53 @@ impl GitVcs {
         }
         let claimed = Sha::parse(claimed)
             .map_err(|_| FleetError::forbidden("the remote's bundle names no valid commit"))?;
-
-        self.delete_ref(&w.repo, &return_ref)?;
-        let outcome = self.verify_and_apply(
-            &w,
-            &branch,
-            &old,
-            &old_tree,
-            sent,
-            &claimed,
-            path,
-            &return_ref,
-            identity,
-            host,
-        );
-        let _ = self.delete_ref(&w.repo, &return_ref);
-        let _ = self.delete_ref(&w.repo, &sent_ref);
-        outcome
+        self.run_ok(
+            scratch,
+            None,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                bundle_text,
+                &format!("+{RETURN_REF}:refs/heads/ret"),
+            ],
+        )
+        .map_err(refused)?;
+        // Git does not check the objects of a bundle when it fetches from one: read every object
+        // of the scratch repository (the tree that was sent plus what came in) the way a push
+        // would be checked: a `.git` entry in a tree, malformed objects.
+        let fsck = self.run(
+            scratch,
+            None,
+            &["fsck", "--strict", "--no-dangling", "--no-progress"],
+        )?;
+        if fsck.code != Some(0) {
+            return Err(FleetError::forbidden(format!(
+                "the remote's objects failed git's checks: {}",
+                safe_text(String::from_utf8_lossy(&fsck.stderr).trim(), 160)
+            )));
+        }
+        // It builds on what was sent: unrelated history and rewritten history are not that. (Looked
+        // at here so that a bundle that fails this leaves nothing in the real repository.)
+        let ancestry = self.run(
+            scratch,
+            None,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                "refs/heads/sent",
+                "refs/heads/ret",
+            ],
+        )?;
+        if ancestry.code != Some(0) {
+            return Err(FleetError::forbidden(
+                "the remote's work does not build on the commit that was sent; refused",
+            ));
+        }
+        Ok(claimed)
     }
 
     fn require_clean(&self, w: &Worktree) -> Result<()> {
@@ -248,14 +350,12 @@ impl GitVcs {
         identity: &Identity,
         host: &str,
     ) -> Result<Imported> {
-        let refspec = format!("+{RETURN_REF}:{return_ref}");
+        let refspec = format!("+refs/heads/ret:{return_ref}");
         self.run_ok(
             &w.repo,
             None,
             &[
-                // The bundle is a file of ours that this call names: the one source allowed.
-                // (Git does not check the objects of a bundle when it fetches from one; the
-                // `fsck` below does.)
+                // The scratch repository is a directory of ours that this call names.
                 "-c",
                 "protocol.file.allow=always",
                 "fetch",
@@ -285,37 +385,6 @@ impl GitVcs {
         if tip != *claimed {
             return Err(FleetError::forbidden(
                 "the commit the bundle delivered is not the one its header named; refused",
-            ));
-        }
-        // Every object reachable from the tip is read and checked the way a push would check it
-        // (a `.git` entry in a tree, malformed objects). That is the tree that was sent plus what
-        // the remote added, not the repository's history.
-        let fsck = self.run(
-            &w.repo,
-            None,
-            &[
-                "fsck",
-                "--strict",
-                "--no-dangling",
-                "--no-progress",
-                tip.as_str(),
-            ],
-        )?;
-        if fsck.code != Some(0) {
-            return Err(FleetError::forbidden(format!(
-                "the remote's objects failed git's checks: {}",
-                safe_text(String::from_utf8_lossy(&fsck.stderr).trim(), 160)
-            )));
-        }
-        // It builds on what was sent: unrelated history and rewritten history are not that.
-        let ancestry = self.run(
-            &w.repo,
-            None,
-            &["merge-base", "--is-ancestor", sent.as_str(), tip.as_str()],
-        )?;
-        if ancestry.code != Some(0) {
-            return Err(FleetError::forbidden(
-                "the remote's work does not build on the commit that was sent; refused",
             ));
         }
         let range = format!("{}..{}", sent.as_str(), tip.as_str());
@@ -429,6 +498,12 @@ impl GitVcs {
                 None,
                 &["update-ref", &full, old.as_str(), new.as_str()],
             );
+            let _ = self.run_in(
+                w,
+                None,
+                &["reset", "--hard", "-q", "--no-recurse-submodules"],
+            );
+            let _ = self.run_in(w, None, &["clean", "-fdq", "-e", ".fleet"]);
             return Err(e);
         }
         Ok(Imported {
@@ -600,6 +675,7 @@ mod tests {
         );
         assert_eq!(heads.lines().count(), 1, "{heads}");
         fx.vcs.drop_remote_refs(&fx.wt, &fx.run, &fx.task).unwrap();
+        fx.vcs.drop_remote_refs(&fx.wt, &fx.run, &fx.task).unwrap();
         assert_eq!(fx.refs(), "");
         fx.vcs.drop_remote_refs(&fx.wt, &fx.run, &fx.task).unwrap();
     }
@@ -614,6 +690,7 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("bundle"), "{}", err.message);
         assert!(!bundle.exists());
+        fx.vcs.drop_remote_refs(&fx.wt, &fx.run, &fx.task).unwrap();
         assert_eq!(fx.refs(), "");
     }
 
@@ -640,6 +717,7 @@ mod tests {
             "new\n"
         );
         assert_eq!(git(Path::new(&fx.wt), &["status", "--porcelain"]), "");
+        fx.vcs.drop_remote_refs(&fx.wt, &fx.run, &fx.task).unwrap();
         assert_eq!(fx.refs(), "", "the quarantine refs are gone");
     }
 
@@ -712,6 +790,7 @@ mod tests {
         assert!(err.message.contains("does not build on"), "{}", err.message);
         assert_eq!(fx.head(), before);
         assert!(!Path::new(&fx.wt).join("evil.txt").exists());
+        fx.vcs.drop_remote_refs(&fx.wt, &fx.run, &fx.task).unwrap();
         assert_eq!(fx.refs(), "");
     }
 
@@ -802,6 +881,7 @@ mod tests {
             err.message
         );
         assert!(err.message.contains("hasDotgit"), "{}", err.message);
+        fx.vcs.drop_remote_refs(&fx.wt, &fx.run, &fx.task).unwrap();
         assert_eq!(fx.refs(), "");
     }
 
@@ -868,5 +948,130 @@ mod tests {
         let err = fx.import(&sent, &odd).unwrap_err();
         assert!(err.message.contains("refused"), "{}", err.message);
         assert!(fx.import(&sent, &back).is_ok());
+    }
+
+    #[test]
+    fn an_old_malformed_object_in_the_repository_does_not_stop_an_honest_import() {
+        let Some(fx) = Fx::new() else { return };
+        // A tree with a zero-padded mode, as some old repositories have (unreachable here).
+        let mut raw = b"040000 d\0".to_vec();
+        raw.extend_from_slice(&[
+            0x4b, 0x82, 0x5d, 0xc6, 0x42, 0xcb, 0x6e, 0xb9, 0xa0, 0x60, 0xe5, 0x4b, 0xf8, 0xd6,
+            0x92, 0x88, 0xfb, 0xee, 0x49, 0x04,
+        ]);
+        let file = fx.dir.join("legacy.tree");
+        fs::write(&file, raw).unwrap();
+        git(
+            &fx.repo,
+            &[
+                "hash-object",
+                "-t",
+                "tree",
+                "-w",
+                "--literally",
+                file.to_str().unwrap(),
+            ],
+        );
+        let (sent, bundle) = fx.export();
+        let back = fx.remote(&bundle, &sent, |r| commit_file(r, "a.txt", "a\n"));
+        let got = fx.import(&sent, &back).expect("an honest import");
+        assert!(got.head.is_some());
+    }
+
+    #[test]
+    fn a_refused_bundle_leaves_no_object_in_the_repository() {
+        let Some(fx) = Fx::new() else { return };
+        let count = |fx: &Fx| {
+            git(&fx.repo, &["count-objects", "-v"])
+                .lines()
+                .filter(|l| l.starts_with("count:") || l.starts_with("in-pack:"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (sent, bundle) = fx.export();
+        let before = count(&fx);
+        let back = fx.remote(&bundle, &sent, |r| {
+            git(r, &["checkout", "-q", "--orphan", "other"]);
+            git(r, &["rm", "-rfq", "."]);
+            commit_file(r, "evil.txt", &"evil\n".repeat(1000));
+            git(r, &["update-ref", "refs/heads/work", "HEAD"]);
+        });
+        assert!(fx.import(&sent, &back).is_err());
+        assert_eq!(
+            count(&fx),
+            before,
+            "objects of a refused bundle stayed behind"
+        );
+        let scratch: Vec<_> = fs::read_dir(fx.dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("scratch-"))
+            .collect();
+        assert!(scratch.is_empty(), "the scratch repository is removed");
+    }
+
+    #[test]
+    fn a_checkout_that_fails_halfway_leaves_the_worktree_as_it_was() {
+        let Some(fx) = Fx::new() else { return };
+        let before = fx.head();
+        let (sent, bundle) = fx.export();
+        let back = fx.remote(&bundle, &sent, |r| {
+            let blob = git(r, &["hash-object", "-w", "--stdin"]);
+            let _ = blob;
+            fs::write(r.join("good.txt"), "good\n").unwrap();
+            let good = git(r, &["hash-object", "-w", "good.txt"]);
+            let long = format!("z{}", "n".repeat(300));
+            git(
+                r,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("100644,{good},a-first.txt"),
+                ],
+            );
+            git(
+                r,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("100644,{good},{long}"),
+                ],
+            );
+            let tree = git(r, &["write-tree"]);
+            let commit = git(
+                r,
+                &[
+                    "-c",
+                    "user.name=x",
+                    "-c",
+                    "user.email=x@x",
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    "HEAD",
+                    "-m",
+                    "x",
+                ],
+            );
+            git(r, &["update-ref", "HEAD", &commit]);
+        });
+        let err = fx.import(&sent, &back).unwrap_err();
+        assert!(!err.message.is_empty());
+        assert_eq!(fx.head(), before, "the branch is as it was");
+        assert_eq!(
+            git(
+                Path::new(&fx.wt),
+                &["status", "--porcelain", "--untracked-files=all"]
+            ),
+            "",
+            "no file of the failed checkout stays behind"
+        );
+        assert!(!Path::new(&fx.wt).join("a-first.txt").exists());
+        assert!(
+            Path::new(&fx.wt).join(".fleet").is_dir(),
+            "fleet's own directory is kept"
+        );
     }
 }
