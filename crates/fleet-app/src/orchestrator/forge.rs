@@ -628,6 +628,7 @@ impl Orchestrator {
                 spec: draft.spec,
                 deps: args.after.clone(),
                 worker: args.worker.clone(),
+                host: None,
             }],
         )?;
         let task = ids

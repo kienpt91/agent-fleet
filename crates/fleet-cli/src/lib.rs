@@ -13,6 +13,7 @@ pub mod args;
 pub mod attach;
 pub mod commands;
 pub mod forge_cli;
+pub mod host_cmd;
 pub mod render;
 pub mod render_context;
 pub mod render_fanout;

@@ -28,7 +28,7 @@ phases that are still to be built.
 | not planned | Deliberately out of scope. Section 5 gives reasons. |
 
 agent-fleet is a headless daemon plus a CLI, a terminal dashboard and (phase 2) a local web dashboard. It has no
-desktop GUI application, no editor, no embedded browser, no Linear integration, no SSH worktrees and no
+desktop GUI application, no editor, no embedded browser, no Linear integration, SSH worktrees only through the system's OpenSSH client (phase 3c) and no
 mobile app.
 
 ## 3. Matrix
@@ -69,7 +69,7 @@ mobile app.
 | Rich previews (Markdown, images; PDF) | partial | `fleet-domain/src/repo/markdown.rs` (property and adversarial tests), `fleet-cli/tests/e2e_web.rs::the_workbench_shows_the_recorded_commit_of_a_task_from_the_real_repository`, `scripts/web-smoke-panes.mjs` | Markdown subset and png/jpeg/gif/webp images only (SVG excluded). PDF is planned for phase 5.5 (first step: the system viewer). Also loaded in headless Chromium (`scripts/workbench-demo.sh`); no desktop browsers. |
 | GitHub integration (PRs, issues) | partial (implemented and tested against a fake `gh`; a real account is owner-verified) | `fleet-app/tests/forge.rs::an_approved_pull_request_is_preflighted_pushed_created_and_recorded`, `forge.rs::changing_anything_after_the_approval_invalidates_it`, `fleet-infra/tests/forge_gh.rs::gh_gets_a_minimal_environment_and_never_a_token`, `forge_gh.rs::a_rate_limit_blocks_further_calls_without_starting_gh_and_comes_back_after_the_wait`, `forge_push.rs::exactly_the_approved_commit_goes_to_exactly_one_ref_of_the_remote`, `fleet-cli/tests/e2e_forge.rs`, `scripts/github-demo.sh` | Read issues and pull requests (checks, reviews), issue to task (untrusted text), pull request creation behind an approval bound to repository, base, head branch and commit, title, body and draft flag; read-only dashboard and TUI views. `pr comment` and review actions are not implemented. Compared 2026-10-31. Verified against `gh` 2.79.0 help text only; a real account, real HTTPS push credentials and macOS are not verified (README "What was not verified"). |
 | Linear integration (issues, boards) | planned | none | Phase 3. |
-| SSH remote worktrees | planned | none | Phase 3. |
+| SSH remote worktrees | implemented | `fleet-infra/tests/ssh_remote.rs` (a real sshd: pinning, wrong key, forwarding, quoting, kill escalation, keepalive, jump host, the `RemoteHost` contract), `fleet-cli/tests/e2e_remote.rs` (the real binary and daemon), `scripts/ssh-demo.sh` (output in the README), ADR 27 | Compared 2026-10-31. Phase 3c: `fleet host add/list/trust/remove/doctor`, `[hosts.<name>]`, `task add --host`; host key pinning by an explicit operator step, no agent forwarding, bounded remote output, bundle transfer verified before use. Criteria 6-10 of phase 3 are met by tests against a local sshd; not verified on macOS, with real accounts or with real agents (owner-verified). Agent forwarding is not offered at all. |
 | Self-hosted server or cloud VM runtime | not planned | none | The daemon is local only (unix socket, loopback web). Listed in public docs summary. |
 | Embedded browser with element capture and design mode | planned | none | Phase 4. |
 | Mobile companion | planned | none | Phase 4. |
@@ -143,7 +143,7 @@ Acceptance criteria (each must be a test or a documented manual check recorded i
 5. Text from issues, pull requests and comments is treated as untrusted (sanitized, redacted, quoted in briefs).
 6. SSH worktrees pin the host key (no trust-on-first-use without an explicit operator step) and refuse a changed
    key.
-7. SSH agent forwarding is off by default and only enabled by an explicit per-host setting.
+7. SSH agent forwarding is off by default and only enabled by an explicit per-host setting. (Phase 3c implements the stricter variant: there is no setting that enables it; the key of the host entry is the only credential.)
 8. Remote workers are subject to the same admission, environment allowlist, sanitization, redaction and output
    bounds as local workers; a test runs the same hostile-output cases against a remote session.
 9. Remote output and remote command duration are bounded (size and time limits) and a stalled connection ends in

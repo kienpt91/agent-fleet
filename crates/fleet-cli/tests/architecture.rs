@@ -1299,3 +1299,119 @@ fn message_text_has_no_path_into_an_approval_a_contract_or_a_goal() {
         "the approval action must name the message, never its words"
     );
 }
+
+// ---- remote hosts: the ssh adapter is an outer adapter with one place that starts the client ----------
+
+/// The code of a file up to its first `#[cfg(test)]` (the tests of a module may do what the module
+/// itself must not).
+fn non_test_code(file: &Path) -> String {
+    let text = read(file);
+    let cut = text.find("#[cfg(test)]").unwrap_or(text.len());
+    code_only(&text[..cut])
+}
+
+#[test]
+fn the_remote_rules_live_in_the_domain_and_the_port_in_the_application_layer() {
+    // The quoting and the closed set of remote calls are pure code of the domain crate.
+    let remote = crate_dir("fleet-domain").join("src/remote.rs");
+    assert!(remote.is_file());
+    let code = non_test_code(&remote);
+    for word in [
+        "std::process",
+        "std::fs",
+        "std::net",
+        "std::thread",
+        "std::env",
+    ] {
+        assert!(
+            !code.contains(word),
+            "fleet-domain/src/remote.rs uses {word}"
+        );
+    }
+    // The port trait and the session host that uses it are in the application layer, which
+    // starts no thread and no process for it.
+    let app = non_test_code(&crate_dir("fleet-app").join("src/remote.rs"));
+    assert!(app.contains("pub trait RemoteHost"));
+    for word in ["std::process", "std::thread", "std::net", "std::fs"] {
+        assert!(!app.contains(word), "fleet-app/src/remote.rs uses {word}");
+    }
+}
+
+#[test]
+fn only_the_executor_starts_the_ssh_client_and_no_shell_is_involved() {
+    let dir = crate_dir("fleet-infra").join("src/ssh");
+    let files = rust_files_in(&dir);
+    assert!(files.len() >= 8, "{files:?}");
+    let mut starters = Vec::new();
+    for file in &files {
+        let rel = relative(file);
+        let code = non_test_code(file);
+        if code.contains("Command::new(") {
+            starters.push(rel.clone());
+        }
+        // no shell on this machine: no `sh -c`, no command string
+        assert!(!code.contains("\"/bin/sh\""), "{rel} names a shell");
+        assert!(!code.contains("arg(\"-c\")"), "{rel} runs `-c`");
+        assert!(!code.contains("std::process::Command"), "{rel}");
+    }
+    assert_eq!(
+        starters,
+        ["crates/fleet-infra/src/ssh/exec.rs"],
+        "who starts a process: {starters:?}"
+    );
+}
+
+#[test]
+fn the_ssh_module_is_used_by_the_daemon_the_doctor_and_the_cli_only() {
+    let src = crate_dir("fleet-infra").join("src");
+    let mut users = Vec::new();
+    for file in rust_files_in(&src) {
+        let rel = file
+            .strip_prefix(&src)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if rel.starts_with("ssh/") || rel == "ssh.rs" {
+            continue;
+        }
+        let code = non_test_code(&file);
+        if mentions_path(&code, "ssh::") || code.contains("crate::ssh") {
+            users.push(rel);
+        }
+    }
+    assert_eq!(users, ["daemon.rs", "doctor.rs"], "{users:?}");
+    // The web adapter and the inner layers know nothing of it.
+    for krate in ["fleet-domain", "fleet-app"] {
+        for file in rust_sources(krate) {
+            let code = non_test_code(&file);
+            assert!(!code.contains("fleet_infra"), "{}", relative(&file));
+        }
+    }
+    let web = crate_dir("fleet-infra").join("src/web");
+    for file in rust_files_in(&web) {
+        let code = non_test_code(&file);
+        assert!(!code.contains("ssh::"), "{}", relative(&file));
+    }
+}
+
+#[test]
+fn the_ssh_client_arguments_are_built_in_one_module_from_fixed_options() {
+    let dir = crate_dir("fleet-infra").join("src/ssh");
+    for file in rust_files_in(&dir) {
+        let rel = relative(&file);
+        let code = non_test_code(&file);
+        // the options that say what ssh trusts and forwards are written only in argv.rs
+        for needle in [
+            "StrictHostKeyChecking",
+            "ForwardAgent",
+            "ClearAllForwardings",
+            "BatchMode",
+        ] {
+            if rel.ends_with("ssh/argv.rs") {
+                assert!(code.contains(needle), "argv.rs lacks {needle}");
+            } else {
+                assert!(!code.contains(needle), "{rel} sets {needle}");
+            }
+        }
+    }
+}

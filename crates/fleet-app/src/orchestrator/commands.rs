@@ -282,7 +282,22 @@ impl Orchestrator {
         ))
     }
 
+    fn check_hosts(&self, tasks: &[NewTask]) -> Result<()> {
+        for t in tasks {
+            if let Some(h) = &t.host {
+                if !self.cfg.hosts.contains_key(h) {
+                    return Err(FleetError::invalid(format!(
+                        "host {} is not defined in the configuration",
+                        fleet_domain::ids::show(h.as_str())
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn add_tasks(&mut self, run: &RunId, tasks: Vec<NewTask>, schema: &str) -> Result<Reply> {
+        self.check_hosts(&tasks)?;
         self.refuse_group_dependencies(run, &tasks)?;
         let (ids, events) = self.state.add_tasks(run, tasks)?;
         self.commit(events)?;
@@ -324,6 +339,7 @@ impl Orchestrator {
         tasks: Vec<NewTask>,
         channels: Vec<ChannelDef>,
     ) -> Result<Reply> {
+        self.check_hosts(&tasks)?;
         let (run_id, new_event) = match (run, new_run) {
             (Some(_), Some(_)) => {
                 return Err(FleetError::invalid(

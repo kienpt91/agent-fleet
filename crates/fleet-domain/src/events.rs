@@ -2,8 +2,8 @@
 //! the audit log is their serialized form, so the field names here are a stable format.
 
 use crate::ids::{
-    ApprovalId, ChannelName, DecisionId, EvidenceId, GoalId, GroupId, MessageId, RunId, Sha,
-    TaskId, WorkerName,
+    ApprovalId, ChannelName, DecisionId, EvidenceId, GoalId, GroupId, HostName, MessageId, RunId,
+    Sha, TaskId, WorkerName,
 };
 use crate::status::{
     BlockKind, BlockReason, ChannelDirection, ChannelMode, CloseReason, ContextMode, DecisionKind,
@@ -95,7 +95,7 @@ define_events! {
     },
     RunStarted = "run_started" { run: RunId, max_parallel: u32 },
     TaskAdded = "task_added" {
-        run: RunId, task: TaskId, title: String, spec: String, deps: Vec<TaskId>, worker: Option<WorkerName>,
+        run: RunId, task: TaskId, title: String, spec: String, deps: Vec<TaskId>, worker: Option<WorkerName>, host: Option<HostName>,
     },
     /// Pending to ready: every dependency is completed.
     TaskReady = "task_ready" { run: RunId, task: TaskId },
@@ -563,6 +563,7 @@ mod tests {
                 spec: "line1\nline2".into(),
                 deps: vec![TaskId::parse("t0").unwrap()],
                 worker: Some(WorkerName::parse("agent").unwrap()),
+                host: Some(HostName::parse("build1").unwrap()),
             },
             DomainEvent::SessionEnded {
                 run: run(),

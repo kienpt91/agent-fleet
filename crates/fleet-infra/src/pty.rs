@@ -641,6 +641,7 @@ mod tests {
                 ("HOME".to_string(), dir.path().to_string_lossy().to_string()),
                 ("TERM".to_string(), "xterm".to_string()),
             ],
+            host: None,
         }
     }
 

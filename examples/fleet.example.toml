@@ -55,3 +55,25 @@ command = "refcheck"
 args = ["check", "--json"]
 format = "refcheck-json"
 timeout_secs = 120
+
+# ---- remote hosts (SSH) ----------------------------------------------------------------------------------------
+# A task runs its worker on a host with `task add --host build` (or `host = "build"` in a plan). Add and pin a host with
+# the CLI instead of editing this file: `fleet host add build --address ... --user ... --identity ... --base-dir ...`,
+# then `fleet host trust build` (shows the key fingerprint, needs a terminal) and `fleet host doctor build`.
+#
+# [remote]
+# ssh = "/usr/bin/ssh"          # optional absolute path; default: found once in PATH (never inside a repository)
+#
+# [hosts.build]
+# address = "build.example.org"
+# port = 22
+# user = "fleet"                # an account made for fleet: the remote worker has all of its rights
+# identity_file = "/home/me/.ssh/fleet_build_ed25519"   # used for this host only; no agent, no ssh config, no password
+# base_dir = "/srv/fleet"       # absolute; every remote worktree is <base_dir>/<run>/<task>
+# allowed_workers = ["my-agent"]  # worker commands (as in [workers.x] command) that may run there
+# max_sessions = 2
+# # proxy_jump = "bastion"      # another [hosts.*] entry; its hop uses that entry's key and pin
+# # connect_timeout_secs = 10   # also: server_alive_secs = 15, server_alive_count = 3, max_bundle_mib = 256
+#
+# [hosts.build.env]             # the only variables the remote worker gets besides FLEET_RUN/TASK/WORKTREE, PATH, TERM
+# API_BASE = "https://example.invalid"

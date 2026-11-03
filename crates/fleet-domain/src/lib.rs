@@ -26,6 +26,7 @@ pub mod msg;
 pub mod output;
 pub mod quality;
 pub mod redact;
+pub mod remote;
 pub mod repo;
 pub mod run;
 pub mod sanitize;

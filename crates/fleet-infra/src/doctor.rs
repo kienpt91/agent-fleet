@@ -62,7 +62,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn new(name: impl Into<String>, status: Status, detail: impl Into<String>) -> Check {
+    pub fn new(name: impl Into<String>, status: Status, detail: impl Into<String>) -> Check {
         Check {
             name: name.into(),
             status,
@@ -92,6 +92,11 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
     checks.extend(check_config(
         input.config.as_deref(),
         &input.layout.default_config,
+        &input.env,
+    ));
+    checks.extend(crate::ssh::doctor::config_checks(
+        input.config.as_deref(),
+        &input.layout,
         &input.env,
     ));
     checks.push(check_undo(&input.env));

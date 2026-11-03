@@ -23,6 +23,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::jobs::{JobTracker, Sweeper};
+
+mod remote_sync;
 use fleet_app::ports::{
     BaseCommit, Identity, IntegrationMerge, IntegrationResult, MergeOutcome, TreeFile, TreeListing,
     Vcs, WorktreeState,
@@ -36,6 +38,7 @@ use fleet_fanout::diff::DiffStat;
 use neo_verify::limits::MAX_CHANGED_PATHS;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
+pub use remote_sync::{ImportRequest, Imported, MAX_REMOTE_COMMITS, RETURN_REF};
 
 mod push;
 mod read;

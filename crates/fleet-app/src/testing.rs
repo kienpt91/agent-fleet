@@ -9,6 +9,7 @@
 pub mod contracts;
 pub mod forge;
 pub mod mail_contracts;
+pub mod remote;
 pub mod repo;
 
 use crate::config::{AppConfig, WorkerDef};
@@ -18,7 +19,9 @@ use fleet_domain::approval::Digest;
 use fleet_domain::contract::{ContractRead, WorkerHandoff, WorkerQuestion, WorkerResult};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{ApprovalId, ChannelName, MessageId, RunId, Sha, TaskId, WorkerName};
+use fleet_domain::ids::{
+    ApprovalId, ChannelName, HostName, MessageId, RunId, Sha, TaskId, WorkerName,
+};
 use fleet_domain::msg::inbox::InboxItem;
 use fleet_domain::msg::message::OutboxMessage;
 use fleet_domain::output::Chunk;
@@ -1152,6 +1155,10 @@ impl SessionHost for FakeSessions {
 
     fn start_token(&self, pid: u32) -> Option<String> {
         self.0.lock().start_tokens.get(&pid).cloned()
+    }
+
+    fn remote_dir(&self, host: &HostName, run: &RunId, task: &TaskId) -> Result<String> {
+        Ok(format!("/remote/{host}/{run}/{task}"))
     }
 
     fn terminate_orphan(&mut self, identity: &ProcessIdentity, _grace_ms: u64) -> SignalOutcome {

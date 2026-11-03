@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-const ALL_SUBCOMMANDS: [&str; 55] = [
+const ALL_SUBCOMMANDS: [&str; 60] = [
     "daemon",
     "run create",
     "task add",
@@ -71,6 +71,11 @@ const ALL_SUBCOMMANDS: [&str; 55] = [
     "msg mute",
     "msg unmute",
     "msg send",
+    "host add",
+    "host list",
+    "host trust",
+    "host remove",
+    "host doctor",
 ];
 
 /// `PATH` without any directory that holds `tool`.
@@ -388,6 +393,7 @@ fn status_json_has_exactly_the_documented_keys() {
                 "failure",
                 "gates",
                 "head",
+                "host",
                 "id",
                 "live",
                 "merged",

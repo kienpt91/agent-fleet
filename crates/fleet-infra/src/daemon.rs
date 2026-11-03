@@ -27,9 +27,11 @@ use fleet_app::api::{parse_command, Command, Reply};
 use fleet_app::browse::{RepoBrowser, RepoImage, RepoReply};
 use fleet_app::config::AppConfig;
 use fleet_app::orchestrator::Orchestrator;
-use fleet_app::ports::{EventPublisher, Ports, StoredEvent};
+use fleet_app::ports::{EventPublisher, Ports, SessionHost, StoredEvent};
+use fleet_app::remote::RemoteSessions;
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::limits::MAX_CONCURRENT_JOBS;
+use fleet_domain::redact::Redactor;
 use fleet_domain::supervision::{is_started_by_daemon, is_worker_origin, Lineage, LiveSession};
 use fleet_domain::value::Value;
 use std::io::IsTerminal;
@@ -163,6 +165,52 @@ fn load_config(
     }
 }
 
+/// The session host: the terminal sessions, wrapped by the remote-host support when hosts are
+/// configured and the `ssh` program was found. Without `ssh` the hosts stay unusable (a task that
+/// names one fails with that reason) and the daemon says why once.
+fn session_host(
+    app: &AppConfig,
+    remote: &crate::config_file::RemoteSettings,
+    env: &[(String, String)],
+    layout: &StateLayout,
+    tracker: &JobTracker,
+    redactor: &Arc<Redactor>,
+    pty: PtySessionHost,
+) -> Box<dyn SessionHost> {
+    if app.hosts.is_empty() {
+        return Box::new(pty);
+    }
+    let path_env = env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map_or("", |(_, v)| v.as_str());
+    match crate::ssh::locate_ssh(remote.ssh_binary.as_deref(), path_env) {
+        Ok(ssh) => {
+            let client = crate::ssh::client::SshClient::new(
+                ssh,
+                app.hosts.clone(),
+                layout.root.clone(),
+                tracker.clone(),
+            )
+            .with_redactor(Arc::clone(redactor));
+            let vcs = GitVcs::new(env.to_vec(), app.env.clone()).with_tracker(tracker.clone());
+            let host = crate::ssh::host::SshRemoteHost::new(client, vcs, app.author.clone());
+            Box::new(RemoteSessions::new(
+                Box::new(pty),
+                Arc::new(host),
+                app.hosts.clone(),
+            ))
+        }
+        Err(e) => {
+            eprintln!(
+                "fleet: remote hosts are disabled: {}; tasks that name a host will fail",
+                e.message
+            );
+            Box::new(pty)
+        }
+    }
+}
+
 /// Starts the daemon and returns once the socket is accepting connections.
 pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     let layout = StateLayout::new(opts.state_dir.clone());
@@ -225,6 +273,15 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
     let forge_jobs = app.forge.enabled.then(|| {
         crate::forge_jobs::build(&app.forge, &env, Arc::clone(&redactor), tracker.clone())
     });
+    let sessions = session_host(
+        &app,
+        &loaded.remote,
+        &env,
+        &layout,
+        &tracker,
+        &redactor,
+        PtySessionHost::new(loaded.ring_bytes, Arc::clone(&redactor), registry.clone()),
+    );
     let ports = Ports {
         clock: Box::new(SystemClock),
         store: Box::new(FileEventStore::open(
@@ -232,11 +289,7 @@ pub fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle> {
             Box::new(Sha256Digest),
         )?),
         vcs: Box::new(GitVcs::new(env.clone(), app.env.clone()).with_tracker(tracker.clone())),
-        sessions: Box::new(PtySessionHost::new(
-            loaded.ring_bytes,
-            Arc::clone(&redactor),
-            registry.clone(),
-        )),
+        sessions,
         contract: Box::new(FsContractFiles::new(Arc::clone(&redactor))),
         outbox: Box::new(FsOutbox::new()),
         inbox: Box::new(FsInbox::new()),

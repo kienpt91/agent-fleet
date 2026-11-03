@@ -1,11 +1,12 @@
 //! Settings of the orchestrator, as plain validated data. Parsing a file into this structure is
 //! an adapter concern; the rules about what a valid configuration is live here.
 
+use crate::hosts::{validate_hosts, HostDef};
 use crate::ports::Identity;
 use fleet_domain::brief::validate_template;
 use fleet_domain::env::{is_valid_name, EnvPolicy};
 use fleet_domain::error::{FleetError, Result};
-use fleet_domain::ids::{show, WorkerName};
+use fleet_domain::ids::{show, HostName, WorkerName};
 use fleet_domain::limits::{
     MAX_ENV_ALLOW, MAX_GATES_CONFIGURED, MAX_RETRIES_CEILING, MAX_SESSIONS_HARD,
     MAX_WORKERS_CONFIGURED,
@@ -144,6 +145,8 @@ pub struct AppConfig {
     pub parent_env: Vec<(String, String)>,
     pub workers: BTreeMap<WorkerName, WorkerDef>,
     pub gates: Vec<GateDef>,
+    /// Remote hosts a task may run on (`[hosts.<name>]`); none unless the operator writes them.
+    pub hosts: BTreeMap<HostName, HostDef>,
     /// Silence after which a question file makes the supervisor stop the worker.
     pub question_grace_ms: u64,
     pub context: ContextConfig,
@@ -180,6 +183,7 @@ impl AppConfig {
             parent_env,
             workers: BTreeMap::new(),
             gates: Vec::new(),
+            hosts: BTreeMap::new(),
             question_grace_ms: 2000,
             context: ContextConfig::default(),
             images: ImageLimits::default(),
@@ -295,6 +299,7 @@ impl AppConfig {
         }
         self.forge.validate()?;
         self.messaging.validate()?;
+        validate_hosts(&self.hosts)?;
         Ok(())
     }
 

@@ -5,8 +5,9 @@ use crate::ports::{GateSpec, Job, JobDone, MergeOutcome, SessionSpec, VerifyOrig
 use fleet_domain::brief::{build_brief, build_pointer_brief, expand_placeholders, BriefInput};
 use fleet_domain::error::{FleetError, Result};
 use fleet_domain::events::DomainEvent;
-use fleet_domain::ids::{RunId, TaskId};
+use fleet_domain::ids::{show, HostName, RunId, TaskId};
 use fleet_domain::limits::{MAX_BRIEF_ARG_BYTES, MAX_CONCURRENT_JOBS, MAX_NOTE};
+use fleet_domain::remote::worker_env;
 use fleet_domain::run::WorkerEnd;
 use fleet_domain::sanitize::{head_str, sanitize_text};
 use fleet_domain::status::{EndKind, TaskStatus};
@@ -24,11 +25,13 @@ impl Orchestrator {
         }
         let run_ids: Vec<RunId> = self.state.runs().map(|r| r.id.clone()).collect();
         for run_id in run_ids {
-            let free = self.cfg.max_sessions.saturating_sub(self.live.len());
             let Ok(run) = self.state.run(&run_id) else {
                 continue;
             };
-            let ready = run.dispatchable(free);
+            // The per-host limits are applied in `dispatch`, which leaves a task that waits for a
+            // host's free slot ready: asking for everything the run's own limit allows keeps such
+            // tasks from crowding out the ones that can start.
+            let ready = run.dispatchable(usize::MAX);
             for task in ready {
                 if self.live.len() >= self.cfg.max_sessions {
                     return Ok(());
@@ -74,6 +77,30 @@ impl Orchestrator {
                 return;
             }
         };
+        let host = match &task.host {
+            None => None,
+            Some(name) => match self.cfg.hosts.get(name) {
+                None => {
+                    self.fail_task(&key, format!("host {} is not defined", show(name.as_str())));
+                    return;
+                }
+                Some(h) if !h.allows_worker(&worker.command) => {
+                    let message = format!(
+                        "worker command {} is not allowed on host {name} (allowed_workers)",
+                        show(&worker.command)
+                    );
+                    self.fail_task(&key, message);
+                    return;
+                }
+                Some(h) => Some(h.clone()),
+            },
+        };
+        if let Some(h) = &host {
+            // A task waits (and stays ready) while its host has no free slot.
+            if self.host_sessions(&h.name) >= h.max_sessions {
+                return;
+            }
+        }
         let worktree =
             match self
                 .ports
@@ -220,12 +247,29 @@ impl Orchestrator {
         if self.ports.undo.available() {
             self.checkpoint(&key, &worktree, "before");
         }
-        let brief_file = format!("{worktree}/.fleet/brief.md");
+        // Where the worker runs: the task worktree, or its copy on the remote host (the paths the
+        // worker sees in `{worktree}` and `{brief_file}` are then the remote ones).
+        let worker_dir = match &host {
+            None => worktree.clone(),
+            Some(h) => match self.ports.sessions.remote_dir(&h.name, run_id, task_id) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    self.start_failed(
+                        &key,
+                        attempt,
+                        &worktree,
+                        &format!("could not place the remote worktree: {}", e.message),
+                    );
+                    return;
+                }
+            },
+        };
+        let brief_file = format!("{worker_dir}/.fleet/brief.md");
         let brief_arg = head_str(&brief, MAX_BRIEF_ARG_BYTES).to_string();
         let vars = [
             ("brief", brief_arg.as_str()),
             ("task", task_id.as_str()),
-            ("worktree", worktree.as_str()),
+            ("worktree", worker_dir.as_str()),
             ("run", run_id.as_str()),
             ("brief_file", brief_file.as_str()),
         ];
@@ -241,12 +285,18 @@ impl Orchestrator {
                 return;
             }
         };
-        let env = self.cfg.env.build(
-            &self.cfg.parent_env,
-            &worker.env_pass,
-            &worker.env_set,
-            &fleet_env(run_id, task_id, &worktree),
-        );
+        // A remote worker gets the explicit values written for its host and fleet's own, never
+        // anything of this daemon's environment (`env_pass` and `env_set` of the worker are local
+        // settings and are not sent).
+        let env = match &host {
+            None => self.cfg.env.build(
+                &self.cfg.parent_env,
+                &worker.env_pass,
+                &worker.env_set,
+                &fleet_env(run_id, task_id, &worktree),
+            ),
+            Some(h) => worker_env(&h.env, run_id, task_id, &worker_dir),
+        };
         let spec = SessionSpec {
             run: run_id.clone(),
             task: task_id.clone(),
@@ -255,6 +305,7 @@ impl Orchestrator {
             args,
             cwd: worktree.clone(),
             env,
+            host: host.as_ref().map(|h| h.name.clone()),
         };
         let spawned = match self.ports.sessions.spawn(&spec) {
             Ok(s) => s,
@@ -307,8 +358,33 @@ impl Orchestrator {
         );
     }
 
+    /// How many live sessions run on `host`.
+    fn host_sessions(&self, host: &HostName) -> usize {
+        self.live
+            .keys()
+            .filter(|(run, task)| {
+                self.state
+                    .run(run)
+                    .ok()
+                    .and_then(|r| r.task(task))
+                    .and_then(|t| t.host.as_ref())
+                    == Some(host)
+            })
+            .count()
+    }
+
     /// Records an attempt that never got a process: a dispatch followed by a failed end.
     fn start_failed(&mut self, key: &Key, attempt: u32, worktree: &str, message: &str) {
+        // The activity feed says why (the session's own record only says "could not be started").
+        self.warn(format!("{}/{}: attempt {attempt}: {message}", key.0, key.1));
+        // and `fleet tail` shows it
+        let shown = head_str(&sanitize_text(message.as_bytes()), MAX_NOTE).to_string();
+        if let Err(e) = self.ports.logs.save(&key.0, &key.1, attempt, &shown) {
+            self.warn(format!(
+                "{}/{}: could not save the reason: {}",
+                key.0, key.1, e.message
+            ));
+        }
         let begin = self
             .state
             .run(&key.0)

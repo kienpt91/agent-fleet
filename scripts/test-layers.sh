@@ -14,6 +14,9 @@
 #                local bare repository
 #   soak         bounded memory with chatty workers (FLEET_SOAK_SECS, default 20)
 #   end-to-end   the real `fleet` binary and daemon (also with --web), CLI, TUI rendering and architecture rules
+#   remote       remote worktrees against a real OpenSSH server (host key pinning, quoting through a real login
+#                shell, forwarding, kill escalation, verification of what a host returns); runs when the image has
+#                sshd (docker/Dockerfile.ssh), which also lets the end-to-end layer run its remote tests
 set -eu
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/target}
@@ -26,8 +29,17 @@ layer() {
   printf '%s\n' "$out" | grep -E '^test result' | awk -v n="$name" '{p+=$4; f+=$6} END {printf "%s: %d passed, %d failed\n", n, p, f}'
 }
 
+# With an OpenSSH server in the image the remote tests run (and must not be skipped).
+RUN=""
+if [ -x /usr/sbin/sshd ]; then RUN="sh scripts/ssh-env.sh"; fi
+
 layer domain       cargo test $OPTS -p fleet-domain -p neo-verify -p neo-goals -p neo-context -p fleet-forge -p fleet-fanout
 layer application  cargo test $OPTS -p fleet-app --features testing
 layer adapters     cargo test $OPTS -p fleet-infra --lib --test contracts --test repo_read --test git_diff --test web_http --test origin --test golden_pack --test forge_gh --test forge_push
 layer soak         cargo test $OPTS -p fleet-infra --test soak
-layer end-to-end   cargo test $OPTS -p fleet-cli
+if [ -n "$RUN" ]; then
+  layer remote     $RUN cargo test $OPTS -p fleet-infra --test ssh_remote
+else
+  printf '\n== remote ==\nskipped: no OpenSSH server in this image (build docker/Dockerfile.ssh)\n'
+fi
+layer end-to-end   $RUN cargo test $OPTS -p fleet-cli

@@ -119,6 +119,7 @@ fn sample_events() -> Vec<DomainEvent> {
             spec: tricky.into(),
             deps: vec![t1.clone()],
             worker: Some(WorkerName::parse("agent").unwrap()),
+            host: None,
         },
         DomainEvent::TaskAdded {
             run: run.clone(),
@@ -127,6 +128,7 @@ fn sample_events() -> Vec<DomainEvent> {
             spec: String::new(),
             deps: vec![],
             worker: None,
+            host: None,
         },
         DomainEvent::TaskReady {
             run: run.clone(),

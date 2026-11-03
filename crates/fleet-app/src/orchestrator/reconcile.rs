@@ -22,6 +22,9 @@ impl Orchestrator {
             version: version.to_string(),
         }])?;
         self.reconcile_orphans();
+        for line in self.ports.sessions.reconcile_remote() {
+            self.warn(line);
+        }
         self.reconcile_commands();
         self.reconcile_handoffs();
         self.reconcile_publications();

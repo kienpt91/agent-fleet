@@ -9,7 +9,7 @@ use fleet_domain::contract::{ContractRead, WorkerHandoff, WorkerQuestion, Worker
 use fleet_domain::error::Result;
 use fleet_domain::events::DomainEvent;
 use fleet_domain::ids::MessageId;
-use fleet_domain::ids::{ApprovalId, GoalId, RunId, Sha, TaskId};
+use fleet_domain::ids::{ApprovalId, GoalId, HostName, RunId, Sha, TaskId};
 use fleet_domain::msg::inbox::InboxItem;
 use fleet_domain::msg::message::OutboxMessage;
 use fleet_domain::output::Chunk;
@@ -280,6 +280,9 @@ pub struct SessionSpec {
     pub cwd: String,
     /// The complete environment of the process; nothing else is inherited.
     pub env: Vec<(String, String)>,
+    /// The remote host the worker runs on. `program`, `args` and `env` are then as they run there
+    /// (see `crate::remote`), and `cwd` is still the local task worktree.
+    pub host: Option<HostName>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,6 +355,23 @@ pub trait SessionHost: Send {
     /// dropped and the answer is an error. The caller passes a fixed sentence and an id, never
     /// text a peer wrote.
     fn notify(&mut self, id: SessionId, line: &str) -> Result<()>;
+    /// True while a session whose process already ended is still being wound up by the host (a
+    /// remote task collecting its work): the supervisor then has nothing to stop and must not
+    /// count the time as a worker that refuses to die. Bounded by the host's own time limits.
+    fn winding_down(&self, _id: SessionId) -> bool {
+        false
+    }
+    /// The worktree directory of a task on a remote host, for placeholders such as `{worktree}`.
+    /// Hosts without remote support refuse.
+    fn remote_dir(&self, _host: &HostName, _run: &RunId, _task: &TaskId) -> Result<String> {
+        Err(fleet_domain::error::FleetError::unavailable(
+            "remote hosts are not available",
+        ))
+    }
+    /// At startup: removes what an earlier daemon run left on remote hosts. One line per finding.
+    fn reconcile_remote(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 // ---- worker contract files ------------------------------------------------------------------

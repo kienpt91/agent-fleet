@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Every subcommand, as typed. The help text must mention each (a test enforces it).
-pub const SUBCOMMANDS: [&str; 55] = [
+pub const SUBCOMMANDS: [&str; 60] = [
     "daemon",
     "run create",
     "task add",
@@ -84,6 +84,11 @@ pub const SUBCOMMANDS: [&str; 55] = [
     "msg mute",
     "msg unmute",
     "msg send",
+    "host add",
+    "host list",
+    "host trust",
+    "host remove",
+    "host doctor",
 ];
 
 pub const HELP: &str = "\
@@ -110,7 +115,7 @@ daemon:
 runs and tasks:
   run create --objective <text> --repo <path> [--base <ref>] [--id <id>] [--max-parallel N]
              [--context off|compiled]
-  task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--id <id>]
+  task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--host <name>] [--id <id>]
                                      (--spec - reads the spec from stdin, at most 16 KiB)
   plan <file.toml|file.json> [--run <run>]
                                      load a whole task graph (with --run: into an existing run)
@@ -207,6 +212,16 @@ messages between agents (declared by the operator in a plan; workers cannot use 
   msg unmute <channel|task>          let it speak again (channel:<ref> or task:<ref> if a name is both)
   msg send --channel <c> --subject <s> --body <b> [--to <task>] [--kind <k>] [--in-reply-to <id>]
                                      a message from the operator, labelled `from operator`
+
+remote hosts (SSH; tasks name one with `task add --host <name>`; never talk to the daemon):
+  host add <name> --address <host> --user <user> --identity <key file> --base-dir <dir on the host>
+           [--port N] [--worker <command>]... [--max-sessions N] [--proxy-jump <host>] [--env NAME=VALUE]...
+           [--config <fleet.toml>]   write a [hosts.<name>] table (the key is not trusted yet)
+  host list [--config <fleet.toml>]  hosts and the key pinned for each
+  host trust <name>                  show the host's key fingerprint and pin it after you type yes
+                                     at a terminal (the only way a key becomes trusted)
+  host remove <name>                 remove the table and forget the pinned key
+  host doctor <name>                 connect once and check key, login, quoting, git and directory
 
 dashboard:
   tui                                terminal dashboard
@@ -314,6 +329,7 @@ pub enum Command {
     Doctor {
         config: Option<PathBuf>,
     },
+    Host(crate::host_cmd::HostCommand),
     VerifyLog,
     Plan {
         file: PathBuf,
@@ -569,6 +585,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                     let spec = p.opt("--spec")?.map(|s| read_spec(s, stdin)).transpose()?;
                     let after = p.multi("--after")?;
                     let worker = p.opt("--worker")?;
+                    let host = p.opt("--host")?;
                     let id = p.opt("--id")?;
                     no_args(p)?;
                     let view = View::TaskAdded(run.clone());
@@ -583,6 +600,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                                 Some(Value::array(after.into_iter().map(Value::Str))),
                             ),
                             ("worker", worker.and_then(st)),
+                            ("host", host.and_then(st)),
                             ("id", id.and_then(st)),
                         ]),
                         view,
@@ -775,6 +793,7 @@ fn parse_command(word: &str, mut p: Parsed, stdin: &mut dyn Read) -> Result<Comm
                     .transpose()?,
             }
         }
+        "host" => Command::Host(crate::host_cmd::parse(p)?),
         "verify-log" => {
             no_args(p)?;
             Command::VerifyLog
@@ -1551,7 +1570,12 @@ fn run_doctor(
     })
 }
 
-fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> {
+fn execute(
+    command: Command,
+    ctx: &Context,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<i32> {
     let layout = StateLayout::new(ctx.state_dir.clone());
     match command {
         Command::Help => write_out(out, HELP)?,
@@ -1582,6 +1606,18 @@ fn execute(command: Command, ctx: &Context, out: &mut dyn Write) -> Result<i32> 
             crate::tui::run_tui(&ctx.socket)?;
         }
         Command::Doctor { config } => return run_doctor(ctx, layout, config, out),
+        Command::Host(cmd) => {
+            return crate::host_cmd::run(
+                cmd,
+                &crate::host_cmd::HostContext {
+                    state_dir: &ctx.state_dir,
+                    json: ctx.json,
+                    env: &ctx.env,
+                },
+                input,
+                out,
+            )
+        }
         Command::VerifyLog => run_verify_log(&layout, ctx.json, out)?,
         Command::Plan { file, run } => {
             let plan = load_plan(&file)?;
@@ -1740,7 +1776,7 @@ pub fn run_with(
             json: cli.json,
             env,
         };
-        execute(cli.command, &ctx, out)
+        execute(cli.command, &ctx, stdin, out)
     })();
     match result {
         Ok(code) => {
@@ -1872,7 +1908,7 @@ mod tests {
             (
                 vec![
                     "task", "add", "--run", "r1", "--title", "T", "--spec", "do x", "--after", "a",
-                    "--after", "b", "--worker", "coder", "--id", "t9",
+                    "--after", "b", "--worker", "coder", "--host", "build1", "--id", "t9",
                 ],
                 req(
                     "task.add",
@@ -1882,6 +1918,7 @@ mod tests {
                         ("spec", s("do x")),
                         ("after", Value::array([s("a"), s("b")])),
                         ("worker", s("coder")),
+                        ("host", s("build1")),
                         ("id", s("t9")),
                     ],
                     View::TaskAdded("r1".into()),
@@ -3308,6 +3345,7 @@ mod tests {
             "--spec",
             "--after",
             "--worker",
+            "--host",
             "--no-newline",
             "--follow",
             "--lines",
@@ -3675,6 +3713,7 @@ mod tests {
                 contract: Some(contract),
             },
             &ctx,
+            &mut std::io::empty(),
             &mut out,
         )
         .unwrap_err();
@@ -3691,6 +3730,7 @@ mod tests {
                 contract: None,
             },
             &ctx,
+            &mut std::io::empty(),
             &mut out,
         )
         .unwrap_err();

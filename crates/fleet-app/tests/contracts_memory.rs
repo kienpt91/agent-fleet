@@ -58,3 +58,10 @@ fn memory_inbox_satisfies_the_contract() {
     let mut harness = MemoryMailHarness::new(World::new());
     inbox_contract(&mut harness);
 }
+
+#[test]
+fn the_fake_remote_host_satisfies_the_contract() {
+    fleet_app::testing::remote::remote_host_contract(
+        &mut fleet_app::testing::remote::MemoryRemoteHarness::new(),
+    );
+}

@@ -77,6 +77,7 @@ impl Orchestrator {
                 spec: args.spec.clone(),
                 deps: Vec::new(),
                 worker: Some(worker.clone()),
+                host: None,
             })
             .collect();
         let (_, mut events) = self.state.add_tasks(&args.run, tasks)?;

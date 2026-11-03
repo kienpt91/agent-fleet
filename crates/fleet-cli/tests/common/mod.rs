@@ -260,6 +260,7 @@ pub struct T {
     pub spec: String,
     pub after: Vec<String>,
     pub worker: Option<String>,
+    pub host: Option<String>,
 }
 
 pub fn t(id: &str) -> T {
@@ -268,6 +269,7 @@ pub fn t(id: &str) -> T {
         spec: String::new(),
         after: Vec::new(),
         worker: None,
+        host: None,
     }
 }
 
@@ -279,6 +281,11 @@ impl T {
 
     pub fn worker(mut self, name: &str) -> T {
         self.worker = Some(name.to_string());
+        self
+    }
+
+    pub fn host(mut self, name: &str) -> T {
+        self.host = Some(name.to_string());
         self
     }
 
@@ -311,6 +318,9 @@ pub fn plan_toml(repo: &Path, run_id: &str, max_parallel: u32, tasks: &[T]) -> S
         }
         if let Some(w) = &task.worker {
             out.push_str(&format!("worker = {}\n", q(w)));
+        }
+        if let Some(h) = &task.host {
+            out.push_str(&format!("host = {}\n", q(h)));
         }
     }
     out

@@ -54,6 +54,13 @@ fleet plan plan.toml  ->  fleet start  ->  one worker per ready task, in .fleet-
   otherwise, with no new dependency. Its credentials are defence in depth, not a boundary against code running as you. See
   [Web dashboard](#web-dashboard).
 
+- **Remote worktrees over SSH.** A task can name a host (`task add --host build`): its worker then runs on that machine,
+  in a terminal that is a local `ssh -tt` process, so the output is sanitized, bounded and redacted like any worker's.
+  Host keys are pinned by an explicit step (`fleet host trust`, with a fingerprint and a terminal), ssh runs with a fixed
+  argument list (no agent, no forwarding, one key, one known_hosts file), the remote environment holds only values you wrote,
+  and what the host sends back (a git bundle) is verified in a quarantine ref before one local commit is made from its tree.
+  Quality gates and verification contracts always run locally on that commit. See [SSH remote worktrees](#ssh-remote-worktrees).
+
 It does not make agents smarter and it does not sandbox them. See [Limitations](#limitations).
 
 ## Quick start
@@ -757,7 +764,7 @@ daemon:
 
 runs and tasks:
   run create --objective <text> --repo <path> [--base <ref>] [--id <id>] [--max-parallel N]
-  task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--id <id>]
+  task add --run <run> --title <text> [--spec <text>|-] [--after <task>]... [--worker <name>] [--host <name>] [--id <id>]
                                      (--spec - reads the spec from stdin, at most 16 KiB)
   plan <file.toml|file.json> [--run <run>]
                                      load a whole task graph (with --run: into an existing run)
@@ -800,6 +807,16 @@ goals and verification (NEO):
   verify <goal|task> [--task <run>/<task>] [--timeout <secs>]
                                      run the contracts independently of the worker and record
                                      evidence; exit 6 when a mandatory check did not pass
+
+remote hosts (SSH; tasks name one with `task add --host <name>`; never talk to the daemon):
+  host add <name> --address <host> --user <user> --identity <key file> --base-dir <dir on the host>
+           [--port N] [--worker <command>]... [--max-sessions N] [--proxy-jump <host>] [--env NAME=VALUE]...
+           [--config <fleet.toml>]   write a [hosts.<name>] table (the key is not trusted yet)
+  host list [--config <fleet.toml>]  hosts and the key pinned for each
+  host trust <name>                  show the host's key fingerprint and pin it after you type yes
+                                     at a terminal (the only way a key becomes trusted)
+  host remove <name>                 remove the table and forget the pinned key
+  host doctor <name>                 connect once and check key, login, quoting, git and directory
 
 dashboard:
   tui                                terminal dashboard
@@ -853,6 +870,8 @@ the status, error and doctor documents are pinned by end-to-end tests
 | `[redact] literals, env_values, [[redact.rules]]` | extra redaction: literal strings, values of secret-looking daemon variables, `prefix` + `charset` (`alnum|hex|base64|token`) + `min_len` rules | built-in key shapes + env values |
 | `[workers.<name>]` | `command`, `args`, `env_pass`, `env_set`, `timeout_secs`, `idle_timeout_secs` | |
 | `[[gates]]` | `name`, `command`, `args`, `env_pass`, `env_set`, `format` (`exit` or `refcheck-json`), `timeout_secs` | exit, 600 s |
+| `[remote] ssh` | absolute path of the `ssh` program; otherwise it is found once in the absolute entries of `PATH` and refused inside a repository or when others can write it | found in `PATH` |
+| `[hosts.<name>]` | `address`, `port`, `user`, `identity_file`, `base_dir`, `allowed_workers`, `max_sessions`, `proxy_jump`, `connect_timeout_secs`, `server_alive_secs`, `server_alive_count`, `max_bundle_mib`; `[hosts.<name>.env]` the explicit variables of remote workers (see [SSH remote worktrees](#ssh-remote-worktrees)) | none; port 22, 2 sessions, 10 s, 15 s x 3, 256 MiB |
 
 Arguments are templates, never shell: `{brief}` (the brief, at most 16 KiB), `{task}`, `{run}`, `{worktree}` and
 `{brief_file}` are replaced inside each argument, `{{` and `}}` are literal braces. A **plan file**
@@ -1399,6 +1418,164 @@ $ /target/release/fleet verify-log
 event log ok: 33 records, head 92f700735e5ab667bb827040fd01795ce101e41599812491c55ece2d9277014e
 ```
 
+## SSH remote worktrees
+
+A task can run its worker on another machine. **Only the worker's process is remote**: the task keeps its local worktree,
+branch, quality gates, verification contracts, approvals and merge. The transport is the system's OpenSSH client (no new
+dependency). The design and its reasons are [ADR 27](docs/adr/0027-ssh-remote-worktrees.md); what it means for security, and
+what stays your job, is in [SECURITY.md](SECURITY.md#remote-hosts-ssh-remote-worktrees).
+
+```bash
+fleet host add build --address build.example.org --user fleet --identity ~/.ssh/fleet_build_ed25519 \
+    --base-dir /srv/fleet --worker my-agent        # writes [hosts.build] to fleet.toml; trusts nothing yet
+fleet host trust build                             # shows the fingerprint; compare it, type yes (needs a terminal)
+fleet host doctor build                            # key, login, quoting through the login shell, git, directory
+fleet task add --run r1 --title "Build it" --host build --worker my-agent     # or host = "build" in a plan
+```
+
+How an attempt goes, and why each step is the way it is:
+
+1. **Prepare.** fleet makes one root commit with exactly the tree of the task branch's head, bundles it (at most
+   `max_bundle_mib`) and streams it over ssh stdin to a fixed script that creates `<base_dir>/<run>/<task>`; the brief follows.
+2. **Run.** The worker starts through `ssh -tt` in a **local pty**: its output goes through the same sanitizer, ring buffer,
+   redaction and limits as a local worker's, idle and total timeouts and TERM-then-KILL apply (the signal is also sent to the
+   remote process group), and the ssh client is a live session, so the control socket and the dashboard refuse it and what it
+   starts. The values written in `[hosts.<name>.env]` go to the host in a 0600 file that the launcher reads and deletes (not on a command line, where `ps` would show them); nothing of your environment goes.
+3. **Collect.** The host commits what the worker left and sends a bundle back; fleet fetches it into a quarantine ref,
+   checks it with `git fsck` in a scratch repository (so a refused bundle leaves nothing in yours), requires that it builds on the commit that was sent, touches no `.git` or `.fleet` path and stays
+   within the commit, file and byte limits, and only then makes **one new local commit with the verified tree**, authored by fleet.
+   The host's commit objects and messages never enter your history. The worker's `result.json` and `question.json` come back
+   through bounded reads and are validated like local ones.
+4. **Clean up.** The remote process group is killed and the remote worktree removed (also after a failure; a host that was down
+   keeps a marker and is cleaned at the next daemon start, which says so in the activity feed).
+
+The host key is **pinned by you**: `fleet host trust` is the only command that writes a key to `<state>/hosts/<name>.known_hosts`
+(0600), and every other connection is strict against that one file. An unpinned host is not connected to; a changed key is refused
+with a message that says why. There is no agent forwarding, no password login, no X11, no port forwarding, no multiplexing and
+no `ProxyJump`/`ProxyCommand` unless you name a `proxy_jump` host (whose hop uses that entry's own key and pin).
+
+**The remote worker is not sandboxed.** It runs as the remote user of the host entry with all of that account's rights; give
+fleet an account of its own. A verified tree is checked for form, not content: it is as untrusted as a local worker's output, and
+the gates and contracts that judge it run here.
+
+A real run of `scripts/ssh-demo.sh` (a throwaway sshd of its own on a loopback port, keys generated for the run and deleted
+after; in the `fleet-ssh` image, see [Development](#development)); the paths are the script's temporary directories:
+
+```text
+The operator compares this fingerprint with the one on the host's console:
+256 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms demo (ED25519)
+
+$ /target/release/fleet host add build --config /tmp/tmp.AIJNF2xrgc/fleet.toml --address 127.0.0.1 --port 23642 --user fleetssh --identity /tmp/tmp.AIJNF2xrgc/sshd/client_key --base-dir /tmp/tmp.AIJNF2xrgc/remote-work --worker sh
+host build added to /tmp/tmp.AIJNF2xrgc/fleet.toml
+next: compare the host's key and pin it with `fleet host trust build`, then check it with `fleet host doctor build`
+
+$ /target/release/fleet host list --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+NAME   ADDRESS          USER      BASE DIRECTORY                   WORKERS  PINNED KEY
+build  127.0.0.1:23642  fleetssh  /tmp/tmp.AIJNF2xrgc/remote-work  sh       not pinned
+
+$ /target/release/fleet host doctor build --config /tmp/tmp.AIJNF2xrgc/fleet.toml   # nothing is trusted yet: no connection is made
+[ok  ] ssh program: /usr/bin/ssh (OpenSSH 9.2)
+[ok  ] host build: identity file: /tmp/tmp.AIJNF2xrgc/sshd/client_key
+[FAIL] host build: pinned key: not pinned yet: run `fleet host trust build`
+[info] host build: connection: not tried: fix the checks above first
+unhealthy: 1 check(s) failed
+(exit code 13)
+
+$ /target/release/fleet host trust build --config /tmp/tmp.AIJNF2xrgc/fleet.toml   # needs a terminal; here one is made with script(1) and "yes" is typed
+yes
+host build (127.0.0.1:23642) presented this key:
+  type:        ssh-ed25519
+  fingerprint: SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+nothing is pinned for this host yet.
+Compare the fingerprint with one you know to be the host's own, over another channel (for example on its console: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
+Type yes to pin this key for host build: pinned SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms for host build; check the host with `fleet host doctor build`
+
+$ /target/release/fleet host list --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+NAME   ADDRESS          USER      BASE DIRECTORY                   WORKERS  PINNED KEY
+build  127.0.0.1:23642  fleetssh  /tmp/tmp.AIJNF2xrgc/remote-work  sh       ssh-ed25519 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+
+$ /target/release/fleet host doctor build --config /tmp/tmp.AIJNF2xrgc/fleet.toml
+[ok  ] ssh program: /usr/bin/ssh (OpenSSH 9.2)
+[ok  ] host build: identity file: /tmp/tmp.AIJNF2xrgc/sshd/client_key
+[ok  ] host build: pinned key: ssh-ed25519 SHA256:XkdRJrITpbijSj+l4HAIdq3R99zB0BRvnu321s0D4Ms
+[ok  ] host build: connection: 591 ms, pinned key accepted, key file accepted
+[ok  ] host build: quoting: the login shell reads quoted text unchanged
+[ok  ] host build: system: Linux
+[ok  ] host build: remote user: uid 501
+[ok  ] host build: git: git version 2.39.5
+[ok  ] host build: base directory: /tmp/tmp.AIJNF2xrgc/remote-work is writable
+healthy
+
+$ /target/release/fleet plan /tmp/tmp.AIJNF2xrgc/plan.toml
+plan loaded into run r1 (1 tasks)
+
+$ /target/release/fleet start --run r1
+run r1 started
+
+$ /target/release/fleet status
+daemon pid 3728 | v0.1.0 | up 17s | sessions 0/4 | undo unavailable | rss 4672 kB
+
+run r1 [finished] max-parallel 2
+  objective  Try a worker on another machine
+  repo       /tmp/tmp.AIJNF2xrgc/repo (base HEAD @ 2c5a6876)
+  branch     fleet/r1/integration
+  tasks      pending 0, ready 0, running 0, review 0, completed 1, failed 0, blocked 0
+  ID      STATUS     DEPS  TRY  WORKER        NOTE
+  remote  completed  -     1    - host:build  wrote a file on the host
+
+recent
+  #1 daemon started (pid 3728)
+  #2 run r1 created
+  #3 r1/remote added
+  #4 r1/remote ready
+  #5 run r1 started (max parallel 2)
+  #6 r1/remote dispatched (attempt 1)
+  #7 r1/remote session exited
+  #8 r1/remote in review
+  #9 r1/remote committed
+  #10 r1/remote completed
+
+$ git -C $REPO show fleet/r1/remote:from-the-host.txt   # the file was written on the host and came back as a commit of the local repository
+hello from Linux, written for task remote in /tmp/tmp.AIJNF2xrgc/remote-work/r1/remote
+
+$ git -C $REPO log --format='%an <%ae>: %s' fleet/r1/remote   # one commit of fleet's own on top of the base
+fleet <fleet@localhost>: fleet: changes made on host build
+demo <demo@example.invalid>: initial commit
+
+$ ls $WORK/remote-work/r1   # nothing is left on the host
+0
+
+$ fleet tail remote   # what fleet recorded about the attempt
+fleet: remote: host build returned 1 commit(s) changing 1 path(s); verified and applied as 7c17a4146e4a
+fleet: remote: the worktree on host build was removed
+
+--- the host is reinstalled: its key changes ---
+256 SHA256:1dI8Jw3XjIWqk/fVln9olas4cE4DLO1Sbm3x6dNGGV0 demo (ED25519)
+
+$ /target/release/fleet task add --run r1 --title Another file --id again --host build
+task added to run r1
+
+$ /target/release/fleet start --run r1
+run r1 started
+
+$ /target/release/fleet events --limit 5
+#12 r1/again ready
+#14 r1/again dispatched (attempt 1)
+#15 r1/again session spawn_failed
+#16 r1/again failed
+#17 run r1 started (max parallel 2)
+
+$ ls $WORK/remote-work/r1   # still nothing: the changed key was refused before anything was sent
+0
+```
+
+What was and was not verified: everything above ran in a Linux container against OpenSSH 9.2 (client and server) and
+git 2.39, including the hostile cases (a host that returns unrelated history, a `.fleet` path or a `.git` tree entry; a
+changed host key; a server that stops answering; a worker that ignores TERM and HUP; a flood of output; forwarding and
+environment requests that the test server would honour). **Not verified:** macOS as the local or the remote machine, real
+accounts and keys, real coding agents, other OpenSSH versions or other sshd configurations (`ForceCommand`, restricted shells).
+A worker that writes a question and keeps running is noticed only when it ends or is stopped by its limits.
+
 ## Architecture
 
 Domain-driven layers in a cargo workspace; the compiler enforces the dependency rule and an architecture test checks
@@ -1411,8 +1588,8 @@ the manifests.
 | `neo-goals` | NEO: the goal ledger aggregate and its status machine | `std`, `fleet-domain`, `neo-verify` |
 | `neo-context` | NEO: the context pack compiler (eight layers, budgets, manifest, digests), the secret rules and handoff packets | `std`, `fleet-domain` |
 | `fleet-fanout` | fan-out groups, diff statistics, comparison facts and the advisory ranking rule | `std`, `fleet-domain`, `neo-verify` |
-| `fleet-app` | use cases (`Orchestrator`, with a `neo` module for goals, verification, context packs and handoffs), commands, read models, port traits, in-memory fakes and port contract suites | the domain crates |
-| `fleet-infra` | adapters: git, ptys, files, event log, job runner (gates, approved commands, verification contracts), sockets, TOML, the web dashboard (hand-written HTTP on `std::net`), daemon wiring | app, domain crates |
+| `fleet-app` | use cases (`Orchestrator`, with a `neo` module for goals, verification, context packs and handoffs, and `RemoteSessions`, the session host of remote tasks), commands, read models, port traits (including `RemoteHost`), in-memory fakes and port contract suites | the domain crates |
+| `fleet-infra` | adapters: git, ptys, files, event log, job runner (gates, approved commands, verification contracts), sockets, TOML, the web dashboard (hand-written HTTP on `std::net`), the OpenSSH adapter for remote hosts, daemon wiring | app, domain crates |
 | `fleet-cli` | the `fleet` binary: argument parsing, rendering, dashboard, attach | all |
 
 State is event-sourced: every change is a domain event, appended to a hash-chained log before it is applied;
@@ -1431,6 +1608,7 @@ later phases, see [docs/parity.md](docs/parity.md).
 | Domain | pure unit tests of ids, DAG, runs/tasks, decision gates, approvals (consume-once, expiry, digest binding, decisions that must name their digest), quality judgement (`refcheck-json` edge cases), supervision, the origin rules and kill escalation, contract validation, sanitizer, redactor, output ring, events, hash chain, brief quoting, environment policy; NEO: contract schema (also with random documents), glob matcher (against an exponential reference), judging, evidence, the goal ledger with property tests of its status machine (tree shape, verified only through evidence, replay equals live state, evidence immutable, evidence counted only for the reviewed commit of its task, eviction identical on replay); the repository workbench (validated paths, tree entries, file views, diffs and their patch reader, bounded word marks, a Markdown subset with property and adversarial tests); NEO N2: the context compiler (determinism and golden digests, layer order, budget and shrink-order laws, property tests with hostile text, delimiter and control-character attacks, the secret rules including worst-case lines in linear time, handoff packets); the forge model (strict schemas, hostile issue text, the pull request digest, remote URL parsing that never repeats a credential, the rate gate, the issue and pull request links with uncapped duplicate guards); fan-out: the group state machine with restart reconcile, diff statistics and scope, comparison facts and overlap, the ranking rule with property tests (deterministic, total and strict, only the listed criteria matter, monotone); messaging: channel and message rules, the board (policy order, rates with a fake clock, loop and storm detection, duplicates, secret shapes, mutes, approvals, replay), the secret-shape scanner against every rule of `scripts/secret-scan.sh`; the review's scenarios at this level (one-way traffic and self-replies never trip the loop rule, a loop mutes the sender and not the channel, the refusal budget, coalesced junk files, the high-water mark of seen files, replies that name a message the sender received, per-run caps, the inbox share, approvals waiting per channel, the shares of the decision pool) | 743 |
 | Application | the orchestrator driven through commands with in-memory fakes for all ports: lifecycle, supervision and timeouts, decisions and approvals (never run twice across a restart), merging and conflicts, recovery and orphan reconciliation, quality gates, hostile text in every document the dashboard serves; NEO: goal commands and views, the completion rule (failing then passing contract, no completion without evidence, restart, job cap, a goal added mid-run, evidence bound to the commit, dirty worktrees, tickets, merge only of the proven commit, the verification cap, job processes as worker origin), `verify`; plus the port contract suites against the fakes (now including verification jobs); NEO N2: compiled context at dispatch, handoffs at task end, retry and crash recovery (including a crash between the end of an attempt and its handoff), tamper tests on stored packs, fact scoping and goal-order independence, plus the context-store contract suite; GitHub: issues and pull requests against a fake forge (nothing leaves before an approval of exactly that pull request, approvals spent only once the adapter can take the call, the run's repository recorded and a changed remote refused, issue text quoted and untrusted, failures redacted, restart reconciliation); fan-out: creation (caps, atomic refusal), partial failures, comparison from facts, pick approval binding, unverified/failed/moved-branch refusals, superseding and cleanup, hostile text; messaging: delivery, refusals and floods, loops with their gate, expiry, approvals, restart, adapter failures, operator commands; the outbox and inbox contract suites against the fakes; the review's scenarios with fakes (`messaging_security.rs`: a refusal flood and secret-shaped floods below the per-minute rate, one-way spam and self-reply chains that must not mute a shared channel, ping-pong across channels, a saturated approval pool next to a worker question, replies to messages the sender never got, one run starving another, one sender filling an inbox) | 463 |
 | Adapters | every real adapter in temp dirs (git hardening with planted hooks/filters/drivers, merge-by-approved-commit, symlink/FIFO/oversize worker files, pty sessions and the input queue, process identity, hash-chained log, sockets with token and fail-closed admission, redaction of gate and command output, agent-undo path rules, config, the doctor checks; NEO: running contracts with real processes, files and git, `open_beneath`, exporting a commit with planted filters and links, the isolated environment and `PATH`, the process sweeper with `setsid`, redaction before the tail cut) and the same contract suites against the real file adapters; the web adapter: HTTP parsing limits, tokens and sessions, TCP peer lookup, Host/Origin/CSRF/rate limits, strict JSON, slowloris, connection and stream caps, event streams and shutdown over real loopback sockets; the one job tracker that every adapter starting children shares, and the ancestry rule for everything the daemon started; NEO N2: the file context store, the knowledge file, `handoff.json` and `context.*` files, the three `Vcs` reads of the real repository, the golden digests with the real SHA-256; the repository reader (renames, links, submodules, hostile names, huge files and trees, planted configuration) against real git and the contract it shares with the fake; GitHub: the `gh` adapter against a fake `gh` (minimal environment, no token, rate gate, timeouts, redacted stderr, strict schemas) and the git push against a local bare repository (one ref, the approved commit, no force, a private git directory, hostile configuration); `diff_summary` against real git repositories (overlap, binary files, renames, odd names, hardening), the read-only group routes, `[compare]` config; the outbox and inbox adapters (FIFO, link, oversize, partial write, forged files, an inbox swapped for a link) and the same contract suites against them; the typed notice (bounded, printable ASCII, never Enter) on a real pty; the `[messages]` config limits; the web messages routes | 704 |
+| Remote (OpenSSH) | `crates/fleet-infra/tests/ssh_remote.rs` (a real sshd started by the test: pinning, changed key, wrong key, forwarding and environment, quoting through the real login shell, hostile bundles, kill escalation, keepalive on a frozen server, a jump host, origin refusal, the `RemoteHost` contract suite) and `crates/fleet-cli/tests/e2e_remote.rs` (the real binary and daemon, 11 tests); skipped when the image has no sshd (`docker/Dockerfile.ssh`, `scripts/ssh-env.sh`) | 27 (and 11 more in the end-to-end layer) |
 | Soak | bounded memory with flooding workers, the dashboard on and a connected event stream | 1 |
 | End to end | the real binary and daemon (flow, crash recovery, tampering, security incl. a worker that tries to approve, CLI, JSON schemas, exit codes), dashboard rendering on a headless backend, architecture rules (the NEO crates' dependency direction, no clock, no I/O, no `unwrap`; no HTTP, async or TLS crate anywhere; the inner layers know nothing of the web adapter); NEO: the ledger, contracts, exports and the job-origin refusal through the binary; the web dashboard against the real daemon, including the goals, evidence and verification views; NEO N2: compiled packs through the real binary, retry packs with failure evidence, forged context and handoff files, hostile titles, a killed daemon re-briefing with identical layers 1-5, a tampered stored pack (exit 11); the workbench against the real daemon (recorded commits, worktree isolation, forged paths and commits, worker refusal, bounded memory); GitHub through the real binary against a fake `gh` (approval, push, one pull request, worker refusal); fan-out through the real binary with fake workers (passing, failing, out-of-scope and overlapping members, approvals, restarts, hostile text in the CLI, the terminal dashboard and the web); messaging with the real binary: two workers exchanging messages, a worker refused on `fleet msg`, secret and hostile text, a ping-pong that mutes with its gate, expiry, a restart without loss or repeat, the operator on a `to_lead` channel, hostile subjects in a brief, a loop that mutes one member while a third keeps talking (and a reply to somebody else's message), junk files recorded once and then only counted, the notice typed without Enter and not at all by default, the read-only web routes | 358 |
 
@@ -1506,6 +1684,10 @@ gate output 4 MiB, event log 64 MiB, at most 64 sessions, 64 runs, 1024 tasks, 6
   scrollback, the browser or `/proc/<daemon>/fd/2` (where you redirected stderr) can take the token. The token lives until the
   daemon stops (no one-time code). Five wrong tokens lock bearer and login attempts of that client for a minute (live sessions
   keep working); a local process that passes admission can still keep connection slots busy for short periods (see SECURITY.md).
+- SSH remote workers run with all rights of their remote account and are not sandboxed; the returned tree is verified for
+  form, not content. Not verified: macOS, real accounts, real agents, other OpenSSH versions. Preparing a remote attempt
+  blocks the engine thread for up to its 120 s budget (a host that timed out is skipped for 120 s);
+  start-up clean-up of leftover remote worktrees is bounded by 20 s. See SECURITY.md, "Remote hosts".
 - macOS: the code type-checks for `aarch64-apple-darwin` but was **not run**; pty, peer-credential, `ps`-based
   process-identity and the `lsof`-based dashboard admission behaviour there is unverified. Windows is not supported.
 - NEO N1 is the goal ledger and verification only: no context compiler, knowledge store, token governor or credential
@@ -1543,10 +1725,10 @@ remove it from the tree and rewrite the history if it was not published.
 What was run for this repository, all inside containers (the official Rust 1.95 image pinned by digest plus git, with
 dependencies fetched once and everything else offline): `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, the test suites above, the release build, the soak (20 seconds by default, with the dashboard and an event stream), a coverage run (see Tests),
-`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/neo-n2-demo.sh`, `scripts/github-demo.sh`, `scripts/fanout-demo.sh`, `scripts/msg-demo.sh`, `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
+`scripts/demo.sh`, `scripts/neo-demo.sh`, `scripts/neo-n2-demo.sh`, `scripts/github-demo.sh`, `scripts/fanout-demo.sh`, `scripts/msg-demo.sh`, `scripts/ssh-demo.sh` (OpenSSH client and server in the `docker/Dockerfile.ssh` image), `scripts/web-demo.sh` (curl and headless Chromium in the `docker/Dockerfile.web` image),
 `node scripts/web-smoke.mjs` (906 checks), `node scripts/web-smoke-panes.mjs` (558 checks), `scripts/workbench-demo.sh` (headless Chromium) and `check-crates-age` (121 locked crates, every version published on or before 2026-10-24: 0 too new). A secret scan of the
 working tree and the whole git history (key shapes, private-key headers, long hex/base64 strings, absolute home paths)
-found no keys or secrets: the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
+found no keys or secrets (the sshd tests generate their keys at run time in temporary directories; none is committed): the only hits are PEM header lines used as redaction-test fixtures (header and a fake body, no key material), `Cargo.lock` checksums and fake `/home/...` paths in tests.
 Not verified: macOS, real coding agents (only scripted ones), and how a model behaves when it reads injected messages.
 No test failed in the final runs of `scripts/test-layers.sh` and `scripts/coverage.sh`, so nothing was repeated.
 
@@ -1574,6 +1756,10 @@ node scripts/web-smoke-panes.mjs   # the workbench panes and the Markdown DOM bu
 IMAGE=fleet-web DOCKER_NET=none run 'cargo build --release --locked --offline && scripts/workbench-demo.sh /target/release/fleet'   # headless Chromium, screenshots in docs/img
 DOCKER_NET=none run 'scripts/neo-demo.sh /target/release/fleet'   # the NEO N1 demo
 DOCKER_NET=none run 'scripts/fanout-demo.sh /target/release/fleet'   # the fan-out demo
+# SSH remote worktrees: an image with an OpenSSH client and server on top of fleet-dev (test use only)
+docker build -f docker/Dockerfile.ssh -t fleet-ssh docker/
+IMAGE=fleet-ssh DOCKER_NET=none run 'sh scripts/ssh-env.sh cargo test -p fleet-infra --test ssh_remote'
+IMAGE=fleet-ssh DOCKER_NET=none run 'cargo build --release --locked --offline && sh scripts/ssh-env.sh scripts/ssh-demo.sh /target/release/fleet'
 ```
 
 Layout: `crates/fleet-domain`, `crates/neo-verify`, `crates/neo-goals`, `crates/neo-context`, `crates/fleet-forge`, `crates/fleet-fanout`, `crates/fleet-app`, `crates/fleet-infra`,

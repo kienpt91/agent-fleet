@@ -33,6 +33,28 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked
 
+  ssh-tests:
+    # The tests against a real OpenSSH server (host key pinning, quoting, kill escalation, verification of
+    # what a host returns). FLEET_SSH_TESTS=1 (set by scripts/ssh-env.sh) makes a missing server a failure
+    # instead of a skip.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: OpenSSH server and client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+      - name: Git identity for tests that create repositories
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - run: cargo fetch --locked
+      - run: sh scripts/ssh-env.sh cargo test --locked -p fleet-infra --test ssh_remote
+      - run: sh scripts/ssh-env.sh cargo test --locked -p fleet-cli --test e2e_remote
+
   secret-scan:
     runs-on: ubuntu-latest
     permissions:
