@@ -666,7 +666,7 @@ function msgListDoc() {
       channel('dev ' + IMG, true, { queued: 1, awaiting_approval: 2, delivered: 3, expired: 0, blocked: 1 }),
       channel('ops', false, { queued: 0, awaiting_approval: 0, delivered: 0, expired: 0, blocked: 0 })
     ],
-    muted_tasks: [{ run: 'r1', task: 'web', reason: 'looping ' + ESC, by: 'operator', gate: null }],
+    muted_tasks: [{ run: 'r1', task: 'web', channel: 'talk', reason: 'looping ' + ESC, by: 'operator', gate: null }],
     messages: msgRows().map((m) => Object.assign({}, m)),
     total: 4,
     truncated: false
@@ -1392,6 +1392,7 @@ async function messagesFlow() {
   check(mutedBadges.length === 2 && mutedBadges.every((b) => b.textContent === 'MUTED'), 'MUTED badges: one for the channel, one for the task');
   check(allText(env).includes('Muted: endpoint-ended ' + SCRIPT + ' (by operator)'), 'the mute reason and who muted are shown, as text');
   check(allText(env).includes('looping [U+001B][31mred[U+001B][0m (by operator)'), 'the muted task shows its reason');
+  check(allText(env).includes('on channel talk: looping'), 'a task muted on one channel names the channel');
   check(allText(env).includes('queued 1') && allText(env).includes('awaiting approval 2') && allText(env).includes('delivered 3') && allText(env).includes('blocked 1'), 'channel message counts');
   check(find(env, (n) => n.hasClass('ms-awaiting-approval')).length >= 2, 'awaiting-approval badges keep their own class');
   // messages: label next to every row, BLOCKED badge with the reason

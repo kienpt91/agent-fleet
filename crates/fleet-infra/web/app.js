@@ -1883,7 +1883,7 @@
       head.appendChild(tagged('ms', MSG_STATUS, 'muted', 'MUTED'));
       head.appendChild(taskLink(clean(t.run, { max: 40 }) + '/' + clean(t.task, { max: 40 }), clean(t.run, { max: 80 }) + '/' + clean(t.task, { max: 80 })));
       row.appendChild(head);
-      row.appendChild(el('div', 'small reason', clean(t.reason, { max: 300 }) +
+      row.appendChild(el('div', 'small reason', (t.channel ? 'on channel ' + clean(t.channel, { max: 80 }) + ': ' : '') + clean(t.reason, { max: 300 }) +
         (t.by ? ' (by ' + clean(t.by, { max: 80 }) + ')' : '') + (t.gate ? ' gate ' + clean(t.gate, { max: 80 }) : '')));
       return row;
     }

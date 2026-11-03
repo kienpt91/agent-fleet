@@ -66,9 +66,13 @@ pub fn render_msg_list(v: &Value) -> String {
         );
     }
     for t in list(v, "muted_tasks") {
+        let on = match s(t, "channel").as_str() {
+            "" => String::new(),
+            c => format!(" on channel {c}"),
+        };
         let _ = writeln!(
             out,
-            "task {}/{} is muted ({})",
+            "task {}/{} is muted{on} ({})",
             s(t, "run"),
             s(t, "task"),
             s(t, "reason")
@@ -143,7 +147,8 @@ pub fn render_msg_show(v: &Value) -> String {
         );
     }
     out.push_str("body (unverified peer content, quoted):\n");
-    for line in s(&m, "body").lines() {
+    let body = crate::render::multiline(m.get("body").and_then(Value::as_str).unwrap_or(""));
+    for line in body.lines() {
         let _ = writeln!(out, "> {line}");
     }
     out
@@ -163,4 +168,88 @@ pub fn render_msg_mute(v: &Value) -> String {
         s(v, "target"),
         if muted { "muted" } else { "unmuted" }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(body: &str) -> Value {
+        Value::object([(
+            "message",
+            Value::object([
+                ("id", Value::str("m3")),
+                ("run", Value::str("r1")),
+                ("channel", Value::str("talk")),
+                ("kind", Value::str("info")),
+                ("status", Value::str("delivered")),
+                ("label", Value::str("from task a (unverified peer message)")),
+                ("subject", Value::str("hello")),
+                ("digest", Value::str("abc")),
+                ("body", Value::str(body)),
+            ]),
+        )])
+    }
+
+    #[test]
+    fn a_body_is_quoted_line_by_line_so_nothing_can_pose_as_a_field() {
+        let shown = render_msg_show(&message("line one\nline two\n\nsubject: forged"));
+        let quoted: Vec<&str> = shown.lines().filter(|l| l.starts_with("> ")).collect();
+        assert_eq!(
+            quoted,
+            ["> line one", "> line two", "> ", "> subject: forged"],
+            "{shown}"
+        );
+        // the label is there, and no unquoted line was written by the peer
+        assert!(shown.contains("from task a (unverified peer message)"));
+        assert_eq!(
+            shown.lines().filter(|l| l.starts_with("subject:")).count(),
+            1,
+            "only the real field starts a line: {shown}"
+        );
+    }
+
+    #[test]
+    fn terminal_controls_in_a_body_are_removed_but_lines_stay() {
+        let shown = render_msg_show(&message("a\u{1b}[2J\u{202e}b\nc\u{7}d"));
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\u{202e}') && !shown.contains('\u{7}')
+        );
+        assert!(shown.contains("> a") && shown.contains("> c"), "{shown}");
+    }
+
+    #[test]
+    fn a_task_muted_on_one_channel_says_which() {
+        let list = Value::object([
+            ("schema", Value::str("fleet.msg.list/1")),
+            ("channels", Value::array([])),
+            (
+                "muted_tasks",
+                Value::array([
+                    Value::object([
+                        ("run", Value::str("r1")),
+                        ("task", Value::str("a")),
+                        ("channel", Value::str("talk")),
+                        ("reason", Value::str("reply-depth")),
+                    ]),
+                    Value::object([
+                        ("run", Value::str("r1")),
+                        ("task", Value::str("b")),
+                        ("channel", Value::Null),
+                        ("reason", Value::str("refusal-budget")),
+                    ]),
+                ]),
+            ),
+            ("messages", Value::array([])),
+        ]);
+        let shown = render_msg_list(&list);
+        assert!(
+            shown.contains("task r1/a is muted on channel talk (reply-depth)"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("task r1/b is muted (refusal-budget)"),
+            "{shown}"
+        );
+    }
 }

@@ -153,6 +153,8 @@ pub struct MsgChannel {
 pub struct MutedTask {
     pub run: String,
     pub task: String,
+    /// Set when the task is muted on that channel only.
+    pub channel: String,
     pub reason: String,
 }
 
@@ -508,6 +510,7 @@ impl Model {
             .map(|t| MutedTask {
                 run: text_of(t, "run"),
                 task: text_of(t, "task"),
+                channel: text_of(t, "channel"),
                 reason: text_of(t, "reason"),
             })
             .collect();

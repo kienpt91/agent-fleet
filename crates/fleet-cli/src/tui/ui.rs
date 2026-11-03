@@ -480,8 +480,13 @@ fn render_messages(frame: &mut Frame, model: &Model, area: Rect) {
         items.push((text, c.muted.then(|| muted_badge(&c.mute_reason))));
     }
     for t in &model.msg_muted_tasks {
+        let on = if t.channel.is_empty() {
+            String::new()
+        } else {
+            format!(" on {}", t.channel)
+        };
         items.push((
-            format!("task {}/{}", t.run, t.task),
+            format!("task {}/{}{on}", t.run, t.task),
             Some(muted_badge(&t.reason)),
         ));
     }
@@ -883,6 +888,29 @@ mod tests {
         m.update_messages(&doc);
         let text = screen(&m, 100, 40);
         assert!(text.contains("task r1/t9 MUTED (noisy)"), "{text}");
+    }
+
+    #[test]
+    fn a_task_muted_on_one_channel_names_the_channel() {
+        let mut m = sample_with_messages("x");
+        let mut doc = msg_list(vec![msg_channel("review", false, "")], vec![]);
+        if let Value::Object(map) = &mut doc {
+            map.insert(
+                "muted_tasks".into(),
+                Value::array([Value::object([
+                    ("run", Value::str("r1")),
+                    ("task", Value::str("t9")),
+                    ("channel", Value::str("review")),
+                    ("reason", Value::str("reply-depth")),
+                ])]),
+            );
+        }
+        m.update_messages(&doc);
+        let text = screen(&m, 100, 40);
+        assert!(
+            text.contains("task r1/t9 on review MUTED (reply-depth)"),
+            "{text}"
+        );
     }
 
     #[test]
