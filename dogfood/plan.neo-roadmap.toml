@@ -17,7 +17,10 @@
 #     by the daemon against its own working directory. The `repo` below names no repository on purpose.
 #   - All other tasks use the worker `agent` and may change ONE named file (the contract's diff
 #     check allows only that), never a protected path (dogfood/PROTECTED_PATHS.md).
-#   - N3 to N5 assume milestone N2 (context compiler) is merged to main before the plan is loaded.
+#   - N3 to N5 build on milestone N2 (the context compiler, `crates/neo-context`), which is part of this tree. The plan
+#     does not switch it on (`context = "compiled"` is an opt-in of a run); layer 5 of its packs is fed today from a static,
+#     human-written file (`crates/fleet-infra/src/knowledge.rs`), and feeding it from the knowledge store is part of the
+#     human-only task n3-integrate.
 
 [run]
 id = "neo-roadmap"
@@ -312,8 +315,9 @@ HUMAN-ONLY (events, ports, use cases, adapters, the daemon and the CLI are prote
 Add the fact events to fleet-domain/src/events.rs, the `neo/knowledge.rs` use cases and the
 KnowledgeBase port to fleet-app, an append-only JSONL store under the state directory (0600, bounded,
 redacted before it is written) and the reading of `.fleet/facts.json` with the same safe-read rules as
-result.json to fleet-infra, the contradiction decision gate, and `fleet facts` commands to the CLI.
-Port contract suites and end-to-end tests included. See dogfood/human-only.md.
+result.json to fleet-infra, the contradiction decision gate, `fleet facts` commands to the CLI, and the
+source of layer 5 of the context compiler (today a static file read by fleet-infra/src/knowledge.rs; the
+compiler's trust rules, ADR 17, stay as they are). Port contract suites and end-to-end tests included. See dogfood/human-only.md.
 '''
 
 [[tasks]]
