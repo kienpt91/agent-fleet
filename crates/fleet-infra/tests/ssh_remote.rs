@@ -16,7 +16,7 @@ use fleet_domain::env::EnvPolicy;
 use fleet_domain::error::Result;
 use fleet_domain::ids::{task_branch, HostName, RunId, Sha, TaskId};
 use fleet_domain::redact::Redactor;
-use fleet_domain::remote::{worker_env, RemoteCall, RemoteLayout};
+use fleet_domain::remote::{worker_env, RemoteCall, RemoteLayout, DEFAULT_REMOTE_PATH};
 use fleet_infra::contract_fs::FsContractFiles;
 use fleet_infra::git::GitVcs;
 use fleet_infra::jobs::JobTracker;
@@ -443,6 +443,105 @@ fn a_task_preparing_twice_replaces_the_stale_remote_worktree() {
     let (remote, _host, task, wt, first) = prepared_task(&fx, &["sh"]);
     let second = prepare(&remote, &task, &wt).unwrap();
     assert_eq!(first.dir, second.dir);
+}
+
+/// The clean-up of an abandoned attempt runs in the background and ends with its local part (the
+/// quarantine refs, the list of remote worktrees). The next attempt of the same task may be prepared
+/// before it ends: it must not lose what it made to the clean-up of the attempt before it. A shim for
+/// `rm` holds the host's removal command open after the directory is gone, which is what a slow
+/// host or a busy machine does, so that the order does not depend on timing.
+#[test]
+fn the_cleanup_of_an_abandoned_attempt_leaves_the_next_attempt_of_the_task_alone() {
+    let Some(fx) = Fx::new() else { return };
+    let shims = fx.sshd.dir.join("shims");
+    std::fs::create_dir_all(&shims).unwrap();
+    let gate = fx.sshd.dir.join("rm-gate");
+    let held = fx.sshd.dir.join("rm-held");
+    let shim = shims.join("rm");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\n/bin/rm \"$@\"; rc=$?\n\
+             if [ \"$1\" = -rf ] && [ -e '{gate}' ]; then : > '{held}'; \
+             while [ -e '{gate}' ]; do sleep 0.02; done; fi\nexit $rc\n",
+            gate = gate.display(),
+            held = held.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut host = fx.host(&["sh"]);
+    host.env = vec![(
+        "PATH".to_string(),
+        format!("{}:{DEFAULT_REMOTE_PATH}", shims.display()),
+    )];
+    let remote = fx.remote(vec![host.clone()]);
+    fx.trust(&remote, &host);
+    let wt = fx.worktree("r1", "t1");
+    let task = rt("build", "r1", "t1");
+    let repo = std::path::Path::new(&fx.repo);
+    let refs = || {
+        git(
+            repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/fleet-remote",
+            ],
+        )
+    };
+    let markers = || {
+        std::fs::read_dir(fx.state.path().join("remote/live"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+
+    prepare(&remote, &task, &wt).unwrap();
+    // Abandon the attempt; its clean-up removes the remote directory and then stays in the removal
+    // command until the gate is opened.
+    std::fs::write(&gate, "").unwrap();
+    remote.abandon(&task);
+    assert!(
+        wait_until(60_000, || held.exists()),
+        "the clean-up did not reach the host within 60 s"
+    );
+    assert!(!fx.remote_dir(&host, "r1", "t1").exists());
+
+    // The next attempt of the task is prepared while that clean-up is still running.
+    let second = prepare(&remote, &task, &wt).unwrap();
+    let sent_ref = format!("refs/fleet-remote/r1/t1/sent {}", second.sent.as_str());
+    assert!(refs().contains(&sent_ref), "{}", refs());
+    assert_eq!(markers(), 1);
+
+    // The clean-up of the first attempt ends now.
+    std::fs::remove_file(&gate).unwrap();
+    assert!(
+        wait_until(60_000, || remote.running_jobs() == 0),
+        "the clean-up did not end within 60 s"
+    );
+    assert!(
+        refs().contains(&sent_ref),
+        "the clean-up of the first attempt removed the quarantine ref of the second: {:?}",
+        refs()
+    );
+    assert_eq!(
+        markers(),
+        1,
+        "the clean-up of the first attempt removed the second attempt's entry in the list of remote worktrees"
+    );
+    assert!(fx.remote_dir(&host, "r1", "t1").exists());
+
+    // The second attempt ends the normal way and leaves nothing behind.
+    let got = collect(&remote, &task, &wt, &second.sent).unwrap();
+    assert!(
+        got.notes.iter().any(|n| n.contains("was removed")),
+        "{:?}",
+        got.notes
+    );
+    assert_eq!(refs(), "");
+    assert_eq!(markers(), 0);
+    assert!(!fx.remote_dir(&host, "r1", "t1").exists());
 }
 
 #[test]
