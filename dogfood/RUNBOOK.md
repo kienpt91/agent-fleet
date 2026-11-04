@@ -236,7 +236,8 @@ bases (the ones of [trials/](trials/README.md) and others; several have been fix
 each lost one task attempt to one of them (`jobs::tests::the_tracker_lists_a_running_group_leader_until_the_job_has_ended` and
 `jobs::tests::gates_and_several_jobs_at_once_are_all_listed`). `dryrun.sh` therefore retries a task that ended `failed` with `fleet retry`, up to
 three rounds, and says so in its output; do the same by hand in a real run, and treat a task that fails the same check twice as a real
-failure. A test that fails under load and passes alone is not a reason to weaken it.
+failure. A test that fails under load and passes alone is not a reason to weaken it. Run the dry run when the machine is quiet: at a load average of 40 or more
+the wall-clock tests of `fleet-domain` fail in every attempt (the appendix says what was tried).
 
 ## 4. The first real run: ONE starter task, one worker
 
@@ -457,21 +458,24 @@ for macOS; very long runs, several daemons, a plan with all 32 tasks running to 
 ## Appendix: the dry run, as it ran
 
 The real, unedited output of `sh dogfood/dryrun.sh --fleet /target/release/fleet --source /work`, run inside the development container
-(`fleet-dev`, no network, cargo cache in docker volumes) on commit `4111beb` of the tree that merges this scaffold with the features of
-`main` (workbench, context compiler, GitHub, fan-out, messaging, SSH remote worktrees), after `cargo build --release --locked --offline` in the
-same container. `/work` was a clone of that commit (a git worktree's `.git` file points outside the container). The cargo checks of
-the contracts went through `container-run.inside.sh` (a copy of the tree at one fixed path, a soak of 2 seconds instead of 20), not through the
-docker wrapper, and in an image without an sshd: the `remote` layer prints `skipped` in every `layers` check, as designed. Paths under `/tmp` are those of
-that run; it took 28 minutes on a machine that other jobs were loading heavily (load average above 50 on 12 cores). Things to read in it:
+(`fleet-dev`, no network, cargo cache in docker volumes) on commit `9bafc91` of the tree that merges this scaffold with the features of
+`main` (workbench, context compiler, GitHub, fan-out, messaging, SSH remote worktrees) and carries the fixes that followed its security review,
+after `cargo build --release --locked --offline` in the same container. `/work` was a clone of that commit (a git worktree's `.git` file points
+outside the container). The cargo checks of the contracts went through `container-run.inside.sh` (a copy of the tree at one fixed path, a soak of
+2 seconds instead of 20), not through the docker wrapper, and in an image without an sshd: the `remote` layer prints `skipped` in every `layers`
+check, as designed. Paths under `/tmp` are those of that run. It took 41 minutes and was started when the machine was quiet (load average 10 on 12
+cores, 22 to 28 while it ran).
 
-- the three starters and `maint-docs-links` completing only after every check passed (`goals list`: `verified`);
+**It needs a quiet machine.** Four earlier runs of the dry run on this tree failed (one at the by-hand `fleet verify` before the merge, one with every
+attempt of one starter task, two with every attempt of all three starter tasks), and each time for the same reason: the `layers` check failed on the wall-clock bounds of a few `fleet-domain` tests (Markdown and word-diff work limits of 3 seconds), which
+the README says are meant for an idle machine, at a load average of 40 to 100 caused by other jobs. The same suite passed as a whole at a load of
+about 20, and each of those tests passed alone at 25 to 60. Limiting the test threads did not help (a trial of 12, 6, 3 and 2 threads under a load of 60 failed
+7, 6, 3 and 4 tests), so no such limit was kept, and no test was changed. Things to read in the output:
+
+- the three starters and `maint-docs-links` completing only after every check passed (`goals list`: `verified`), with the `dogfood` layer (the
+  shell tests of the checkers) inside the `layers` check;
 - `starter-dag-property` failing its first attempt on `SECURITY.md` (`protected-diff` and `protected-script` in the audit log, shown by
-  `fleet events`), as scripted;
-- the load: its next attempt, and the first of `starter-docs-glossary`, failed the `layers` check on wall-clock bounds of `fleet-domain`
-  tests (the Markdown and word-diff work limits that the README says are meant for an idle machine); the failed output is quoted in the section of failed
-  checks. Fleet retried what it retries itself, `dryrun.sh` ran `fleet retry starter-value-property` once, and every task then passed with the **same**
-  tests: nothing was weakened. This is the flakiness the section above warns about, and it is why a task that fails the same check twice is
-  the one to look at;
+  `fleet events`), as scripted, and passing at its retry (try 2); `maint-docs-links` needed a retry of fleet's own as well (try 2);
 - `n3-scaffold` failing at once and `n3-source` behind it `blocked`; `fleet verify` of the human-only goal failing both checks with evidence that does not count (exit 6);
 - the merge answering exit 5 with an approval bound to the exact commit; the commits authored `fleet <fleet@localhost>`; the cherry-pick and the commit
   under another identity. The run ended with `exit=0`.
@@ -483,22 +487,22 @@ that run; it took 28 minutes on a machine that other jobs were loading heavily (
 error: could not lock config file /tmp/home/.gitconfig: No such file or directory
 
 $ git clone <source> clone   # a throwaway clone; the worker never sees any other checkout
-base commit 4111beb9770864dfdd229292843d188fecb2a85e
+base commit 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c
 
-$ sh /tmp/dogfood-dryrun.pykQzI/clone/dogfood/install-tools.sh --repo /tmp/dogfood-dryrun.pykQzI/clone --ref HEAD --dest /tmp/dogfood-dryrun.pykQzI/tools
-install-tools: reading dogfood/ at 4111beb9770864dfdd229292843d188fecb2a85e
+$ sh /tmp/dogfood-dryrun.teK9d6/clone/dogfood/install-tools.sh --repo /tmp/dogfood-dryrun.teK9d6/clone --ref HEAD --dest /tmp/dogfood-dryrun.teK9d6/tools
+install-tools: reading dogfood/ at 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c
   f414a8f567dfb41ed462a917a8e383760eddc338d4c4809857b3321ca36745d3  check-protected.sh
   4ecf5b37c93bc91e09aa05a8119883ac0e85fb90d71f4196b75064a134eb1b2b  check-docs-claims.sh
   268d6b286238209d998fe06b980147fc2777f3255003822a7f19f832bb21b1e7  check-secret-tree.sh
   ca0093d07b5cb43288cc178b236a48e8542066bf3fcd5e2470fdc02739e4d808  check-conflict-markers.sh
   d470021f85e161b5c81ff4f1febba937bfc5c68a2b74d6f43c4ab9632e36b75a  check-test-only.sh
-  0e6c1904f5ab90863e5ecec1abe5518abf79f664ee59f11e62c416421d8095d2  protected-paths.json
-install-tools: installed into /tmp/dogfood-dryrun.pykQzI/tools
+  a67e97beed5ef98fa03e39bc9faf6611c4d0cc5fa9512b79870a625c056e800d  protected-paths.json
+install-tools: installed into /tmp/dogfood-dryrun.teK9d6/tools
 
-$ container-run = a copy of dogfood/container-run.inside.sh outside the clone (/tmp/dogfood-dryrun.pykQzI/container-run)
+$ container-run = a copy of dogfood/container-run.inside.sh outside the clone (/tmp/dogfood-dryrun.teK9d6/container-run)
 
 $ dryrun config: dogfood/fleet.dogfood.example.toml with the worker command replaced (diff)
-< command = "/usr/local/bin/omp"
+< command = "/usr/local/bin/omp"            # EDIT: the absolute path of YOUR omp (`command -v omp`)
 < args = [
 <   "-p",
 <   "--no-session",
@@ -509,30 +513,30 @@ $ dryrun config: dogfood/fleet.dogfood.example.toml with the worker command repl
 <   "--cwd", "{worktree}",
 <   "--approval-mode", "write",
 <   "@{brief_file}",
-> command = "/tmp/dogfood-dryrun.pykQzI/clone/examples/agents/fake-agent.sh"
+> command = "/tmp/dogfood-dryrun.teK9d6/clone/examples/agents/fake-agent.sh"
 > args = []
 < [[gates]]
 < name = "tests"
-< command = "/opt/fleet-dogfood/bin/container-run"
+< command = "/opt/fleet-dogfood/bin/container-run"   # EDIT: the absolute path of YOUR wrapper, outside the repository
 < args = ["sh scripts/test-layers.sh"]
 < timeout_secs = 1800
 
 $ sh dogfood/plan-without.sh --repo <clone> dogfood/plan.neo-roadmap.toml <all but 6 tasks> > stage.toml
 tasks in the stage: 6
 
-$ /target/release/fleet plan /tmp/dogfood-dryrun.pykQzI/stage.toml
+$ /target/release/fleet plan /tmp/dogfood-dryrun.teK9d6/stage.toml
 plan loaded into run neo-roadmap (6 tasks)
 
 $ sh dogfood/apply-goals.sh --plan stage.toml --skip-tasks <the others> --apply ...   # renders one contract per goal (a dependent's scope also allows its dependencies') and adds the goals
 goal m-starters added (open)
-goal g-starter-error-tests added (open), contract 4de06c5a73da
-goal g-starter-value-property added (open), contract 1f3b67a890a7
-goal g-starter-docs-glossary added (open), contract 8b3d8bb34ce5
+goal g-starter-error-tests added (open), contract aeaa6f44366d
+goal g-starter-dag-property added (open), contract 21a6ca6e48d1
+goal g-starter-docs-glossary added (open), contract b07db76a9c09
 goal m-maint added (open)
-goal g-maint-docs-links added (open), contract 2384f24796d1
+goal g-maint-docs-links added (open), contract 98a1c4afbe28
 goal m-n3 added (open)
 goal g-n3-scaffold added (open), contract 46f26596d621
-goal g-n3-source added (open), contract 08a3e6bb2f7d
+goal g-n3-source added (open), contract b4944f0f847b
 goal m-n4 added (open)
 goal m-n5 added (open)
 apply-goals: 11 goal(s) added
@@ -540,24 +544,24 @@ apply-goals: 11 goal(s) added
 $ the scope check of maint-docs-links: it runs after the three starters, whose work fleet merges into its branch
       "id": "scope",
       "kind": "diff",
-      "allow": ["README.md", "docs/**", "crates/fleet-domain/src/error.rs", "crates/fleet-domain/src/value.rs", "docs/domain.md"]
+      "allow": ["README.md", "docs/**", "crates/fleet-domain/src/error.rs", "crates/fleet-domain/src/dag.rs", "docs/domain.md"]
     }
   ]
 
 $ /target/release/fleet goals list
 11 goals, 0 verified, 0 abandoned
-GOAL                        STATUS  CONTRACT  TASKS                                             TITLE
-m-starters                  open    none      -                                                 The loop works end to end on small safe tasks
-  g-starter-error-tests     open    pending   neo-roadmap/starter-error-tests (ready, pending)  fleet-domain error.rs has unit tests
-  g-starter-value-property  open    pending   neo-roadmap/starter-value-property (ready, pend…  Value canonical form has a property test
-  g-starter-docs-glossary   open    pending   neo-roadmap/starter-docs-glossary (ready, pendi…  The glossary names the self-development terms
-m-maint                     open    none      -                                                 Maintenance stays small and under control
-  g-maint-docs-links        open    pending   neo-roadmap/maint-docs-links (pending, pending)   Relative links and anchors in the docs resolve
-m-n3                        open    none      -                                                 N3: the knowledge store
-  g-n3-scaffold             open    pending   neo-roadmap/n3-scaffold (pending, pending)        The neo-knowledge crate exists in the workspace
-  g-n3-source               open    pending   neo-roadmap/n3-source (pending, pending)          Fact sources and their confidence
-m-n4                        open    none      -                                                 N4: the token governor
-m-n5                        open    none      -                                                 N5: the credential broker
+GOAL                       STATUS  CONTRACT  TASKS                                             TITLE
+m-starters                 open    none      -                                                 The loop works end to end on small safe tasks
+  g-starter-error-tests    open    pending   neo-roadmap/starter-error-tests (ready, pending)  fleet-domain error.rs has unit tests
+  g-starter-dag-property   open    pending   neo-roadmap/starter-dag-property (ready, pendin…  Task ordering has a property test
+  g-starter-docs-glossary  open    pending   neo-roadmap/starter-docs-glossary (ready, pendi…  The glossary names the self-development terms
+m-maint                    open    none      -                                                 Maintenance stays small and under control
+  g-maint-docs-links       open    pending   neo-roadmap/maint-docs-links (pending, pending)   Relative links and anchors in the docs resolve
+m-n3                       open    none      -                                                 N3: the knowledge store
+  g-n3-scaffold            open    pending   neo-roadmap/n3-scaffold (pending, pending)        The neo-knowledge crate exists in the workspace
+  g-n3-source              open    pending   neo-roadmap/n3-source (pending, pending)          Fact sources and their confidence
+m-n4                       open    none      -                                                 N4: the token governor
+m-n5                       open    none      -                                                 N5: the credential broker
 
 $ /target/release/fleet goals show g-starter-docs-glossary
 goal g-starter-docs-glossary [open]
@@ -566,177 +570,160 @@ parent:   m-starters
 reason:   added
 intent:
   > docs/domain.md has rows for protected path, human-only task and self-development; only that file changed
-contract: pending (id 8b3d8bb34ce5)
+contract: pending (id b07db76a9c09)
 tasks:
   neo-roadmap/starter-docs-glossary  ready  verification: pending
 checks (newest evidence of each):
   protected-diff [diff, mandatory] not run
     changes nothing matching .github/**, .github/workflows/**, SECURITY.md, scripts/**, scripts/test-la…
   protected-script [command, mandatory] not run
-    /tmp/dogfood-dryrun.pykQzI/tools/check-protected.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111beb…
+    /tmp/dogfood-dryrun.teK9d6/tools/check-protected.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc91…
   lock-unchanged [file, mandatory] not run
     Cargo.lock has sha256 ed369f7785bd21f502f66ebcef8275adda520a879a363303b42875e8bc0a8d9b
   docs-claims [command, mandatory] not run
-    /tmp/dogfood-dryrun.pykQzI/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111b…
+    /tmp/dogfood-dryrun.teK9d6/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc…
   conflict-markers [command, mandatory] not run
-    /tmp/dogfood-dryrun.pykQzI/tools/check-conflict-markers.sh --tree (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-conflict-markers.sh --tree (expect exit 0)
   secret-scan [command, mandatory] not run
-    /tmp/dogfood-dryrun.pykQzI/tools/check-secret-tree.sh (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-secret-tree.sh (expect exit 0)
   fmt [command, mandatory] not run
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo fmt --all -- --check (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo fmt --all -- --check (expect exit 0)
   clippy [command, mandatory] not run
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo clippy --workspace --all-targets --locked --offline …
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo clippy --workspace --all-targets --locked --offline …
   architecture [command, mandatory] not run
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo test --locked --offline -p fleet-cli --test architec…
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo test --locked --offline -p fleet-cli --test architec…
   layers [command, mandatory] not run
-    /tmp/dogfood-dryrun.pykQzI/container-run sh scripts/test-layers.sh (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/container-run sh scripts/test-layers.sh (expect exit 0)
   scope [diff, mandatory] not run
     changes only docs/domain.md
 
 $ /target/release/fleet goals remaining
 11 goals, 0 verified, 0 abandoned
 open leaves:
-  GOAL                      STATUS  CONTRACT  TASKS                                             TITLE
-  g-starter-error-tests     open    pending   neo-roadmap/starter-error-tests (ready, pending)  fleet-domain error.rs has unit tests
-  g-starter-value-property  open    pending   neo-roadmap/starter-value-property (ready, pend…  Value canonical form has a property test
-  g-starter-docs-glossary   open    pending   neo-roadmap/starter-docs-glossary (ready, pendi…  The glossary names the self-development terms
-  g-maint-docs-links        open    pending   neo-roadmap/maint-docs-links (pending, pending)   Relative links and anchors in the docs resolve
-  g-n3-scaffold             open    pending   neo-roadmap/n3-scaffold (pending, pending)        The neo-knowledge crate exists in the workspace
-  g-n3-source               open    pending   neo-roadmap/n3-source (pending, pending)          Fact sources and their confidence
-  m-n4                      open    none      -                                                 N4: the token governor
-  m-n5                      open    none      -                                                 N5: the credential broker
+  GOAL                     STATUS  CONTRACT  TASKS                                             TITLE
+  g-starter-error-tests    open    pending   neo-roadmap/starter-error-tests (ready, pending)  fleet-domain error.rs has unit tests
+  g-starter-dag-property   open    pending   neo-roadmap/starter-dag-property (ready, pendin…  Task ordering has a property test
+  g-starter-docs-glossary  open    pending   neo-roadmap/starter-docs-glossary (ready, pendi…  The glossary names the self-development terms
+  g-maint-docs-links       open    pending   neo-roadmap/maint-docs-links (pending, pending)   Relative links and anchors in the docs resolve
+  g-n3-scaffold            open    pending   neo-roadmap/n3-scaffold (pending, pending)        The neo-knowledge crate exists in the workspace
+  g-n3-source              open    pending   neo-roadmap/n3-source (pending, pending)          Fact sources and their confidence
+  m-n4                     open    none      -                                                 N4: the token governor
+  m-n5                     open    none      -                                                 N5: the credential broker
 blockers:
   none
 next ready tasks:
   neo-roadmap/starter-error-tests  (goal g-starter-error-tests)  Starter: unit tests for fleet-domain error.rs
-  neo-roadmap/starter-value-property  (goal g-starter-value-property)  Starter: a property test for the canonical form of fleet-do…
+  neo-roadmap/starter-dag-property  (goal g-starter-dag-property)  Starter: a property test for the task order of fleet-domain…
   neo-roadmap/starter-docs-glossary  (goal g-starter-docs-glossary)  Starter: glossary entries for self-development in docs/doma…
 
 $ /target/release/fleet start --run neo-roadmap --max-parallel 1
 run neo-roadmap started
-
-$ fleet retry starter-error-tests   # only a failed task can be retried; the others answer with a conflict
-fleet: task starter-error-tests is completed; only failed tasks can be retried
-
-$ fleet retry starter-value-property   # only a failed task can be retried; the others answer with a conflict
-retry requested for starter-value-property
-
-$ fleet retry starter-docs-glossary   # only a failed task can be retried; the others answer with a conflict
-fleet: task starter-docs-glossary is completed; only failed tasks can be retried
-
-$ fleet retry maint-docs-links   # only a failed task can be retried; the others answer with a conflict
-fleet: task maint-docs-links is pending; only failed tasks can be retried
+fleet: requests from worker processes are refused; approvals and decisions are made by a person
+fleet: requests from worker processes are refused; approvals and decisions are made by a person
+fleet: requests from worker processes are refused; approvals and decisions are made by a person
+fleet: requests from worker processes are refused; approvals and decisions are made by a person
 
 $ /target/release/fleet status
-daemon pid 72 | v0.1.0 | up 23m52s | sessions 0/1 | undo unavailable | rss 8004 kB
+daemon pid 72 | v0.1.0 | up 33m12s | sessions 0/1 | undo unavailable | rss 7808 kB
 
 run neo-roadmap [active] max-parallel 1
   objective  Build NEO milestones N3, N4 and N5 under human control: agents write pure domain code and docs in n…
-  repo       /tmp/dogfood-dryrun.pykQzI/clone (base HEAD @ 4111beb9)
+  repo       /tmp/dogfood-dryrun.teK9d6/clone (base HEAD @ 9bafc91e)
   branch     fleet/neo-roadmap/integration
   tasks      pending 0, ready 0, running 0, review 0, completed 4, failed 1, blocked 1
   ID                    STATUS     DEPS                      TRY  WORKER      NOTE
   starter-error-tests   completed  -                         1    agent       added the unit tests of error.rs
-  starter-value-prope…  completed  -                         3    agent       added a property test of the canonical form
-  starter-docs-glossa…  completed  -                         2    agent       added three glossary rows
-  maint-docs-links      completed  starter-error-tests,sta…  1    agent       checked the links
+  starter-dag-property  completed  -                         2    agent       added a property test of the task order
+  starter-docs-glossa…  completed  -                         1    agent       added three glossary rows
+  maint-docs-links      completed  starter-error-tests,sta…  2    agent       checked the links
   n3-scaffold           failed     starter-error-tests,sta…  2    human-only  failed: worker exited with code 1
   n3-source             blocked    n3-scaffold               0    agent       blocked: dependency n3-scaffold - dependency n3-scaffold di…
 
 recent
-  #190 evidence e71: goal g-maint-docs-links check "conflict-markers" passed
-  #191 evidence e72: goal g-maint-docs-links check "secret-scan" passed
-  #192 evidence e73: goal g-maint-docs-links check "fmt" passed
-  #193 evidence e74: goal g-maint-docs-links check "clippy" passed
-  #194 evidence e75: goal g-maint-docs-links check "architecture" passed
-  #195 evidence e76: goal g-maint-docs-links check "layers" passed
-  #196 evidence e77: goal g-maint-docs-links check "scope" passed
-  #197 goal g-maint-docs-links is verified
-  #198 goal m-maint is verified
-  #199 neo-roadmap/maint-docs-links completed
+  #156 evidence e60: goal g-maint-docs-links check "conflict-markers" passed
+  #157 evidence e61: goal g-maint-docs-links check "secret-scan" passed
+  #158 evidence e62: goal g-maint-docs-links check "fmt" passed
+  #159 evidence e63: goal g-maint-docs-links check "clippy" passed
+  #160 evidence e64: goal g-maint-docs-links check "architecture" passed
+  #161 evidence e65: goal g-maint-docs-links check "layers" passed
+  #162 evidence e66: goal g-maint-docs-links check "scope" passed
+  #163 goal g-maint-docs-links is verified
+  #164 goal m-maint is verified
+  #165 neo-roadmap/maint-docs-links completed
 
 $ /target/release/fleet goals list
 11 goals, 6 verified, 0 abandoned
-GOAL                        STATUS    CONTRACT  TASKS                                             TITLE
-m-starters                  verified  none      -                                                 The loop works end to end on small safe tasks
-  g-starter-error-tests     verified  passed    neo-roadmap/starter-error-tests (completed, ver…  fleet-domain error.rs has unit tests
-  g-starter-value-property  verified  passed    neo-roadmap/starter-value-property (completed, …  Value canonical form has a property test
-  g-starter-docs-glossary   verified  passed    neo-roadmap/starter-docs-glossary (completed, v…  The glossary names the self-development terms
-m-maint                     verified  none      -                                                 Maintenance stays small and under control
-  g-maint-docs-links        verified  passed    neo-roadmap/maint-docs-links (completed, verifi…  Relative links and anchors in the docs resolve
-m-n3                        open      none      -                                                 N3: the knowledge store
-  g-n3-scaffold             open      pending   neo-roadmap/n3-scaffold (failed, pending)         The neo-knowledge crate exists in the workspace
-  g-n3-source               open      pending   neo-roadmap/n3-source (blocked, pending)          Fact sources and their confidence
-m-n4                        open      none      -                                                 N4: the token governor
-m-n5                        open      none      -                                                 N5: the credential broker
+GOAL                       STATUS    CONTRACT  TASKS                                             TITLE
+m-starters                 verified  none      -                                                 The loop works end to end on small safe tasks
+  g-starter-error-tests    verified  passed    neo-roadmap/starter-error-tests (completed, ver…  fleet-domain error.rs has unit tests
+  g-starter-dag-property   verified  passed    neo-roadmap/starter-dag-property (completed, ve…  Task ordering has a property test
+  g-starter-docs-glossary  verified  passed    neo-roadmap/starter-docs-glossary (completed, v…  The glossary names the self-development terms
+m-maint                    verified  none      -                                                 Maintenance stays small and under control
+  g-maint-docs-links       verified  passed    neo-roadmap/maint-docs-links (completed, verifi…  Relative links and anchors in the docs resolve
+m-n3                       open      none      -                                                 N3: the knowledge store
+  g-n3-scaffold            open      pending   neo-roadmap/n3-scaffold (failed, pending)         The neo-knowledge crate exists in the workspace
+  g-n3-source              open      pending   neo-roadmap/n3-source (blocked, pending)          Fact sources and their confidence
+m-n4                       open      none      -                                                 N4: the token governor
+m-n5                       open      none      -                                                 N5: the credential broker
 
-$ /target/release/fleet goals show g-starter-value-property
-goal g-starter-value-property [verified]
-title:    Value canonical form has a property test
+$ /target/release/fleet goals show g-starter-dag-property
+goal g-starter-dag-property [verified]
+title:    Task ordering has a property test
 parent:   m-starters
 reason:   every mandatory check of the contract passed
 intent:
-  > value.rs has a property-style test of key-order independence; only that file changed
-contract: passed (id 1f3b67a890a7)
+  > dag.rs has a property-style test that a random task graph is ordered with every dependency first; only that file changed
+contract: passed (id 21a6ca6e48d1)
 tasks:
-  neo-roadmap/starter-value-property  completed  verification: verified
+  neo-roadmap/starter-dag-property  completed  verification: verified
 checks (newest evidence of each):
   protected-diff [diff, mandatory] passed: 1 changed path(s), all allowed
     changes nothing matching .github/**, .github/workflows/**, SECURITY.md, scripts/**, scripts/test-la…
   protected-script [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-protected.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111beb…
-    > check-protected: 1 changed path(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-value-property, none protected (84 entries)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-protected.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc91…
+    > check-protected: 1 changed path(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-dag-property, none protected (85 entries)
   lock-unchanged [file, mandatory] passed: the file's sha256 matches
     Cargo.lock has sha256 ed369f7785bd21f502f66ebcef8275adda520a879a363303b42875e8bc0a8d9b
   docs-claims [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111b…
-    > check-docs-claims: 0 changed documentation line(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-value-property, no measured number among them
+    /tmp/dogfood-dryrun.teK9d6/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc…
+    > check-docs-claims: 0 changed documentation line(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-dag-property, no measured number among them
   conflict-markers [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-conflict-markers.sh --tree (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-conflict-markers.sh --tree (expect exit 0)
     > check-conflict-markers: clean (--tree)
   secret-scan [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-secret-tree.sh (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-secret-tree.sh (expect exit 0)
     > secret-scan: clean (--tree)
   fmt [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo fmt --all -- --check (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo fmt --all -- --check (expect exit 0)
   clippy [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo clippy --workspace --all-targets --locked --offline …
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo clippy --workspace --all-targets --locked --offline …
     >
     > --- stderr ---
-    >     Checking fleet-domain v0.1.0 (/tmp/work/crates/fleet-domain)
-    >     Checking neo-context v0.1.0 (/tmp/work/crates/neo-context)
-    >     Checking neo-verify v0.1.0 (/tmp/work/crates/neo-verify)
-    >     Checking fleet-forge v0.1.0 (/tmp/work/crates/fleet-forge)
-    >     Checking neo-goals v0.1.0 (/tmp/work/crates/neo-goals)
-    >     Checking fleet-fanout v0.1.0 (/tmp/work/crates/fleet-fanout)
-    >     Checking fleet-app v0.1.0 (/tmp/work/crates/fleet-app)
-    >     Checking fleet-infra v0.1.0 (/tmp/work/crates/fleet-infra)
-    >     Checking fleet-cli v0.1.0 (/tmp/work/crates/fleet-cli)
-    >     Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.09s
+    >     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.25s
   architecture [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo test --locked --offline -p fleet-cli --test architec…
-    > ... (22 earlier lines not shown)
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo test --locked --offline -p fleet-cli --test architec…
+    > ... (21 earlier lines not shown)
+    > test no_source_file_contains_the_unsafe_keyword ... ok
+    > test terminal_libraries_are_used_by_the_cli_only ... ok
+    > test the_pure_layers_do_not_touch_the_outside_world ... ok
+    > test the_inner_layers_know_nothing_of_networking_or_the_web_adapter ... ok
+    > test only_the_message_file_adapter_and_its_tests_write_inboxes ... ok
+    >
+    > test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+    >
+    >
     > --- stderr ---
-    >    Compiling fleet-domain v0.1.0 (/tmp/work/crates/fleet-domain)
-    >    Compiling neo-verify v0.1.0 (/tmp/work/crates/neo-verify)
-    >    Compiling neo-context v0.1.0 (/tmp/work/crates/neo-context)
-    >    Compiling fleet-forge v0.1.0 (/tmp/work/crates/fleet-forge)
-    >    Compiling neo-goals v0.1.0 (/tmp/work/crates/neo-goals)
-    >    Compiling fleet-fanout v0.1.0 (/tmp/work/crates/fleet-fanout)
-    >    Compiling fleet-app v0.1.0 (/tmp/work/crates/fleet-app)
-    >    Compiling fleet-infra v0.1.0 (/tmp/work/crates/fleet-infra)
-    >    Compiling fleet-cli v0.1.0 (/tmp/work/crates/fleet-cli)
-    >     Finished `test` profile [unoptimized + debuginfo] target(s) in 5.91s
+    >     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
     >      Running tests/architecture.rs (/target/debug/deps/architecture-c8d89152e6ed4dea)
   layers [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run sh scripts/test-layers.sh (expect exit 0)
-    > ... (6 earlier lines not shown)
-    >
-    > == adapters ==
-    > adapters: 775 passed, 0 failed
+    /tmp/dogfood-dryrun.teK9d6/container-run sh scripts/test-layers.sh (expect exit 0)
+    > ... (9 earlier lines not shown)
     >
     > == soak ==
     > soak: 1 passed, 0 failed
+    >
+    > == dogfood ==
+    > dogfood: 573 passed, 0 failed
     >
     > == remote ==
     > skipped: no OpenSSH server in this image (build docker/Dockerfile.ssh)
@@ -744,29 +731,29 @@ checks (newest evidence of each):
     > == end-to-end ==
     > end-to-end: 382 passed, 0 failed
   scope [diff, mandatory] passed: 1 changed path(s), all allowed
-    changes only crates/fleet-domain/src/value.rs
+    changes only crates/fleet-domain/src/dag.rs
 evidence history (newest first):
-  EVIDENCE  CHECK             VERDICT  COMMIT        TASK                    SUMMARY
-  e66       scope             passed   1629515401d0  starter-value-property  1 changed path(s), all allowed
-  e65       layers            passed   1629515401d0  starter-value-property  exit code 0
-  e64       architecture      passed   1629515401d0  starter-value-property  exit code 0
-  e63       clippy            passed   1629515401d0  starter-value-property  exit code 0
-  e62       fmt               passed   1629515401d0  starter-value-property  exit code 0
-  e61       secret-scan       passed   1629515401d0  starter-value-property  exit code 0
-  e60       conflict-markers  passed   1629515401d0  starter-value-property  exit code 0
-  e59       docs-claims       passed   1629515401d0  starter-value-property  exit code 0
-  e58       lock-unchanged    passed   1629515401d0  starter-value-property  the file's sha256 matches
-  e57       protected-script  passed   1629515401d0  starter-value-property  exit code 0
-  e56       protected-diff    passed   1629515401d0  starter-value-property  1 changed path(s), all allowed
-  e44       scope             passed   1629515401d0  starter-value-property  1 changed path(s), all allowed
-  e43       layers            failed   1629515401d0  starter-value-property  exit code 1, expected 0
-  e42       architecture      passed   1629515401d0  starter-value-property  exit code 0
-  e41       clippy            passed   1629515401d0  starter-value-property  exit code 0
-  e40       fmt               passed   1629515401d0  starter-value-property  exit code 0
-  e39       secret-scan       passed   1629515401d0  starter-value-property  exit code 0
-  e38       conflict-markers  passed   1629515401d0  starter-value-property  exit code 0
-  e37       docs-claims       passed   1629515401d0  starter-value-property  exit code 0
-  e36       lock-unchanged    passed   1629515401d0  starter-value-property  the file's sha256 matches
+  EVIDENCE  CHECK             VERDICT  COMMIT        TASK                  SUMMARY
+  e44       scope             passed   50f274eb5872  starter-dag-property  1 changed path(s), all allowed
+  e43       layers            passed   50f274eb5872  starter-dag-property  exit code 0
+  e42       architecture      passed   50f274eb5872  starter-dag-property  exit code 0
+  e41       clippy            passed   50f274eb5872  starter-dag-property  exit code 0
+  e40       fmt               passed   50f274eb5872  starter-dag-property  exit code 0
+  e39       secret-scan       passed   50f274eb5872  starter-dag-property  exit code 0
+  e38       conflict-markers  passed   50f274eb5872  starter-dag-property  exit code 0
+  e37       docs-claims       passed   50f274eb5872  starter-dag-property  exit code 0
+  e36       lock-unchanged    passed   50f274eb5872  starter-dag-property  the file's sha256 matches
+  e35       protected-script  passed   50f274eb5872  starter-dag-property  exit code 0
+  e34       protected-diff    passed   50f274eb5872  starter-dag-property  1 changed path(s), all allowed
+  e22       scope             failed   01c372a38f38  starter-dag-property  1 changed path(s) outside the allowed globs
+  e21       layers            passed   01c372a38f38  starter-dag-property  exit code 0
+  e20       architecture      passed   01c372a38f38  starter-dag-property  exit code 0
+  e19       clippy            passed   01c372a38f38  starter-dag-property  exit code 0
+  e18       fmt               passed   01c372a38f38  starter-dag-property  exit code 0
+  e17       secret-scan       passed   01c372a38f38  starter-dag-property  exit code 0
+  e16       conflict-markers  passed   01c372a38f38  starter-dag-property  exit code 0
+  e15       docs-claims       passed   01c372a38f38  starter-dag-property  exit code 0
+  e14       lock-unchanged    passed   01c372a38f38  starter-dag-property  the file's sha256 matches
 
 $ /target/release/fleet goals show g-starter-docs-glossary
 goal g-starter-docs-glossary [verified]
@@ -775,30 +762,30 @@ parent:   m-starters
 reason:   every mandatory check of the contract passed
 intent:
   > docs/domain.md has rows for protected path, human-only task and self-development; only that file changed
-contract: passed (id 8b3d8bb34ce5)
+contract: passed (id b07db76a9c09)
 tasks:
   neo-roadmap/starter-docs-glossary  completed  verification: verified
 checks (newest evidence of each):
   protected-diff [diff, mandatory] passed: 1 changed path(s), all allowed
     changes nothing matching .github/**, .github/workflows/**, SECURITY.md, scripts/**, scripts/test-la…
   protected-script [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-protected.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111beb…
-    > check-protected: 1 changed path(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-docs-glossary, none protected (84 entries)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-protected.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc91…
+    > check-protected: 1 changed path(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-docs-glossary, none protected (85 entries)
   lock-unchanged [file, mandatory] passed: the file's sha256 matches
     Cargo.lock has sha256 ed369f7785bd21f502f66ebcef8275adda520a879a363303b42875e8bc0a8d9b
   docs-claims [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111b…
-    > check-docs-claims: 3 changed documentation line(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-docs-glossary, no measured number among them
+    /tmp/dogfood-dryrun.teK9d6/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc…
+    > check-docs-claims: 3 changed documentation line(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-docs-glossary, no measured number among them
   conflict-markers [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-conflict-markers.sh --tree (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-conflict-markers.sh --tree (expect exit 0)
     > check-conflict-markers: clean (--tree)
   secret-scan [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-secret-tree.sh (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-secret-tree.sh (expect exit 0)
     > secret-scan: clean (--tree)
   fmt [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo fmt --all -- --check (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo fmt --all -- --check (expect exit 0)
   clippy [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo clippy --workspace --all-targets --locked --offline …
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo clippy --workspace --all-targets --locked --offline …
     >
     > --- stderr ---
     >     Checking fleet-domain v0.1.0 (/tmp/work/crates/fleet-domain)
@@ -810,31 +797,31 @@ checks (newest evidence of each):
     >     Checking fleet-app v0.1.0 (/tmp/work/crates/fleet-app)
     >     Checking fleet-infra v0.1.0 (/tmp/work/crates/fleet-infra)
     >     Checking fleet-cli v0.1.0 (/tmp/work/crates/fleet-cli)
-    >     Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.01s
+    >     Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.16s
   architecture [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo test --locked --offline -p fleet-cli --test architec…
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo test --locked --offline -p fleet-cli --test architec…
     > ... (22 earlier lines not shown)
     > --- stderr ---
     >    Compiling fleet-domain v0.1.0 (/tmp/work/crates/fleet-domain)
     >    Compiling neo-verify v0.1.0 (/tmp/work/crates/neo-verify)
     >    Compiling neo-context v0.1.0 (/tmp/work/crates/neo-context)
     >    Compiling fleet-forge v0.1.0 (/tmp/work/crates/fleet-forge)
-    >    Compiling neo-goals v0.1.0 (/tmp/work/crates/neo-goals)
     >    Compiling fleet-fanout v0.1.0 (/tmp/work/crates/fleet-fanout)
+    >    Compiling neo-goals v0.1.0 (/tmp/work/crates/neo-goals)
     >    Compiling fleet-app v0.1.0 (/tmp/work/crates/fleet-app)
     >    Compiling fleet-infra v0.1.0 (/tmp/work/crates/fleet-infra)
     >    Compiling fleet-cli v0.1.0 (/tmp/work/crates/fleet-cli)
-    >     Finished `test` profile [unoptimized + debuginfo] target(s) in 13.74s
+    >     Finished `test` profile [unoptimized + debuginfo] target(s) in 7.84s
     >      Running tests/architecture.rs (/target/debug/deps/architecture-c8d89152e6ed4dea)
   layers [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run sh scripts/test-layers.sh (expect exit 0)
-    > ... (6 earlier lines not shown)
-    >
-    > == adapters ==
-    > adapters: 775 passed, 0 failed
+    /tmp/dogfood-dryrun.teK9d6/container-run sh scripts/test-layers.sh (expect exit 0)
+    > ... (9 earlier lines not shown)
     >
     > == soak ==
     > soak: 1 passed, 0 failed
+    >
+    > == dogfood ==
+    > dogfood: 573 passed, 0 failed
     >
     > == remote ==
     > skipped: no OpenSSH server in this image (build docker/Dockerfile.ssh)
@@ -845,26 +832,17 @@ checks (newest evidence of each):
     changes only docs/domain.md
 evidence history (newest first):
   EVIDENCE  CHECK             VERDICT  COMMIT        TASK                   SUMMARY
-  e55       scope             passed   3fd3591097a6  starter-docs-glossary  1 changed path(s), all allowed
-  e54       layers            passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e53       architecture      passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e52       clippy            passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e51       fmt               passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e50       secret-scan       passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e49       conflict-markers  passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e48       docs-claims       passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e47       lock-unchanged    passed   3fd3591097a6  starter-docs-glossary  the file's sha256 matches
-  e46       protected-script  passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e45       protected-diff    passed   3fd3591097a6  starter-docs-glossary  1 changed path(s), all allowed
-  e33       scope             passed   3fd3591097a6  starter-docs-glossary  1 changed path(s), all allowed
-  e32       layers            failed   3fd3591097a6  starter-docs-glossary  exit code 1, expected 0
-  e31       architecture      passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e30       clippy            passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e29       fmt               passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e28       secret-scan       passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e27       conflict-markers  passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e26       docs-claims       passed   3fd3591097a6  starter-docs-glossary  exit code 0
-  e25       lock-unchanged    passed   3fd3591097a6  starter-docs-glossary  the file's sha256 matches
+  e33       scope             passed   bfee265fc390  starter-docs-glossary  1 changed path(s), all allowed
+  e32       layers            passed   bfee265fc390  starter-docs-glossary  exit code 0
+  e31       architecture      passed   bfee265fc390  starter-docs-glossary  exit code 0
+  e30       clippy            passed   bfee265fc390  starter-docs-glossary  exit code 0
+  e29       fmt               passed   bfee265fc390  starter-docs-glossary  exit code 0
+  e28       secret-scan       passed   bfee265fc390  starter-docs-glossary  exit code 0
+  e27       conflict-markers  passed   bfee265fc390  starter-docs-glossary  exit code 0
+  e26       docs-claims       passed   bfee265fc390  starter-docs-glossary  exit code 0
+  e25       lock-unchanged    passed   bfee265fc390  starter-docs-glossary  the file's sha256 matches
+  e24       protected-script  passed   bfee265fc390  starter-docs-glossary  exit code 0
+  e23       protected-diff    passed   bfee265fc390  starter-docs-glossary  1 changed path(s), all allowed
 
 $ /target/release/fleet goals show g-maint-docs-links
 goal g-maint-docs-links [verified]
@@ -873,30 +851,30 @@ parent:   m-maint
 reason:   every mandatory check of the contract passed
 intent:
   > Broken links and anchors in README.md and docs/ are fixed without touching any measured number
-contract: passed (id 2384f24796d1)
+contract: passed (id 98a1c4afbe28)
 tasks:
   neo-roadmap/maint-docs-links  completed  verification: verified
 checks (newest evidence of each):
   protected-diff [diff, mandatory] passed: 4 changed path(s), all allowed
     changes nothing matching .github/**, .github/workflows/**, SECURITY.md, scripts/**, scripts/test-la…
   protected-script [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-protected.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111beb…
-    > check-protected: 4 changed path(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/maint-docs-links, none protected (84 entries)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-protected.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc91…
+    > check-protected: 4 changed path(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/maint-docs-links, none protected (85 entries)
   lock-unchanged [file, mandatory] passed: the file's sha256 matches
     Cargo.lock has sha256 ed369f7785bd21f502f66ebcef8275adda520a879a363303b42875e8bc0a8d9b
   docs-claims [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111b…
-    > check-docs-claims: 4 changed documentation line(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/maint-docs-links, no measured number among them
+    /tmp/dogfood-dryrun.teK9d6/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc…
+    > check-docs-claims: 4 changed documentation line(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/maint-docs-links, no measured number among them
   conflict-markers [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-conflict-markers.sh --tree (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-conflict-markers.sh --tree (expect exit 0)
     > check-conflict-markers: clean (--tree)
   secret-scan [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-secret-tree.sh (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-secret-tree.sh (expect exit 0)
     > secret-scan: clean (--tree)
   fmt [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo fmt --all -- --check (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo fmt --all -- --check (expect exit 0)
   clippy [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo clippy --workspace --all-targets --locked --offline …
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo clippy --workspace --all-targets --locked --offline …
     >
     > --- stderr ---
     >     Checking fleet-domain v0.1.0 (/tmp/work/crates/fleet-domain)
@@ -908,31 +886,31 @@ checks (newest evidence of each):
     >     Checking fleet-app v0.1.0 (/tmp/work/crates/fleet-app)
     >     Checking fleet-infra v0.1.0 (/tmp/work/crates/fleet-infra)
     >     Checking fleet-cli v0.1.0 (/tmp/work/crates/fleet-cli)
-    >     Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.92s
+    >     Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.23s
   architecture [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo test --locked --offline -p fleet-cli --test architec…
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo test --locked --offline -p fleet-cli --test architec…
     > ... (22 earlier lines not shown)
     > --- stderr ---
     >    Compiling fleet-domain v0.1.0 (/tmp/work/crates/fleet-domain)
     >    Compiling neo-verify v0.1.0 (/tmp/work/crates/neo-verify)
-    >    Compiling neo-context v0.1.0 (/tmp/work/crates/neo-context)
     >    Compiling fleet-forge v0.1.0 (/tmp/work/crates/fleet-forge)
+    >    Compiling neo-context v0.1.0 (/tmp/work/crates/neo-context)
     >    Compiling neo-goals v0.1.0 (/tmp/work/crates/neo-goals)
     >    Compiling fleet-fanout v0.1.0 (/tmp/work/crates/fleet-fanout)
     >    Compiling fleet-app v0.1.0 (/tmp/work/crates/fleet-app)
     >    Compiling fleet-infra v0.1.0 (/tmp/work/crates/fleet-infra)
     >    Compiling fleet-cli v0.1.0 (/tmp/work/crates/fleet-cli)
-    >     Finished `test` profile [unoptimized + debuginfo] target(s) in 8.29s
+    >     Finished `test` profile [unoptimized + debuginfo] target(s) in 14.67s
     >      Running tests/architecture.rs (/target/debug/deps/architecture-c8d89152e6ed4dea)
   layers [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run sh scripts/test-layers.sh (expect exit 0)
-    > ... (6 earlier lines not shown)
-    >
-    > == adapters ==
-    > adapters: 775 passed, 0 failed
+    /tmp/dogfood-dryrun.teK9d6/container-run sh scripts/test-layers.sh (expect exit 0)
+    > ... (9 earlier lines not shown)
     >
     > == soak ==
     > soak: 1 passed, 0 failed
+    >
+    > == dogfood ==
+    > dogfood: 573 passed, 0 failed
     >
     > == remote ==
     > skipped: no OpenSSH server in this image (build docker/Dockerfile.ssh)
@@ -940,20 +918,29 @@ checks (newest evidence of each):
     > == end-to-end ==
     > end-to-end: 382 passed, 0 failed
   scope [diff, mandatory] passed: 4 changed path(s), all allowed
-    changes only README.md, docs/**, crates/fleet-domain/src/error.rs, crates/fleet-domain/src/value.rs…
+    changes only README.md, docs/**, crates/fleet-domain/src/error.rs, crates/fleet-domain/src/dag.rs, …
 evidence history (newest first):
   EVIDENCE  CHECK             VERDICT  COMMIT        TASK              SUMMARY
-  e77       scope             passed   52f1e0497f3b  maint-docs-links  4 changed path(s), all allowed
-  e76       layers            passed   52f1e0497f3b  maint-docs-links  exit code 0
-  e75       architecture      passed   52f1e0497f3b  maint-docs-links  exit code 0
-  e74       clippy            passed   52f1e0497f3b  maint-docs-links  exit code 0
-  e73       fmt               passed   52f1e0497f3b  maint-docs-links  exit code 0
-  e72       secret-scan       passed   52f1e0497f3b  maint-docs-links  exit code 0
-  e71       conflict-markers  passed   52f1e0497f3b  maint-docs-links  exit code 0
-  e70       docs-claims       passed   52f1e0497f3b  maint-docs-links  exit code 0
-  e69       lock-unchanged    passed   52f1e0497f3b  maint-docs-links  the file's sha256 matches
-  e68       protected-script  passed   52f1e0497f3b  maint-docs-links  exit code 0
-  e67       protected-diff    passed   52f1e0497f3b  maint-docs-links  4 changed path(s), all allowed
+  e66       scope             passed   5d2edc193337  maint-docs-links  4 changed path(s), all allowed
+  e65       layers            passed   5d2edc193337  maint-docs-links  exit code 0
+  e64       architecture      passed   5d2edc193337  maint-docs-links  exit code 0
+  e63       clippy            passed   5d2edc193337  maint-docs-links  exit code 0
+  e62       fmt               passed   5d2edc193337  maint-docs-links  exit code 0
+  e61       secret-scan       passed   5d2edc193337  maint-docs-links  exit code 0
+  e60       conflict-markers  passed   5d2edc193337  maint-docs-links  exit code 0
+  e59       docs-claims       passed   5d2edc193337  maint-docs-links  exit code 0
+  e58       lock-unchanged    passed   5d2edc193337  maint-docs-links  the file's sha256 matches
+  e57       protected-script  passed   5d2edc193337  maint-docs-links  exit code 0
+  e56       protected-diff    passed   5d2edc193337  maint-docs-links  4 changed path(s), all allowed
+  e55       scope             passed   5d2edc193337  maint-docs-links  4 changed path(s), all allowed
+  e54       layers            failed   5d2edc193337  maint-docs-links  exit code 1, expected 0
+  e53       architecture      passed   5d2edc193337  maint-docs-links  exit code 0
+  e52       clippy            passed   5d2edc193337  maint-docs-links  exit code 0
+  e51       fmt               passed   5d2edc193337  maint-docs-links  exit code 0
+  e50       secret-scan       passed   5d2edc193337  maint-docs-links  exit code 0
+  e49       conflict-markers  passed   5d2edc193337  maint-docs-links  exit code 0
+  e48       docs-claims       passed   5d2edc193337  maint-docs-links  exit code 0
+  e47       lock-unchanged    passed   5d2edc193337  maint-docs-links  the file's sha256 matches
 
 $ /target/release/fleet goals remaining
 11 goals, 6 verified, 0 abandoned
@@ -971,20 +958,13 @@ next ready tasks:
 
 $ the checks that failed for g-starter-error-tests (fleet goals show g-starter-error-tests --json)
 
-$ the checks that failed for g-starter-value-property (fleet goals show g-starter-value-property --json)
-  [layers @ 1629515401d0] FAILED: exit code 1, expected 0
-      failures:
-          repo::markdown::tests::adversarial_code_spans_and_backslashes
-          repo::markdown::tests::adversarial_tables
-          repo::worddiff::tests::work_is_bounded_whatever_the_lines_are
-      test result: FAILED. 495 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.65s
-      error: test failed, to rerun pass `-p fleet-domain --lib`
-      --- stderr ---
-      FAILED: domain
+$ the checks that failed for g-starter-dag-property (fleet goals show g-starter-dag-property --json)
+  [scope @ 01c372a38f38] FAILED: 1 changed path(s) outside the allowed globs
+      "SECURITY.md"
 
 $ fleet events --limit 200 | grep ... # every failed protected-path check of the run (the daemon keeps the last 200 events in memory: enough here)
-#55 evidence e12: goal g-starter-value-property check "protected-diff" failed
-#56 evidence e13: goal g-starter-value-property check "protected-script" failed
+#55 evidence e12: goal g-starter-dag-property check "protected-diff" failed
+#56 evidence e13: goal g-starter-dag-property check "protected-script" failed
 
 $ the worker that costs nothing: fleet tail n3-scaffold
 task n3-scaffold is human-only: a person does this one, see dogfood/human-only.md
@@ -996,59 +976,59 @@ goal g-starter-docs-glossary [verified] contract passed
   protected-diff [diff, mandatory] passed: 1 changed path(s), all allowed
     changes nothing matching .github/**, .github/workflows/**, SECURITY.md, scripts/**, scripts/test-la…
   protected-script [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-protected.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111beb…
-    > check-protected: 1 changed path(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-docs-glossary, none protected (84 entries)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-protected.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc91…
+    > check-protected: 1 changed path(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-docs-glossary, none protected (85 entries)
   lock-unchanged [file, mandatory] passed: the file's sha256 matches
     Cargo.lock has sha256 ed369f7785bd21f502f66ebcef8275adda520a879a363303b42875e8bc0a8d9b
   docs-claims [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111b…
-    > check-docs-claims: 3 changed documentation line(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-docs-glossary, no measured number among them
+    /tmp/dogfood-dryrun.teK9d6/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc…
+    > check-docs-claims: 3 changed documentation line(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-docs-glossary, no measured number among them
   conflict-markers [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-conflict-markers.sh --tree (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-conflict-markers.sh --tree (expect exit 0)
     > check-conflict-markers: clean (--tree)
   secret-scan [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/tools/check-secret-tree.sh (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/tools/check-secret-tree.sh (expect exit 0)
     > secret-scan: clean (--tree)
   fmt [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo fmt --all -- --check (expect exit 0)
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo fmt --all -- --check (expect exit 0)
   clippy [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo clippy --workspace --all-targets --locked --offline …
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo clippy --workspace --all-targets --locked --offline …
     >
     > --- stderr ---
     >     Checking fleet-domain v0.1.0 (/tmp/work/crates/fleet-domain)
     >     Checking neo-context v0.1.0 (/tmp/work/crates/neo-context)
     >     Checking neo-verify v0.1.0 (/tmp/work/crates/neo-verify)
     >     Checking fleet-forge v0.1.0 (/tmp/work/crates/fleet-forge)
-    >     Checking fleet-fanout v0.1.0 (/tmp/work/crates/fleet-fanout)
     >     Checking neo-goals v0.1.0 (/tmp/work/crates/neo-goals)
+    >     Checking fleet-fanout v0.1.0 (/tmp/work/crates/fleet-fanout)
     >     Checking fleet-app v0.1.0 (/tmp/work/crates/fleet-app)
     >     Checking fleet-infra v0.1.0 (/tmp/work/crates/fleet-infra)
     >     Checking fleet-cli v0.1.0 (/tmp/work/crates/fleet-cli)
-    >     Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.98s
+    >     Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.54s
   architecture [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run cargo test --locked --offline -p fleet-cli --test architec…
+    /tmp/dogfood-dryrun.teK9d6/container-run cargo test --locked --offline -p fleet-cli --test architec…
     > ... (22 earlier lines not shown)
     > --- stderr ---
     >    Compiling fleet-domain v0.1.0 (/tmp/work/crates/fleet-domain)
     >    Compiling neo-verify v0.1.0 (/tmp/work/crates/neo-verify)
-    >    Compiling neo-context v0.1.0 (/tmp/work/crates/neo-context)
     >    Compiling fleet-forge v0.1.0 (/tmp/work/crates/fleet-forge)
-    >    Compiling neo-goals v0.1.0 (/tmp/work/crates/neo-goals)
+    >    Compiling neo-context v0.1.0 (/tmp/work/crates/neo-context)
     >    Compiling fleet-fanout v0.1.0 (/tmp/work/crates/fleet-fanout)
+    >    Compiling neo-goals v0.1.0 (/tmp/work/crates/neo-goals)
     >    Compiling fleet-app v0.1.0 (/tmp/work/crates/fleet-app)
     >    Compiling fleet-infra v0.1.0 (/tmp/work/crates/fleet-infra)
     >    Compiling fleet-cli v0.1.0 (/tmp/work/crates/fleet-cli)
-    >     Finished `test` profile [unoptimized + debuginfo] target(s) in 6.19s
+    >     Finished `test` profile [unoptimized + debuginfo] target(s) in 9.72s
     >      Running tests/architecture.rs (/target/debug/deps/architecture-c8d89152e6ed4dea)
   layers [command, mandatory] passed: exit code 0
-    /tmp/dogfood-dryrun.pykQzI/container-run sh scripts/test-layers.sh (expect exit 0)
-    > ... (6 earlier lines not shown)
-    >
-    > == adapters ==
-    > adapters: 775 passed, 0 failed
+    /tmp/dogfood-dryrun.teK9d6/container-run sh scripts/test-layers.sh (expect exit 0)
+    > ... (9 earlier lines not shown)
     >
     > == soak ==
     > soak: 1 passed, 0 failed
+    >
+    > == dogfood ==
+    > dogfood: 573 passed, 0 failed
     >
     > == remote ==
     > skipped: no OpenSSH server in this image (build docker/Dockerfile.ssh)
@@ -1065,61 +1045,61 @@ note: the commit that was checked is not the one the last review recorded for th
 goal g-n3-scaffold [open] contract pending
   no-change-at-all [diff, mandatory] failed (not the reviewed commit: does not count): 3 changed path(s) match a denied glob
     changes nothing matching **
+    > "crates/fleet-domain/src/dag.rs" (denied)
     > "crates/fleet-domain/src/error.rs" (denied)
-    > "crates/fleet-domain/src/value.rs" (denied)
     > "docs/domain.md" (denied)
   never-exists [file, mandatory] failed (not the reviewed commit: does not count): the file does not exist
     dogfood/.human-only-this-file-never-exists exists
 exit 6
 
-$ git log --oneline 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-value-property   # what the retry committed
-1629515 fleet: starter-value-property - Starter: a property test for the canonical form of fleet-domain Value
-94eba89 fleet: starter-value-property - Starter: a property test for the canonical form of fleet-domain Value
+$ git log --oneline 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-dag-property   # what the retry committed
+50f274e fleet: starter-dag-property - Starter: a property test for the task order of fleet-domain dag.rs
+01c372a fleet: starter-dag-property - Starter: a property test for the task order of fleet-domain dag.rs
 
-$ git diff --stat 4111beb9770864dfdd229292843d188fecb2a85e fleet/neo-roadmap/starter-value-property
- crates/fleet-domain/src/value.rs | 86 ++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 86 insertions(+)
+$ git diff --stat 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c fleet/neo-roadmap/starter-dag-property
+ crates/fleet-domain/src/dag.rs | 45 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
 
-$ sh /tmp/dogfood-dryrun.pykQzI/tools/check-protected.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-value-property
-check-protected: 1 changed path(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-value-property, none protected (84 entries)
+$ sh /tmp/dogfood-dryrun.teK9d6/tools/check-protected.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-dag-property
+check-protected: 1 changed path(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-dag-property, none protected (85 entries)
 
-$ sh /tmp/dogfood-dryrun.pykQzI/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.pykQzI/clone 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-value-property
-check-docs-claims: 0 changed documentation line(s) in 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-value-property, no measured number among them
+$ sh /tmp/dogfood-dryrun.teK9d6/tools/check-docs-claims.sh --repo /tmp/dogfood-dryrun.teK9d6/clone 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-dag-property
+check-docs-claims: 0 changed documentation line(s) in 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-dag-property, no measured number among them
 
 $ fleet merge starter-docs-glossary   # needs an approval bound to the exact commit
-fleet: merging neo-roadmap/starter-docs-glossary needs approval a1 (digest 8dcd44694b3e); approve it with `fleet approve a1` and run the merge again
+fleet: merging neo-roadmap/starter-docs-glossary needs approval a1 (digest dd80e0fb66bb); approve it with `fleet approve a1` and run the merge again
 run: fleet approve a1
 exit 5
 
 $ /target/release/fleet approval list
-approval a1 [merge] neo-roadmap/starter-docs-glossary pending digest 8dcd44694b3e
-  git: "merge" "fleet/neo-roadmap/integration" "fleet/neo-roadmap/starter-docs-glossary" "3fd3591097a61616dbdcf18f8e1a2803e4a5754d"
+approval a1 [merge] neo-roadmap/starter-docs-glossary pending digest dd80e0fb66bb
+  git: "merge" "fleet/neo-roadmap/integration" "fleet/neo-roadmap/starter-docs-glossary" "bfee265fc3909766b3908fa65da13dd826343ac5"
   decide: fleet approve a1 | fleet deny a1
 
 $ /target/release/fleet approve a1
 approval a1 approved
 
 $ /target/release/fleet merge starter-docs-glossary
-merged neo-roadmap/starter-docs-glossary (fleet/neo-roadmap/starter-docs-glossary) into fleet/neo-roadmap/integration at 34c0c8cce85c
+merged neo-roadmap/starter-docs-glossary (fleet/neo-roadmap/starter-docs-glossary) into fleet/neo-roadmap/integration at 1b65bcd3499d
 
 $ /target/release/fleet verify-log
-event log ok: 217 records, head 0a6ce023da34d59a28153848bfb4d089dbd1fe36198a12effda66e6f73d9fb75
+event log ok: 183 records, head c76ebd30186db2227c2dc72cae32b3655907220f3964a8c636d66db0a448f43d
 
 $ git status --short   # the clone's own branch and working tree were never touched
-merge/dogfood
+fix/integration
 
-$ git log --format='%h %an <%ae> %s' 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-docs-glossary   # who fleet says made the commits
-3fd3591 fleet <fleet@localhost> fleet: starter-docs-glossary - Starter: glossary entries for self-development in docs/domain.md
+$ git log --format='%h %an <%ae> %s' 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-docs-glossary   # who fleet says made the commits
+bfee265 fleet <fleet@localhost> fleet: starter-docs-glossary - Starter: glossary entries for self-development in docs/domain.md
 
-$ git -C /tmp/dogfood-dryrun.pykQzI/clone switch -q -c owner-branch 4111beb9770864dfdd229292843d188fecb2a85e
+$ git -C /tmp/dogfood-dryrun.teK9d6/clone switch -q -c owner-branch 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c
 
-$ git cherry-pick -n 4111beb9770864dfdd229292843d188fecb2a85e..fleet/neo-roadmap/starter-docs-glossary   # applied to the index and the files, not committed
+$ git cherry-pick -n 9bafc91e43b1c6c716b90bb1c3d7e5cbc19a987c..fleet/neo-roadmap/starter-docs-glossary   # applied to the index and the files, not committed
 
-$ sh /tmp/dogfood-dryrun.pykQzI/tools/check-conflict-markers.sh --git /tmp/dogfood-dryrun.pykQzI/clone
+$ sh /tmp/dogfood-dryrun.teK9d6/tools/check-conflict-markers.sh --git /tmp/dogfood-dryrun.teK9d6/clone
 check-conflict-markers: clean (--git)
 
 $ git commit as the owner (the commit message is the owner's own)
-aa73831 Owner Name <owner@example.invalid> Add the self-development terms to the glossary
+6770eaa Owner Name <owner@example.invalid> Add the self-development terms to the glossary
 exit=0
 ```
 
