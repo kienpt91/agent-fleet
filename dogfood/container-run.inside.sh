@@ -8,10 +8,6 @@
 #
 #   container-run.inside.sh '<shell command>'
 #
-# The tests run on 6 threads (RUST_TEST_THREADS, override it in the environment of the dry run): a few tests bound their wall-clock
-# time for an idle machine (README, Tests) and fail when their own siblings and other jobs starve them, which on a loaded
-# machine failed a task of the dry run eight times in a row. No test is changed.
-#
 # Not for real runs on a machine that has docker: there, container-run.example.sh adds the network
 # and file isolation of a container, which this script does not.
 set -eu
@@ -26,5 +22,5 @@ mkdir -p "$work" /tmp/home
 cp -a "$src/." "$work/"
 cd "$work"
 exec env -i HOME=/tmp/home CARGO_HOME="${CARGO_HOME:-/cargo}" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/target}" CARGO_TERM_COLOR=never \
-  RUSTUP_HOME="${RUSTUP_HOME:-/usr/local/rustup}" PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin FLEET_SOAK_SECS="${FLEET_SOAK_SECS:-2}" RUST_TEST_THREADS="${RUST_TEST_THREADS:-6}" \
+  RUSTUP_HOME="${RUSTUP_HOME:-/usr/local/rustup}" PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin FLEET_SOAK_SECS="${FLEET_SOAK_SECS:-2}" \
   sh -c "$1"
