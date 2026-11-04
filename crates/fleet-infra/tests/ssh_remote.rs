@@ -228,6 +228,23 @@ fn output_text(done: &Done) -> String {
     String::from_utf8_lossy(&done.stdout).replace('\r', "")
 }
 
+/// A worker that ignores TERM, HUP and INT and creates the file named by `$1` once those traps are
+/// in place (`sh -c STUBBORN_WORKER sh <file>`).
+const STUBBORN_WORKER: &str =
+    "trap '' TERM HUP INT; : > \"$1\"; echo up; while :; do sleep 1; done";
+
+/// Waits until the stubborn worker has installed its traps (it created `marker`). The launcher
+/// writes the pid file before it hands over to the worker, so that file says nothing about the traps:
+/// a TERM sent as soon as it appears can still kill a worker that is about to ignore it. The wait is
+/// generous and only ever as long as the machine is slow.
+fn wait_for_traps(marker: &std::path::Path) {
+    assert!(
+        wait_until(60_000, || marker.exists()),
+        "the worker did not report within 60 s that it ignores TERM and HUP: {} was not created",
+        marker.display()
+    );
+}
+
 // ---- host key pinning ---------------------------------------------------------------------------
 
 #[test]
@@ -974,6 +991,8 @@ fn a_remote_worker_that_ignores_term_and_hangup_is_stopped_by_the_remote_kill() 
     let Some(fx) = Fx::new() else { return };
     let (remote, host, task, _wt, _prepared) = prepared_task(&fx, &["sh"]);
     let pidfile = fx.remote_dir(&host, "r1", "t1").with_extension("pid");
+    let marker = fx.sshd.dir.join("traps-installed");
+    let marker_arg = marker.display().to_string();
     let remote = Arc::new(remote);
     let worker = {
         let remote = Arc::clone(&remote);
@@ -985,7 +1004,7 @@ fn a_remote_worker_that_ignores_term_and_hangup_is_stopped_by_the_remote_kill() 
                 &host,
                 &task,
                 "sh",
-                &["-c", "trap '' TERM HUP INT; while :; do sleep 1; done"],
+                &["-c", STUBBORN_WORKER, "sh", &marker_arg],
                 &[],
                 40,
             )
@@ -997,6 +1016,7 @@ fn a_remote_worker_that_ignores_term_and_hangup_is_stopped_by_the_remote_kill() 
     let pid: i32 = text.split_whitespace().next().unwrap().parse().unwrap();
     let alive = |p: i32| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok();
     assert!(alive(pid));
+    wait_for_traps(&marker);
     // TERM: ignored by the worker.
     remote.signal(&task, Signal::Term);
     std::thread::sleep(Duration::from_millis(1500));
@@ -1163,14 +1183,12 @@ mod sessions {
     fn stopping_a_remote_worker_that_ignores_term_and_hangup_kills_it_on_the_host_too() {
         let Some(fx) = Fx::new() else { return };
         let mut rig = rig(&fx, &["sh"], 64 * 1024, Redactor::builtin());
+        let marker = fx.sshd.dir.join("traps-installed");
         let spec = spec(
             &fx,
             &rig,
             "sh",
-            &[
-                "-c",
-                "trap '' TERM HUP INT; echo up; while :; do sleep 1; done",
-            ],
+            &["-c", STUBBORN_WORKER, "sh", &marker.display().to_string()],
         );
         let spawned = rig.sessions.spawn(&spec).unwrap();
         // The local ssh client is a live session: the origin checks refuse it and what it starts.
@@ -1194,6 +1212,8 @@ mod sessions {
             .unwrap();
         let alive = |p: i32| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok();
         assert!(alive(pid));
+        // Only a worker that already ignores TERM and HUP can show that TERM alone leaves it running.
+        wait_for_traps(&marker);
         // The supervisor's sequence: TERM, a grace period, KILL.
         assert_eq!(
             rig.sessions.signal(spawned.id, Signal::Term),
@@ -1201,15 +1221,16 @@ mod sessions {
         );
         std::thread::sleep(Duration::from_millis(2500));
         assert!(
-            alive(pid) || rig.sessions.poll(spawned.id) != SessionState::Running,
-            "TERM alone does not stop it on the host"
+            alive(pid),
+            "TERM (and the hang-up of the ended ssh client) stopped a worker that ignores both"
         );
+        // KILL cannot be ignored: the worker on the host goes, and the session ends.
         let _ = rig.sessions.signal(spawned.id, Signal::Kill);
         let state = wait_exit(&mut rig, spawned.id, 60);
         assert!(matches!(state, SessionState::Exited { .. }), "{state:?}");
         assert!(
             wait_until(10_000, || !alive(pid)),
-            "the worker on the host is gone"
+            "the worker on the host survived KILL"
         );
         let out = rig.sessions.release(spawned.id);
         assert!(out.text.contains("was removed"), "{}", out.text);
