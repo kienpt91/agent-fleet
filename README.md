@@ -2016,6 +2016,10 @@ event log ok: 62 records, head 790da2af8692af69c0096da41206de2d53e66f346bd525615
 
 What was not verified for fan-out: no real coding agent was used (only scripted fakes), nothing ran on macOS, and the groups page of the web dashboard was only checked through its JSON routes, the static-asset scans and the fake-DOM smoke test, not drawn in a browser.
 
+## Releasing
+
+Releases are cut by pushing a `vMAJOR.MINOR.PATCH` tag. The `release` workflow then verifies the code, builds the files, writes `SHA256SUMS`, attests where they were built and creates the GitHub release. See [RELEASING.md](RELEASING.md) for how to cut a release and how to verify a download with `gh attestation verify`.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Copyright (c) 2026 Kien Phan.
