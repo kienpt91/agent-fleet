@@ -23,7 +23,7 @@ fleet-forge = { path = "../fleet-forge" }
 fleet-infra = { path = "../fleet-infra" }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 crossterm = { version = "=0.29.0", default-features = false, features = ["events"] }
-nix = { version = "=0.31.3", default-features = false, features = ["poll", "user"] }
+nix = { version = "=0.32.0", default-features = false, features = ["poll", "user"] }
 
 [lints]
 workspace = true
